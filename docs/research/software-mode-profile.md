@@ -302,8 +302,8 @@ profile, not measured; nothing here is a number for `docs/benchmarks.md`.
 | 1 | The first boot of a fresh AVD: `apexd` decompresses 24 `.capex` files serially, then `system_server` does its first-boot work | 360 s to `sys.boot_completed` and 386 s to the launcher, against 156 to 179 s warm: 190 to 200 s of every new AVD's first start | Section 4: init's wait for `apexd.status=activated` is 118.4 s of the 125 s extra before zygote; `ams_ready` is 67 s after `pms_ready` against 20 s; 4 first boots 360.1 to 366.7 s | `crates/emu-avd/src/lib.rs` creates the AVD, `apps/emu/src/main.rs:161` (`create_avd`) and `apps/emu/src/provision.rs:91` (`-provision ... -create-avd`) never boot it; `-clone-avd` is `apps/emu/src/main.rs:235` | Done: a clone of a settled AVD booted in 161.1 s / 190.4 s (one boot). To ship it: `-create-avd` (or `-provision`) boots the image once and keeps a settled userdata to clone for later AVDs of that image. Gain about 200 s per new AVD after the first; no QEMU or guest change |
 | 2 | Guest code runs at a fraction of its speed because every guest context switch flushes QEMU's soft TLB and jump cache (no PCID in TCG) | Everything the guest does: the 156 to 179 s warm boot, about 7 frames a second in the launcher, 95% janky frames | Section 3: 30% of vCPU time is guest code, 25 to 30% finding the next block, 18 to 26% soft MMU. Section 4: 564 context switches a second idle = 570 TLB flushes a second; 2,111 a second swiping; `-cpu max,+pcid` is refused by TCG; a 16× larger jump cache is slower (`tcg_flush_jmp_cache` 0.13 to 0.17 cores) | `crates/emu-vmm/src/soft.rs:25` (`CPU`) and `:96` (`-accel tcg,thread=multi`): QEMU exposes no option for it | Not config-only. Keep the soft TLB and jump cache across a CR3 write by tagging entries with the guest's PCID in QEMU's x86 target (the structure the profile points at), or measure the bound first: a guest pipe ping-pong between two processes (a context switch per message) against the same work in one process. Estimate: removing half of the lookup and soft-MMU share is 25% of vCPU time, so the guest runs about 1.3× faster: boot 170 s to about 130 s. **Measured since (tcg-context-switch.md, #227): withdrawn.** A CR3 write costs 100 to 150 µs, the guest writes CR3 about 125 times a second idle and 150,000 times in a boot, which is a 3 to 4% ceiling; a prototype that keeps 8 PCIDs left boot unchanged (idle host CPU 10% lower). The lookup share is 36% in a loop with no context switches, so it is not mostly the flush |
 | 3 | The warm boot is one serial guest job at about half a core per vCPU: kernel and init 52 to 55 s, preload 14 to 22 s, PackageManager 18 s, ActivityManager 19 s, screen and boot animation 36 s | 156 to 179 s to `sys.boot_completed` | Section 3: host CPU never above 2.83 of 4 cores in boot; vCPUs 54 to 65% busy; guest uptime milestones. Section 4: 3 vCPUs cost 16%, 2 cost 150%, 6 cost 12% (4 is right on 4 host cores) | `crates/emu-avd/src/lib.rs:218` (`cpus`, default 2 when the AVD sets no `hw.cpu.ncore`; `emu -create-avd` writes 4) and `crates/emu-vmm/src/soft.rs:99` | A booted snapshot is the only thing that skips it, and QEMU's `savevm` is refused (below): the vsock, console, net, input and GPU devices are emu's vhost-user and vfio-user backends and none is migratable, and the renderer's state is in emu. Estimate if it worked: restore of 1.5 GB plus a cold translation cache, tens of seconds against 170 s. A spike: serialize one device (vsock) through vhost-user's device-state protocol and see how many others block. **Spiked since (section 7, #214): the save and the load work and take 8.5 s; the restored guest's graphics crash because the goldfish address space and the renderer start empty** |
-| 4 | SwiftShader draws every frame on the same 4 cores as the vCPUs | The launcher's 7 frames a second: its four rasterizer threads take 0.35 to 0.55 cores while swiping (24% of host CPU over adb) and 0.56 in boot | Section 3: `Thread<0n>` rows; the SwiftShader JIT is the second symbol in boot and in the adb swipes. Section 4: 540×960 at 240 dpi gave 194 frames against 173 to 183 and p90 200 ms against 300 (one boot) | `apps/emu/src/instance.rs:390` (SwiftShader unless `-gpu lavapipe`, which crashed emu 66 s and 138 s in) | Run `lcd540` three times and an AVD with `hw.lcd.vsync=30` together (they were measured separately): if the gains add, a documented software-mode AVD profile (smaller screen, 30 Hz) is a config change. Estimate: 10 to 20% fewer janky frames, not a change in frame rate |
-| 5 | An idle guest costs 0.58 host cores | A device left running takes a core's worth of a 4-core host | Section 3: vCPUs 0.50 of it, QEMU's main loop 0.06, emu 0.01; the guest does 564 context switches a second (each a flush, rank 2) and takes 60 composer callbacks a second | `apps/emu/src/instance.rs:883` (`androidboot.qemu.vsync` from the AVD's `hw.lcd.vsync`), the AVD's sensor rate | `hw.lcd.vsync=30`: 0.55 against 0.59 here, 0.12 lower in docs/benchmarks.md. Lowering the sensors HAL's 15 Hz poll is a guest change; estimate 0.05 to 0.1 more. Fixing rank 2 lowers this too |
+| 4 | SwiftShader draws every frame on the same 4 cores as the vCPUs | The launcher's 7 frames a second: its four rasterizer threads take 0.35 to 0.55 cores while swiping (24% of host CPU over adb) and 0.56 in boot | Section 3: `Thread<0n>` rows; the SwiftShader JIT is the second symbol in boot and in the adb swipes. Section 4: 540×960 at 240 dpi gave 194 frames against 173 to 183 and p90 200 ms against 300 (one boot) | `apps/emu/src/instance.rs:390` (SwiftShader unless `-gpu lavapipe`, which crashed emu 66 s and 138 s in) | Run `lcd540` three times and an AVD with `hw.lcd.vsync=30` together (they were measured separately): if the gains add, a documented software-mode AVD profile (smaller screen, 30 Hz) is a config change. Estimate: 10 to 20% fewer janky frames, not a change in frame rate. **Measured since (section 8, #228):** together they cost 17% less host CPU while swiping (2.41 against 1.99 cores), p90 frame time 350 against 200 ms, 3 to 18% more frames, and shipped as `emu -create-avd -profile software-lite` |
+| 5 | An idle guest costs 0.58 host cores | A device left running takes a core's worth of a 4-core host | Section 3: vCPUs 0.50 of it, QEMU's main loop 0.06, emu 0.01; the guest does 564 context switches a second (each a flush, rank 2) and takes 60 composer callbacks a second | `apps/emu/src/instance.rs:883` (`androidboot.qemu.vsync` from the AVD's `hw.lcd.vsync`), the AVD's sensor rate | `hw.lcd.vsync=30`: 0.55 against 0.59 here, 0.12 lower in docs/benchmarks.md. Lowering the sensors HAL's 15 Hz poll is a guest change; estimate 0.05 to 0.1 more. Fixing rank 2 lowers this too. **Measured since (section 8):** 30 Hz with the 540x960 screen settles at 0.46 cores against 0.68 |
 
 Checked and not bottlenecks (so no work belongs there): emu's own threads (vsock, vhost-user kicks,
 GPU decoder, console, display) are at most 0.03 cores, 0.01 idle, and `vhost_user.rs:587` blocks in
@@ -487,3 +487,47 @@ QMP `stop`, then `migrate` with `{"uri": "exec:zstd -T0 -3 -q -o state.zst"}`, p
 `query-migrate`, then `quit`; a new emu with `QEMU_EXTRA="-incoming defer"`, `migrate-incoming`
 with `{"uri": "exec:zstd -d -c state.zst"}`, `cont`. The unmodified QEMU stops at the first
 `migrate` with the vsock error above.
+
+## 8. A smaller screen and 30 Hz together
+
+Ranks 4 and 5 of section 5 each measured one config change once: 540x960 at 240 dpi
+(section 4: 8% more frames, p90 200 ms against 300) and `hw.lcd.vsync=30` (idle 0.04 to 0.12 cores
+lower). [#228](https://github.com/kaeawc/simee/issues/228) measured them together and each alone, against the default,
+on one AVD, three rounds of the four warm boots in turn (12 boots), 2026-11-27. The method, host
+and every run are in [benchmarks.md](../benchmarks.md#software-mode-a-smaller-screen-and-30-hz);
+`scripts/bench/software-profile.sh` reproduces it. Medians:
+
+| | default | 540x960 only | 30 Hz only | both |
+| --- | --- | --- | --- | --- |
+| Idle host CPU, 240 to 300 s after boot | 0.68 cores | 0.57 | 0.53 | 0.46 |
+| Host CPU while swiping, warm launcher | 2.41 cores | 2.09 | 2.18 | 1.99 |
+| Frames in 20 swipes, warm / cold launcher | 188 / 108 | 186 / 118 | 182 / 115 | 193 / 127 |
+| p90 frame time, warm launcher | 350 ms | 200 ms | 250 ms | 200 ms |
+| Warm boot to `sys.boot_completed` | 174.0 s | 171.1 s | 172.6 s | 165.0 s |
+| Process tree PSS | 2356 MB | 2321 | 2344 | 2309 |
+
+What it says:
+
+- **The gains add, for CPU.** Idle: 0.11 from the screen, 0.15 from 30 Hz, 0.22 together. 30 Hz
+  removes callbacks the composer takes while nothing draws (section 5, rank 5); the smaller screen
+  has SwiftShader draw 44% fewer pixels (rank 4), which fits it helping the swipes (2.41 to 2.09
+  cores) and the frame times (p90 350 to 200 ms) more than the idle guest.
+- **Frames: modest.** The warm launcher draws 3% more frames (6% more a second, 4.08 to 4.31),
+  the cold first run 18% more. Software mode still draws 2 to 4 frames a second under adb-driven
+  swipes; the profile makes them cheaper, not many.
+- **Janky frames fall from 97% to 75%, mostly because a 30 Hz deadline is 33 ms**: 30 Hz alone is
+  87%, the screen alone 97%. Read the frame times, not that percentage.
+- **No boot or memory win.** 165 s against 174 s is inside the default's own 152.6 to 188.4 s,
+  and the processes' PSS is within 2%: a 1.5 GB guest and QEMU's translation cache are the
+  memory, not the framebuffer.
+- **Noise.** The default's idle cost was 0.56, 0.70 and 0.68 on three boots of one AVD; the
+  profile's 0.45, 0.46 and 0.48 is under all three, and lower in each round, but the screen alone (0.57,
+  0.56, 0.70) can't be told from the default on three boots.
+
+This host is smaller than any before it (3.8 GiB, a 3.3 GiB cgroup limit, 4 vCPUs): a 1.5 GB guest
+booted and ran 12 times with the emu and QEMU processes at about 2.3 GB PSS, with no out-of-memory
+kill. The decision: the profile ships, opt-in (`-profile software-lite`), with the default AVD
+unchanged, since apps then see a 540x960, 30 Hz display. What this doesn't cover: one host, one
+image (API 36 `default` x86_64), a 1.5 GB guest, animations on, 3 boots per arm; launcher swipes
+over adb, not a real app; the stock emulator (it has no software mode that boots, docs/android.md);
+and the sensors HAL's poll rate, which the profile doesn't touch.

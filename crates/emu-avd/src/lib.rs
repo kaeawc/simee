@@ -433,6 +433,15 @@ impl Avd {
     }
 }
 
+/// The named AVD profiles `emu -create-avd -profile NAME` takes ([`NewAvd::with_profile`]).
+pub const PROFILES: [&str; 1] = ["software-lite"];
+
+/// The software-lite profile's screen: 540x960 at 240 dpi, 56% of the default 720x1280's pixels.
+pub const SOFTWARE_LITE_LCD: (u32, u32, u32) = (540, 960, 240);
+
+/// The software-lite profile's refresh rate, `hw.lcd.vsync`.
+pub const SOFTWARE_LITE_VSYNC_HZ: u32 = 30;
+
 /// What `create_avd` writes. Defaults favour cheap, fast boots: a small screen boots markedly
 /// faster than a large one, and more than 2 GB of RAM makes cold boots slower, not faster.
 #[derive(Clone, Debug)]
@@ -469,6 +478,33 @@ impl NewAvd {
             dpad: false,
             extra: Vec::new(),
             boot_props: Vec::new(),
+        }
+    }
+
+    /// The AVD with profile `name` applied ([`PROFILES`]).
+    ///
+    /// `software-lite` is for software mode (x86_64 Linux without KVM), where the guest's CPU and
+    /// the frames SwiftShader draws share the host's cores: a 540x960 screen at 240 dpi and a 30 Hz
+    /// display (`hw.lcd.vsync=30`). It takes the screen, so apps see a smaller, slower display;
+    /// RAM and vCPUs stay as they were (docs/android.md "Software mode" has what it saves). Only
+    /// phone images have a screen to shrink: the other form factors are refused.
+    pub fn with_profile(mut self, name: &str) -> Result<NewAvd> {
+        match name {
+            "software-lite" => {
+                let tag = self.sysdir.trim_matches('/').split('/').nth(2).unwrap_or_default().to_owned();
+                let kind = android_profile(|k| (k == "tag.id").then(|| tag.clone())).kind;
+                if kind.form_factor != FormFactor::Phone {
+                    return Err(Error::Config(format!(
+                        "profile software-lite shrinks a phone's screen; '{tag}' images are a {:?} with a screen of their own",
+                        kind.form_factor
+                    )));
+                }
+                self.lcd = SOFTWARE_LITE_LCD;
+                self.extra.retain(|(k, _)| k != "hw.lcd.vsync");
+                self.extra.push(("hw.lcd.vsync".to_owned(), SOFTWARE_LITE_VSYNC_HZ.to_string()));
+                Ok(self)
+            }
+            other => Err(Error::Config(format!("unknown AVD profile '{other}' (profiles: {})", PROFILES.join(", ")))),
         }
     }
 
@@ -1237,6 +1273,56 @@ mod tests {
             [Some(true), Some(false), Some(false)]
         );
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn software_lite_is_a_smaller_screen_at_30_hz_and_nothing_else() {
+        let tmp = std::env::temp_dir().join(format!("emu-avd-lite-{}", std::process::id()));
+        let sdk = tmp.join("sdk");
+        let sys = "system-images/android-36/default/x86_64";
+        std::fs::create_dir_all(sdk.join(sys)).expect("mkdir");
+        std::fs::write(sdk.join(sys).join("kernel-ranchu"), b"k").expect("write");
+        let env = Env { sdk_root: Some(sdk), avd_home: tmp.join("avd") };
+        let plain = NewAvd::for_image("plain", sys);
+        env.create_avd(&plain).expect("create plain");
+        env.create_avd(&NewAvd::for_image("lite", sys).with_profile("software-lite").expect("phone image")).expect("create lite");
+        let (plain, lite) = (env.load("plain").expect("plain"), env.load("lite").expect("lite"));
+        assert_eq!((plain.lcd(), plain.vsync_hz()), ((720, 1280, 320), 60), "the default profile is unchanged");
+        assert_eq!((lite.lcd(), lite.vsync_hz()), ((540, 960, 240), 30));
+        let text = std::fs::read_to_string(lite.dir.join("config.ini")).expect("config");
+        assert_eq!(text.lines().filter(|l| l.starts_with("hw.lcd.vsync=")).count(), 1, "one vsync line: {text}");
+        assert!(text.contains("hw.lcd.vsync=30\n"));
+        // Nothing but the screen and the refresh rate differs from a plain phone AVD.
+        let keys = |a: &Avd| {
+            let mut kv: Vec<(String, String)> = a.config.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            kv.retain(|(k, _)| !k.starts_with("hw.lcd.") && !k.starts_with("AvdId") && !k.starts_with("avd.ini"));
+            kv
+        };
+        assert_eq!(keys(&plain), keys(&lite), "RAM, vCPUs and the rest stay as they were");
+        assert_eq!((lite.cpus(), lite.ram_bytes()), (4, 2 << 30));
+        // The settled user data depends on the screen, not the refresh rate: lite gets its own golden.
+        let shape = |a: &Avd| golden::SHAPE_KEYS.map(|k| a.get(k).map(str::to_owned));
+        assert_ne!(shape(&plain), shape(&lite));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn software_lite_replaces_a_vsync_and_refuses_other_form_factors() {
+        let mut spec = NewAvd::for_image("x", "system-images/android-36/google_apis/x86_64");
+        spec.extra.push(("hw.lcd.vsync".into(), "120".into()));
+        let spec = spec.with_profile("software-lite").expect("phone");
+        assert_eq!(
+            spec.extra.iter().filter(|(k, _)| k == "hw.lcd.vsync").collect::<Vec<_>>(),
+            [&("hw.lcd.vsync".to_string(), "30".to_string())]
+        );
+        assert_eq!(spec.lcd, SOFTWARE_LITE_LCD);
+        for tag in ["android-wear", "android-tv", "android-automotive"] {
+            let err =
+                NewAvd::for_image("x", &format!("system-images/android-34/{tag}/x86_64")).with_profile("software-lite").expect_err(tag);
+            assert!(err.to_string().contains(tag) && err.to_string().contains("software-lite"), "{err}");
+        }
+        let err = NewAvd::for_image("x", "system-images/android-36/default/x86_64").with_profile("fast").expect_err("unknown");
+        assert!(err.to_string().contains("software-lite"), "the error lists the profiles: {err}");
     }
 
     #[test]

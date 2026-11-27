@@ -47,6 +47,7 @@ recoverable from what was recorded, or they need something the repository doesn'
 | [Software mode, CPU model](#android-software-mode-linux-without-kvm) | zygote 49.4 s | | 4-vCPU Xeon VM, 2026-11-26 | `scripts/bench/software-mode.sh --arms "tcg:…"` |
 | [Software mode, boot](#boot-to-sysboot_completed-with-emus-devices) | 168 s, 0.75 cores idle | SDK emulator `-accel off` 2302 s, 1.09 cores | 4-vCPU Xeon VM, 2026-11-26 | `scripts/bench/software-mode.sh --arms "emu stock"` |
 | [Software mode, `emu -avd`](#software-mode-through-emu--avd) | 161 s, tap 60.8 ms, screenshot 36.9 ms | SDK emulator unusable | 4-vCPU Xeon VM, 2026-11-26 | `android-frames.sh`, `api-steps.sh --android` |
+| [Software mode, software-lite profile](#software-mode-a-smaller-screen-and-30-hz) | 0.46 cores idle, 1.99 cores swiping, p90 frame 200 ms | default profile 0.68, 2.41, 350 ms | 4-vCPU Xeon VM, 2026-11-27 | `scripts/bench/software-profile.sh` |
 | [Android farm](#android-farm) | 8 settled in 266 s | not measured | not recorded, before 2026-11-24 | `scripts/bench/android-farm.sh` |
 | [Device bundles](#android-device-bundles) | 1225 MB, 7.2 s export, 6.7 s import | no stock tool | M3 Max, 2026-11-27 | `scripts/bench/android-bundle.sh` |
 | [iOS boot](#ios-simee-against-simctl) | 15.5 s first, 2.3 s later | `simctl` 18.9 s, 2.3 s | M3 Max, 2026-11-24 | `scripts/bench/ios-boot.sh` |
@@ -557,6 +558,57 @@ a fresh userdata reached `sys.boot_completed` in 243.9 s (one run). This host's 
 Where software mode spends its time, phase by phase, with its own reproduction steps:
 [research/software-mode-profile.md](research/software-mode-profile.md) (a profile on a
 Firecracker VM, 2026-11-27, not a comparison).
+
+### Software mode: a smaller screen and 30 Hz
+
+The `software-lite` profile (`emu -create-avd NAME -sysdir … -profile software-lite`: 540x960 at
+240 dpi and `hw.lcd.vsync=30`) against the default 720x1280 at 320 dpi and 60 Hz, and each half
+alone, on one AVD whose `config.ini` the script rewrites between boots (the same userdata, animations
+on). A 4-vCPU Intel Xeon 2.2 GHz Firecracker VM with 3.8 GiB of RAM (3.3 GiB cgroup limit), no
+`/dev/kvm`, 2026-11-27; QEMU 11.1.3, emu from main at 0b99d0b, API 36 `default` x86_64 r2, the
+AVD 4 vCPUs and 1.5 GB. Three rounds, each booting the four arms warm in turn (the order alternating
+between rounds), after one uncounted first boot: 12 boots, medians with the three runs in
+parentheses. Idle is emu's and QEMU's CPU time over the 60 s that start 240 s after
+`sys.boot_completed`; the swipes are `scripts/android-jank.sh` (10 up and 10 down launcher
+swipes over adb, about 46 s), twice per boot, the first run being the coldest; frames per second
+is the launcher's frames over the run's wall time; memory is the emu and QEMU processes'
+proportional set size after the swipes (shared guest RAM counted once) and the peak sum of their
+resident sizes sampled during the boot. Host load (1-minute average at the end of the idle
+windows) was 0.4 to 1.1: the guest's own, with nothing else running.
+
+```bash
+scripts/bench/software-profile.sh --qemu <qemu-system-x86_64> --rounds 3
+```
+
+| Measure | default | 540x960 only | 30 Hz only | software-lite (both) |
+| --- | --- | --- | --- | --- |
+| Warm boot to `sys.boot_completed` | 174.0 s (152.6, 174.0, 188.4) | 171.1 s (165.1, 171.1, 191.0) | 172.6 s (172.6, 158.7, 194.9) | 165.0 s (164.7, 165.0, 171.7) |
+| Warm boot to the launcher | 217.5 s (199.5, 217.5, 231.9) | 206.9 s (202.8, 206.9, 250.8) | 217.9 s (217.9, 195.9, 251.4) | 206.6 s (201.0, 206.6, 212.8) |
+| Idle host CPU | 0.68 cores (0.56, 0.70, 0.68) | 0.57 (0.57, 0.56, 0.70) | 0.53 (0.53, 0.50, 0.54) | 0.46 (0.45, 0.46, 0.48) |
+| Swipes, second run: frames in 20 swipes | 188 (188, 193, 179) | 186 (182, 196, 186) | 182 (182, 187, 178) | 193 (199, 193, 193) |
+| Swipes, second run: frames per second | 4.08 (4.22, 4.08, 3.71) | 4.16 (4.16, 4.38, 3.92) | 3.97 (3.97, 4.25, 3.80) | 4.31 (4.56, 4.31, 4.20) |
+| Swipes, second run: frame time p50 / p90 | 150 / 350 ms | 150 / 200 ms | 150 / 250 ms | 129 / 200 ms |
+| Swipes, second run: janky frames | 97.3% (97.3, 96.9, 98.3) | 97.3% (94.0, 98.0, 97.3) | 87.2% (83.5, 87.2, 89.9) | 74.6% (71.4, 74.6, 80.8) |
+| Swipes, second run: host CPU | 2.41 cores (2.31, 2.47, 2.41) | 2.09 (2.04, 2.09, 2.24) | 2.18 (2.18, 2.12, 2.27) | 1.99 (1.96, 1.99, 2.04) |
+| Swipes, first run: frames in 20 swipes | 108 (114, 104, 108) | 118 (129, 108, 118) | 115 (115, 128, 103) | 127 (119, 134, 127) |
+| Swipes, first run: frames per second | 2.26 (2.51, 2.24, 2.26) | 2.54 (2.88, 2.42, 2.54) | 2.49 (2.49, 2.85, 2.25) | 2.83 (2.83, 3.07, 2.75) |
+| Swipes, first run: frame time p50 / p90 | 150 / 350 ms | 150 / 250 ms | 150 / 300 ms | 117 / 200 ms |
+| Swipes, first run: janky frames | 96.5% (96.5, 94.2, 98.2) | 95.8% (95.4, 96.3, 95.8) | 80.9% (80.9, 78.9, 84.5) | 71.4% (71.4, 70.2, 78.0) |
+| Swipes, first run: host CPU | 3.06 cores (2.97, 3.33, 3.06) | 2.93 (2.91, 2.93, 3.35) | 3.04 (3.04, 2.93, 3.21) | 2.97 (2.70, 2.97, 3.07) |
+| Memory, PSS after the swipes | 2356 MB (2298, 2356, 2362) | 2321 (2349, 2314, 2321) | 2344 (2335, 2344, 2357) | 2309 (2337, 2309, 2303) |
+| Memory, peak resident sum in the boot | 2197 MB (2195, 2197, 2219) | 2191 (2208, 2191, 2153) | 2194 (2207, 2194, 2186) | 2183 (2204, 2183, 2170) |
+
+The profile settles 0.22 cores lower (a third) and was lower in every round (0.45, 0.46, 0.48
+against the default's 0.56, 0.70, 0.68). The two halves nearly add: 0.11 from the screen and 0.15
+from 30 Hz alone, 0.22 together. While swiping it costs 17% less CPU (2.41 against 1.99 cores) and
+draws 3% more frames on a warm launcher (6% more a second), 18% more on the cold first run, with
+the p90 frame time at 200 ms against 350. Most of the janky-frame drop is the 30 Hz deadline, 33
+ms instead of 17: that arm alone is 87%, so the frame times are the number to read. Boot is not
+a result: 165 s against 174 s is inside the 152.6 to 188.4 s spread of the default's own three
+boots, and memory is the same to 2%, since the guest's 1.5 GB of RAM and QEMU's translation cache
+dominate it. These are the numbers of one 4-vCPU host, and the default's idle cost varied from 0.56
+to 0.70 across three boots of the same AVD: the screen's 0.11 on its own is inside that spread,
+while the profile's 0.45 to 0.48 is under every default run.
 
 ## Android farm
 
