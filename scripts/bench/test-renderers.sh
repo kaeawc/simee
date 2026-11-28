@@ -2,9 +2,10 @@
 # Tests for renderers.sh's device and process safety, with no device and no emulator:
 #   - a protected console or adb port is refused whether or not anything listens on it, and the
 #     default port is not a protected one;
-#   - a process is signalled only while its PID still has the start time recorded at launch (a
-#     reused PID is left alone), and the console quit goes out only to the process that listens on
-#     the port;
+#   - a process is signalled only while its PID still has the identity recorded at launch (a
+#     reused PID is left alone: lib.sh's identity is tested by test-lib.sh), and the console quit
+#     goes out only to the process that listens on the port;
+#   - the ports are checked right before a launch, after the wait for a boot slot;
 #   - the boot gate's waiters are stopped at exit only while they are still the ones started;
 #   - a failed run's samples are dropped and counted.
 #
@@ -82,25 +83,21 @@ bench_log() { :; }
 sleep 60 &
 live=$!
 pids+=("$live")
-started=$(pid_start "$live")
-check "a live process has a start time" "$([ -n "$started" ] && echo ok)"
-check "proc_is: the process it started" "$(yes_if proc_is "$live" "$started")"
-check "proc_is: not when the start time differs (a reused PID)" "$(no_if proc_is "$live" "Thu Jan  1 00:00:00 1970")"
-check "proc_is: not with no start time recorded" "$(no_if proc_is "$live" "")"
-check "proc_is: not with no PID" "$(no_if proc_is "" "$started")"
+ident="$(bench_pid_start "$live")|"
+check "a live process has an identity" "$([ "$ident" != "|" ] && echo ok)"
 
 # A stale record: the PID is alive but isn't the process that was started.
 : >"$fake_log"
-emu_stop "$live" "Thu Jan  1 00:00:00 1970" 5700
-check "emu_stop leaves a PID whose start time differs alone" "$(yes_if kill -0 "$live")"
+emu_stop "$live" "Thu Jan  1 00:00:00 1970|" 5700
+check "emu_stop leaves a PID whose identity differs alone" "$(yes_if kill -0 "$live")"
 check "emu_stop sends no console quit for it" "$([ ! -s "$fake_log" ] && echo ok)"
 emu_stop "$live" "" 5700
-check "emu_stop with no start time recorded signals nothing" "$(yes_if kill -0 "$live")"
+check "emu_stop with no identity recorded signals nothing" "$(yes_if kill -0 "$live")"
 emu_stop "" "" 5700
 check "emu_stop with no PID is a no-op" "$([ ! -s "$fake_log" ] && echo ok)"
 
 # The real one, not listening on the port: SIGINT, and no console quit.
-emu_stop "$live" "$started" 5700
+emu_stop "$live" "$ident" 5700
 check "emu_stop stops the process it started" "$(no_if kill -0 "$live" 2>/dev/null)"
 check "emu_stop sends no console quit when the process doesn't own the port" "$([ ! -s "$fake_log" ] && echo ok)"
 
@@ -125,13 +122,12 @@ time.sleep(60)' "$lport" &
   sleep 60 &
   other=$!
   pids+=("$other")
-  other_start=$(pid_start "$other")
+  other_ident="$(bench_pid_start "$other")|"
   : >"$fake_log"
-  emu_stop "$other" "$other_start" "$lport"
+  emu_stop "$other" "$other_ident" "$lport"
   check "the port's owner is not this process: no console quit reaches it" "$([ ! -s "$fake_log" ] && echo ok)"
   check "the process this run started still stops" "$(no_if kill -0 "$other" 2>/dev/null)"
-  owner_start=$(pid_start "$owner")
-  emu_stop "$owner" "$owner_start" "$lport"
+  emu_stop "$owner" "$(bench_pid_start "$owner")|" "$lport"
   check "the process on the port gets the console quit for its own serial" "$(grep -qx -- "-s emulator-$lport emu kill" "$fake_log" && echo ok)"
   check "and is stopped" "$(no_if kill -0 "$owner" 2>/dev/null)"
 else
@@ -153,12 +149,12 @@ check "gate_cleanup empties its list" "$([ "${#GATE_SLOTS[@]}" = 0 ] && echo ok)
 sleep 60 &
 waiter=$!
 pids+=("$waiter")
-GATE_SLOTS=("$waiter|$(pid_start "$waiter")")
+GATE_SLOTS=("$waiter|$(bench_pid_start "$waiter")")
 gate_cleanup
 check "gate_cleanup stops a waiter still running that it started" "$(no_if kill -0 "$waiter" 2>/dev/null)"
 sleep 60 &
 gone=$!
-gone_entry="$gone|$(pid_start "$gone")"
+gone_entry="$gone|$(bench_pid_start "$gone")"
 kill "$gone"
 wait "$gone" 2>/dev/null
 GATE_SLOTS=("$gone_entry" "$live|x")
@@ -169,9 +165,47 @@ check "gate_reap drops waiters that finished or aren't the ones started" "$([ "$
 printf '#!/bin/sh\nexit 1\n' >"$work/badgate"
 chmod +x "$work/badgate"
 gate="$work/badgate"
+# shellcheck disable=SC2218 # the real one, from renderers.sh; the boot tests below stub it
 gate_acquire pretend
 check "gate_acquire fails when the gate exits without a slot" "$([ $? = 1 ] && echo ok)"
 check "and leaves no waiter to signal at exit" "$([ "${#GATE_SLOTS[@]}" = 0 ] && echo ok)"
+
+# --- A boot: the ports are checked after the slot wait, right before the launch ---
+
+# boot_arm with its collaborators replaced by ones that record the order they are called in.
+order="$work/order.log"
+arm_env() { echo ""; }
+arm_gpu() { echo host; }
+load1() { echo 0; }
+now() { echo 0; }
+gate_release() { echo release >>"$order"; }
+port_clear() { echo port_clear >>"$order"; }
+android_boot() {
+  echo android_boot >>"$order"
+  BOOT_PID=4242
+  BOOT_IDENT="Thu Jan  1 00:00:00 1970|/bin/emu"
+  return "$stub_boot_rc"
+}
+gate_acquire() {
+  echo gate_acquire >>"$order"
+  return "$stub_gate_rc"
+}
+AVD=avd
+port=5700
+: >"$work/boot.log"
+stub_gate_rc=0
+stub_boot_rc=0
+: >"$order"
+boot_arm lavapipe "$work/boot.log"
+check "boot_arm: the slot first, then the ports, then the launch, then the slot is released" "$([ "$(tr '\n' ' ' <"$order")" = "gate_acquire port_clear android_boot release " ] && echo ok)"
+check "boot_arm: the identity is the one recorded at launch" "$([ "$BOOT_PID" = 4242 ] && [ "$BOOT_IDENT" = "Thu Jan  1 00:00:00 1970|/bin/emu" ] && echo ok)"
+stub_gate_rc=1
+BOOT_IDENT=old
+: >"$order"
+boot_arm lavapipe "$work/boot.log"
+check "boot_arm: without a slot it returns 2" "$([ $? = 2 ] && echo ok)"
+check "boot_arm: without a slot the ports aren't checked and nothing launches" "$([ "$(tr '\n' ' ' <"$order")" = "gate_acquire " ] && echo ok)"
+check "boot_arm: a previous boot's identity doesn't carry over" "$([ -z "$BOOT_IDENT" ] && [ -z "$BOOT_PID" ] && echo ok)"
 
 # --- Failed runs ---
 
