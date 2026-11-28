@@ -1427,6 +1427,8 @@ mod tests {
     /// #409: `--set` goes with every method a command calls, as an absolute path, before or after
     /// the subcommand; a `set` the params already have stays; with no set at all (a test's
     /// transport) nothing is added.
+    // Unix paths; device sets are iOS (macOS) only.
+    #[cfg(unix)]
     #[test]
     fn the_set_flag_goes_with_every_call_as_an_absolute_path() {
         let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).expect("arguments");
@@ -1875,6 +1877,7 @@ mod tests {
     }
 
     /// [`fake_server`], recording each request's params too.
+    #[cfg(unix)]
     fn fake_server_params(socket: &std::path::Path, answer: Option<Answer>) -> (Seen<String>, Seen<Value>) {
         use std::io::BufRead;
         let listener = std::os::unix::net::UnixListener::bind(socket).expect("bind");
@@ -1909,11 +1912,13 @@ mod tests {
     }
 
     /// What a fake server has been sent, as it arrives.
+    #[cfg(unix)]
     type Seen<T> = std::sync::Arc<std::sync::Mutex<Vec<T>>>;
 
     /// #409: the device set is this command's, said on every call: `--set`, else this process's
     /// `SIMEE_IOS_DEVICE_SET` (made absolute), else the default set (`""`). A server with another
     /// set in its environment never picks the set (it would be the owner's default set).
+    #[cfg(unix)]
     #[test]
     fn the_commands_own_device_set_reaches_a_server_on_every_call() {
         let root = android_root("set-forward");
