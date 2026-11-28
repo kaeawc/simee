@@ -322,6 +322,10 @@ fn move_out(s: &mut State) -> bool {
         s.live.iter().for_each(|l| l.button(button, Direction::Up));
     }
     crate::stylus_off(s);
+    // A pop-out has no CarPlay control: the device shows its iPhone screen there.
+    s.live.iter().for_each(|l| {
+        l.shared.leave_carplay();
+    });
     let size = s.screen_size();
     let device = Popped {
         live: s.live.take(),

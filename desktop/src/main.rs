@@ -771,6 +771,12 @@ fn fold_to(d: &sim_android::Device, posture: Posture) -> Result<(), String> {
 /// Folds an iPhone Duo through the API's `fold` (SpringBoard sweeps its hinge: a second or two),
 /// off the UI thread; the capture thread then shows the screen in use.
 fn apple_fold(s: &mut State, udid: String, posture: Posture) {
+    // The busy slot stays with the job holding it until that returns: a fold sharing it would
+    // clear it with the first job's completion, letting a second attach start beside the fold.
+    if let Some(running) = s.busy {
+        s.status = Some(format!("Wait for {running} to finish"));
+        return;
+    }
     s.run_async("Folding…", move || {
         let params = serde_json::json!({"device": udid, "posture": posture});
         sim_api::call_method(&mut sim_api::Session::default(), "fold", &params).map(drop)
@@ -1662,6 +1668,22 @@ mod tests {
         rt.frame(1.0 / 60.0);
         assert!(rt.state.carplay_shown());
         assert_eq!(rt.state.screen_size(), (800, 480));
+    }
+
+    /// A Duo fold while CarPlay attaches (or any job runs) leaves the busy slot alone: the slot
+    /// stays held until the attach call returns, so a second attach can't start beside the fold.
+    #[test]
+    fn a_fold_waits_for_the_job_holding_the_busy_slot() {
+        let mut s = init();
+        s.waker = Some(Arc::new(|| {}));
+        s.busy = Some("Attaching CarPlay…");
+        s.work_done.store(false, Ordering::Relaxed);
+        apple_fold(&mut s, "no-such-device".into(), Posture::Closed);
+        assert_eq!(s.busy, Some("Attaching CarPlay…"));
+        assert!(!s.work_done.load(Ordering::Relaxed), "the attach's completion flag was not reset");
+        s.busy = None;
+        apple_fold(&mut s, "no-such-device".into(), Posture::Closed);
+        assert_eq!(s.busy, Some("Folding…"), "a free slot runs it");
     }
 
     #[test]

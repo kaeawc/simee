@@ -34,6 +34,8 @@ pub struct Live {
     kicked: Arc<AtomicBool>,
     pub dark: bool,
     orientation: Orientation,
+    /// Where the touch in progress goes, so a switch of screen mid-drag lifts the old one.
+    route: std::sync::Mutex<TouchRoute>,
 }
 
 impl Live {
@@ -54,6 +56,7 @@ impl Live {
             kicked,
             dark: false,
             orientation: Orientation::Portrait,
+            route: std::sync::Mutex::default(),
         })
     }
 
@@ -75,13 +78,17 @@ impl Live {
         let (Some(hid), Some(screen)) = (&self.hid, self.screen()) else { return };
         let at = screen.normalize(Point::new(f64::from(x), f64::from(y)));
         let carplay = self.shared.showing_carplay.load(Ordering::Relaxed);
-        let sent = match Target::of(carplay, self.shared.screen_id.load(Ordering::Relaxed)) {
-            Target::CarPlay => hid.carplay_touch(at, phase),
-            Target::Main => hid.touch(at, phase),
-            Target::Screen(id) => hid.screen_touch(id, at, phase, None),
-        };
-        if let Err(e) = sent {
-            eprintln!("touch: {e}");
+        let target = Target::of(carplay, self.shared.screen_id.load(Ordering::Relaxed));
+        let routed = self.route.lock().map(|mut r| r.route(target, at, phase)).unwrap_or_default();
+        for (target, at, phase) in routed {
+            let sent = match target {
+                Target::CarPlay => hid.carplay_touch(at, phase),
+                Target::Main => hid.touch(at, phase),
+                Target::Screen(id) => hid.screen_touch(id, at, phase, None),
+            };
+            if let Err(e) = sent {
+                eprintln!("touch: {e}");
+            }
         }
         self.kick();
     }
@@ -218,6 +225,7 @@ fn spawn_capture(udid: String, native: NativeSurface, shared: Arc<Shared>, kicke
             let mut carplay: Option<Display> = None;
             let mut change = Change::Seed;
             let mut verify = false;
+            let mut hash_rate = HashRate::new();
             let mut current: Option<(Surface, PixelBuffer)> = None;
             let mut last_seed = None;
             let mut frame_id = 0u64;
@@ -232,10 +240,11 @@ fn spawn_capture(udid: String, native: NativeSurface, shared: Arc<Shared>, kicke
                     verify = true;
                     sim_coresim::autoreleasepool(|| {
                         // CarPlay follows the window's switch: on once its display has rendered, off at once.
-                        let switch = match (shared.carplay.load(Ordering::Relaxed), carplay.is_some()) {
-                            (true, false) => device.external_display().ok().map(Some),
-                            (false, true) => Some(None),
-                            _ => None,
+                        // It also notices the display going away from outside the window.
+                        let switch = match carplay_switch(&shared, carplay.is_some(), || device.external_display().is_ok()) {
+                            Some(Switch::Attach) => device.external_display().ok().map(Some),
+                            Some(Switch::Detach | Switch::Lost) => Some(None),
+                            None => None,
                         };
                         if let Some(next) = switch {
                             carplay = next;
@@ -283,9 +292,14 @@ fn spawn_capture(udid: String, native: NativeSurface, shared: Arc<Shared>, kicke
                     let first = last_seed.is_none();
                     let moved = !first && last_seed != Some(seed);
                     last_seed = Some(seed);
-                    let contents = || carplay.as_ref().and_then(|d| sim_coresim::autoreleasepool(|| d.content_hash().ok())).map(|(_, h)| h);
+                    let verifying = first || std::mem::take(&mut verify);
+                    let readable = hash_rate.allow(Instant::now(), verifying);
+                    let contents = || {
+                        let d = carplay.as_ref().filter(|_| readable)?;
+                        sim_coresim::autoreleasepool(|| d.content_hash().ok()).map(|(_, h)| h)
+                    };
                     let before = change;
-                    let fresh = change.look(moved, first || std::mem::take(&mut verify), contents);
+                    let fresh = change.look(moved, verifying, contents);
                     if matches!((before, change), (Change::Unverified(_), Change::Contents(_))) {
                         eprintln!("capture: the CarPlay surface's seed doesn't follow its frames; comparing its contents");
                     }
@@ -393,6 +407,90 @@ fn follow_fold(main: &Display, inner: &Display, shown: Screen, shared: &Shared) 
     next
 }
 
+/// What the 250 ms check does about the CarPlay display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Switch {
+    /// The window asked for it and it isn't presented yet.
+    Attach,
+    /// The window turned it off while it is presented.
+    Detach,
+    /// It was presented and is gone: detached from outside the window (the API's `carplay off`, a
+    /// reboot, the device shutting down). The window's state is cleared with it.
+    Lost,
+}
+
+/// The check's decision. `present` says whether the external display still exists (a cheap look
+/// the check makes only while it presents CarPlay). A lost display clears [`Shared::carplay`], so
+/// the view falls back to the iPhone as the toggle's off does and the next press attaches anew.
+fn carplay_switch(shared: &Shared, presented: bool, present: impl FnOnce() -> bool) -> Option<Switch> {
+    match (shared.carplay.load(Ordering::Relaxed), presented) {
+        (true, false) => Some(Switch::Attach),
+        (false, true) => Some(Switch::Detach),
+        (true, true) if !present() => {
+            shared.carplay.store(false, Ordering::Relaxed);
+            Some(Switch::Lost)
+        }
+        _ => None,
+    }
+}
+
+/// Bounds how often the contents' hash is read to the 250 ms check's cadence: the pacer may look
+/// every 4 ms while a screen moves, and a hash of a whole surface is not cheap. A verification
+/// (the check itself) always reads.
+struct HashRate {
+    last: Option<Instant>,
+}
+
+impl HashRate {
+    const EVERY: Duration = Duration::from_millis(250);
+
+    fn new() -> Self {
+        Self { last: None }
+    }
+
+    fn allow(&mut self, now: Instant, verifying: bool) -> bool {
+        let due = verifying || self.last.is_none_or(|t| now.saturating_duration_since(t) >= Self::EVERY);
+        if due {
+            self.last = Some(now);
+        }
+        due
+    }
+}
+
+/// Routes a touch's samples to the target that took its start. A drag that spans a switch of
+/// target (CarPlay on or off) lifts the old target's touch where it last was, so none is left
+/// held, and the rest of that drag goes nowhere: the next touch starts on the new target.
+#[derive(Default)]
+struct TouchRoute {
+    held: Option<(Target, Point)>,
+    /// The rest of a drag the switch cut, until its up.
+    cut: bool,
+}
+
+impl TouchRoute {
+    /// The samples to send for one touch sample at `at` (normalized) toward `target`.
+    fn route(&mut self, target: Target, at: Point, phase: Phase) -> Vec<(Target, Point, Phase)> {
+        if phase == Phase::Down {
+            self.cut = false;
+        }
+        let mut out = Vec::new();
+        if let Some((old, last)) = self.held.filter(|(old, _)| *old != target) {
+            out.push((old, last, Phase::Up));
+            self.held = None;
+            self.cut = true;
+        }
+        if self.cut {
+            if phase == Phase::Up {
+                self.cut = false;
+            }
+            return out;
+        }
+        self.held = (phase != Phase::Up).then_some((target, at));
+        out.push((target, at, phase));
+        out
+    }
+}
+
 /// Lists devices for the picker. Errors become an empty list plus a message.
 pub fn list(ctx: &Context) -> Result<Vec<DeviceInfo>, String> {
     let mut devices: Vec<DeviceInfo> = ctx.devices().map_err(|e| e.to_string())?.iter().map(Device::info).filter(|d| d.available).collect();
@@ -479,5 +577,80 @@ mod tests {
         assert_eq!(Target::of(true, 3), Target::CarPlay);
         assert_eq!(Target::of(false, 0), Target::Main);
         assert_eq!(Target::of(false, 3), Target::Screen(3));
+    }
+
+    fn shared(carplay: bool) -> Shared {
+        let s = Shared::default();
+        s.carplay.store(carplay, Ordering::Relaxed);
+        s
+    }
+
+    /// CarPlay detached from outside the window (the API's `carplay off`, a reboot, a shutdown): the
+    /// display is gone while the view presents it. The switch is cleared with it, the view goes back
+    /// to the iPhone's screen and touches route to the iPhone.
+    #[test]
+    fn carplay_detached_from_outside_returns_the_view_to_the_iphone() {
+        let shared = shared(true);
+        shared.showing_carplay.store(true, Ordering::Relaxed);
+        assert_eq!(Target::of(true, 0), Target::CarPlay);
+        let next = carplay_switch(&shared, true, || false);
+        assert_eq!(next, Some(Switch::Lost));
+        assert!(!shared.carplay.load(Ordering::Relaxed), "the window's CarPlay state is cleared");
+        // The capture thread drops the display and says it no longer shows it.
+        shared.showing_carplay.store(false, Ordering::Relaxed);
+        let target = Target::of(shared.showing_carplay.load(Ordering::Relaxed), shared.screen_id.load(Ordering::Relaxed));
+        assert_eq!(target, Target::Main, "touches go to the iPhone");
+        assert_eq!(carplay_switch(&shared, false, || false), None, "nothing more to do");
+        // Pressing the toggle again attaches.
+        shared.carplay.store(true, Ordering::Relaxed);
+        assert_eq!(carplay_switch(&shared, false, || false), Some(Switch::Attach));
+    }
+
+    /// Neighbouring behaviour: a display that is still there is left alone, and the toggle's own
+    /// off detaches.
+    #[test]
+    fn a_present_display_stays_and_the_toggle_still_attaches_and_detaches() {
+        let on = shared(true);
+        assert_eq!(carplay_switch(&on, true, || true), None);
+        assert!(on.carplay.load(Ordering::Relaxed));
+        assert_eq!(carplay_switch(&on, false, || panic!("not probed")), Some(Switch::Attach));
+        let off = shared(false);
+        assert_eq!(carplay_switch(&off, true, || panic!("not probed")), Some(Switch::Detach));
+    }
+
+    /// The hash fallback never runs faster than the 250 ms check, however fast the loop spins
+    /// (4 ms polls), but a verification always reads.
+    #[test]
+    fn the_contents_hash_is_read_at_most_every_250_ms() {
+        let start = Instant::now();
+        let mut rate = HashRate::new();
+        let reads = (0..1000u64).filter(|i| rate.allow(start + Duration::from_millis(i * 4), false)).count();
+        // 4 s of 4 ms polls: one read per 250 ms (the first at once).
+        assert_eq!(reads, 16);
+        let mut rate = HashRate::new();
+        assert!(rate.allow(start, false));
+        assert!(!rate.allow(start + Duration::from_millis(4), false));
+        assert!(rate.allow(start + Duration::from_millis(8), true), "a verification reads");
+        assert!(!rate.allow(start + Duration::from_millis(12), false), "and restarts the interval");
+        assert!(rate.allow(start + Duration::from_millis(8) + HashRate::EVERY, false));
+    }
+
+    /// A drag that spans the switch to CarPlay (or back) lifts the old target's touch, and the rest
+    /// of that drag goes nowhere; the next touch starts on the new target.
+    #[test]
+    fn a_drag_spanning_the_switch_lifts_the_old_touch() {
+        let (a, b) = (Point::new(0.1, 0.2), Point::new(0.3, 0.4));
+        let mut route = TouchRoute::default();
+        assert_eq!(route.route(Target::Main, a, Phase::Down), [(Target::Main, a, Phase::Down)]);
+        assert_eq!(route.route(Target::Main, b, Phase::Move), [(Target::Main, b, Phase::Move)]);
+        let moved = route.route(Target::CarPlay, a, Phase::Move);
+        assert_eq!(moved, [(Target::Main, b, Phase::Up)], "the iPhone's touch lifts where it last was");
+        assert!(route.route(Target::CarPlay, b, Phase::Move).is_empty());
+        assert!(route.route(Target::CarPlay, b, Phase::Up).is_empty());
+        assert_eq!(route.route(Target::CarPlay, a, Phase::Down), [(Target::CarPlay, a, Phase::Down)]);
+        assert_eq!(route.route(Target::CarPlay, b, Phase::Up), [(Target::CarPlay, b, Phase::Up)]);
+        // An up that lands after the switch lifts the old touch too, rather than going to CarPlay.
+        route.route(Target::Main, a, Phase::Down);
+        assert_eq!(route.route(Target::CarPlay, b, Phase::Up), [(Target::Main, a, Phase::Up)]);
     }
 }

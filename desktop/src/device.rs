@@ -47,6 +47,12 @@ impl Shared {
         }
     }
 
+    /// Stops asking for the CarPlay display: the capture thread shows the iPhone's screen again.
+    /// Whether it was asked for.
+    pub fn leave_carplay(&self) -> bool {
+        self.carplay.swap(false, Ordering::Relaxed)
+    }
+
     pub fn size(&self) -> Option<(u32, u32)> {
         match self.size.load(Ordering::Relaxed) {
             0 => None,
@@ -151,6 +157,16 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::Shared;
+
+    /// A pop-out has no CarPlay control, so the device leaves CarPlay as it moves out.
+    #[test]
+    fn leaving_carplay_clears_what_the_window_asked_for() {
+        let shared = Shared::default();
+        assert!(!shared.leave_carplay(), "nothing to leave");
+        shared.carplay.store(true, Ordering::Relaxed);
+        assert!(shared.leave_carplay());
+        assert!(!shared.carplay.load(Ordering::Relaxed));
+    }
 
     /// The capture thread wakes the window the device is in now: a pop-out once it's moved
     /// there, the main window again once it's back, never both.
