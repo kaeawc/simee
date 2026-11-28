@@ -322,6 +322,10 @@ fn move_out(s: &mut State) -> bool {
         s.live.iter().for_each(|l| l.button(button, Direction::Up));
     }
     crate::stylus_off(s);
+    // A pop-out has no CarPlay control: the device shows its iPhone screen there.
+    s.live.iter().for_each(|l| {
+        l.shared.leave_carplay();
+    });
     let size = s.screen_size();
     let device = Popped {
         live: s.live.take(),
@@ -670,12 +674,12 @@ fn window_key(w: &mut Window, k: &KeyEvent, tx: &mut Tx) -> bool {
     true
 }
 
-/// The toolbar controls a pop-out performs: the device's own, without the stylus (a main-window
-/// mode) or the 3D view's.
+/// The toolbar controls a pop-out performs: the device's own, without the stylus or CarPlay
+/// (main-window modes) or the 3D view's.
 pub fn controls(d: &DeviceInfo) -> Vec<crate::controls::Control> {
     crate::controls::for_device(d)
         .into_iter()
-        .filter(|c| !matches!(c.action, Action::ToggleStylus | Action::ToggleView3d | Action::View3d(_)))
+        .filter(|c| !matches!(c.action, Action::ToggleStylus | Action::ToggleCarPlay | Action::ToggleView3d | Action::View3d(_)))
         .collect()
 }
 
