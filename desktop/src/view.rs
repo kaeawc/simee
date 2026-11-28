@@ -18,10 +18,13 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let t = tok::theme(DARK);
     // The mark's clock: none under the system's reduced motion, so every mark rests.
     let clock = (!cx.system_reduced_motion()).then_some(s.mark_t);
-    let panel = s.showing_screen().then(|| match s.selected_info().map(|d| d.platform) {
+    // The panel is there whether or not a screen is (#560): a selection, a boot or a pop-out
+    // never shows or hides it.
+    let panel = match s.selected_info().map(|d| d.platform) {
+        _ if !s.showing_screen() => empty_panel(s, t),
         Some(Platform::Android) => android_panel(s, t),
         _ => crate::debug::panel(s, t),
-    });
+    };
     // The panes' widths and visibility, and their drag handles.
     crate::panes::layout(s, t, sidebar(s, t, clock), stage(s, t, clock), panel)
 }
@@ -72,7 +75,7 @@ fn sidebar(s: &State, t: Theme, clock: Option<f32>) -> El {
         .radius(radius::SM)
         .fill(t.control_off)
         .on_edit(|s: &mut State| &mut s.search)
-        .on_input_change(|s: &mut State, _: &mut Tx| s.search_highlight = None)
+        .on_input_change(|s: &mut State, _: &mut Tx| crate::list::query_changed(s))
         .on_input_key(crate::list::search_key);
     col()
         .w(240.0)
@@ -90,7 +93,7 @@ fn sidebar(s: &State, t: Theme, clock: Option<f32>) -> El {
 
 /// One device's row: its state mark (booting while a boot from here runs), name and platform. A
 /// click or Return selects it and boots it when it is shut down; ⌥ selects only ([`crate::list::activate`]).
-/// Its keys name the device (`device-<udid>`), never its place: focus follows the device when a
+/// Its keys name the device ([`row_key`]), never its place: focus follows the device when a
 /// rescan or a boot reorders the list, so Return presses the row the user focused.
 fn device_row(s: &State, i: usize, highlighted: bool, t: Theme, clock: Option<f32>) -> El {
     let d = &s.devices[i];
@@ -101,22 +104,19 @@ fn device_row(s: &State, i: usize, highlighted: bool, t: Theme, clock: Option<f3
     let motion = job.map_or_else(|| crate::mark::for_device(d.state), crate::mark::for_busy);
     let moving = job.is_some() || crate::mark::moves(d.state);
     let state_mark = crate::mark::toned(motion, clock.filter(|_| moving), Some(crate::mark::tone(d.platform)), 16.0)
-        .key(format!("device-{}-mark", d.udid));
+        .key(row_key("device-mark", &d.udid));
     let (udid, menu_udid) = (d.udid.clone(), d.udid.clone());
     let popped = s.popouts.is_open(&d.udid).then(|| crate::popout::row_mark(&d.udid, t));
-    let mut badge = platform_badge(d, t).key(format!("device-{}-platform", d.udid));
+    let mut badge = platform_badge(d, t).key(row_key("device-platform", &d.udid));
     if selected {
         // The secondary colour is too faint on the tint.
         badge = badge.color(t.text);
     }
     // The bar's slot is there on every row, so names line up whichever is selected.
-    let bar = el().key(format!("device-{}-bar", d.udid)).w(3.0).h(16.0).radius(1.5).fill(if selected {
-        highlight.bar
-    } else {
-        Color::TRANSPARENT
-    });
+    let bar =
+        el().key(row_key("device-bar", &d.udid)).w(3.0).h(16.0).radius(1.5).fill(if selected { highlight.bar } else { Color::TRANSPARENT });
     let mut item = row()
-        .key(format!("device-{}", d.udid))
+        .key(row_key("device-row", &d.udid))
         .role("button")
         .label(format!("{}, {}", d.name, d.label()))
         .focusable(true)
@@ -149,6 +149,14 @@ fn device_row(s: &State, i: usize, highlighted: bool, t: Theme, clock: Option<f3
         item = item.fill(t.hover);
     }
     item
+}
+
+/// The key of a device row's `part` (`device-row`, `device-mark`, `device-bar`,
+/// `device-platform`, `device-popped`) for `udid`: `device-row:pixel_9`. The colon can't be in a
+/// fixed key (`device-screen`) nor in a part, so no AVD name makes a key that's another's: an AVD
+/// named `screen` is `device-row:screen`, and `x-mark`'s row isn't `x`'s mark (#571).
+pub fn row_key(part: &str, udid: &str) -> String {
+    format!("{part}:{udid}")
 }
 
 /// How the selected device's row is drawn.
@@ -187,7 +195,9 @@ pub fn runtime_label(id: &str) -> String {
 }
 
 fn stage(s: &State, t: Theme, clock: Option<f32>) -> El {
-    let mut controls = row().key("controls").w_full().gap(8.0).center_y();
+    // The device list's toggle leads the toolbar, so it stays in reach while the list is hidden.
+    let mut controls =
+        row().key("controls").w_full().gap(8.0).center_y().child(crate::panes::toolbar_toggle(s, crate::panes::Side::Sidebar, t));
     // A boot from here says Booting before the service or the emulator does.
     let state = |d: &DeviceInfo| if s.jobs.booting(&d.udid) && d.state != DeviceState::Booted { "Booting" } else { d.state.as_str() };
     let title = s.selected_info().map_or_else(|| "Select a device".to_string(), |d| format!("{} · {} · {}", d.name, d.label(), state(d)));
@@ -221,12 +231,18 @@ fn stage(s: &State, t: Theme, clock: Option<f32>) -> El {
             .child(button("face-on-button", &icons::FACE_ON, "Face on (⌘0)", Action::View3d(Command::FaceOn), false, t))
             .child(button("flip-button", &icons::FLIP, "Flip (⌘F)", Action::View3d(Command::Flip), false, t));
     }
+    // The panel's toggle ends it, beside where the panel is.
+    controls = controls.child(crate::panes::toolbar_toggle(s, crate::panes::Side::Inspector, t));
     let body = match popped {
         Some(udid) => crate::popout::placeholder(udid, t),
         None if s.showing_screen() => screen(s),
         None => placeholder(s, t, clock),
     };
     let mut stage = col().w_full().h_full().grow(1.0).min_w(0.0).padding(16.0).gap(12.0).child(controls).child(body);
+    // A pane the window is too narrow for: why it's gone, and that it comes back.
+    if let Some(note) = crate::panes::narrow_note(s) {
+        stage = stage.child(text(note).key("narrow-note").font(type_::LABEL).color(t.text).truncate());
+    }
     let footer = match (&s.status, &s.socket) {
         (Some(msg), _) => Some(msg.clone()),
         (None, Some(sock)) => Some(format!("API: {sock}")),
@@ -370,6 +386,27 @@ pub fn screen_radius(shape: Shape, width: f32) -> f32 {
 const EMPTY_LOG: &str = "No log yet. Devices booted here stream logcat (info and up) to this panel. \
                          The kernel console only has critical messages: for the full kernel log, \
                          start emu with -show-kernel or EMU_CONSOLE=full.";
+
+/// The panel while no device screen shows (none selected, one shut down or booting, one out in
+/// its own window): what it will show, and the resource panel's toggle in its corner.
+fn empty_panel(s: &State, t: Theme) -> El {
+    let msg = match s.selected.as_deref() {
+        Some(udid) if s.popouts.is_open(udid) => "This device's window has its screen; its panel shows here once it's back",
+        Some(_) => "The device's details show here once it's running",
+        None => "Select a device to see its details here",
+    };
+    col()
+        .key("inspector-empty")
+        .w(340.0)
+        .h_full()
+        .padding(12.0)
+        .gap(10.0)
+        .fill(t.card)
+        .border(1.0, t.card_border)
+        .child(el().h(22.0))
+        .child(text("DEVICE").font(type_::SECTION).color(t.text_secondary))
+        .child(text(msg).key("inspector-empty-note").font(type_::BODY).color(t.text_secondary).wrap())
+}
 
 /// An Android device's panel: what it is, and its guest log (the console's critical lines, then
 /// logcat).

@@ -284,6 +284,11 @@ impl Store {
         store
     }
 
+    /// The file changes are written to, if any.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     /// Whether changes reach a file.
     pub fn persistent(&self) -> bool {
         self.path.is_some()

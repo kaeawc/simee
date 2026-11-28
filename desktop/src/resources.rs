@@ -4,8 +4,8 @@
 //! last minute per device, from `devices_usage`; a device's running stream from `streams`. Each
 //! row has quick actions: show the device in the window, stop its stream, shut it down.
 //!
-//! ⌘⌥R, or the gauge button in the inspector's top-right corner, shows and hides it in place of
-//! the platform panel. Its visibility and sort persist in [`crate::settings`].
+//! ⌘⌥R, View > Resources or the gauge button in the inspector's top-right corner shows and hides
+//! it in place of the platform panel. Its visibility and sort persist in [`crate::settings`].
 //!
 //! Idle cost is near zero: the panel samples at most once every [`INTERVAL`] and only while it
 //! shows (the inspector visible, the window on screen); hidden, it asks for no sample and no
@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sim_api::Session;
 
+use crate::panes::{Cause, Side, Target};
 use crate::{Action, State, icons};
 
 /// Seconds between samples while the panel shows.
@@ -494,8 +495,7 @@ impl Resources {
 
 /// Whether the panel is on screen: chosen, in a visible inspector, in a visible window.
 pub fn showing(s: &State) -> bool {
-    let c = &s.prefs.current;
-    s.visible && c.inspector.visible && c.resources.visible
+    s.visible && crate::panes::ViewItem::Resources.on(s)
 }
 
 /// Every poll: the panel's samples and quick actions. Returns whether the window should redraw.
@@ -519,13 +519,15 @@ pub fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
     changed
 }
 
-/// ⌘⌥R and the inspector's gauge button: shows the panel (and the inspector, if hidden) or
-/// hides it.
-pub fn toggle(s: &mut State) {
-    let c = &mut s.prefs.current;
-    c.resources.visible = !c.resources.visible;
-    if c.resources.visible {
-        c.inspector.visible = true;
+/// ⌘⌥R, the View menu's Resources and the inspector's gauge button: shows the panel (and the
+/// inspector, if hidden), or swaps it back for the platform panel when it's on screen. It
+/// changes nothing else, and nothing else changes it (#561): a scan, a boot or a selection
+/// leaves it as it is.
+pub fn toggle(s: &mut State, cause: Cause) {
+    let on_screen = crate::panes::ViewItem::Resources.on(s);
+    crate::panes::set(s, Target::Resources, !on_screen, cause);
+    if !on_screen {
+        crate::panes::show(s, Side::Inspector, cause);
     }
 }
 
@@ -885,15 +887,15 @@ fn toggle_button(s: &State, t: Theme) -> El {
         .padding(5.0)
         .radius(radius::SM)
         .fill(if on { tok::accent(0, true) } else { t.control_off })
-        .on_press(toggle)
+        .on_press(|s: &mut State| toggle(s, Cause::Button))
         .child(rune::icon(&icons::GAUGE, 16.0).color(t.text))
 }
 
 /// The inspector: the resource panel while chosen (with or without a device on screen),
 /// otherwise the platform panel; either way with the toggle in its corner.
-pub fn inspector(s: &State, t: Theme, platform: Option<El>) -> Option<El> {
-    let panel = if s.prefs.current.resources.visible { Some(panel(s, t)) } else { platform }?;
-    Some(panel.child(toggle_button(s, t).pin(None, Some(10.0), Some(12.0), None)))
+pub fn inspector(s: &State, t: Theme, platform: El) -> El {
+    let panel = if s.prefs.current.resources.visible { panel(s, t) } else { platform };
+    panel.child(toggle_button(s, t).pin(None, Some(10.0), Some(12.0), None))
 }
 
 // ----- scenes -----------------------------------------------------------------------------------

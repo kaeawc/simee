@@ -339,11 +339,12 @@ pub fn choose(s: &mut State, choice: Choice) {
     s.actions.push(Action::BootNow(sheet.request.ids(n)));
 }
 
-/// The sheet's "why": the resource panel, with the inspector it lives in.
+/// The sheet's "why": the resource panel, with the inspector it lives in. Only opens it: the
+/// check itself (asking, landing, the sheet closing) never changes the panel.
 fn show_resources(s: &mut State) {
-    let c = &mut s.prefs.current;
-    c.resources.visible = true;
-    c.inspector.visible = true;
+    use crate::panes::{Cause, Side, Target};
+    crate::panes::set(s, Target::Resources, true, Cause::Admission);
+    crate::panes::show(s, Side::Inspector, Cause::Admission);
 }
 
 // ----- view -------------------------------------------------------------------------------------

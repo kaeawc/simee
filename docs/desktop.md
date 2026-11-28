@@ -165,11 +165,15 @@ Every word of the query has to match. A UDID matches only as a run of its charac
 scoring is in `sim_core::fuzzy`. While you type, the groups collapse to the matches, booted
 ones first and then the best matches. ↑ and ↓ move through them, Return acts on the
 highlighted one as a click would (⌥Return selects only), and Escape clears the query. Escape
-again leaves the field.
+again leaves the field. The highlight belongs to a device, the first match as it is first
+shown until an arrow moves it, so a rescan that lists a better match (a farm's new AVD) before
+Return doesn't change what Return boots.
 
 One click on a shut-down device, or Return on its row, selects it and boots it. The boot goes
 through [admission](#admission-before-a-boot) as the Boot button's does. ⌥-click selects
-without booting.
+without booting. Boot on a device that is already booting (started elsewhere) says so on the
+status line. Rows are keyed `device-row:<udid or AVD name>` (their parts `device-mark:`,
+`device-bar:`, `device-platform:`, `device-popped:`), so no AVD name gives a row a fixed key.
 
 Boots and other long jobs (shutting down, a Duo fold, CarPlay) belong to their device
 (`desktop/src/jobs.rs`, #558). The stage's "Waiting for the device to finish booting…" and the
@@ -186,9 +190,29 @@ The headless scenes `list-booted` (a device booting from here, selected, at the 
 
 The device list (left) and the panel (right) each have a drag handle on their inner edge:
 drag it to resize (180–420 points for the list, 280–600 for the panel, always leaving the
-screen at least 420), double-click it for the default width. ⌘⌥S hides and shows the list,
-⌘⌥I the panel, ⌘⌥R the [resource panel](#resource-panel). The headless scenes `sidebar-hidden`, `inspector-hidden`, `panes-hidden` and
-`panes-wide` show them.
+screen at least 420), double-click it for the default width. To hide and show them:
+
+- the stage toolbar's sidebar buttons: the list's leads the toolbar and stays at the window's
+  left edge while the list is hidden, the panel's ends it;
+- the View menu on macOS: Show/Hide Device List (⌘⌥S), Show/Hide Panel (⌘⌥I) and Resources
+  (⌘⌥R, the [resource panel](#resource-panel));
+- the shortcuts alone, ⌘⌥S, ⌘⌥I and ⌘⌥R, on every platform.
+
+A pane changes only on one of those (#559, #560, #561). A rescan, a selection, a boot finishing,
+an admission check or popping a device out or back in leaves both panes and the panel's mode as
+they are; with no device on screen the panel stays and says so. A pop-out window has no panes of
+its own: its menu bar holds its own items, so ⌘⌥S, ⌘⌥I and ⌘⌥R pressed there change nothing in
+the main window. A window too narrow for the panes beside the screen's 420 points first draws
+them narrower (down to their minimums, saving nothing), then collapses the panel, then the
+list, with a note on the stage, and brings each back once there's room again. A pane hidden by
+hand stays hidden.
+
+Each change goes to stderr with its cause, for example `simee-desktop: panes: panel hidden
+(key)`; the causes are `key`, `button`, `menu`, `restore` (from the settings file at start),
+`narrow`, `room` and `admission` (the admission sheet's "Why?"). The headless scenes
+`sidebar-hidden`, `inspector-hidden`, `panes-hidden`, `panes-wide`, `toggled-list`,
+`toggled-panel` and `panel-empty` show them; `--size 800x870` with any of them shows a
+collapsed panel.
 
 The window keeps its layout in a small versioned JSON file (`desktop/src/settings.rs`):
 `~/Library/Application Support/simee/desktop.json` on macOS, `$XDG_CONFIG_HOME/simee/` (or
@@ -201,12 +225,14 @@ after changes stop, and again as the window closes, through a temporary file ren
 A file that can't be read, isn't valid, or comes from a newer version falls back to the
 defaults with one line in the status bar. It is copied aside first
 (`desktop.json.<why>-<secs>.bak`) and never deleted; if even the copy fails, nothing is saved
-that session. Headless runs never read or write it.
+that session. Headless runs never read or write it. The window names the file it uses on
+stderr as it starts (`simee-desktop: settings: <path>`).
 
 ## Resource panel
 
-⌘⌥R, or the gauge button in the panel's top-right corner, swaps the panel for the resource panel
-(`desktop/src/resources.rs`, #276), and shows the panel first if it was hidden. It shows what the
+⌘⌥R, View > Resources, or the gauge button in the panel's top-right corner swaps the panel for
+the resource panel (`desktop/src/resources.rs`, #276), and shows the panel first if it was
+hidden; again, it swaps the platform panel back. Nothing else changes it. It shows what the
 host has left and what each running device costs. Host gauges come from the API's `host`: busy
 CPU, load per core, memory pressure and free memory, swap, free disk, the thermal state and the
 admit / hold / backoff verdict. The device list comes from `devices_usage`: CPU, memory, disk I/O

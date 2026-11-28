@@ -1,8 +1,16 @@
 //! The window's side panes: the device list on the left and the platform panel (the inspector)
 //! on the right. Each has a drag handle on its inner edge (double-click puts the default width
-//! back) and hides with a shortcut: ⌘⌥S the sidebar, ⌘⌥I the inspector. Their widths and
+//! back) and shows and hides from the stage toolbar's sidebar buttons, the View menu (macOS) or a
+//! shortcut: ⌘⌥S the sidebar, ⌘⌥I the inspector, ⌘⌥R the resource panel in it. Their widths and
 //! visibility, the selected device and tab, and the window's frame persist through
 //! [`crate::settings`].
+//!
+//! A pane shows or hides only on one of those explicit actions (#559, #560, #561), never on a
+//! rescan, a selection change, a boot finishing or a pop-out: the inspector shows with no device
+//! on screen too. The one exception is room. A window too narrow for the panes beside the stage's
+//! [`STAGE_MIN`] squeezes them to their minimum widths, then collapses the inspector (and then
+//! the list) with a note on the stage, and brings it back as soon as there's room. Every change
+//! is logged with its [`Cause`] ([`Change`]): on stderr, and in [`Panes::changes`].
 //!
 //! rune-kit's `SplitView` would do this, but rune-kit isn't one of the desktop's dependencies,
 //! so the handles are the small ones here.
@@ -116,11 +124,117 @@ pub fn sanitize(s: &mut Settings) {
     }
 }
 
+/// What made a pane show or hide, or the panel change mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cause {
+    /// ⌘⌥S, ⌘⌥I or ⌘⌥R.
+    Key,
+    /// A toolbar button, or the panel's gauge button.
+    Button,
+    /// The View menu.
+    Menu,
+    /// The settings file, at start.
+    Restore,
+    /// The window got too narrow for the pane.
+    Narrow,
+    /// The window has room for it again.
+    Room,
+    /// The admission sheet's "Why?".
+    Admission,
+}
+
+impl Cause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Cause::Key => "key",
+            Cause::Button => "button",
+            Cause::Menu => "menu",
+            Cause::Restore => "restore",
+            Cause::Narrow => "narrow",
+            Cause::Room => "room",
+            Cause::Admission => "admission",
+        }
+    }
+}
+
+/// What changed: a pane, or the panel's mode (the resource panel in place of the platform one).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    Sidebar,
+    Inspector,
+    Resources,
+}
+
+impl Target {
+    fn name(self) -> &'static str {
+        match self {
+            Target::Sidebar => "device list",
+            Target::Inspector => "panel",
+            Target::Resources => "resource panel",
+        }
+    }
+}
+
+impl From<Side> for Target {
+    fn from(side: Side) -> Target {
+        match side {
+            Side::Sidebar => Target::Sidebar,
+            Side::Inspector => Target::Inspector,
+        }
+    }
+}
+
+/// One logged change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Change {
+    pub target: Target,
+    pub shown: bool,
+    pub cause: Cause,
+}
+
+impl std::fmt::Display for Change {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let verb = match (self.target, self.shown) {
+            (Target::Resources, true) => "on",
+            (Target::Resources, false) => "off",
+            (_, true) => "shown",
+            (_, false) => "hidden",
+        };
+        write!(f, "{} {verb} ({})", self.target.name(), self.cause.as_str())
+    }
+}
+
+/// Changes [`Panes::changes`] keeps, newest last.
+const KEPT_CHANGES: usize = 64;
+
+/// Which panes the window is too narrow for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Collapsed {
+    pub sidebar: bool,
+    pub inspector: bool,
+}
+
+impl Collapsed {
+    fn of(self, side: Side) -> bool {
+        match side {
+            Side::Sidebar => self.sidebar,
+            Side::Inspector => self.inspector,
+        }
+    }
+}
+
 /// The window's own state for the panes, which isn't saved.
 #[derive(Debug, Default)]
 pub struct Panes {
     /// The window's width in points, as last laid out (0 before the first layout).
     pub window_w: f32,
+    /// Chosen panes the window is too narrow for right now ([`fit`]): back once there's room.
+    pub collapsed: Collapsed,
+    /// The last changes, newest last; each is also on stderr.
+    pub changes: Vec<Change>,
+    /// What the View menu said when it was last titled: the list, the panel and the resource
+    /// panel shown.
+    pub menu: Option<(bool, bool, bool)>,
     /// The window opened at its saved size for this device: its first fit keeps that size.
     pub keep_window: Option<String>,
     /// The window opened at a saved position: the first live poll checks it's on a display.
@@ -147,6 +261,18 @@ pub fn tab_named(name: &str) -> Option<Tab> {
 pub fn restore(s: &mut State, mut store: Store) {
     sanitize(&mut store.current);
     let c = &store.current;
+    // What the saved settings change from the defaults, so the next "it hid on its own" can
+    // tell a restored pane from one hidden this run.
+    let restored = [
+        (Target::Sidebar, c.sidebar.visible, true),
+        (Target::Inspector, c.inspector.visible, true),
+        (Target::Resources, c.resources.visible, false),
+    ];
+    for (target, shown, default) in restored {
+        if shown != default {
+            note(&mut s.panes, Change { target, shown, cause: Cause::Restore });
+        }
+    }
     if s.selected.is_none() {
         s.selected = c.last_device.clone();
     }
@@ -162,22 +288,83 @@ pub fn restore(s: &mut State, mut store: Store) {
     s.prefs = store;
 }
 
-/// The window's layout: the sidebar, its handle, the stage, and the inspector with its handle,
-/// each pane at its width or left out while hidden.
-pub fn layout(s: &State, t: Theme, sidebar: El, stage: El, inspector: Option<El>) -> El {
+/// Which of the panes `c` chooses can't fit a window `window_w` wide (0, not laid out yet, fits
+/// both) beside the stage's [`STAGE_MIN`], even at their minimum widths: the inspector goes
+/// first, then the list.
+pub fn collapse(c: &Settings, window_w: f32) -> Collapsed {
+    if window_w <= 0.0 {
+        return Collapsed::default();
+    }
+    let room = window_w - STAGE_MIN;
+    let (s_min, i_min) = (Side::Sidebar.range().min, Side::Inspector.range().min);
+    let sidebar_min = if c.sidebar.visible { s_min } else { 0.0 };
+    Collapsed { sidebar: c.sidebar.visible && s_min > room, inspector: c.inspector.visible && sidebar_min + i_min > room }
+}
+
+/// Whether `side` is on screen: chosen, and with room for it.
+pub fn shown(s: &State, side: Side) -> bool {
+    side.pane(&s.prefs.current).visible && !s.panes.collapsed.of(side)
+}
+
+/// The width `side` draws at now: its own, narrower while the window is (never under its
+/// minimum), so the stage keeps [`STAGE_MIN`]. The list keeps its width first; the inspector
+/// gives way. Nothing saved changes: a wider window gives the panes their widths back.
+pub fn shown_width(s: &State, side: Side) -> f32 {
     let c = &s.prefs.current;
-    let inspector = crate::resources::inspector(s, t, inspector);
-    let mut root = row().key("window").w_full().h_full().fill(t.bg).on_layout(|s: &mut State, r: [f32; 4]| s.panes.window_w = r[2]);
-    if c.sidebar.visible {
-        let w = width(c, Side::Sidebar);
+    let w = s.panes.window_w;
+    let inspector_min = if shown(s, Side::Inspector) { Side::Inspector.range().min } else { 0.0 };
+    let sidebar = clamp(Side::Sidebar, c.sidebar.width, w, inspector_min);
+    match side {
+        Side::Sidebar => sidebar,
+        Side::Inspector => clamp(Side::Inspector, c.inspector.width, w, if shown(s, Side::Sidebar) { sidebar } else { 0.0 }),
+    }
+}
+
+/// Brings [`Panes::collapsed`] up to date with the window's width and the panes chosen, and
+/// logs each chosen pane the window collapses for room or has room for again. Every poll and
+/// every layout of the window.
+pub fn fit(s: &mut State) {
+    let (was, now) = (s.panes.collapsed, collapse(&s.prefs.current, s.panes.window_w));
+    if now == was {
+        return;
+    }
+    s.panes.collapsed = now;
+    for side in [Side::Sidebar, Side::Inspector] {
+        // A pane hidden by hand neither comes back with room nor is hidden again without it.
+        if now.of(side) != was.of(side) && side.pane(&s.prefs.current).visible {
+            let cause = if now.of(side) { Cause::Narrow } else { Cause::Room };
+            note(&mut s.panes, Change { target: side.into(), shown: !now.of(side), cause });
+        }
+    }
+}
+
+/// What the stage says while the window is too narrow for a chosen pane.
+pub fn narrow_note(s: &State) -> Option<&'static str> {
+    match (s.panes.collapsed.sidebar, s.panes.collapsed.inspector) {
+        (true, true) => Some("The window is too narrow for the device list and the panel: widen it to bring them back"),
+        (true, false) => Some("The window is too narrow for the device list: widen it to bring it back"),
+        (false, true) => Some("The window is too narrow for the panel: widen it to bring it back"),
+        (false, false) => None,
+    }
+}
+
+/// The window's layout: the sidebar, its handle, the stage, and the inspector with its handle,
+/// each pane at its width or left out while hidden (or collapsed for room).
+pub fn layout(s: &State, t: Theme, sidebar: El, stage: El, platform: El) -> El {
+    let mut root = row().key("window").w_full().h_full().fill(t.bg).on_layout(|s: &mut State, r: [f32; 4]| {
+        s.panes.window_w = r[2];
+        fit(s);
+    });
+    let sidebar_shown = shown(s, Side::Sidebar);
+    if sidebar_shown {
+        let w = shown_width(s, Side::Sidebar);
         root = root.child(sidebar.w(w).min_w(w).child(handle(Side::Sidebar).pin(None, Some(0.0), Some(-HANDLE / 2.0), Some(0.0))));
     }
     // With the sidebar hidden the stage is leftmost, under the traffic lights.
-    root = root.child(if c.sidebar.visible { stage } else { stage.pt(16.0 + TITLE_BAR) });
-    if let Some(panel) = inspector
-        && c.inspector.visible
-    {
-        let w = width(c, Side::Inspector);
+    root = root.child(if sidebar_shown { stage } else { stage.pt(16.0 + TITLE_BAR) });
+    if shown(s, Side::Inspector) {
+        let w = shown_width(s, Side::Inspector);
+        let panel = crate::resources::inspector(s, t, platform);
         root = root.child(panel.w(w).min_w(w).child(handle(Side::Inspector).pin(Some(-HANDLE / 2.0), Some(0.0), None, Some(0.0))));
     }
     root
@@ -192,50 +379,219 @@ fn handle(side: Side) -> El {
     };
     el().key(side.handle_key()).role("separator").label(label).w(HANDLE).cursor(Cursor::ResizeEw).on_drag(
         move |s: &mut State, d: &mut Drag, tx: &mut Tx| {
-            let c = &mut s.prefs.current;
             if d.phase == Phase::Down {
-                d.data = width(c, side);
+                // From the width it draws at, which a narrow window may have squeezed.
+                d.data = shown_width(s, side);
                 if d.clicks == 2 {
-                    side.pane_mut(c).width = 0.0;
+                    side.pane_mut(&mut s.prefs.current).width = 0.0;
                 }
                 return;
             }
             let travel = if side == Side::Sidebar { d.dx } else { -d.dx };
             let want = if d.cancelled() { d.data } else { d.data + travel };
-            let other = taken(c, side.other());
-            side.pane_mut(c).width = clamp(side, want, s.panes.window_w, other);
+            let other = if shown(s, side.other()) { shown_width(s, side.other()) } else { 0.0 };
+            side.pane_mut(&mut s.prefs.current).width = clamp(side, want, s.panes.window_w, other);
             tx.request_poll();
         },
     )
 }
 
-/// Shows or hides `side`.
-pub fn toggle(s: &mut State, side: Side) {
-    let pane = side.pane_mut(&mut s.prefs.current);
-    pane.visible = !pane.visible;
+/// Logs `change`: on stderr, the app's log (not in tests), and in [`Panes::changes`].
+pub fn note(p: &mut Panes, change: Change) {
+    if !cfg!(test) {
+        eprintln!("simee-desktop: panes: {change}");
+    }
+    p.changes.push(change);
+    if p.changes.len() > KEPT_CHANGES {
+        p.changes.remove(0);
+    }
+}
+
+/// Shows or hides `target` for `cause`, and logs it when that changes anything. Returns whether
+/// it did.
+pub fn set(s: &mut State, target: Target, visible: bool, cause: Cause) -> bool {
+    let c = &mut s.prefs.current;
+    let field = match target {
+        Target::Sidebar => &mut c.sidebar.visible,
+        Target::Inspector => &mut c.inspector.visible,
+        Target::Resources => &mut c.resources.visible,
+    };
+    if *field == visible {
+        return false;
+    }
+    *field = visible;
+    note(&mut s.panes, Change { target, shown: visible, cause });
+    fit(s);
+    true
+}
+
+/// Hides `side` when it's on screen, else shows it, for `cause`. A pane the window is too narrow
+/// for stays chosen, and the status line says why it doesn't show.
+pub fn toggle(s: &mut State, side: Side, cause: Cause) {
+    if shown(s, side) {
+        set(s, side.into(), false, cause);
+    } else {
+        show(s, side, cause);
+    }
+}
+
+/// Shows `side` for `cause`; while the window is too narrow for it, the status line says so.
+pub fn show(s: &mut State, side: Side, cause: Cause) {
+    set(s, side.into(), true, cause);
+    if s.panes.collapsed.of(side) {
+        s.status = narrow_note(s).map(str::to_owned);
+    }
 }
 
 /// ⌘⌥S shows or hides the sidebar, ⌘⌥I the inspector, ⌘⌥R the resource panel in it.
 pub fn on_key(s: &mut State, k: &KeyEvent, tx: &mut Tx) -> bool {
-    let side = match k.key {
-        Key::Command('s') if k.mods.alt && !k.mods.shift => Side::Sidebar,
-        Key::Command('i') if k.mods.alt && !k.mods.shift => Side::Inspector,
-        Key::Command('r') if k.mods.alt && !k.mods.shift => {
-            crate::resources::toggle(s);
-            tx.request_poll();
-            return true;
-        }
-        _ => return false,
-    };
-    toggle(s, side);
+    let Some(item) = ViewItem::for_key(k) else { return false };
+    item.perform(s, Cause::Key);
     tx.request_poll();
     true
+}
+
+/// The View menu's items, which the shortcuts and the toolbar's buttons also do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewItem {
+    /// ⌘⌥S.
+    Sidebar,
+    /// ⌘⌥I.
+    Inspector,
+    /// ⌘⌥R.
+    Resources,
+}
+
+impl ViewItem {
+    pub const ALL: [ViewItem; 3] = [ViewItem::Sidebar, ViewItem::Inspector, ViewItem::Resources];
+
+    /// The key of its ⌘⌥ chord.
+    pub fn key(self) -> char {
+        match self {
+            ViewItem::Sidebar => 's',
+            ViewItem::Inspector => 'i',
+            ViewItem::Resources => 'r',
+        }
+    }
+
+    pub fn for_key(k: &KeyEvent) -> Option<ViewItem> {
+        let Key::Command(c) = k.key else { return None };
+        if !k.mods.alt || k.mods.shift {
+            return None;
+        }
+        ViewItem::ALL.into_iter().find(|a| a.key() == c)
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub fn id(self) -> &'static str {
+        match self {
+            ViewItem::Sidebar => "view-device-list",
+            ViewItem::Inspector => "view-panel",
+            ViewItem::Resources => "view-resources",
+        }
+    }
+
+    /// Whether what it shows is on screen.
+    pub fn on(self, s: &State) -> bool {
+        match self {
+            ViewItem::Sidebar => shown(s, Side::Sidebar),
+            ViewItem::Inspector => shown(s, Side::Inspector),
+            ViewItem::Resources => shown(s, Side::Inspector) && s.prefs.current.resources.visible,
+        }
+    }
+
+    /// Its title as the window is now: Show or Hide for a pane; the resource panel's item has a
+    /// checkmark instead.
+    pub fn title(self, s: &State) -> &'static str {
+        match (self, self.on(s)) {
+            (ViewItem::Sidebar, true) => "Hide Device List",
+            (ViewItem::Sidebar, false) => "Show Device List",
+            (ViewItem::Inspector, true) => "Hide Panel",
+            (ViewItem::Inspector, false) => "Show Panel",
+            (ViewItem::Resources, _) => "Resources",
+        }
+    }
+
+    pub fn perform(self, s: &mut State, cause: Cause) {
+        match self {
+            ViewItem::Sidebar => toggle(s, Side::Sidebar, cause),
+            ViewItem::Inspector => toggle(s, Side::Inspector, cause),
+            ViewItem::Resources => crate::resources::toggle(s, cause),
+        }
+    }
+
+    /// Picked in the View menu (macOS only; tests pick items directly).
+    #[cfg(any(target_os = "macos", test))]
+    pub fn pick(self, s: &mut State, tx: &mut Tx) {
+        self.perform(s, Cause::Menu);
+        tx.request_poll();
+    }
+}
+
+/// The View menu, titled for the window as it is (macOS's menu bar; Rune has none elsewhere).
+/// Each item's shortcut goes to the window's keys first ([`rune::MenuItem::keys_first`]), so a
+/// press is logged as a key and a click in the menu as the menu.
+#[cfg(target_os = "macos")]
+pub fn menu(s: &State) -> Vec<rune::MenuItem<State>> {
+    let item = |a: ViewItem, action: fn(&mut State, &mut Tx)| {
+        let shortcut = format!("cmd+alt+{}", a.key()).parse().expect("a valid shortcut");
+        let checked = a == ViewItem::Resources && a.on(s);
+        rune::MenuItem::new(a.title(s), action).id(a.id()).menu("View").key_equivalent(shortcut).keys_first().checked(checked)
+    };
+    vec![
+        item(ViewItem::Sidebar, |s, tx| ViewItem::Sidebar.pick(s, tx)),
+        item(ViewItem::Inspector, |s, tx| ViewItem::Inspector.pick(s, tx)),
+        item(ViewItem::Resources, |s, tx| ViewItem::Resources.pick(s, tx)),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    /// The main window's app, to retitle its View menu (on the UI thread, where `poll` runs).
+    static APP: RefCell<Option<rune::AppHandle<State>>> = const { RefCell::new(None) };
+}
+
+/// Keeps the main window's app for its View menu.
+#[cfg(target_os = "macos")]
+pub fn remember_app(handle: rune::AppHandle<State>) {
+    APP.with(|cell| *cell.borrow_mut() = Some(handle));
+}
+
+/// The stage toolbar's button for `side` (macOS's sidebar.left and sidebar.right): at the
+/// toolbar's leading end for the list and its trailing end for the panel, so each stays in
+/// reach while its pane is hidden.
+pub fn toolbar_toggle(s: &State, side: Side, t: Theme) -> El {
+    let (key, glyph, item) = match side {
+        Side::Sidebar => ("sidebar-toggle", &crate::icons::SIDEBAR_LEFT, ViewItem::Sidebar),
+        Side::Inspector => ("inspector-toggle", &crate::icons::SIDEBAR_RIGHT, ViewItem::Inspector),
+    };
+    let label = format!("{} (⌘⌥{})", item.title(s), item.key().to_ascii_uppercase());
+    crate::debug::icon_button(key, glyph, &label, false, t, move |s: &mut State| toggle(s, side, Cause::Button))
+}
+
+/// Retitles the View menu when what it says changed.
+fn sync_menu(s: &mut State) {
+    let now = (ViewItem::Sidebar.on(s), ViewItem::Inspector.on(s), ViewItem::Resources.on(s));
+    if s.panes.menu == Some(now) {
+        return;
+    }
+    s.panes.menu = Some(now);
+    #[cfg(target_os = "macos")]
+    APP.with(|cell| {
+        if let Some(app) = cell.borrow().as_ref()
+            && let Err(e) = app.set_menu(menu(s))
+        {
+            eprintln!("simee-desktop: View menu: {e}");
+        }
+    });
 }
 
 /// Every poll: notes the selection and tab, writes the settings once they've settled, and
 /// checks a restored window landed on a display. Returns whether the window should redraw.
 pub fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
+    fit(s);
+    sync_menu(s);
     if s.selected_info().is_some() && s.prefs.current.last_device != s.selected {
         s.prefs.current.last_device = s.selected.clone();
     }
@@ -324,6 +680,25 @@ pub fn panes_hidden_scene(s: &mut State) {
     crate::demo(s);
     s.prefs.current.sidebar.visible = false;
     s.prefs.current.inspector.visible = false;
+}
+
+/// The toolbar's toggles: the list hidden by its button (the button stays at the stage's
+/// leading edge to bring it back), and the panel hidden by its.
+pub fn toggled_list_scene(s: &mut State) {
+    crate::demo(s);
+    toggle(s, Side::Sidebar, Cause::Button);
+}
+
+pub fn toggled_panel_scene(s: &mut State) {
+    crate::demo(s);
+    toggle(s, Side::Inspector, Cause::Button);
+}
+
+/// The panel with no device on screen (a shut-down device selected): still there, as it was.
+pub fn panel_empty_scene(s: &mut State) {
+    crate::demo(s);
+    s.selected = Some("B2".into());
+    s.offline_screen = false;
 }
 
 pub fn panes_wide_scene(s: &mut State) {
@@ -417,6 +792,149 @@ mod tests {
         rt.key(cmd_alt('i'));
         settle(&mut rt);
         assert!(target(&rt, "device-list").is_some() && target(&rt, "debug-panel").is_some());
+        let changes = &rt.state.prefs.current;
+        assert!(changes.sidebar.visible && changes.inspector.visible);
+        let logged: Vec<(Target, bool, Cause)> = rt.state.panes.changes.iter().map(|c| (c.target, c.shown, c.cause)).collect();
+        assert_eq!(
+            logged,
+            [
+                (Target::Sidebar, false, Cause::Key),
+                (Target::Inspector, false, Cause::Key),
+                (Target::Sidebar, true, Cause::Key),
+                (Target::Inspector, true, Cause::Key)
+            ]
+        );
+    }
+
+    fn press(rt: &mut Runtime<State>, key: &str) {
+        let (x, y) = rt.find(key).unwrap_or_else(|| panic!("{key} is on screen"));
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        settle(rt);
+    }
+
+    fn label(rt: &Runtime<State>, key: &str) -> String {
+        rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key)).and_then(|e| e.label).unwrap_or_default()
+    }
+
+    /// #559, #560: the stage toolbar's buttons hide and show each pane with the mouse alone. The
+    /// list's button leads the toolbar, so it's still there (at the window's left) to bring the
+    /// list back; the panel's ends it.
+    #[test]
+    fn the_toolbar_buttons_hide_and_show_the_panes() {
+        let mut rt = runtime(crate::demo);
+        assert_eq!(label(&rt, "sidebar-toggle"), "Hide Device List (⌘⌥S)");
+        assert_eq!(label(&rt, "inspector-toggle"), "Hide Panel (⌘⌥I)");
+        press(&mut rt, "sidebar-toggle");
+        assert!(target(&rt, "device-list").is_none(), "the list is hidden");
+        let back = target(&rt, "sidebar-toggle").expect("the button stays on the stage");
+        assert!(back[0] < 40.0, "at the window's left edge: {back:?}");
+        assert_eq!(label(&rt, "sidebar-toggle"), "Show Device List (⌘⌥S)");
+        press(&mut rt, "inspector-toggle");
+        assert!(target(&rt, "debug-panel").is_none());
+        let right = target(&rt, "inspector-toggle").expect("the panel's button stays");
+        assert!(right[0] + right[2] > 1240.0 - 40.0, "at the window's right edge: {right:?}");
+        press(&mut rt, "sidebar-toggle");
+        press(&mut rt, "inspector-toggle");
+        assert!(target(&rt, "device-list").is_some() && target(&rt, "debug-panel").is_some());
+        assert!(rt.state.panes.changes.iter().all(|c| c.cause == Cause::Button) && rt.state.panes.changes.len() == 4);
+        assert!(rt.state.actions.is_empty(), "the buttons queue nothing for the device");
+    }
+
+    /// The View menu's items (macOS's menu bar) do what the buttons do, titled for what they'll
+    /// do next, and logged as the menu.
+    #[test]
+    fn the_view_menu_hides_and_shows_the_panes() {
+        let mut rt = runtime(crate::demo);
+        let titles = |rt: &Runtime<State>| ViewItem::ALL.map(|a| a.title(&rt.state));
+        assert_eq!(titles(&rt), ["Hide Device List", "Hide Panel", "Resources"]);
+        assert!(!ViewItem::Resources.on(&rt.state));
+        for item in ViewItem::ALL {
+            rt.update(move |s, tx| item.pick(s, tx));
+        }
+        settle(&mut rt);
+        assert!(target(&rt, "device-list").is_none(), "Hide Device List");
+        // Hide Panel, then Resources: the resource panel, with its panel shown again.
+        assert!(target(&rt, "resources-panel").is_some());
+        assert_eq!(titles(&rt), ["Show Device List", "Hide Panel", "Resources"]);
+        assert!(ViewItem::Resources.on(&rt.state));
+        assert!(rt.state.panes.changes.iter().all(|c| c.cause == Cause::Menu), "{:?}", rt.state.panes.changes);
+        rt.update(|s, tx| ViewItem::Resources.pick(s, tx));
+        settle(&mut rt);
+        assert!(target(&rt, "resources-panel").is_none() && target(&rt, "debug-panel").is_some(), "back to the platform panel");
+        assert_eq!(ViewItem::ALL.map(ViewItem::id), ["view-device-list", "view-panel", "view-resources"]);
+        #[cfg(target_os = "macos")]
+        assert_eq!(menu(&rt.state).len(), 3);
+    }
+
+    /// #559, #560: a window too narrow for the panel collapses it with a note on the stage, logs
+    /// why, and brings it back once it's wide again. Narrowing first squeezes the panes, saving
+    /// nothing.
+    #[test]
+    fn a_narrow_window_collapses_the_panel_and_widening_brings_it_back() {
+        let mut rt = runtime(panes_wide_scene);
+        rt.set_viewport((1000.0, 870.0), 2.0);
+        settle(&mut rt);
+        let (list, panel) = (target(&rt, "device-list").unwrap(), target(&rt, "debug-panel").unwrap());
+        assert!(list[2] + panel[2] <= 1000.0 - STAGE_MIN + 0.5, "squeezed to fit: {list:?} {panel:?}");
+        assert_eq!((rt.state.prefs.current.sidebar.width, rt.state.prefs.current.inspector.width), (340.0, 460.0), "nothing saved");
+        assert!(rt.find("narrow-note").is_none() && rt.state.panes.changes.is_empty());
+        rt.set_viewport((800.0, 870.0), 2.0);
+        settle(&mut rt);
+        assert!(target(&rt, "debug-panel").is_none(), "no room for the panel");
+        assert!(target(&rt, "device-list").is_some(), "the list stays");
+        assert!(rt.find("narrow-note").is_some(), "the stage says why");
+        assert!(rt.state.prefs.current.inspector.visible, "the panel is still chosen");
+        // Asking for it while there's no room says so, and leaves it chosen.
+        rt.key(cmd_alt('i'));
+        settle(&mut rt);
+        assert!(rt.state.prefs.current.inspector.visible && rt.state.status.as_deref().is_some_and(|s| s.contains("too narrow")));
+        rt.set_viewport((1240.0, 870.0), 2.0);
+        settle(&mut rt);
+        assert!(target(&rt, "debug-panel").is_some(), "back with room");
+        assert!(rt.find("narrow-note").is_none());
+        let logged: Vec<(Target, bool, Cause)> = rt.state.panes.changes.iter().map(|c| (c.target, c.shown, c.cause)).collect();
+        assert_eq!(logged, [(Target::Inspector, false, Cause::Narrow), (Target::Inspector, true, Cause::Room)]);
+        // Narrower still: the list goes too, and both come back.
+        rt.set_viewport((560.0, 870.0), 2.0);
+        settle(&mut rt);
+        assert!(target(&rt, "device-list").is_none() && target(&rt, "sidebar-toggle").is_some());
+        rt.set_viewport((1240.0, 870.0), 2.0);
+        settle(&mut rt);
+        assert!(target(&rt, "device-list").is_some() && target(&rt, "debug-panel").is_some());
+    }
+
+    /// A pane hidden by hand stays hidden when the window narrows and widens again.
+    #[test]
+    fn room_brings_back_only_what_was_chosen() {
+        let mut rt = runtime(crate::demo);
+        rt.key(cmd_alt('i'));
+        rt.set_viewport((800.0, 870.0), 2.0);
+        settle(&mut rt);
+        rt.set_viewport((1240.0, 870.0), 2.0);
+        settle(&mut rt);
+        assert!(target(&rt, "debug-panel").is_none());
+        assert_eq!(rt.state.panes.changes.len(), 1, "only the key: {:?}", rt.state.panes.changes);
+    }
+
+    /// #559: a list saved hidden opens hidden, says so in the log, and the toolbar brings it back.
+    #[test]
+    fn a_list_saved_hidden_opens_hidden_and_the_toolbar_brings_it_back() {
+        let mut store = Store::default();
+        store.current.sidebar.visible = false;
+        store.current.resources.visible = true;
+        let mut s = crate::init();
+        restore(&mut s, store);
+        let restored: Vec<(Target, bool, Cause)> = s.panes.changes.iter().map(|c| (c.target, c.shown, c.cause)).collect();
+        assert_eq!(restored, [(Target::Sidebar, false, Cause::Restore), (Target::Resources, true, Cause::Restore)]);
+        assert_eq!(s.panes.changes[0].to_string(), "device list hidden (restore)");
+        let mut rt = Runtime::new(s, crate::view::view, (1240.0, 870.0), Env::new(true, 2.0));
+        rt.poll = Some(crate::poll);
+        crate::demo(&mut rt.state);
+        rt.frame(0.0);
+        assert!(target(&rt, "device-list").is_none());
+        press(&mut rt, "sidebar-toggle");
+        assert!(target(&rt, "device-list").is_some());
     }
 
     #[test]

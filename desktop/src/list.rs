@@ -119,6 +119,28 @@ pub fn highlighted(s: &State) -> Option<usize> {
     kept.or_else(|| order.first().copied())
 }
 
+/// Pins the highlight to a device while the search is in use: the first match as it's first
+/// shown (a query typed, the field focused), so a rescan that lists a better match before
+/// Return (a farm lane's new AVD) doesn't change what Return boots (#571). A pinned device
+/// that left the list gives way to the first one shown. Out of use, nothing is pinned.
+pub fn keep_highlight(s: &mut State) {
+    if !s.search.focused && s.search.text.trim().is_empty() {
+        s.search_highlight = None;
+        return;
+    }
+    let order = order(s);
+    let listed = |u: &str| order.iter().any(|&i| s.devices[i].udid == u);
+    if !s.search_highlight.as_deref().is_some_and(listed) {
+        s.search_highlight = order.first().map(|&i| s.devices[i].udid.clone());
+    }
+}
+
+/// The query changed: the highlight starts again on its first match.
+pub fn query_changed(s: &mut State) {
+    s.search_highlight = None;
+    keep_highlight(s);
+}
+
 /// Moves the highlight `by` places through the list's order, stopping at either end.
 fn step(s: &mut State, by: isize) {
     let order = order(s);
