@@ -960,14 +960,27 @@ pub(crate) fn camera_launchctl(s: &mut Session, udid: &str, args: &[String], env
 /// The simulator `query` names, as a link sees it; `None` when there is none in the call's set.
 pub(crate) fn link_device(s: &mut Session, query: &str) -> Result<Option<crate::links::Sim>, String> {
     match s.ctx()?.device(query) {
-        Ok(d) => {
-            let info = d.info();
-            let running = info.state == DeviceState::Booted;
-            Ok(Some(crate::links::Sim { udid: info.udid, name: info.name, form_factor: info.form_factor, running }))
-        }
+        Ok(d) => Ok(Some(link_sim(&d))),
         Err(sim_coresim::Error::NotFound(_)) => Ok(None),
         Err(e) => Err(err(e)),
     }
+}
+
+/// Every simulator in the call's set, as a link sees it: for `links` without a device.
+pub(crate) fn link_devices(s: &mut Session) -> Result<Vec<crate::links::Sim>, String> {
+    Ok(s.ctx()?.devices().map_err(err)?.iter().map(link_sim).collect())
+}
+
+fn link_sim(d: &Device) -> crate::links::Sim {
+    let info = d.info();
+    let running = info.state == DeviceState::Booted;
+    crate::links::Sim { udid: info.udid, name: info.name, form_factor: info.form_factor, running }
+}
+
+/// simee's state directory in the simulator's data (`<data>/simee/`, beside `cameras.ini`): where
+/// the links simee keeps (every kind but a watch pair) have their copy.
+pub(crate) fn link_state_dir(s: &mut Session, udid: &str) -> Result<std::path::PathBuf, String> {
+    Ok(std::path::PathBuf::from(s.ctx()?.device(udid).map_err(err)?.data_path()).join("simee"))
 }
 
 /// Every watch-phone pair in the call's set.
@@ -1992,7 +2005,18 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         // A device that stops (or is erased, which removes its socket) takes its camera feed with it.
         "shutdown" | "erase" => {
             let d = s.device(p)?;
-            ok(if method == "shutdown" { d.shutdown() } else { d.erase() })?;
+            // Erasing wipes `<data>/`, the device's `links.json` with it: keep the links
+            // (docs/design/device-links.md, "Persistence").
+            let links_dir = std::path::PathBuf::from(d.data_path()).join("simee");
+            let links_file = crate::links::records::LINKS_FILE;
+            let kept = if method == "erase" { std::fs::read_to_string(links_dir.join(links_file)).ok() } else { None };
+            let done = ok(if method == "shutdown" { d.shutdown() } else { d.erase() });
+            if let Some(text) = kept {
+                sim_android::StateLock::take(&links_dir, links_file)
+                    .and_then(|_lock| sim_android::write_state_file(&links_dir, links_file, Some(&text)))
+                    .map_err(|e| format!("{} was erased but its links weren't kept: {e}", d.info().name))?;
+            }
+            done?;
             crate::camera::ios_stopped(&d.info().udid);
             Ok(Value::Null)
         }

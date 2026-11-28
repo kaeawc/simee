@@ -76,6 +76,9 @@ else echo @net:bpf; for c in 'connectivity trafficcontroller' netstats 'netd tra
 o=$(dumpsys $c 2>/dev/null); case \"$o\" in *mAppUidStatsMap*) echo \"$o\"; break;; esac; done; fi; \
 echo @net:ps; ps -A -o PID,UID,USER,NAME; echo @net:packages; pm list packages -U";
 
+/// The TCP tables alone: what [`Adb::listening`] reads.
+const TCP_TABLES: &str = "echo @net:tcp; cat /proc/net/tcp; echo @net:tcp6; cat /proc/net/tcp6";
+
 impl Device {
     /// What the emulator's NAT is shaped to (the console's `network status`), with the report's
     /// lines as it gave them.
@@ -165,6 +168,74 @@ impl Adb {
     pub fn traffic(&self) -> Result<Vec<UidTraffic>, String> {
         traffic_from(&self.shell(TRAFFIC, self.deadlines.query)?)
     }
+}
+
+impl Adb {
+    /// `adb forward tcp:0 tcp:<port>`: forwards a host port adb picks (free at the time) to `port`
+    /// in the device, and returns it. The adb server holds the forward, so it outlives simee, and
+    /// goes with the device's next boot or the server's restart.
+    pub fn forward(&self, port: u16) -> Result<u16, String> {
+        let guest = format!("tcp:{port}");
+        match self.run(&["forward", "tcp:0", &guest], self.deadlines.query)? {
+            (true, text) => text
+                .split_whitespace()
+                .find_map(|w| w.parse::<u16>().ok())
+                .ok_or_else(|| format!("adb forward tcp:0 {guest} printed no host port: {}", text.trim())),
+            (false, text) => Err(failure(&format!("adb forward tcp:0 {guest}"), &text)),
+        }
+    }
+
+    /// `adb forward --remove tcp:<host_port>`.
+    pub fn remove_forward(&self, host_port: u16) -> Result<(), String> {
+        let host = format!("tcp:{host_port}");
+        match self.run(&["forward", "--remove", &host], self.deadlines.query)? {
+            (true, _) => Ok(()),
+            (false, text) => Err(failure(&format!("adb forward --remove {host}"), &text)),
+        }
+    }
+
+    /// This device's TCP forwards, (host port, device port) each: `adb forward --list`, which
+    /// lists every device's.
+    pub fn forwards(&self) -> Result<Vec<(u16, u16)>, String> {
+        match self.run(&["forward", "--list"], self.deadlines.query)? {
+            (true, text) => Ok(forwards_of(&text, &self.serial)),
+            (false, text) => Err(failure("adb forward --list", &text)),
+        }
+    }
+
+    /// The TCP ports something in the device listens on (IPv4 or IPv6, any address), ascending:
+    /// the kernel's tables, which any user may read.
+    pub fn listening(&self) -> Result<Vec<u16>, String> {
+        Ok(listening_in(&self.shell(TCP_TABLES, self.deadlines.query)?))
+    }
+}
+
+/// `serial`'s TCP forwards in `adb forward --list`'s lines (`<serial> tcp:<host> tcp:<device>`).
+fn forwards_of(text: &str, serial: &str) -> Vec<(u16, u16)> {
+    let tcp = |s: &str| s.strip_prefix("tcp:").and_then(|p| p.parse::<u16>().ok());
+    text.lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            match f[..] {
+                [s, host, guest] if s == serial => Some((tcp(host)?, tcp(guest)?)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// The listening ports in [`TCP_TABLES`]' output (Linux's `TCP_LISTEN` is 10).
+fn listening_in(text: &str) -> Vec<u16> {
+    let parts = parts(text);
+    let mut ports: Vec<u16> = [("tcp", false), ("tcp6", true)]
+        .into_iter()
+        .flat_map(|(table, v6)| parse_proc_net(parts.get(table).map_or("", String::as_str), v6))
+        .filter(|e| e.state == 10)
+        .map(|e| e.local.port())
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 /// One row of a `/proc/net/{tcp,udp}[6]` table.
@@ -439,6 +510,22 @@ fn traffic_from(out: &str) -> Result<Vec<UidTraffic>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn forwards_are_read_for_one_serial_and_listening_ports_from_the_tcp_tables() {
+        let list = "emulator-5554 tcp:41001 tcp:8080\nemulator-5556 tcp:41002 tcp:9000\nemulator-5554 localabstract:x tcp:1\n\
+                    emulator-5554 tcp:41003 tcp:9443\n";
+        assert_eq!(forwards_of(list, "emulator-5554"), [(41001, 8080), (41003, 9443)]);
+        assert_eq!(forwards_of(list, "emulator-5558"), []);
+        let tables = "@net:tcp\n  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:1388 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 17 1 0 100 0 0 10 0\n\
+   1: 0F02000A:A1B2 2E2E3AD8:01BB 01 00000000:00000000 02:000A7B2C 00000000 10086        0 18 2 0 20 4 30 10 -1\n\
+@net:tcp6\n  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 00000000000000000000000000000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 19 1 0 100 0 0 10 0\n\
+   1: 00000000000000000000000000000000:1388 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 20 1 0 100 0 0 10 0\n";
+        assert_eq!(listening_in(tables), [5000, 8080], "LISTEN rows only, IPv4 and IPv6, once each");
+        assert_eq!(listening_in(""), Vec::<u16>::new());
+    }
+
     use super::*;
 
     const TCP: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
@@ -689,6 +776,24 @@ mod device_tests {
         let adb = fake_adb(&android);
         let emulator = if stock { fake_stock_emulator(&android, "phone") } else { fake_emulator(&android, "phone") };
         (android, root, adb, emulator)
+    }
+
+    #[test]
+    fn forwards_are_added_listed_and_removed_through_adb() {
+        let (android, root, adb, _emulator) = device("forward");
+        let a = android.device("phone").expect("device").adb(&android).expect("adb");
+        assert_eq!(a.forward(8080), Ok(41001));
+        assert_eq!(a.forward(9000), Ok(41002));
+        assert_eq!(a.forwards(), Ok(vec![(41001, 8080), (41002, 9000)]));
+        a.remove_forward(41001).expect("remove");
+        assert_eq!(a.forwards(), Ok(vec![(41002, 9000)]));
+        assert_eq!(a.listening(), Ok(vec![8080]));
+        let calls = adb.calls();
+        assert!(
+            calls.contains(&"forward tcp:0 tcp:8080".to_owned()) && calls.contains(&"forward --remove tcp:41001".to_owned()),
+            "{calls:?}"
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

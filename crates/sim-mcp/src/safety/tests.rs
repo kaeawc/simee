@@ -125,6 +125,15 @@ fn a_call_is_filed_by_how_it_ended() {
     assert_eq!(outcome(&Err("device is gone".into())).0, audit::status::ERROR);
 }
 
+#[test]
+fn unlinking_a_kept_link_says_nothing_is_erased() {
+    let pair = [(Resolved { udid: "xr".into(), name: "xr".into(), running: true }, "headset".to_owned())];
+    let kept = what_it_does("unlink", &json!({"link": "lnk-0123abcd"}), &[], None, &pair);
+    assert_eq!(kept, "unlink `lnk-0123abcd` (headset `xr`): its forwards and each member's saved copy are removed");
+    let watch = what_it_does("unlink", &json!({"link": "FA1A0000-0000-4000-8000-000000000001"}), &[], None, &[]);
+    assert!(watch.ends_with("CoreSimulator may shut its watch down and erase it"), "{watch}");
+}
+
 /// The device `phone` in two sets: `U-A-PHONE` in the default set, `U-B-PHONE` in set `B`.
 struct TwoSets;
 

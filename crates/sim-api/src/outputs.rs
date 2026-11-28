@@ -60,8 +60,9 @@ const DEFS: &[(&str, &str)] = &[
     (
         "link",
         r#"{id: string, kind: "watch-phone"|"car-phone"|"headset-phone"|"network", mechanism: string,
-            state: "pending"|"active"|"broken", reason: string, since: string|null, active: boolean,
-            members: [{device: string, name: string|null, platform: "ios"|"android", role: string, running: boolean}]}"#,
+            state: "pending"|"active"|"broken", reason: string, since: string|null, active: boolean|null,
+            members: [{device: string, name: string|null, platform: "ios"|"android", role: string, running: boolean}],
+            forwards?: [{device: string, port: number, host_port: number|null}]}"#,
     ),
     ("prefs_change", r#"store: string, visible: "now"|"after_relaunch", app: "untouched"|"stopped"|"relaunched", note?: string"#),
     ("frame", "{address: string, symbol: string, image?: string, source?: string}"),
