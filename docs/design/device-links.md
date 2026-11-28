@@ -226,10 +226,12 @@ instead of making a link that can never be active.
 
 ### Headsets (`headset-phone`, #426)
 
-Neither visionOS nor Android XR has a watch-style pairing in the simulators. Until #426 says
-otherwise, `headset-phone` is a `network` link with roles: the same mechanism, plus the headset
-and phone roles so the desktop can draw them as a pair. When #426 finds a real pairing flow, it
-gets its own mechanism under the same kind.
+Neither visionOS nor Android XR headsets have a watch-style pairing in the simulators, so
+`headset-phone` with a headset is a `network` link with roles: the same mechanism, plus the
+headset and phone roles so the desktop can draw them as a pair. Android XR audio and display
+glasses do pair: stock pairs a glasses AVD with one phone AVD over Bluetooth, and the app runs on
+the phone. A glasses member gets `bt-netsim` under the same kind, and is refused until the
+netsimd bridge (#435) exists. Details: [research/headset-pairing.md](../research/headset-pairing.md).
 
 ### A shared virtual network (`network`)
 
@@ -467,8 +469,9 @@ Each has the default this design uses if nobody decides otherwise.
 5. **DHU and CarPlay: links or projections?** Default: projections on the phone, outside the link
    store; `car-phone` is AAOS + phone only. If the DHU should show as a device, it becomes a `car`
    member without an AVD.
-6. **`headset-phone` mechanism.** Default: a `network` link with roles until #426 finds a pairing
-   flow.
+6. **`headset-phone` mechanism.** Default: a `network` link with roles for headsets; `bt-netsim`
+   for Android XR glasses, which #426 found do pair with a phone
+   ([research/headset-pairing.md](../research/headset-pairing.md)).
 7. **Cross-platform links.** Default: only `network` crosses platforms.
 8. **Network mechanism and discovery.** Default: `net-forward` now, `net-segment` (emu-to-emu L2,
    mDNS between Android guests) as a follow-up issue; no iOS-Android mDNS reflector until a user
