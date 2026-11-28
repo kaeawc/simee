@@ -19,7 +19,7 @@
 //! `cargo run` opens the window (`SIMEE_DEVICE=<udid|name|booted>` preselects a device);
 //! `cargo run -- --snap shot.png --scene demo` renders headless (scenes: demo, android, foldable,
 //! folded, tablet, ipad, watch, tv, apple-watch, apple-tv, auto, carplay, vision-pro, android-xr,
-//! glasses, turned, turned-tablet, empty,
+//! glasses, iphone-pro, pixel-pro, watch-ultra, turned, turned-tablet, empty,
 //! sidebar-hidden, inspector-hidden, panes-hidden, panes-wide, toggled-list, toggled-panel, panel-empty,
 //! resources, resources-memory, admission,
 //! admission-many, popped, list-booted, list-search); a release build needs `--features tooling` for it.
@@ -528,12 +528,14 @@ fn info(udid: &str, name: &str, device_type: &str, runtime: &str, state: DeviceS
 }
 
 fn android_info(udid: &str, form_factor: FormFactor, image: &str, state: DeviceState) -> DeviceInfo {
+    // An AVD made for a hardware definition carries its name (`hw.device.name`): the demo's Pixels do.
+    let device_type = if udid.starts_with("pixel_") { udid } else { "custom" };
     DeviceInfo {
         udid: udid.into(),
         name: udid.into(),
         state,
         runtime_id: format!("system-images;{image};arm64-v8a"),
-        device_type_id: "custom".into(),
+        device_type_id: device_type.into(),
         available: true,
         platform: Platform::Android,
         form_factor: None,
@@ -748,6 +750,24 @@ fn glasses_scene(s: &mut State) {
     let glasses = android_info("ai_glasses", FormFactor::Vision, "android-36;ai-glasses", DeviceState::Booted);
     select_added(s, glasses, (450, 450), Shape::Rectangle);
     say_if_no_body(s);
+}
+
+/// An iPhone 17 Pro: the camera plateau across its back (the 3D view's back and side views).
+fn iphone_pro_scene(s: &mut State) {
+    let pro = info("P1", "iPhone 17 Pro", "iPhone-17-Pro", "iOS-26-5", DeviceState::Booted);
+    select_added(s, pro, (402, 874), Shape::Rounded);
+}
+
+/// A Pixel 9 Pro (an AVD made for the `pixel_9_pro` hardware definition), at a quarter size.
+fn pixel_pro_scene(s: &mut State) {
+    let pro = android_info("pixel_9_pro", FormFactor::Phone, "android-36;google_apis", DeviceState::Booted);
+    select_added(s, pro, (320, 714), Shape::Rounded);
+}
+
+/// An Apple Watch Ultra 3: the flat crystal, the crown guard and the Action button.
+fn watch_ultra_scene(s: &mut State) {
+    let ultra = info("U1", "Apple Watch Ultra 3 (49mm)", "Apple-Watch-Ultra-3-49mm", "watchOS-26-0", DeviceState::Booted);
+    select_added(s, ultra, (422, 514), Shape::Rounded);
 }
 
 fn empty(s: &mut State) {
@@ -1359,6 +1379,9 @@ fn main() {
             ("vision-pro", vision_pro_scene),
             ("android-xr", android_xr_scene),
             ("glasses", glasses_scene),
+            ("iphone-pro", iphone_pro_scene),
+            ("pixel-pro", pixel_pro_scene),
+            ("watch-ultra", watch_ultra_scene),
             ("turned", turned_scene),
             ("turned-tablet", turned_tablet_scene),
             ("empty", empty),
@@ -1702,6 +1725,38 @@ mod tests {
         let (w, h, _) = sim_core::form_factor::ANDROID_GLASSES_SCREEN;
         let p = d.kind().expect("a kind").image_profile(tag);
         assert_eq!((p.width, p.height), (w, h));
+    }
+
+    #[test]
+    fn a_scenes_device_is_drawn_as_its_own_hardware() {
+        // A device that isn't running here has no screen to check: its device type's row is its
+        // body, so the demo's Pixels are Pixels, not generic slabs (#590).
+        type Scene = fn(&mut State);
+        let cases: [(Scene, &str); 8] = [
+            (demo, "iPhone-17"),
+            (android_scene, "pixel_9"),
+            (pixel_pro_scene, "pixel_9_pro"),
+            (iphone_pro_scene, "iPhone-17-Pro"),
+            (tablet_scene, "pixel_tablet"),
+            (foldable_scene, "pixel_fold"),
+            (apple_watch_scene, "Apple-Watch-Series-10-46mm"),
+            (watch_ultra_scene, "Apple-Watch-Ultra-3-49mm"),
+        ];
+        for (scene_fn, id) in cases {
+            let mut s = init();
+            s.view3d = scene::Toggle { on: true, supported: true, ..scene::Toggle::default() };
+            scene_fn(&mut s);
+            let b = scene::body_for(&s).unwrap_or_else(|| panic!("{id}: a body"));
+            assert_eq!(b.id, id);
+            assert!(matches!(b.source, sim_core::body::Source::Published(_)), "{id}: a published row");
+            // The scene's frame goes on the row's front screen, upright.
+            let placed = scene::place(&b, s.screen_size(), sim_core::rotation::Rotation::Deg0).expect("placed");
+            assert_eq!((placed.face, placed.quarters), (sim_core::body::Face::Front, 0), "{id}");
+        }
+        // An AVD with a hardware definition the table doesn't list still gets a generic body.
+        let mut s = init();
+        watch_scene(&mut s);
+        assert!(matches!(scene::body_for(&s).expect("a watch").source, sim_core::body::Source::Generic(_)));
     }
 
     fn text_of(rt: &Runtime<State>, key: &str) -> String {

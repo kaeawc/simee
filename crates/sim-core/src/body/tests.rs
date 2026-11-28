@@ -263,6 +263,27 @@ fn closed_volume(m: &Mesh, parts: &[Part]) -> Result<f32, String> {
     Ok(volume)
 }
 
+#[test]
+fn a_parts_positions_are_the_vertices_its_triangles_use() {
+    for b in bodies_to_mesh() {
+        let m = mesh(&b);
+        for part in &m.parts {
+            let (lo, hi) = (part.vertex_first, part.vertex_first + part.vertex_count);
+            assert!(m.part_indices(part).iter().all(|i| (lo..hi).contains(i)), "{} {:?}", b.id, part.role);
+            assert_eq!(m.part_positions(part).len(), part.vertex_count as usize);
+            // The box of its positions is the box of what it draws, but for a panel's skin, whose
+            // three parts share the panel's vertices.
+            if !matches!(part.role, Role::Glass | Role::Shell | Role::Back) {
+                let drawn = part_bounds(&m, part);
+                let all = m.part_positions(part).iter().fold(([f32::MAX; 3], [f32::MIN; 3]), |(lo, hi), p| {
+                    (std::array::from_fn(|k| lo[k].min(p[k])), std::array::from_fn(|k| hi[k].max(p[k])))
+                });
+                assert_eq!(drawn, all, "{} {:?}", b.id, part.role);
+            }
+        }
+    }
+}
+
 /// The box a part's vertices fill.
 fn part_bounds(m: &Mesh, part: &Part) -> ([f32; 3], [f32; 3]) {
     m.part_indices(part).iter().map(|&i| m.positions[i as usize]).fold(([f32::MAX; 3], [f32::MIN; 3]), |(lo, hi), p| {
@@ -339,15 +360,20 @@ fn meshes_are_well_formed() {
         let panels = b.panels().len();
         for panel in 0..panels {
             // The shell and the screens set into it close up, and face out.
+            // The panel's skin: its cover glass, band and back (the slab's own parts, before any
+            // block of the same role) with the screens set into them.
+            let skin = |p: &&Part| p.panel == panel && matches!(p.role, Role::Glass | Role::Shell | Role::Back | Role::Screen(_));
             let outer: Vec<Part> =
-                m.parts.iter().filter(|p| p.panel == panel && matches!(p.role, Role::Shell | Role::Screen(_))).copied().collect();
-            assert_eq!(outer.iter().filter(|p| p.role == Role::Shell).count(), 1, "{id}: one shell per panel");
+                m.parts.iter().take_while(|p| !matches!(p.role, Role::Cutout | Role::Bump | Role::Recess)).filter(skin).copied().collect();
+            assert_eq!(outer.iter().filter(|p| p.role == Role::Shell).count(), 1, "{id}: one band per panel");
+            assert!(outer.iter().any(|p| p.role == Role::Glass), "{id}: cover glass round the front screen");
+            assert!(outer.iter().any(|p| matches!(p.role, Role::Back | Role::Glass) && p.first > outer[0].first), "{id}: a back");
             let v = closed_volume(&m, &outer).unwrap_or_else(|e| panic!("{id} panel {panel}: {e}"));
             let p = b.panels()[panel];
             let slab = p.size[0] * p.size[1] * b.size[2];
             assert!(v > 0.6 * slab && v <= slab * 1.001, "{id} panel {panel}: volume {v} of {slab}");
         }
-        for part in m.parts.iter().filter(|p| !matches!(p.role, Role::Shell | Role::Screen(_) | Role::Cutout)) {
+        for part in m.parts.iter().filter(|p| !matches!(p.role, Role::Shell | Role::Glass | Role::Back | Role::Screen(_) | Role::Cutout)) {
             let v = closed_volume(&m, &[*part]).unwrap_or_else(|e| panic!("{id} {:?}: {e}", part.role));
             assert!(v > 0.0, "{id} {:?} faces out", part.role);
         }
@@ -356,13 +382,17 @@ fn meshes_are_well_formed() {
         let extras = &m.parts[m.parts.len() - b.extras.len()..];
         for (x, part) in b.extras.iter().zip(extras) {
             let what = format!("{id} {:?} at {:?}", x.role, x.center);
-            assert!(!matches!(x.role, Role::Shell | Role::Screen(_) | Role::Cutout), "{what}: a block is a solid part");
+            assert!(
+                !matches!(x.role, Role::Shell | Role::Glass | Role::Back | Role::Recess | Role::Screen(_) | Role::Cutout),
+                "{what}: a block is a solid part"
+            );
             assert_eq!((part.role, part.panel), (x.role, b.panel_at([x.center[0], x.center[1]])), "{what}");
             let v = closed_volume(&m, &[*part]).unwrap_or_else(|e| panic!("{what}: {e}"));
             let cube = x.size[0] * x.size[1] * x.size[2];
             assert!(v > 0.5 * cube && v <= cube * 1.001, "{what}: volume {v} of {cube}");
+            // A block that leans (a band's segment) fills another box than its own.
             let (lo, hi) = part_bounds(&m, part);
-            for k in 0..3 {
+            for k in (0..3).filter(|_| x.tilt == 0.0) {
                 let (want_lo, want_hi) = (x.center[k] - x.size[k] / 2.0, x.center[k] + x.size[k] / 2.0);
                 assert!((lo[k] - want_lo).abs() < 1e-3 && (hi[k] - want_hi).abs() < 1e-3, "{what}: axis {k} spans {lo:?}..{hi:?}");
             }
@@ -677,45 +707,59 @@ pub(super) fn fingerprint(b: &Body) -> u64 {
 // macOS, where they were taken.
 #[cfg(target_os = "macos")]
 #[test]
-fn phone_tablet_and_foldable_bodies_are_unchanged_by_the_split() {
-    // As they were before each form factor got its module (#500); the watches' own pin is in
-    // watch.rs. None of the form factor modules may change these.
-    let before: [(&str, u64); 26] = [
-        ("iPhone-17-Pro", 0xd093af151d72e8d3),
-        ("iPhone-17-Pro-Max", 0xb06f426ad92e4164),
-        ("iPhone-17", 0x6b83a9e1f21ce0f4),
-        ("iPhone-Air", 0x096947610a67f745),
-        ("iPhone-16e", 0x6d798dcc1313c57a),
-        ("iPhone-16", 0xef0981547d3a7ae5),
-        ("iPhone-16-Plus", 0x7911de4cf2b9d540),
-        ("iPhone-16-Pro", 0x6a070335970014ee),
-        ("iPhone-16-Pro-Max", 0x3cead82f457ece80),
-        ("iPhone-SE-3rd-generation", 0x5c87fdb115a2b350),
-        ("iPad-Pro-11-inch-M4", 0x17c7c58109f16db5),
-        ("iPad-Pro-13-inch-M4", 0xe8e25a6641218e79),
-        ("iPad-Air-11-inch-M3", 0x91bfaab073614946),
-        ("iPad-Air-13-inch-M3", 0x73048cf9c5674d92),
-        ("iPad-mini-A17-Pro", 0xf97f13bd9f07c3d2),
-        ("iPad-A16", 0x4bd26dc04a05442a),
-        ("pixel_fold", 0x1f8b7d48e1d8f4c3),
-        ("surface_duo", 0xc226fae94453ab39),
-        ("iPhone-Duo", 0x56b8745fd4bfcb50),
-        ("android-phone-720x1280-320dpi-rounded", 0xb83b5db9e9d1f2b2),
-        ("android-tablet-2560x1600-320dpi-rounded", 0x4921fd00dc078c0a),
-        ("android-foldable-2208x1840-420dpi-rectangle-folded-1080x2092", 0x814c5f14d7e6b1bc),
-        ("ios-phone-1206x2622-3x-rounded", 0x8294654427b16679),
-        ("android-foldable-1080x2640-420dpi-rectangle-folded-720x748-horizontal-hinge-0-180-gap0", 0x6f7de05030587255),
-        ("android-foldable-1080x2640-420dpi-rectangle-folded-720x748-vertical-hinge-0-120-gap0", 0x01faf8a0eb1737f9),
-        ("android-foldable-1080x2640-420dpi-rectangle-folded-720x748-vertical-hinge-0-360-gap84", 0xc160af820cdaf96b),
-    ];
+fn phone_tablet_and_foldable_bodies_are_pinned() {
+    // Every phone, tablet and foldable body and its mesh; the watches' own pin is in watch.rs.
+    // #500 took these so that splitting the form factors into modules changed none of them;
+    // #590 redrew every body (cover glass, band and back as separate parts, continuous corners,
+    // recessed keys, camera housings and lenses, finishes) and took them again. A change here is a
+    // change to how a device looks: update the values with the change.
     let mut bodies: Vec<Arc<Body>> = all().to_vec();
     bodies.push(for_apple_type(&apple_type("iPhone-18-Pro", "iPhone 18 Pro", "iPhone", (1206, 2622), 3)).expect("generic"));
     bodies.extend(unlisted_foldables());
-    let got: HashMap<&str, u64> = bodies.iter().map(|b| (b.id.as_str(), fingerprint(b))).collect();
-    for (id, want) in before {
-        assert_eq!(got.get(id), Some(&want), "{id}");
+    let by_id: HashMap<&str, u64> = bodies.iter().map(|b| (b.id.as_str(), fingerprint(b))).collect();
+    let got: Vec<(&str, u64)> = PINS.iter().map(|&(id, _)| (id, by_id.get(id).copied().unwrap_or_default())).collect();
+    assert_eq!(got, PINS, "{got:#x?}");
+    // Every phone, tablet and foldable row is pinned.
+    for b in all().iter().filter(|b| matches!(b.form_factor, FormFactor::Phone | FormFactor::Tablet | FormFactor::Foldable)) {
+        assert!(PINS.iter().any(|(id, _)| *id == b.id), "{} has no pin", b.id);
     }
 }
+
+#[cfg(target_os = "macos")]
+const PINS: [(&str, u64); 32] = [
+    ("iPhone-17-Pro", 0xca0a0d6c9521e870),
+    ("iPhone-17-Pro-Max", 0x7698a8e3ebff3738),
+    ("iPhone-17", 0x657139fbbe497d4c),
+    ("iPhone-Air", 0x942893c90ba10552),
+    ("iPhone-16e", 0x364b999549eb4069),
+    ("iPhone-16", 0xe818ebad5919768d),
+    ("iPhone-16-Plus", 0x4787173c7fa83d64),
+    ("iPhone-16-Pro", 0xdb358cd56b5c5b79),
+    ("iPhone-16-Pro-Max", 0x920b61a663f7f6bd),
+    ("iPhone-SE-3rd-generation", 0xb5d65a91bd6044a9),
+    ("pixel_9", 0x2f13072534d178fb),
+    ("pixel_9_pro", 0xa565a6b7a76afbc8),
+    ("pixel_9_pro_xl", 0x060993f484621e82),
+    ("pixel_8", 0x00f3a4bde1d1479b),
+    ("pixel_8_pro", 0x499c44f0c0e18daa),
+    ("iPad-Pro-11-inch-M4", 0x21975e421ee7da87),
+    ("iPad-Pro-13-inch-M4", 0x89f536e46813d227),
+    ("iPad-Air-11-inch-M3", 0x27fb16b5ea6d29f8),
+    ("iPad-Air-13-inch-M3", 0xfc472a2628495123),
+    ("iPad-mini-A17-Pro", 0xcf027e88962c73f3),
+    ("iPad-A16", 0x0888d186c787f319),
+    ("pixel_tablet", 0x884d8f071b5f5718),
+    ("pixel_fold", 0x29e96b0b0696bcf3),
+    ("surface_duo", 0x8ce4a577a69a6e72),
+    ("iPhone-Duo", 0x54cc21491a3fbdd7),
+    ("android-phone-720x1280-320dpi-rounded", 0xcf2b508a2dcbcd47),
+    ("android-tablet-2560x1600-320dpi-rounded", 0xc013074c610fa54b),
+    ("android-foldable-2208x1840-420dpi-rectangle-folded-1080x2092", 0x16b707d1b7bb7100),
+    ("ios-phone-1206x2622-3x-rounded", 0xf28f12e8c8255fe3),
+    ("android-foldable-1080x2640-420dpi-rectangle-folded-720x748-horizontal-hinge-0-180-gap0", 0x56fab0ac22312322),
+    ("android-foldable-1080x2640-420dpi-rectangle-folded-720x748-vertical-hinge-0-120-gap0", 0x5e144c8f1d1a9c87),
+    ("android-foldable-1080x2640-420dpi-rectangle-folded-720x748-vertical-hinge-0-360-gap84", 0xd52fb40c06a30960),
+];
 
 /// A module that sizes its generic body another way (`SIZES_BY_DPI` false: a TV by its diagonal, a
 /// headset by its eyepiece) passes the shared reference check with a screen of any size, while one
@@ -769,6 +813,209 @@ fn has_body_is_what_each_form_factor_module_says() {
     }
 }
 
+// --- #590: the bodies as the hardware is ---
+
+/// The profile of an AVD made for a hardware definition with this screen.
+fn avd_profile(form_factor: FormFactor, (w, h): (u32, u32), dpi: u32) -> Profile {
+    kind(Platform::Android, form_factor).profile().with_screen(w, h, Density::Dpi(dpi))
+}
+
+#[test]
+fn pixel_phones_and_the_tablet_are_rows_with_googles_dimensions() {
+    // (hardware definition, width, height, depth mm, pixels, diagonal inches, rear lenses).
+    let phones = [
+        ("pixel_9", [72.0, 152.8, 8.5], (1080, 2424), 6.3, 2),
+        ("pixel_9_pro", [72.0, 152.8, 8.5], (1280, 2856), 6.3, 3),
+        ("pixel_9_pro_xl", [76.6, 162.8, 8.5], (1344, 2992), 6.8, 3),
+        ("pixel_8", [70.8, 150.5, 8.9], (1080, 2400), 6.2, 2),
+        ("pixel_8_pro", [76.5, 162.6, 8.8], (1344, 2992), 6.7, 3),
+    ];
+    for (id, size, px, inches, lenses) in phones {
+        // An AVD made for the definition (the emulator's density, not the panel's) gets the row.
+        let b = for_android(id, &avd_profile(FormFactor::Phone, px, 420)).unwrap_or_else(|| panic!("{id}: a body"));
+        assert_eq!((b.id.as_str(), b.size, b.form_factor), (id, size, FormFactor::Phone));
+        assert!(matches!(b.source, Source::Published(_)), "{id}");
+        let s = b.screen(Display::Main).expect("screen");
+        assert!(close(s.diagonal_inches(), inches, PUBLISHED), "{id}: {} in", s.diagonal_inches());
+        assert_eq!(s.cutout.map(|c| c.kind), Some(CutoutKind::PunchHole), "{id}: a punch hole");
+        // The camera bar crosses the back near the top, its lenses under one cover glass.
+        let bar = b.bump.expect("camera bar");
+        assert!(bar.size[0] > 0.6 * size[0] && bar.size[0] <= size[0] && bar.center[1] > 0.25 * size[1], "{id}: {bar:?}");
+        assert!(bar.height >= 2.0, "{id}: the bar stands {} mm proud", bar.height);
+        let count = |role| b.extras.iter().filter(|x| x.role == role).count();
+        assert_eq!((count(Role::Camera), count(Role::Lens), count(Role::Flash)), (lenses, 1, 1), "{id}");
+        let top = -size[2] / 2.0 - bar.height;
+        for x in b.extras.iter() {
+            let inside = (x.center[0] - bar.center[0]).abs() + x.size[0] / 2.0 <= bar.size[0] / 2.0
+                && (x.center[1] - bar.center[1]).abs() + x.size[1] / 2.0 <= bar.size[1] / 2.0;
+            assert!(inside, "{id}: {:?} is on the bar", x.role);
+            assert!(x.center[2] - x.size[2] / 2.0 <= top + 1e-3, "{id}: {:?} reaches the bar's face", x.role);
+        }
+        assert_eq!(b.buttons.iter().map(|k| (k.name, k.side)).collect::<Vec<_>>(), [("power", Side::Right), ("volume", Side::Right)]);
+        // A screen that isn't the definition's is not drawn on its row.
+        let other = for_android(id, &avd_profile(FormFactor::Phone, (720, 1280), 320)).expect("generic");
+        assert!(matches!(other.source, Source::Generic(_)), "{id}");
+    }
+    let tablet = for_android("pixel_tablet", &avd_profile(FormFactor::Tablet, (2560, 1600), 320)).expect("tablet");
+    assert_eq!((tablet.id.as_str(), tablet.size), ("pixel_tablet", [258.0, 169.0, 8.1]));
+    assert!(close(tablet.screens[0].diagonal_inches(), 10.95, PUBLISHED));
+}
+
+#[test]
+fn modern_phones_have_thin_even_bezels() {
+    // From the body's edge to the screen: the band's rounded-over edge, then black under the cover
+    // glass. Even on all four sides, and the black border 1 to 2.2 mm wide.
+    for id in ["iPhone-17-Pro", "iPhone-17-Pro-Max", "iPhone-17", "iPhone-Air", "iPhone-16-Pro", "pixel_9", "pixel_9_pro", "pixel_9_pro_xl"]
+    {
+        let b = get(id).expect("row");
+        let [l, r, bottom, top] = b.screens[0].rect();
+        let [w, h, _] = b.size;
+        let margins = [l + w / 2.0, w / 2.0 - r, bottom + h / 2.0, h / 2.0 - top];
+        let (lo, hi) = margins.iter().fold((f32::MAX, f32::MIN), |(lo, hi), m| (lo.min(*m), hi.max(*m)));
+        assert!(hi - lo < 0.45, "{id}: bezels {margins:?} are even");
+        let border = lo - b.bevel;
+        assert!((1.0..=2.2).contains(&border), "{id}: {border} mm of black border inside a {} mm band edge", b.bevel);
+        assert!(hi < 3.7, "{id}: {hi} mm from the edge to the screen");
+    }
+    // A generic phone is drawn the same way: no thick slab round the screen.
+    let generic = for_profile(&kind(Platform::Android, FormFactor::Phone).profile()).expect("generic");
+    let [l, _, bottom, _] = generic.screens[0].rect();
+    let [w, h, t] = generic.size;
+    assert!(l + w / 2.0 <= 3.0 + 1e-4 && (l + w / 2.0 - (bottom + h / 2.0)).abs() < 1e-3 && t < 9.0);
+}
+
+#[test]
+fn a_continuous_corner_reads_as_the_circular_one_it_stands_for() {
+    let c = Corner::continuous(10.0);
+    assert_eq!(c.exponent, 3.0);
+    assert!(close(c.radius, 10.0 * CONTINUOUS_REACH, EXACT) && c.radius > 14.0);
+    // Its middle is as far in from the corner as a 10 mm arc's: reach * (1 - 2^(-1/3)) is 1 - 2^(-1/2).
+    let superellipse = c.radius * (1.0 - 0.5f32.powf(1.0 / 3.0));
+    let circle = 10.0 * (1.0 - 0.5f32.sqrt());
+    assert!((superellipse - circle).abs() < 1e-3, "{superellipse} vs {circle}");
+    assert_eq!(Corner::round(4.0), Corner { radius: 4.0, exponent: 2.0 });
+    // Phones, tablets and Apple Watches have continuous corners; a round watch is a circle.
+    for id in ["iPhone-17-Pro", "pixel_9", "iPad-Pro-11-inch-M4", "pixel_tablet", "Apple-Watch-Series-10-46mm"] {
+        assert_eq!(get(id).expect("row").corner.exponent, 3.0, "{id}");
+    }
+    assert_eq!(get("wearos_large_round").expect("row").corner.exponent, 2.0);
+}
+
+#[test]
+fn a_panels_skin_is_cover_glass_a_band_and_a_back() {
+    let parts = |b: &Body| mesh(b).parts.iter().map(|p| p.role).collect::<Vec<_>>();
+    let phone = get("pixel_9").expect("row");
+    let roles = parts(&phone);
+    assert_eq!(roles[..4], [Role::Glass, Role::Shell, Role::Back, Role::Screen(Display::Main)]);
+    // Flat cover glass lies in the front face; a crystal that wraps comes down the front edge.
+    let front_reach = |b: &Body| {
+        let m = mesh(b);
+        let glass = m.parts.iter().find(|p| p.role == Role::Glass).expect("cover glass");
+        b.size[2] / 2.0 - part_bounds(&m, glass).0[2]
+    };
+    assert!(front_reach(&phone).abs() < 1e-4, "flat glass");
+    let watch = get("Apple-Watch-Series-10-46mm").expect("row");
+    assert!(watch.finish.glass_wraps && (front_reach(&watch) - watch.bevel).abs() < 1e-3, "the crystal wraps {}", front_reach(&watch));
+    // A back with a screen set into it (a book's cover screen) is cover glass too; its other
+    // panel has a back.
+    let fold = get("pixel_fold").expect("row");
+    let m = mesh(&fold);
+    let of_panel = |panel: usize| m.parts.iter().filter(|p| p.panel == panel).map(|p| p.role).take(3).collect::<Vec<_>>();
+    assert_eq!(of_panel(0), [Role::Glass, Role::Shell, Role::Glass]);
+    assert_eq!(of_panel(1), [Role::Glass, Role::Shell, Role::Back]);
+    // Every row says what it is made of, in colours a display can show.
+    for b in all() {
+        let f = b.finish;
+        assert!(f.frame_colour.iter().chain(&f.back_colour).all(|c| (0.0..=1.0).contains(c)), "{}", b.id);
+    }
+    assert_eq!(get("iPhone-16-Pro").expect("row").finish.frame, Surface::Titanium);
+    assert_eq!(get("pixel_9_pro").expect("row").finish.back, Surface::MatteGlass);
+    assert_eq!(get("pixel_9").expect("row").finish.back, Surface::Glass);
+}
+
+#[test]
+fn keys_are_machined_into_the_band_where_its_outline_is() {
+    for b in bodies_to_mesh() {
+        let m = mesh(&b);
+        // The body's own keys: an extra block may be a key too (a head unit's), with no recess.
+        let own = &m.parts[..m.parts.len() - b.extras.len()];
+        let keys: Vec<(usize, &Part)> = own.iter().enumerate().filter(|(_, p)| matches!(p.role, Role::Button | Role::Crown)).collect();
+        assert_eq!(keys.len(), b.buttons.len() + usize::from(b.crown.is_some()), "{}", b.id);
+        for (i, key) in keys {
+            // Each key follows its recess, which is a little larger along and across the side and
+            // barely stands off it.
+            let recess = &m.parts[i - 1];
+            assert_eq!((recess.role, recess.panel), (Role::Recess, key.panel), "{}: a recess under each key", b.id);
+            let ((klo, khi), (rlo, rhi)) = (part_bounds(&m, key), part_bounds(&m, recess));
+            let wider = (0..3).filter(|&k| rlo[k] < klo[k] - 0.1 && rhi[k] > khi[k] + 0.1).count();
+            assert_eq!(wider, 2, "{}: the recess shows all round its key", b.id);
+        }
+    }
+    // A phone's keys stand a fraction of a millimetre proud of a flat side.
+    let phone = get("iPhone-17-Pro").expect("row");
+    assert!(phone.buttons.iter().all(|k| k.depth <= 0.4), "{:?}", phone.buttons);
+    let m = mesh(&phone);
+    let side = m.parts.iter().filter(|p| p.role == Role::Button).map(|p| part_bounds(&m, p).1[0]).fold(f32::MIN, f32::max);
+    assert!((side - (phone.size[0] / 2.0 + 0.35)).abs() < 1e-3, "{side}");
+    // On a round case the key starts at the circle, not at its bounding box: its outer face is
+    // its depth beyond the circle where the key is, and its back is inside the circle at its ends.
+    let round = get("wearos_large_round").expect("row");
+    let key = round.buttons[0];
+    let r = round.size[0] / 2.0;
+    let at = |y: f32| (r * r - y * y).sqrt();
+    let m = mesh(&round);
+    let part = m.parts.iter().find(|p| p.role == Role::Button).expect("the side button");
+    let (lo, hi) = part_bounds(&m, part);
+    assert!((hi[0] - (at(key.at) + key.depth)).abs() < 0.02, "outer face at {} on a {r} mm circle", hi[0]);
+    assert!(hi[0] < r, "inside the bounding box: the old key floated out here");
+    let far = key.at.abs() + key.length / 2.0;
+    assert!(lo[0] < at(far), "its back, {}, is inside the circle at its far end, {}", lo[0], at(far));
+}
+
+#[test]
+fn iphones_carry_their_cameras_dynamic_island_and_keys() {
+    let lenses = |id: &str| get(id).expect("row").extras.iter().filter(|x| x.role == Role::Camera).count();
+    // The Pro's three lenses and LiDAR window; two on the 17 and 16; one on the Air, 16e and SE.
+    assert_eq!(
+        (lenses("iPhone-17-Pro"), lenses("iPhone-16-Pro"), lenses("iPhone-17"), lenses("iPhone-Air"), lenses("iPhone-16e")),
+        (4, 4, 2, 1, 1)
+    );
+    let pro = get("iPhone-17-Pro").expect("row");
+    // The plateau runs nearly the body's width across the top of the back.
+    let plateau = pro.bump.expect("plateau");
+    assert!(plateau.size[0] > 0.88 * pro.size[0] && plateau.size[1] > 30.0 && plateau.center[0] == 0.0, "{plateau:?}");
+    assert!(pro.size[1] / 2.0 - (plateau.center[1] + plateau.size[1] / 2.0) < 4.0, "near the top edge");
+    // The Dynamic Island: a pill near the screen's top.
+    let s = &pro.screens[0];
+    let island = s.cutout.expect("island");
+    assert_eq!(island.kind, CutoutKind::Island);
+    assert!(island.size[0] > 3.0 * island.size[1] && s.size()[1] / 2.0 - island.center[1] < 6.0);
+    // Action, volume up and down on the left; the side button and the flush Camera Control on the right.
+    let names: Vec<_> = pro.buttons.iter().map(|k| (k.name, k.side)).collect();
+    assert_eq!(
+        names,
+        [
+            ("action", Side::Left),
+            ("volume-up", Side::Left),
+            ("volume-down", Side::Left),
+            ("side", Side::Right),
+            ("camera-control", Side::Right)
+        ]
+    );
+    assert!(pro.buttons[4].depth < 0.1, "the Camera Control lies flush");
+    // No two lenses overlap, and each stands on its housing.
+    for b in all().iter().filter(|b| b.form_factor == FormFactor::Phone) {
+        let cams: Vec<&Block> = b.extras.iter().filter(|x| x.role == Role::Camera).collect();
+        for (i, a) in cams.iter().enumerate() {
+            for c in &cams[i + 1..] {
+                let d = (a.center[0] - c.center[0]).hypot(a.center[1] - c.center[1]);
+                assert!(d >= (a.size[0] + c.size[0]) / 2.0, "{}: lenses {d} mm apart overlap", b.id);
+            }
+            assert!(a.center[2] < -b.size[2] / 2.0, "{}: on the back", b.id);
+        }
+    }
+}
+
 /// A body with one block of each extra role: on both panels of a foldable, standing off its
 /// faces and its sides, round and square, sunk into it and clear of it.
 fn with_extras() -> Vec<Arc<Body>> {
@@ -778,10 +1025,38 @@ fn with_extras() -> Vec<Arc<Body>> {
     let round = |d: f32| Corner { radius: d / 2.0, exponent: 2.0 };
     let square = Corner { radius: 2.0, exponent: 3.0 };
     fold.extras = vec![
-        Block { role: Role::Stand, center: [-w / 4.0, -h / 2.0 - 10.0, 0.0], size: [40.0, 20.0, 30.0], corner: square, bevel: 1.0 },
-        Block { role: Role::Knob, center: [w / 4.0, 0.0, t / 2.0 + 3.0], size: [12.0, 12.0, 6.0], corner: round(12.0), bevel: 1.5 },
-        Block { role: Role::Lens, center: [w / 4.0, h / 4.0, -t / 2.0 - 0.5], size: [20.0, 14.0, 1.5], corner: round(14.0), bevel: 0.4 },
-        Block { role: Role::Trim, center: [0.0, 0.0, -t / 2.0 - 1.0], size: [w + 6.0, h + 6.0, 2.0], corner: square, bevel: 0.0 },
+        Block {
+            role: Role::Stand,
+            center: [-w / 4.0, -h / 2.0 - 10.0, 0.0],
+            size: [40.0, 20.0, 30.0],
+            corner: square,
+            bevel: 1.0,
+            tilt: 0.0,
+        },
+        Block {
+            role: Role::Knob,
+            center: [w / 4.0, 0.0, t / 2.0 + 3.0],
+            size: [12.0, 12.0, 6.0],
+            corner: round(12.0),
+            bevel: 1.5,
+            tilt: 0.0,
+        },
+        Block {
+            role: Role::Lens,
+            center: [w / 4.0, h / 4.0, -t / 2.0 - 0.5],
+            size: [20.0, 14.0, 1.5],
+            corner: round(14.0),
+            bevel: 0.4,
+            tilt: 0.0,
+        },
+        Block {
+            role: Role::Trim,
+            center: [0.0, 0.0, -t / 2.0 - 1.0],
+            size: [w + 6.0, h + 6.0, 2.0],
+            corner: square,
+            bevel: 0.0,
+            tilt: 0.0,
+        },
     ];
     let mut watch = (*get("Apple-Watch-Series-10-46mm").expect("watch")).clone();
     watch.id = "test-extras-watch".into();
@@ -793,6 +1068,7 @@ fn with_extras() -> Vec<Arc<Body>> {
             size: [ww - 14.0, 32.0, wt * 0.4],
             corner: Corner { radius: 3.0, exponent: 2.0 },
             bevel: 1.0,
+            tilt: 0.0,
         })
         .to_vec();
     vec![Arc::new(fold), Arc::new(watch)]

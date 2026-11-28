@@ -159,6 +159,7 @@ fn head_unit(
             size: [14.0 * f, 9.0 * f, 3.5],
             corner: soft,
             bevel: 0.8,
+            tilt: 0.0,
         });
     }
     extras.push(Block {
@@ -167,6 +168,7 @@ fn head_unit(
         size: [22.0 * f, 22.0 * f, 14.0],
         corner: round(22.0 * f),
         bevel: 1.5,
+        tilt: 0.0,
     });
     // The dash: a slab behind the unit's front, wider than it on every side, with three vent slots
     // each side of the unit standing 1 mm off the dash.
@@ -177,6 +179,7 @@ fn head_unit(
         size: [w + 80.0, h + 60.0, 10.0],
         corner: Corner { radius: 8.0, exponent: 2.0 },
         bevel: 0.0,
+        tilt: 0.0,
     });
     for side_sign in [-1.0, 1.0] {
         for row in [-1.0, 0.0, 1.0] {
@@ -186,6 +189,7 @@ fn head_unit(
                 size: [24.0, 3.5, 2.0],
                 corner: round(3.5),
                 bevel: 0.5,
+                tilt: 0.0,
             });
         }
     }
@@ -205,6 +209,8 @@ fn head_unit(
         crown: None,
         fold: None,
         extras,
+        // A moulded housing: gloss black round the screen, dark plastic behind.
+        finish: Finish::new(Surface::Plastic, [0.016, 0.016, 0.018], Surface::Plastic, [0.02, 0.02, 0.022]),
     }
 }
 

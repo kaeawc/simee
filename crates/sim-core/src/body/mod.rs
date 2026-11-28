@@ -16,7 +16,13 @@
 //! Phones, tablets and foldables are in `table`; each other form factor has a module of its own
 //! (`watch`, `tv`, `car`, `headset`) that says whether it has bodies yet ([`has_body`]) and
 //! builds its rows and generic bodies, with parts a phone has no use for (straps, a stand, a
-//! knob, lenses) as [`Body::extras`]. TVs, car head units and headsets have no body yet.
+//! knob, lenses) as [`Body::extras`].
+//!
+//! A body also says what it is made of ([`Finish`]): the band round its sides, its back and how
+//! the cover glass meets the band. The mesh splits each panel's skin along those lines
+//! ([`Role::Glass`], [`Role::Shell`], [`Role::Back`]) so the scene shades glass as glass and
+//! metal as metal. A row's colours are close to a finish its maker sells; a generic body's are a
+//! neutral graphite.
 //!
 //! [`Kind::profile`]: crate::form_factor::Kind::profile
 //! [`fold::devices`]: crate::fold::devices
@@ -67,6 +73,81 @@ impl Source {
 pub struct Corner {
     pub radius: f32,
     pub exponent: f32,
+}
+
+impl Corner {
+    /// A circular corner of `radius`.
+    pub const fn round(radius: f32) -> Corner {
+        Corner { radius, exponent: 2.0 }
+    }
+
+    /// A continuous ("squircle") corner that reads as a circular one of `radius`: a superellipse
+    /// quadrant of exponent 3 reaching [`CONTINUOUS_REACH`] times as far along each edge, so the
+    /// curve starts earlier and eases into the straight (no jump in curvature where a circular arc
+    /// meets its edge) while its middle is exactly as far in from the corner as the circle's.
+    pub fn continuous(radius: f32) -> Corner {
+        Corner { radius: radius * CONTINUOUS_REACH, exponent: 3.0 }
+    }
+}
+
+/// How much further along its edges a [`Corner::continuous`] corner reaches than the circular
+/// corner it stands for: (1 - 2^(-1/2)) / (1 - 2^(-1/3)), the ratio that puts both curves'
+/// midpoints the same distance in from the corner. Apple's own continuous corners reach about
+/// 1.53 times the radius; this is the same construction on a plain superellipse.
+pub const CONTINUOUS_REACH: f32 = 1.419_874;
+
+/// What a surface of the body is made of: what the scene shades it as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Surface {
+    /// Anodized aluminium: a satin metal.
+    Aluminium,
+    /// Polished aluminium or stainless steel: a mirror-bright metal.
+    Polished,
+    /// Brushed titanium: a darker satin metal.
+    Titanium,
+    /// Glossy glass over a colour (a glass back).
+    Glass,
+    /// Etched or frosted glass over a colour (a matte glass back).
+    MatteGlass,
+    /// Ceramic and sapphire (a watch's back crystal): glossy, near white or black.
+    Ceramic,
+    /// Moulded plastic: a TV's back, a head unit's housing.
+    Plastic,
+    /// Fabric over foam: a headset's body.
+    Fabric,
+}
+
+/// What a body is made of. Colours are linear RGB.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Finish {
+    /// The band round the sides, and what the buttons, crown and camera housing are cut from.
+    pub frame: Surface,
+    pub frame_colour: [f32; 3],
+    pub back: Surface,
+    pub back_colour: [f32; 3],
+    /// The cover glass curves over the front edge down to the band (a watch's crystal); else it
+    /// is flat and the band's rounded-over edge shows round it (a phone).
+    pub glass_wraps: bool,
+}
+
+impl Finish {
+    /// Graphite satin aluminium with a glossy glass back: what a body with no known finish gets.
+    pub const GRAPHITE: Finish = Finish {
+        frame: Surface::Aluminium,
+        frame_colour: [0.105, 0.108, 0.115],
+        back: Surface::Glass,
+        back_colour: [0.030, 0.032, 0.036],
+        glass_wraps: false,
+    };
+
+    pub const fn new(frame: Surface, frame_colour: [f32; 3], back: Surface, back_colour: [f32; 3]) -> Finish {
+        Finish { frame, frame_colour, back, back_colour, glass_wraps: false }
+    }
+
+    /// The same finish with the cover glass curving over the front edge.
+    pub const fn wrapped(self) -> Finish {
+        Finish { glass_wraps: true, ..self }
+    }
 }
 
 /// Which of a device's screens this is.
@@ -186,7 +267,8 @@ pub struct Bump {
     pub height: f32,
 }
 
-/// A side key, drawn as a small rounded box.
+/// A side key: a pill machined from the band's metal, standing a little proud of a dark recess
+/// cut into the side ([`Role::Recess`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Button {
     pub name: &'static str,
@@ -201,7 +283,8 @@ pub struct Button {
     pub width: f32,
 }
 
-/// A watch's crown (the Digital Crown, a Wear OS rotary crown), drawn as a short cylinder.
+/// A watch's crown (the Digital Crown, a Wear OS rotary crown), drawn as a short cylinder on a
+/// recessed collar.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Crown {
     pub side: Side,
@@ -304,6 +387,30 @@ pub struct Block {
     pub corner: Corner,
     /// The radius its front and back edges are rounded over, mm.
     pub bevel: f32,
+    /// How far it leans back about its own x axis, radians: its top (local +y) tips toward -z.
+    /// A watch band's segments drape with it; 0 everywhere else.
+    pub tilt: f32,
+}
+
+impl Block {
+    /// An upright block (no tilt).
+    pub const fn new(role: Role, center: [f32; 3], size: [f32; 3], corner: Corner, bevel: f32) -> Block {
+        Block { role, center, size, corner, bevel, tilt: 0.0 }
+    }
+
+    /// A disc of `diameter` lying on the back face (`z` is the face it sits on, -t/2 or a bump's
+    /// top), its centre at `at` as seen from the front, standing `height` proud and sunk `sink`
+    /// into what it sits on.
+    pub fn on_back(role: Role, at: [f32; 2], z: f32, diameter: f32, height: f32, sink: f32) -> Block {
+        let bevel = (0.3 * height).min(0.3);
+        Block::new(
+            role,
+            [at[0], at[1], z + (sink - height) / 2.0],
+            [diameter, diameter, height + sink],
+            Corner::round(diameter / 2.0),
+            bevel,
+        )
+    }
 }
 
 /// A device type's body.
@@ -330,6 +437,8 @@ pub struct Body {
     pub fold: Option<FoldBody>,
     /// Parts beyond the above ([`Block`]): straps, a stand, a knob, lenses.
     pub extras: Vec<Block>,
+    /// What it is made of.
+    pub finish: Finish,
 }
 
 impl Body {
@@ -380,7 +489,7 @@ pub(super) fn sizes_by_dpi(form_factor: FormFactor) -> bool {
 }
 
 /// Whether a form factor has a body: phones, tablets and foldables always; each other form factor
-/// once its module says so (watches do; TVs, car head units and headsets don't yet).
+/// once its module says so (every one does now).
 pub fn has_body(form_factor: FormFactor) -> bool {
     match form_factor {
         FormFactor::Phone | FormFactor::Tablet | FormFactor::Foldable => true,

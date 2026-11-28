@@ -15,9 +15,9 @@ pub(super) const ENABLED: bool = true;
 #[cfg(test)]
 pub(super) const SIZES_BY_DPI: bool = true;
 
-const APPLE_WATCH: &str = "Apple tech specs: case size and display area; corner radii, crown, sensor dome, button positions, lugs and strap stubs estimated (Apple publishes which bands fit each case, not their width in mm)";
+const APPLE_WATCH: &str = "Apple tech specs (apple.com/watch/compare): case size and display area; corner radii, the crystal's curve, crown, back crystal, button positions, lugs and band estimated (Apple publishes which bands fit each case, not their width in mm)";
 
-const WEAR_SDK: &str = "Android SDK devices.xml (wear.xml): pixel size and xhdpi (320 dpi) density as simee reports them, no published dimensions (the SDK's diagonal-length is not a round screen's diameter); case, bezel, crown, button, lugs and strap stubs estimated";
+const WEAR_SDK: &str = "Android SDK devices.xml (wear.xml): pixel size and xhdpi (320 dpi) density as simee reports them, no published dimensions (the SDK's diagonal-length is not a round screen's diameter); case, domed crystal, bezel, crown, button, lugs and band estimated";
 
 struct Watch {
     id: &'static str,
@@ -35,7 +35,19 @@ struct Watch {
     action: bool,
     /// The band's width at the lugs, mm.
     band: f32,
+    finish: Finish,
 }
+
+/// Polished natural titanium over a dark ceramic back, the crystal curving down to the band.
+const NATURAL: Finish = Finish::new(Surface::Polished, [0.58, 0.56, 0.52], Surface::Ceramic, [0.02, 0.02, 0.022]).wrapped();
+/// Jet black: polished anodized aluminium.
+const JET: Finish = Finish::new(Surface::Polished, [0.02, 0.02, 0.022], Surface::Ceramic, [0.02, 0.02, 0.022]).wrapped();
+/// Starlight satin aluminium.
+const STARLIGHT: Finish = Finish::new(Surface::Aluminium, [0.70, 0.67, 0.61], Surface::Ceramic, [0.03, 0.03, 0.032]).wrapped();
+/// Brushed titanium under a flat sapphire crystal (no wrap): the Ultra.
+const ULTRA: Finish = Finish::new(Surface::Titanium, [0.50, 0.48, 0.44], Surface::Ceramic, [0.025, 0.025, 0.027]);
+/// A Wear OS case: polished silver aluminium under a domed crystal.
+const WEAR_CASE: Finish = Finish::new(Surface::Polished, [0.66, 0.66, 0.67], Surface::Plastic, [0.03, 0.03, 0.033]).wrapped();
 
 const fn apple_watch(id: &'static str, name: &'static str, size: [f32; 3], px: (u32, u32), area: f32, corner: f32) -> Watch {
     Watch {
@@ -46,10 +58,11 @@ const fn apple_watch(id: &'static str, name: &'static str, size: [f32; 3], px: (
         area,
         corner,
         screen_radius: corner - 3.4,
-        bevel: 2.4,
-        crown: 5.5,
+        bevel: 3.1,
+        crown: 6.2,
         action: false,
         band: apple_band(size[1]),
+        finish: NATURAL,
     }
 }
 
@@ -64,13 +77,20 @@ const fn apple_band(case_height: f32) -> f32 {
 const WATCHES: [Watch; 10] = [
     apple_watch("Apple-Watch-Series-10-46mm", "Apple Watch Series 10 (46mm)", [39.0, 46.0, 9.7], (416, 496), 1220.0, 12.5),
     apple_watch("Apple-Watch-Series-10-42mm", "Apple Watch Series 10 (42mm)", [36.0, 42.0, 9.7], (374, 446), 989.0, 11.5),
-    apple_watch("Apple-Watch-Series-11-46mm", "Apple Watch Series 11 (46mm)", [39.0, 46.0, 9.7], (416, 496), 1220.0, 12.5),
-    apple_watch("Apple-Watch-Series-11-42mm", "Apple Watch Series 11 (42mm)", [36.0, 42.0, 9.7], (374, 446), 989.0, 11.5),
+    Watch {
+        finish: JET,
+        ..apple_watch("Apple-Watch-Series-11-46mm", "Apple Watch Series 11 (46mm)", [39.0, 46.0, 9.7], (416, 496), 1220.0, 12.5)
+    },
+    Watch {
+        finish: JET,
+        ..apple_watch("Apple-Watch-Series-11-42mm", "Apple Watch Series 11 (42mm)", [36.0, 42.0, 9.7], (374, 446), 989.0, 11.5)
+    },
     Watch {
         screen_radius: 6.0,
-        bevel: 2.0,
-        crown: 7.0,
+        bevel: 1.3,
+        crown: 7.2,
         action: true,
+        finish: ULTRA,
         ..apple_watch("Apple-Watch-Ultra-2-49mm", "Apple Watch Ultra 2 (49mm)", [44.0, 49.0, 14.4], (410, 502), 1185.0, 9.5)
     },
     // Ultra 3 (Apple tech specs: 49mm case as the Ultra 2's, 422x514 at 1245 mm²) and SE 3 (the
@@ -78,15 +98,25 @@ const WATCHES: [Watch; 10] = [
     // still gets these dimensions by name or falls back to a generic body.
     Watch {
         screen_radius: 6.0,
-        bevel: 2.0,
-        crown: 7.0,
+        bevel: 1.3,
+        crown: 7.2,
         action: true,
+        finish: ULTRA,
         ..apple_watch("Apple-Watch-Ultra-3-49mm", "Apple Watch Ultra 3 (49mm)", [44.0, 49.0, 14.4], (422, 514), 1245.0, 9.5)
     },
-    Watch { bevel: 2.6, ..apple_watch("Apple-Watch-SE-3-44mm", "Apple Watch SE 3 (44mm)", [38.0, 44.0, 10.7], (368, 448), 977.0, 11.5) },
-    Watch { bevel: 2.6, ..apple_watch("Apple-Watch-SE-3-40mm", "Apple Watch SE 3 (40mm)", [34.0, 40.0, 10.7], (324, 394), 759.0, 10.5) },
     Watch {
-        bevel: 2.6,
+        bevel: 3.0,
+        finish: STARLIGHT,
+        ..apple_watch("Apple-Watch-SE-3-44mm", "Apple Watch SE 3 (44mm)", [38.0, 44.0, 10.7], (368, 448), 977.0, 11.5)
+    },
+    Watch {
+        bevel: 3.0,
+        finish: STARLIGHT,
+        ..apple_watch("Apple-Watch-SE-3-40mm", "Apple Watch SE 3 (40mm)", [34.0, 40.0, 10.7], (324, 394), 759.0, 10.5)
+    },
+    Watch {
+        bevel: 3.0,
+        finish: STARLIGHT,
         ..apple_watch(
             "Apple-Watch-SE-44mm-2nd-generation",
             "Apple Watch SE (44mm) (2nd generation)",
@@ -97,7 +127,8 @@ const WATCHES: [Watch; 10] = [
         )
     },
     Watch {
-        bevel: 2.6,
+        bevel: 3.0,
+        finish: STARLIGHT,
         ..apple_watch(
             "Apple-Watch-SE-40mm-2nd-generation",
             "Apple Watch SE (40mm) (2nd generation)",
@@ -149,7 +180,7 @@ fn wear(&(id, name, px, round, band): &WearRow) -> Body {
     let [sw, sh] = screen.size();
     let screen = Screen { corner_radius: if round { sw.min(sh) / 2.0 } else { 0.0 }, ..screen };
     let mut body = wear_case(Platform::Android, id, name.to_owned(), screen, Source::Generic(WEAR_SDK), 4.5);
-    body.extras = straps(&body, band);
+    with_band(&mut body, band);
     body
 }
 
@@ -169,12 +200,15 @@ fn watch(p: &Watch) -> Body {
         cutout: None,
         published: Some(Published::Area(p.area)),
     };
-    let mut buttons = vec![Button { name: "side", side: Side::Right, at: -0.12 * h, length: 0.17 * h, depth: 0.6, width: 3.5 }];
+    // The side button lies nearly flush below the crown. An Ultra's crown and side button sit in
+    // a guard that stands off the case's right side, and its Action button is on the left.
+    let guard = if p.action { 1.8 } else { 0.0 };
+    let mut buttons =
+        vec![Button { name: "side", side: Side::Right, at: -0.14 * h, length: 0.2 * h, depth: guard + 0.25, width: 0.34 * t }];
     if p.action {
-        buttons.push(Button { name: "action", side: Side::Left, at: 0.1 * h, length: 0.25 * h, depth: 0.8, width: 4.0 });
+        buttons.push(Button { name: "action", side: Side::Left, at: 0.02 * h, length: 0.27 * h, depth: 0.5, width: 0.3 * t });
     }
-    let dome = 0.65 * w.min(h);
-    let corner = Corner { radius: p.corner, exponent: 3.0 };
+    let dome = 0.72 * w.min(h);
     let mut body = Body {
         id: p.id.to_owned(),
         aliases: Vec::new(),
@@ -183,22 +217,36 @@ fn watch(p: &Watch) -> Body {
         form_factor: FormFactor::Watch,
         source: Source::Published(APPLE_WATCH),
         size: [w, h, t],
-        corner,
+        corner: Corner::continuous(p.corner),
         bevel: p.bevel,
         screens: vec![screen],
-        bump: Some(Bump { center: [0.0, 0.0], size: [dome, dome], corner: Corner { radius: dome / 2.0, exponent: 2.0 }, height: 0.8 }),
+        bump: None,
         buttons,
-        crown: Some(Crown { side: Side::Right, at: 0.15 * h, diameter: p.crown, length: 2.6 }),
+        crown: Some(Crown { side: Side::Right, at: 0.16 * h, diameter: p.crown, length: guard + 2.2 }),
         fold: None,
         extras: Vec::new(),
+        finish: p.finish,
     };
     body.extras = straps(&body, p.band);
+    body.extras.push(back_crystal(t, dome));
+    if p.action {
+        // The crown guard: a block of the case's metal the crown and side button stand out of.
+        let guard_block = [guard + 1.2, 0.56 * h, 0.66 * t];
+        body.extras.push(Block::new(Role::Bump, [w / 2.0 + (guard - 1.2) / 2.0, 0.01 * h, 0.0], guard_block, Corner::round(1.4), 1.2));
+    }
     body
+}
+
+/// The back crystal a watch's sensors sit under: a shallow glass dome on the back.
+fn back_crystal(t: f32, diameter: f32) -> Block {
+    let mut dome = Block::on_back(Role::Lens, [0.0, 0.0], -t / 2.0, diameter, 0.9, 0.3);
+    dome.bevel = 0.8;
+    dome
 }
 
 /// A watch with no published dimensions: the screen at its density in a generic case, round
 /// for a round screen (a crown at 3 o'clock and a side button below it), else rounded (a crown
-/// and a button), with lugs and strap stubs top and bottom.
+/// and a button), with lugs and a band top and bottom.
 pub(super) fn generic(g: &Spec) -> Option<Body> {
     // Screen corner radius for a rounded screen.
     let screen = g.screen(6.0);
@@ -207,32 +255,36 @@ pub(super) fn generic(g: &Spec) -> Option<Body> {
     // Apple Watch bands by case height as the rows' ([`apple_band`]); a Wear OS band is about
     // half the case's narrower side (an estimate), 16 to 24mm.
     let band = if g.platform == Platform::Ios { apple_band(h) } else { (w.min(h) * 0.5).clamp(16.0, 24.0).round() };
-    body.extras = straps(&body, band);
+    with_band(&mut body, band);
     Some(body)
 }
 
 /// The case, bump, crown and buttons around a watch screen: `side` is the bezel to the case's
 /// edge, mm. Round screens get a round case.
 fn wear_case(platform: Platform, id: &str, name: String, screen: Screen, source: Source, side: f32) -> Body {
-    let (t, bevel) = (11.0, 2.0);
     let round = screen.shape == Shape::Round;
+    // A round case is a pebble: a crystal that domes from the screen's edge down to a band half
+    // way through its thickness. A square one is flatter.
+    let (t, bevel) = if round { (12.3, (side - MIN_RADIUS - 0.1).min(4.4)) } else { (11.0, (side - MIN_RADIUS - 0.1).min(2.6)) };
     let [sw, sh] = screen.size();
     let (size, corner) = if round {
         let d = sw.max(sh) + 2.0 * side;
-        ([d, d, t], Corner { radius: d / 2.0, exponent: 2.0 })
+        ([d, d, t], Corner::round(d / 2.0))
     } else {
-        let (w, h) = (sw + 2.0 * side, sh + 2.0 * side);
-        ([w, h, t], Corner { radius: screen.corner_radius.max(2.0) + side, exponent: 2.0 })
+        let corner = if screen.shape == Shape::Rounded {
+            Corner::continuous(screen.corner_radius.max(2.0) + side)
+        } else {
+            Corner::round(2.0 + side)
+        };
+        ([sw + 2.0 * side, sh + 2.0 * side, t], corner)
     };
     let [w, h, _] = size;
-    let dome = 0.6 * w.min(h);
-    let bump = Bump { center: [0.0, 0.0], size: [dome, dome], corner: Corner { radius: dome / 2.0, exponent: 2.0 }, height: 0.8 };
     let buttons = if round {
         vec![round_side_button(w / 2.0)]
     } else {
-        vec![Button { name: "button", side: Side::Right, at: -0.2 * h, length: 0.15 * h, depth: 0.6, width: 2.6 }]
+        vec![Button { name: "button", side: Side::Right, at: -0.2 * h, length: 0.17 * h, depth: 0.3, width: 2.8 }]
     };
-    let crown = Crown { side: Side::Right, at: if round { 0.0 } else { 0.1 * h }, diameter: 5.0, length: 2.5 };
+    let crown = Crown { side: Side::Right, at: if round { 0.0 } else { 0.1 * h }, diameter: 6.0, length: 2.2 };
     Body {
         id: id.to_owned(),
         aliases: Vec::new(),
@@ -244,22 +296,19 @@ fn wear_case(platform: Platform, id: &str, name: String, screen: Screen, source:
         corner,
         bevel,
         screens: vec![screen],
-        bump: Some(bump),
+        bump: None,
         buttons,
         crown: Some(crown),
         fold: None,
-        extras: Vec::new(),
+        extras: vec![back_crystal(t, 0.62 * w.min(h))],
+        finish: WEAR_CASE,
     }
 }
 
 /// The side button of a round Wear OS case, below the crown at 3 o'clock (Pixel Watch style).
-/// The case is a circle but a side key starts at its bounding box, so the key is deepened by the
-/// gap the curve leaves at the key's far end, and still stands 0.8mm proud there.
+/// The mesh sets a key into the case's outline where the key is, so it follows the circle.
 fn round_side_button(radius: f32) -> Button {
-    let (at, length) = (-0.17 * 2.0 * radius, 0.12 * 2.0 * radius);
-    let far = at.abs() + length / 2.0;
-    let gap = radius - (radius * radius - far * far).sqrt();
-    Button { name: "button", side: Side::Right, at, length, depth: 0.8 + gap, width: 2.6 }
+    Button { name: "button", side: Side::Right, at: -0.17 * 2.0 * radius, length: 0.12 * 2.0 * radius, depth: 0.45, width: 2.8 }
 }
 
 /// How far a case's outline stands in from its bounding box at a distance `x` from the centre
@@ -278,24 +327,46 @@ fn edge_inset(size: [f32; 3], corner: Corner, x: f32) -> f32 {
     }
 }
 
-/// The lugs and the first stretch of strap, above and below the case: for each end a lug that
-/// sinks into the case (past the outline's inset at the band's edge) and a strap stub beyond it.
+/// Puts the band's parts first among `body`'s extras (the checks and the scene find the lug there).
+fn with_band(body: &mut Body, band: f32) {
+    let mut extras = straps(body, band);
+    extras.append(&mut body.extras);
+    body.extras = extras;
+}
+
+/// How many segments each end of the band is drawn as, and how long each is, mm.
+const BAND_SEGMENTS: usize = 7;
+const BAND_SEGMENT: f32 = 7.0;
+
+/// The lugs and the band, above and below the case: for each end a lug that sinks into the case
+/// (past the outline's inset at the band's edge), then the band as [`BAND_SEGMENTS`] flat
+/// segments that lean further back one after another, so it drapes away behind the case the way
+/// a band hangs on a stand.
 fn straps(body: &Body, band: f32) -> Vec<Block> {
     let [w, h, t] = body.size;
     let inset = edge_inset(body.size, body.corner, band / 2.0);
-    // The lug reaches 3mm past the case's edge at the centre line; the strap starts inside it.
-    let (lug_len, lug_t) = (inset + 1.5 + 3.0, 0.6 * t);
-    let (stub_len, stub_t) = (9.0, 3.0);
+    // The lug reaches 3mm past the case's edge at the centre line; the band starts inside it.
+    let (lug_len, lug_t) = (inset + 1.5 + 3.0, 0.5 * t);
+    let band_t = 2.6;
     let strap_w = band.min(w - 4.0);
-    let corner = Corner { radius: 1.2, exponent: 2.0 };
+    let corner = Corner::round(1.2);
     let mut out = Vec::new();
     for sign in [1.0, -1.0] {
         let edge = sign * h / 2.0;
         // From 1.5mm + inset inside the edge, 3mm beyond it.
         let lug_mid = edge + sign * (3.0 - lug_len / 2.0);
-        out.push(Block { role: Role::Strap, center: [0.0, lug_mid, 0.0], size: [strap_w, lug_len, lug_t], corner, bevel: 0.5 });
-        let stub_mid = edge + sign * (3.0 - 1.0 + stub_len / 2.0);
-        out.push(Block { role: Role::Strap, center: [0.0, stub_mid, 0.0], size: [strap_w - 1.0, stub_len, stub_t], corner, bevel: 0.6 });
+        out.push(Block::new(Role::Strap, [0.0, lug_mid, -0.1 * t], [strap_w, lug_len, lug_t], corner, 1.0));
+        // The band leaves the lug's end and leans back a little more with every segment.
+        let (mut y, mut z) = (edge + sign * 2.0, -0.1 * t);
+        for i in 0..BAND_SEGMENTS {
+            let lean = (8.0 + 12.0 * i as f32).to_radians();
+            let (dy, dz) = (sign * lean.cos(), -lean.sin());
+            let center = [0.0, y + dy * BAND_SEGMENT / 2.0, z + dz * BAND_SEGMENT / 2.0];
+            // Each overlaps the last by its thickness, so the bend shows no gap.
+            let size = [strap_w - 1.0, BAND_SEGMENT + band_t, band_t];
+            out.push(Block { tilt: sign * lean, ..Block::new(Role::Strap, center, size, corner, 1.0) });
+            (y, z) = (y + dy * BAND_SEGMENT, z + dz * BAND_SEGMENT);
+        }
     }
     out
 }
@@ -422,45 +493,81 @@ mod checks {
             let key = b.buttons.iter().find(|k| k.name == "button").unwrap_or_else(|| panic!("{id}: a side button"));
             assert_eq!((key.side, crown.side), (Side::Right, Side::Right), "{id}");
             assert!(key.at + key.length / 2.0 < crown.at - crown.diameter / 2.0, "{id}: below the crown, not touching it");
-            // It reaches the round case's curve at its far end and stands proud at its near end.
-            let r = b.size[0] / 2.0;
-            let far = key.at.abs() + key.length / 2.0;
-            let edge = (r * r - far * far).sqrt();
-            assert!(key.depth >= r - edge + 0.5, "{id}: depth {} reaches the curve", key.depth);
+            // The mesh sets it into the circle where it is: it only says how far it stands proud.
+            assert!((0.2..=1.0).contains(&key.depth), "{id}: stands {} mm proud", key.depth);
         }
         let g = for_profile(&Kind::new(Platform::Android, FormFactor::Watch).expect("Wear OS").profile()).expect("generic");
         assert!(g.buttons.iter().any(|k| k.name == "button"), "the generic round Wear OS watch has one too");
     }
 
+    /// A body's band: its lugs and segments.
+    fn band(b: &Body) -> Vec<&Block> {
+        b.extras.iter().filter(|x| x.role == Role::Strap).collect()
+    }
+
     #[test]
-    fn straps_are_lugs_and_stubs_above_and_below_clear_of_the_keys() {
+    fn the_band_is_a_lug_and_draped_segments_above_and_below_clear_of_the_keys() {
         for b in watch_bodies() {
             let id = &b.id;
-            assert_eq!(b.extras.len(), 4, "{id}: a lug and a strap stub at each end");
-            assert!(b.extras.iter().all(|x| x.role == Role::Strap), "{id}");
+            let band = band(&b);
+            assert_eq!(band.len(), 2 * (1 + BAND_SEGMENTS), "{id}: a lug and the band's segments at each end");
+            assert!(b.extras.iter().take(band.len()).all(|x| x.role == Role::Strap), "{id}: the band comes first");
             let [w, h, t] = b.size;
             let keys = key_boxes(&b);
             let (mut up, mut down) = (0, 0);
-            for x in &b.extras {
+            for x in &band {
                 let r = box_xy(x.center[0], x.center[1], x.size[0], x.size[1]);
                 assert!(x.size[0] < w, "{id}: narrower than the case");
                 assert!(x.size[2] <= t, "{id}: within the case's thickness");
                 assert!(x.center[0].abs() < 1e-6, "{id}: on the centre line");
-                // Each reaches into the case so nothing floats.
                 if x.center[1] > 0.0 {
                     up += 1;
                 } else {
                     down += 1;
                 }
                 for (name, k) in &keys {
-                    assert!(!overlap(r, *k), "{id}: strap block at {:?} touches the {name}", x.center);
+                    assert!(!overlap(r, *k), "{id}: band block at {:?} touches the {name}", x.center);
                 }
             }
-            assert_eq!((up, down), (2, 2), "{id}");
-            // The strap goes past the case on both ends, symmetrically.
-            let reach = |sign: f32| b.extras.iter().map(|x| sign * (x.center[1] + sign * x.size[1] / 2.0)).fold(f32::MIN, f32::max);
-            assert!(reach(1.0) > h / 2.0 + 5.0 && (reach(1.0) - reach(-1.0)).abs() < 1e-4, "{id}");
+            assert_eq!(up, down, "{id}");
+            // Each end: an upright lug, then segments that lean back further one after another,
+            // each starting where the last ended, the same on both ends.
+            for (sign, end) in [(1.0, &band[..band.len() / 2]), (-1.0, &band[band.len() / 2..])] {
+                assert_eq!(end[0].tilt, 0.0, "{id}: the lug is upright");
+                let mut last = 0.0;
+                for x in &end[1..] {
+                    let lean = sign * x.tilt;
+                    assert!(lean > last && lean < std::f32::consts::FRAC_PI_2, "{id}: leans {lean} after {last}");
+                    assert!(x.center[2] < end[0].center[2] + 1e-3, "{id}: behind the lug");
+                    last = lean;
+                }
+                let far = end.last().expect("a segment");
+                assert!(sign * far.center[1] > h / 2.0 + 15.0, "{id}: the band goes well past the case");
+            }
+            for (a, z) in band[..band.len() / 2].iter().zip(&band[band.len() / 2..]) {
+                assert!((a.center[1] + z.center[1]).abs() < 1e-4 && (a.center[2] - z.center[2]).abs() < 1e-4, "{id}: symmetric");
+            }
+            // The sensors' crystal is on the back, in the middle.
+            let crystal = b.extras.iter().find(|x| x.role == Role::Lens).unwrap_or_else(|| panic!("{id}: a back crystal"));
+            assert!(crystal.center[2] < 0.0 && crystal.center[0] == 0.0 && crystal.center[1] == 0.0, "{id}");
         }
+    }
+
+    #[test]
+    fn an_ultra_has_a_crown_guard_and_a_flat_crystal() {
+        for id in ["Apple-Watch-Ultra-2-49mm", "Apple-Watch-Ultra-3-49mm"] {
+            let b = get(id).expect("row");
+            assert!(!b.finish.glass_wraps && b.finish.frame == Surface::Titanium, "{id}");
+            let guard = b.extras.iter().find(|x| x.role == Role::Bump).unwrap_or_else(|| panic!("{id}: a crown guard"));
+            let reach = guard.center[0] + guard.size[0] / 2.0 - b.size[0] / 2.0;
+            assert!(reach > 1.0, "{id}: stands {reach} mm off the right side");
+            let crown = b.crown.expect("crown");
+            let side = b.buttons.iter().find(|k| k.name == "side").expect("side button");
+            assert!(crown.length > reach && side.depth > reach, "{id}: the crown and side button stand out of the guard");
+        }
+        // The others' crystal curves down to the band.
+        assert!(get("Apple-Watch-Series-10-46mm").expect("row").finish.glass_wraps);
+        assert!(get("wearos_large_round").expect("row").finish.glass_wraps);
     }
 
     #[test]
@@ -524,25 +631,25 @@ mod tests {
     }
 
     const PINS: [(&str, u64); 20] = [
-        ("Apple-Watch-Series-10-46mm", 0x1e2102c687fee9d7),
-        ("Apple-Watch-Series-10-42mm", 0x1a1354b6604826ad),
-        ("Apple-Watch-Series-11-46mm", 0x17105339f5aba925),
-        ("Apple-Watch-Series-11-42mm", 0x48806a2ce251ead3),
-        ("Apple-Watch-Ultra-2-49mm", 0xfe8de8448803fd8e),
-        ("Apple-Watch-Ultra-3-49mm", 0x7a470c620895395f),
-        ("Apple-Watch-SE-3-44mm", 0x3d545b906f49fc37),
-        ("Apple-Watch-SE-3-40mm", 0x22601089ea9208ba),
-        ("Apple-Watch-SE-44mm-2nd-generation", 0x5fcc2241020c67c9),
-        ("Apple-Watch-SE-40mm-2nd-generation", 0xf3a59e228acb74b8),
-        ("wearos_small_round", 0xb1fcca58a7d784cd),
-        ("wearos_large_round", 0x56cde642c0cd94b0),
-        ("wearos_xl_round", 0x38f30ffb063d5ea5),
-        ("wearos_square", 0xa725ae73ecd04e2f),
-        ("wearos_rect", 0x5661742e90cc714c),
-        ("android-watch-454x454-320dpi-round", 0x17a3a1eabfbaaef4),
-        ("android-watch-454x454-320dpi-rectangle", 0x1ee7750fb78fb58a),
-        ("android-watch-454x454-320dpi-rounded", 0x83af56423f766794),
-        ("android-watch-384x384-320dpi-round", 0xb95deac366b2288b),
-        ("ios-watch-416x496-2x-rounded", 0xc6260618e088fc59),
+        ("Apple-Watch-Series-10-46mm", 0x3043513cffb5e78e),
+        ("Apple-Watch-Series-10-42mm", 0x19b22d5239729950),
+        ("Apple-Watch-Series-11-46mm", 0x384ed1683299b3c5),
+        ("Apple-Watch-Series-11-42mm", 0xf023e13f941c3cb3),
+        ("Apple-Watch-Ultra-2-49mm", 0xf9f77e47ec34cdf2),
+        ("Apple-Watch-Ultra-3-49mm", 0x674c77dbe8906109),
+        ("Apple-Watch-SE-3-44mm", 0x5219e00738440f84),
+        ("Apple-Watch-SE-3-40mm", 0x7f4348bbd93957c9),
+        ("Apple-Watch-SE-44mm-2nd-generation", 0x8d8d571f7a58fea6),
+        ("Apple-Watch-SE-40mm-2nd-generation", 0xcb9c5d90bbe7b0eb),
+        ("wearos_small_round", 0x48af1d2da4d6ac07),
+        ("wearos_large_round", 0x238f097501148134),
+        ("wearos_xl_round", 0x8918188e98e76b4a),
+        ("wearos_square", 0x13693e929e2d06c5),
+        ("wearos_rect", 0x4fbf9ca8dac38a7b),
+        ("android-watch-454x454-320dpi-round", 0x2cf5b75740279887),
+        ("android-watch-454x454-320dpi-rectangle", 0x47e780b4e58b53a6),
+        ("android-watch-454x454-320dpi-rounded", 0x58943d8f23ed3fe4),
+        ("android-watch-384x384-320dpi-round", 0x3389a947c7cf9262),
+        ("ios-watch-416x496-2x-rounded", 0xd1532b7afe3f1b8b),
     ];
 }

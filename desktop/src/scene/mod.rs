@@ -1,6 +1,6 @@
 //! The 3D device view (#151, #152): the selected device's body (`sim_core::body`) drawn in
-//! perspective with depth and 4x MSAA, lit by one directional light and ambient, with the live
-//! screen on its screen face. ⌘3 toggles it; `SIMEE_VIEW=3d` starts with it on.
+//! perspective with depth and 4x MSAA, shaded as the glass and metal it is made of under a soft
+//! studio with a contact shadow beneath it (#590), with the live screen on its screen face. ⌘3 toggles it; `SIMEE_VIEW=3d` starts with it on.
 //!
 //! The screen texture is the flat view's own picture: the view keeps the flat screen element
 //! where it always is and lays an effect slot over the stage that asks Rune for a backdrop copy
@@ -380,6 +380,14 @@ pub fn body_for(s: &State) -> Option<Arc<Body>> {
             let device = s.android.as_ref().filter(|a| a.info.udid == d.udid);
             // `system-images;android-36;ai-glasses;arm64-v8a`: the image's tag.
             let tag = d.runtime_id.split(';').nth(2).unwrap_or_default();
+            // A device not running here has no screen to check a row against: its hardware
+            // definition's row is its body (a `pixel_9` AVD is a Pixel 9).
+            if device.is_none()
+                && let Some(row) =
+                    body::get(&d.device_type_id).filter(|b| b.platform == Platform::Android && Some(b.form_factor) == d.form_factor)
+            {
+                return Some(row);
+            }
             let profile = device.and_then(|a| a.profile().ok()).or_else(|| d.kind().map(|k| k.image_profile(tag)))?;
             // An unlisted foldable folds the way its AVD's hinge says (a flip, its angles).
             let config = device.and_then(|a| a.avd.as_ref());

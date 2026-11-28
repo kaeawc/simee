@@ -3,7 +3,8 @@
 //! `Renderer::draw_with_backdrop`; at the scene's slot, while the pass is closed, it renders the
 //! body into its own 4x MSAA colour and depth targets (Rune's passes have neither), sampling the
 //! flat screen's rect of the backdrop copy for the live screen, then draws the resolved picture
-//! into the slot. Nothing is cached between frames: the window draws only when something changed
+//! into the slot. The body is shaded as glass and metal under a studio fixed to the camera, over
+//! a floor that carries its contact shadow (scene.wgsl; the materials are `layout::material`). Nothing is cached between frames: the window draws only when something changed
 //! (a device frame, input, a resize), so a still scene costs nothing.
 
 use std::num::NonZeroU64;
@@ -11,7 +12,7 @@ use std::sync::Arc;
 
 use rune::compose::{Compositor, DeviceKey, Frame};
 use rune::render::{EffectPhase, EffectSite};
-use sim_core::body::{Body, Face, Mesh};
+use sim_core::body::{Body, Face, Mesh, Role};
 
 use super::camera::{self, Camera, Framing, Mat4, Turn};
 use super::layout::{self, STRIDE};
@@ -22,11 +23,14 @@ const SAMPLES: u32 = 4;
 const COLOR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Bytes of the frame uniform (`Frame` in scene.wgsl) and of one draw's (`Draw`).
-const FRAME_BYTES: u64 = 128;
+const FRAME_BYTES: u64 = 208;
 const DRAW_BYTES: u64 = 96;
-/// Towards the light in the camera's frame: from above, a little left and in front.
-const LIGHT: [f32; 3] = [-0.35, 0.65, 0.7];
-const AMBIENT: f32 = 0.28;
+/// How dark the contact shadow is at its middle (a share of the stage's colour taken away), how
+/// far it fades beyond the body's footprint and how far under the body the floor lies, the last
+/// two as shares of the body's height.
+const SHADOW: f32 = 0.62;
+const SHADOW_BLUR: f32 = 0.16;
+const FLOOR_GAP: f32 = 0.012;
 
 /// What one frame of the scene draws, read from the state before Rune's passes borrow it.
 struct Job {
@@ -48,6 +52,8 @@ struct Solved {
     turn: Mat4,
     /// Where the live screen's corners land, slot device pixels, when it faces the camera.
     screen: Option<[[f32; 2]; 4]>,
+    /// The box the turned body fills (its centre and half size, world): what the floor lies under.
+    body: ([f32; 3], [f32; 3]),
 }
 
 impl Job {
@@ -67,7 +73,7 @@ impl Job {
         let live = sim_core::body::Role::Screen(self.placement.display);
         let points = mesh.parts.iter().filter(|p| p.role == live).flat_map(move |part| {
             let m = models[part.panel.min(1)];
-            mesh.part_indices(part).iter().map(move |&i| camera::apply(&m, mesh.positions[i as usize]))
+            mesh.part_positions(part).iter().map(move |&p| camera::apply(&m, p))
         });
         camera::bounds(points)
     }
@@ -94,7 +100,7 @@ impl Job {
         });
         let in_front = corners.iter().all(|c| (0.0..=1.0).contains(&c[2]));
         let screen = (facing && in_front).then(|| corners.map(|[x, y, _]| [(x + 1.0) / 2.0 * w, (1.0 - y) / 2.0 * h]));
-        Solved { view_proj, eye, turn, screen }
+        Solved { view_proj, eye, turn, screen, body: (center, half) }
     }
 
     /// The body's roll about z: clockwise as its screen is seen (from the back for a back-face
@@ -117,9 +123,11 @@ impl Job {
     fn bounds(&self, root: &Mat4) -> ([f32; 3], [f32; 3]) {
         let models = [self.panel(root, 0), self.panel(root, 1)];
         let mesh = &self.mesh;
-        let points = mesh.parts.iter().flat_map(move |part| {
+        // Each vertex once: a part's positions, and a panel's skin (three parts on the same
+        // vertices) by its band alone.
+        let points = mesh.parts.iter().filter(|p| !matches!(p.role, Role::Glass | Role::Back)).flat_map(move |part| {
             let m = models[part.panel.min(1)];
-            mesh.part_indices(part).iter().map(move |&i| camera::apply(&m, mesh.positions[i as usize]))
+            mesh.part_positions(part).iter().map(move |&p| camera::apply(&m, p))
         });
         camera::bounds(points)
     }
@@ -136,6 +144,30 @@ pub fn facing_back(body: &Body, placement: &Placement) -> bool {
     };
     // The normal's z after the panel's turn: the third column's z.
     m[2][2] * z < 0.0
+}
+
+/// The floor under a body and the footprint it casts there.
+struct Floor {
+    /// The unit quad (`layout::floor_quad`) scaled over the shadow and set at the floor's height.
+    model: Mat4,
+    /// Centre x and z, half width and half depth of the body's box on the floor, mm.
+    foot: [f32; 4],
+    /// How far the shadow fades beyond the footprint, mm.
+    blur: f32,
+}
+
+impl Floor {
+    /// The floor for a body whose box is `half` about `center` (world, mm): just under it, with
+    /// a quad that reaches as far as the shadow does.
+    fn under(center: [f32; 3], half: [f32; 3]) -> Floor {
+        let height = 2.0 * half[1];
+        let blur = (SHADOW_BLUR * height).max(1.0);
+        let y = center[1] - half[1] - FLOOR_GAP * height;
+        let (sx, sz) = (half[0] + blur, half[2] + blur);
+        let model = [[sx, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, sz, 0.0], [center[0], y, center[2], 1.0]];
+        // The footprint is drawn in a little from the box: a body's corners are rounded.
+        Floor { model, foot: [center[0], center[2], 0.94 * half[0], 0.94 * half[2]], blur }
+    }
 }
 
 /// The 3D view's compositor (see the module docs).
@@ -204,6 +236,8 @@ struct MeshBuffers {
     id: String,
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
+    /// Where the floor's quad starts in the index buffer, after the body's own indices.
+    floor: u32,
 }
 
 struct Gpu {
@@ -409,10 +443,16 @@ impl Gpu {
             use wgpu::util::DeviceExt;
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: &data, usage })
         };
+        // The floor's quad rides at the end of the body's buffers.
+        let (mut vertices, mut indices) = (layout::vertices(&job.mesh), layout::indices(&job.mesh));
+        let (quad_v, quad_i) = layout::floor_quad(job.mesh.positions.len() as u32);
+        vertices.extend(quad_v);
+        indices.extend(quad_i);
         self.mesh = Some(MeshBuffers {
             id: job.body.id.clone(),
-            vertices: buffer("simee body vertices", layout::vertices(&job.mesh), wgpu::BufferUsages::VERTEX),
-            indices: buffer("simee body indices", layout::indices(&job.mesh), wgpu::BufferUsages::INDEX),
+            vertices: buffer("simee body vertices", vertices, wgpu::BufferUsages::VERTEX),
+            indices: buffer("simee body indices", indices, wgpu::BufferUsages::INDEX),
+            floor: job.mesh.indices.len() as u32,
         });
     }
 
@@ -454,29 +494,46 @@ impl Gpu {
         let size = ((r[2].round() as u32).max(1), (r[3].round() as u32).max(1));
         self.targets(device, size);
         self.mesh(device, job);
-        self.draws(device, job.mesh.parts.len());
+        // One draw per part, and the floor.
+        let parts = job.mesh.parts.len();
+        self.draws(device, parts + 1);
         let (Some(t), Some(mesh), Some((_, draw_u, draw_group))) = (&self.targets, &self.mesh, &self.draws) else { return None };
 
         let root = job.root();
         let [x, y, w, h] = super::screen_rect(r, site.scale, site.data);
         let flat_screen = [x + w / 2.0 - (r[0] + r[2] / 2.0), y + h / 2.0 - (r[1] + r[3] / 2.0), h];
-        let Solved { view_proj, eye, turn, screen } = job.solve(size, flat_screen);
-        let light = job.camera.world(LIGHT, job.back);
+        let Solved { view_proj, eye, turn, screen, body: (center, half) } = job.solve(size, flat_screen);
+        // The studio is fixed to the camera: its axes in the world.
+        let axes = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]].map(|v| job.camera.world(v, job.back));
+        // The floor lies just under the turned body, which casts its footprint on it.
+        let floor = Floor::under(center, half);
+        let bg = super::background();
+        // The glass's reflection leaves the live screen as the view comes face on (1:1).
+        let sheen = (1.0 - job.camera.one_to_one).clamp(0.0, 1.0);
         let bd = backdrop.texture();
         let (bw, bh) = (bd.width().max(1) as f32, bd.height().max(1) as f32);
         let (x, y) = (x - site.origin[0], y - site.origin[1]);
         let mut frame: Vec<f32> = flat(&view_proj).collect();
-        frame.extend([eye[0], eye[1], eye[2], 1.0, light[0], light[1], light[2], AMBIENT]);
+        frame.extend([eye[0], eye[1], eye[2], sheen]);
+        for a in axes {
+            frame.extend([a[0], a[1], a[2], 0.0]);
+        }
         frame.extend([x / bw, y / bh, w / bw, h / bh, if site.srgb_blend { 1.0 } else { 0.0 }, job.placement.quarters as f32, 0.0, 0.0]);
+        frame.extend([bg.r, bg.g, bg.b, SHADOW]);
+        frame.extend(floor.foot);
         queue.write_buffer(&self.frame_u, 0, &bytes(&frame));
-        let mut draws = vec![0u8; job.mesh.parts.len() * self.draw_stride as usize];
-        for (i, part) in job.mesh.parts.iter().enumerate() {
-            let m = layout::material(part.role, job.placement.display);
-            let mut d: Vec<f32> = flat(&camera::mul(&turn, &job.panel(&root, part.panel))).collect();
-            d.extend([m.base[0], m.base[1], m.base[2], if m.live { 1.0 } else { 0.0 }, m.specular, m.shininess, 0.0, 0.0]);
+        let mut draws = vec![0u8; (parts + 1) * self.draw_stride as usize];
+        let mut put = |i: usize, model: &Mat4, m: &layout::Material, extra: f32| {
+            let mut d: Vec<f32> = flat(model).collect();
+            d.extend([m.base[0], m.base[1], m.base[2], m.kind.code(), m.metallic, m.roughness, m.reflectance, extra]);
             let at = i * self.draw_stride as usize;
             draws[at..at + DRAW_BYTES as usize].copy_from_slice(&bytes(&d));
+        };
+        for (i, part) in job.mesh.parts.iter().enumerate() {
+            let m = layout::material(part.role, job.placement.display, &job.body.finish);
+            put(i, &camera::mul(&turn, &job.panel(&root, part.panel)), &m, 0.0);
         }
+        put(parts, &floor.model, &layout::FLOOR, floor.blur);
         queue.write_buffer(draw_u, 0, &draws);
         let frame_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("simee scene frame"),
@@ -487,7 +544,6 @@ impl Gpu {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
             ],
         });
-        let bg = super::background();
         let [cr, cg, cb] = [bg.r, bg.g, bg.b].map(f64::from);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("simee scene"),
@@ -517,6 +573,9 @@ impl Gpu {
             pass.set_bind_group(1, draw_group, &[(i as u64 * self.draw_stride) as u32]);
             pass.draw_indexed(part.first..part.first + part.count, 0, 0..1);
         }
+        // The floor last: the body has already written its depth over it.
+        pass.set_bind_group(1, draw_group, &[(parts as u64 * self.draw_stride) as u32]);
+        pass.draw_indexed(mesh.floor..mesh.floor + 6, 0, 0..1);
         drop(pass);
         self.ready = true;
         let scale = site.scale.max(f32::EPSILON);
@@ -619,12 +678,27 @@ mod tests {
 
     #[test]
     fn uniform_layouts_match_the_shader() {
-        // view_proj, eye, light, uv_rect, flags.
-        assert_eq!(FRAME_BYTES, 64 + 4 * 16);
+        // view_proj, eye, the camera's three axes, uv_rect, flags, stage, foot.
+        assert_eq!(FRAME_BYTES, 64 + 9 * 16);
         // model, base, params.
         assert_eq!(DRAW_BYTES, 64 + 2 * 16);
         assert_eq!(bytes(&[1.0, -2.0]).len(), 8);
         assert_eq!(flat(&IDENTITY).count(), 16);
+    }
+
+    #[test]
+    fn the_floor_lies_under_the_body_and_reaches_as_far_as_its_shadow() {
+        let f = Floor::under([10.0, 5.0, -2.0], [36.0, 75.0, 4.0]);
+        // Under the box's bottom (5 - 75), by a little.
+        let y = f.model[3][1];
+        assert!(y < -70.0 && y > -73.0, "{y}");
+        assert_eq!((f.model[3][0], f.model[3][2]), (10.0, -2.0));
+        // The quad covers the footprint and the blur beyond it; the footprint is inside the box.
+        assert_eq!(f.blur, SHADOW_BLUR * 150.0);
+        assert_eq!((f.model[0][0], f.model[2][2]), (36.0 + f.blur, 4.0 + f.blur));
+        assert!(f.foot[2] < 36.0 && f.foot[3] < 4.0 && f.foot[..2] == [10.0, -2.0]);
+        // A body with no height still has a shadow of some width.
+        assert!(Floor::under([0.0; 3], [1.0, 0.0, 1.0]).blur >= 1.0);
     }
 
     /// An iPhone 17 showing its frame upright, with `camera` and `turn`.
