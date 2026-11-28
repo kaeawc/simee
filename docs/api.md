@@ -248,6 +248,16 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `car_start` | Android | device, input?(touch\|rotary\|hybrid), resolution?(800x480\|1280x720\|1920x1080), dpi?(160), headless?(false) | Android Auto projection: run Google's Desktop Head Unit (installed by `emu -provision-dhu`) against a booted phone and supervise it (its PID is kept in the AVD's simee directory). Needs Android Auto on the phone (6.0 or newer) with its head unit server running (developer mode, then "Start head unit server"); each phone gets its own adb forward to port 5277 and its own head unit. Then tap/swipe/screenshot with display=car, and `vehicle` sets speed, gear, night and parking-brake. Returns pid, serial, forward_port, resolution, dpi, input and headless |
 | `car_stop` | Android | device | Stop the phone's Desktop Head Unit and remove its adb forward; a head unit that already exited just has its record cleared |
 
+`rotate` returns `{orientation}` on iOS. On Android it returns `{rotation, note?}`:
+
+- **When it returns.** Once the guest has turned, or at most 3 s after the turn when it hasn't.
+  When the guest can't turn at all, it returns after one read: the app in front pins its
+  orientation (portrait, landscape, nosensor, their reverses, locked), or auto-rotate is off and
+  the app doesn't ask for the sensor (sensor, full sensor, sensor landscape or portrait).
+- **`rotation`** is the degrees the display is at. It is `null` without adb, or when the guest's
+  window manager doesn't answer in time.
+- **`note`** says why the guest stayed, or that it may only have been slow.
+
 ## Admission
 
 `boot`, `boot_many`, `create` and `clone` say what the new devices would do to the host before they
