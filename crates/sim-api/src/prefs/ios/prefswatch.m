@@ -7,9 +7,11 @@
 //
 // prints, for each store i (0-based, in argument order), "snap <i> <base64 binary plist: every
 // key's value>" once at start, then "ready", then a new "snap" line each time cfprefsd tells it the
-// domain changed and its values differ from the last line for it. It waits in the run loop with no
-// timer, so it costs nothing until a store changes, and exits when the host process exits or its
-// output is closed. Anything that keeps it from following a store prints "error <why>" and exits 1.
+// domain changed and its values differ from the last line for it. A store whose values take more
+// than kMaxSnap bytes isn't sent: it prints "large <i>" once instead, until the store fits again
+// (the host follows that store's file meanwhile). It waits in the run loop with no timer, so it
+// costs nothing until a store changes, and exits when the host process exits or its output is
+// closed. Anything that keeps it from following a store prints "error <why>" and exits 1.
 //
 // cfprefsd tells a process about another process's write to a domain only while the process
 // observes the domain with KVO (`NSUserDefaults` then asks cfprefsd to send it changes). The
@@ -33,6 +35,9 @@ typedef void (*HandleFn)(id, SEL, CFStringRef, BOOL);
 /// The key observed to make cfprefsd send changes: never read or written.
 static NSString *const kObservedKey = @"dev.simee.prefswatch.observed";
 static NSString *const kHandleSelector = @"handleChangeNotificationForDomainIdentifier:isRemote:";
+/// The most bytes of a store's binary plist a "snap" line carries (as base64, a third more): the
+/// host refuses a line past its own cap (`MAX_LINE` in ios.rs, 1 MiB), which is well above this.
+static const NSUInteger kMaxSnap = 256 * 1024;
 
 @interface Store : NSObject
 @property NSString *domain;
@@ -40,6 +45,8 @@ static NSString *const kHandleSelector = @"handleChangeNotificationForDomainIden
 @property NSUserDefaults *defaults;
 @property NSData *last;
 @property BOOL pending;
+/// Whether the last look found it past kMaxSnap ("large" was printed).
+@property BOOL large;
 @end
 @implementation Store
 @end
@@ -53,7 +60,11 @@ static NSString *const kHandleSelector = @"handleChangeNotificationForDomainIden
 
 static NSArray<Store *> *gStores;
 static CopyMultipleFn gCopy;
-static NSMutableDictionary<NSValue *, NSValue *> *gOriginals;
+/// The handlers wrapped.
+static unsigned gWrapped;
+/// How deep this thread is in wrapped handlers: a wrapped handler that calls a wrapped one (its
+/// superclass's, through `super`) reports the notice once, from the outermost.
+static _Thread_local unsigned gDepth;
 
 static int fail(NSString *why) {
     printf("error %s\n", why.UTF8String);
@@ -71,13 +82,20 @@ static void snap(NSUInteger i) {
     NSData *bytes = [NSPropertyListSerialization dataWithPropertyList:(all ?: @{}) format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
     if (!bytes || [bytes isEqualToData:store.last]) return;
     store.last = bytes;
-    printf("snap %lu %s\n", (unsigned long)i, [bytes base64EncodedStringWithOptions:0].UTF8String);
+    if (bytes.length > kMaxSnap) {
+        if (!store.large) printf("large %lu\n", (unsigned long)i);
+        store.large = YES;
+    } else {
+        store.large = NO;
+        printf("snap %lu %s\n", (unsigned long)i, [bytes base64EncodedStringWithOptions:0].UTF8String);
+    }
     fflush(stdout);
 }
 
-/// A change notice for `domain`: each store of it is read again once the notices of this turn of
-/// the run loop are in (cfprefsd sends more than one for a write). A notice that names no store
-/// followed here (or no domain) reads them all: a read whose values haven't changed prints nothing.
+/// A change notice for `domain`, on the main queue: each store of it is read again once the notices
+/// of this turn of the run loop are in (cfprefsd sends more than one for a write). A notice that
+/// names no store followed here (or no domain) reads them all: a read whose values haven't changed
+/// prints nothing.
 static void changed(NSString *domain) {
     BOOL named = NO;
     for (Store *store in gStores) named |= domain && [store.domain isEqualToString:domain];
@@ -91,21 +109,11 @@ static void changed(NSString *domain) {
     }
 }
 
-static void handle(id self, SEL cmd, CFStringRef identifier, BOOL remote) {
-    HandleFn original = (HandleFn)[gOriginals[[NSValue valueWithPointer:(__bridge void *)object_getClass(self)]] pointerValue];
-    if (!original) {
-        // A subclass that inherits the wrapped method: the first wrapped class above it.
-        for (Class c = class_getSuperclass(object_getClass(self)); c && !original; c = class_getSuperclass(c)) {
-            original = (HandleFn)[gOriginals[[NSValue valueWithPointer:(__bridge void *)c]] pointerValue];
-        }
-    }
-    if (original) original(self, cmd, identifier, remote);
-    changed(identifier ? (__bridge NSString *)identifier : nil);
-}
-
 /// Wraps the change handler of `name` (and the classes it is inherited by are covered through it);
 /// NO when the class or its method isn't there or its signature isn't the one this was written
-/// against (void, a CFString, a BOOL).
+/// against (void, a CFString, a BOOL). Each class's wrapper keeps that class's own original: a
+/// subclass's handler that calls `super` runs the superclass's wrapper, which runs the superclass's
+/// original (never the subclass's again, which would recurse).
 static BOOL wrap(NSString *name) {
     Class cls = NSClassFromString(name);
     SEL sel = NSSelectorFromString(kHandleSelector);
@@ -123,8 +131,20 @@ static BOOL wrap(NSString *name) {
     for (unsigned i = 0; i < n; i++) implements |= method_getName(own[i]) == sel;
     free(own);
     if (!implements) return YES;
-    IMP previous = method_setImplementation(m, (IMP)handle);
-    gOriginals[[NSValue valueWithPointer:(__bridge void *)cls]] = [NSValue valueWithPointer:(void *)previous];
+    HandleFn original = (HandleFn)method_getImplementation(m);
+    IMP wrapper = imp_implementationWithBlock(^(id self, CFStringRef identifier, BOOL remote) {
+        gDepth++;
+        original(self, sel, identifier, remote);
+        gDepth--;
+        if (gDepth) return;
+        NSString *domain = identifier ? [(__bridge NSString *)identifier copy] : nil;
+        // On the main queue, where the stores are read and printed (a notice comes on cfprefsd's).
+        dispatch_async(dispatch_get_main_queue(), ^{
+            changed(domain);
+        });
+    });
+    method_setImplementation(m, wrapper);
+    gWrapped++;
     return YES;
 }
 
@@ -137,11 +157,10 @@ int main(int argc, char **argv) {
         if (!gCopy) return fail(@"this runtime has no _CFPreferencesCopyMultipleWithContainer");
         SEL init = NSSelectorFromString(@"_initWithSuiteName:container:");
         if (![NSUserDefaults instancesRespondToSelector:init]) return fail(@"this runtime's NSUserDefaults has no _initWithSuiteName:container:");
-        gOriginals = [NSMutableDictionary dictionary];
         // The suite source (a defaults object made with a suite name) and the plain one.
         wrap(@"CFPrefsSearchListSource");
         wrap(@"CFPrefsSuiteSearchListSource");
-        if (gOriginals.count == 0) {
+        if (gWrapped == 0) {
             return fail([NSString stringWithFormat:@"this runtime's CoreFoundation has no %@ to follow cfprefsd's changes", kHandleSelector]);
         }
 

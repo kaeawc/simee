@@ -20,9 +20,10 @@
 //!   every process's changes, and prints the store's values each time one comes; the feed reports
 //!   each key whose value changed as it is made. It also watches the store files and their
 //!   directories with kqueue ([`sim_coresim::FileWatch`]): a store the observer doesn't follow (it
-//!   can't be built or started, its runtime lacks the SPI, it exited, or a domain that appeared
-//!   after the feed started) shows when cfprefsd writes its file. The observer waits with no timer
-//!   and is stopped when the feed ends (and exits by itself with this process).
+//!   can't be built or started, its runtime lacks the SPI, it exited, a store too large for it to
+//!   send, or a domain that appeared after the feed started) shows when cfprefsd writes its file.
+//!   The observer waits with no timer and is stopped when the feed ends or its output can't be
+//!   followed (and exits by itself with this process).
 
 use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
@@ -333,9 +334,24 @@ impl Tracker {
     /// A file older than what the observer reported (cfprefsd hadn't written it yet) is not read
     /// as a change back; the next time cfprefsd writes it, it is.
     pub fn unobserved(&mut self) {
-        for tracked in self.stores.iter_mut().filter(|t| t.live) {
-            tracked.live = false;
-            tracked.stamp = stamp(&tracked.file);
+        self.stores.iter_mut().for_each(Tracked::unobserve);
+    }
+
+    /// Store `i` is past the observer's cap (its `large`): its file follows it, as when the
+    /// observer ends, until the observer sends it again. Its name, unless the observer wasn't
+    /// given it.
+    pub fn too_large(&mut self, i: usize) -> Option<String> {
+        let tracked = self.stores.get_mut(i)?;
+        tracked.unobserve();
+        Some(tracked.store.name.clone())
+    }
+}
+
+impl Tracked {
+    fn unobserve(&mut self) {
+        if self.live {
+            self.live = false;
+            self.stamp = stamp(&self.file);
         }
     }
 }
@@ -347,6 +363,9 @@ pub enum ObserverLine {
     Snap(usize, Entries),
     /// `ready`: it follows every store it was given.
     Ready,
+    /// `large <i>`: store `i`'s values are past the observer's cap, so it doesn't send them (until
+    /// its next `snap` of the store).
+    Large(usize),
     /// `error <why>`: it can't follow them, and exits.
     Error(String),
 }
@@ -362,6 +381,9 @@ pub fn observer_line(line: &str) -> Result<ObserverLine, String> {
         return Ok(ObserverLine::Error(why.to_owned()));
     }
     let bad = || format!("the preferences observer printed {:?}", line.chars().take(80).collect::<String>());
+    if let Some(i) = line.strip_prefix("large ") {
+        return i.parse().map(ObserverLine::Large).map_err(|_| bad());
+    }
     let (i, b64) = line.strip_prefix("snap ").and_then(|rest| rest.split_once(' ')).ok_or_else(bad)?;
     let i = i.parse().map_err(|_| bad())?;
     let bytes = base64::engine::general_purpose::STANDARD.decode(b64).map_err(|_| bad())?;
@@ -383,26 +405,111 @@ pub struct Observer {
     pub stop: Box<dyn FnOnce() + Send>,
 }
 
-/// Follows the observer's output into the tracker and `sink` until it ends: `Ok` when it ended
-/// after it was ready, or the feed ended; else why it couldn't follow the stores.
-fn follow_observer(reader: impl std::io::Read, tracker: &Mutex<Tracker>, sink: &super::Sink) -> Result<(), String> {
-    use std::io::BufRead as _;
+/// The longest line read from the observer: well past its largest `snap` (`kMaxSnap` in
+/// `ios/prefswatch.m`, 256 KiB of plist sent as base64). A longer line isn't read whole: it ends
+/// the observer.
+const MAX_LINE: usize = 1 << 20;
+
+/// How following the observer's output ended.
+#[derive(Debug, PartialEq)]
+enum Followed {
+    /// Its output closed (it exited, or was stopped), after it was `ready` or not.
+    Closed { ready: bool },
+    /// It said why it can't follow the stores (`error`), and its output then closed.
+    Refused(String),
+    /// The feed ended; the observer is still running.
+    FeedEnded,
+    /// Its output can't be followed (a line that isn't one of its lines, or too long to be); it
+    /// may still be running.
+    Unreadable(String),
+}
+
+/// Follows the observer's output into the tracker and `sink` until it ends. `say` gets a notice
+/// for a store too large for the observer to send.
+fn follow_observer(reader: impl std::io::Read, tracker: &Mutex<Tracker>, sink: &super::Sink, say: &dyn Fn(String)) -> Followed {
+    let mut reader = std::io::BufReader::new(reader);
+    let mut buf = Vec::new();
     let mut ready = false;
-    for line in std::io::BufReader::new(reader).lines() {
-        let line = line.map_err(|e| format!("reading the preferences observer: {e}"))?;
-        match observer_line(&line)? {
-            ObserverLine::Ready => ready = true,
-            ObserverLine::Error(why) => return Err(why),
-            ObserverLine::Snap(i, entries) => {
+    loop {
+        let line = match next_line(&mut reader, &mut buf) {
+            Ok(Some(line)) => line,
+            Ok(None) => return Followed::Closed { ready },
+            Err(why) => return Followed::Unreadable(why),
+        };
+        match observer_line(&line) {
+            Err(why) => return Followed::Unreadable(why),
+            Ok(ObserverLine::Ready) => ready = true,
+            Ok(ObserverLine::Error(why)) => {
+                // It exits after saying so: once its output closes, it is known to have.
+                std::io::copy(&mut reader, &mut std::io::sink()).ok();
+                return Followed::Refused(why);
+            }
+            Ok(ObserverLine::Large(i)) => {
+                let mut tracker = lock(tracker);
+                if let Some(name) = tracker.too_large(i) {
+                    say(format!(
+                        "simee: {}'s {name} preferences are too large for the observer to send (over 256 KiB): the feed follows its file until they fit (cfprefsd writes it about every 10 s)",
+                        tracker.app
+                    ));
+                }
+            }
+            Ok(ObserverLine::Snap(i, entries)) => {
                 // Under the tracker's lock, so a file's changes and the observer's go out in order.
                 let mut tracker = lock(tracker);
                 if !tracker.observe(i, entries, Date::now()).into_iter().all(|change| sink.send(change)) {
-                    return Ok(());
+                    return Followed::FeedEnded;
                 }
             }
         }
     }
-    if ready { Ok(()) } else { Err("the preferences observer exited before it followed the stores".into()) }
+}
+
+/// The observer's next line, without its newline; `None` once its output has closed. A line past
+/// [`MAX_LINE`] is not read whole: an error.
+fn next_line(reader: &mut impl std::io::BufRead, buf: &mut Vec<u8>) -> Result<Option<String>, String> {
+    use std::io::{BufRead as _, Read as _};
+    buf.clear();
+    let limit = u64::try_from(MAX_LINE).unwrap_or(u64::MAX).saturating_add(1);
+    let n = reader.by_ref().take(limit).read_until(b'\n', buf).map_err(|e| format!("reading the preferences observer: {e}"))?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    } else if buf.len() > MAX_LINE {
+        return Err(format!("the preferences observer printed a line longer than {MAX_LINE} bytes"));
+    }
+    String::from_utf8(std::mem::take(buf)).map(Some).map_err(|_| "the preferences observer printed a line that isn't UTF-8".into())
+}
+
+/// The observer's stop, shared by the feed's two threads: whichever ends first stops it, once,
+/// and never after its output has closed (it exited, and its pid may be another process's).
+struct Stopper {
+    stop: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+impl Stopper {
+    /// Stops the observer, unless it was stopped or has exited.
+    fn stop(&self) {
+        let stop = {
+            let mut stop = self.stop.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let taken = stop.take();
+            if taken.is_some() {
+                self.stopped.store(true, std::sync::atomic::Ordering::Release);
+            }
+            taken
+        };
+        if let Some(stop) = stop {
+            stop();
+        }
+    }
+
+    /// Its output has closed: it isn't signalled from now on. Whether the feed stopped it.
+    fn closed(&self) -> bool {
+        self.stop.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        self.stopped.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 fn lock(tracker: &Mutex<Tracker>) -> std::sync::MutexGuard<'_, Tracker> {
@@ -413,41 +520,59 @@ fn lock(tracker: &Mutex<Tracker>) -> std::sync::MutexGuard<'_, Tracker> {
 /// `alive` (the device is booted) turns false. The files are watched throughout (`files` already
 /// watches `tracker.paths()`); while `observer` follows a store, its changes come from cfprefsd
 /// as they are made and its file isn't read. An observer that can't follow the stores, or exits,
-/// leaves the feed on the files. When the feed ends the observer is stopped.
+/// leaves the feed on the files, and `say`s why in one line (stderr on a device). When the feed
+/// ends, or the observer's output can't be followed, the observer is stopped.
 pub fn run_feed(
     tracker: Tracker,
     sink: super::Sink,
     mut files: impl Files + 'static,
-    alive: impl Fn() -> bool + Send + 'static,
+    alive: impl Fn() -> bool + Send + Sync + 'static,
     observer: Option<Observer>,
+    say: impl Fn(String) + Send + 'static,
 ) -> Result<(), String> {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     let app = tracker.app.clone();
     let tracker = Arc::new(Mutex::new(tracker));
     let sink = Arc::new(sink);
-    // Whether the observer's output has closed (it exited): it is never signalled after that.
-    let exited = Arc::new(AtomicBool::new(true));
-    let mut stop = None;
-    if let Some(Observer { reader, stop: stopper }) = observer {
-        exited.store(false, Ordering::Release);
-        let (t, s, e) = (tracker.clone(), sink.clone(), exited.clone());
+    let alive = Arc::new(alive);
+    let mut stopper = None;
+    if let Some(Observer { reader, stop }) = observer {
+        let helper = Arc::new(Stopper { stop: Mutex::new(Some(stop)), stopped: false.into() });
+        let (t, s, a, h) = (tracker.clone(), sink.clone(), alive.clone(), helper.clone());
         std::thread::Builder::new()
             .name("simee-prefs-ios-observer".into())
             .spawn(move || {
-                let result = follow_observer(reader, &t, &s);
-                e.store(true, Ordering::Release);
+                let why = match follow_observer(reader, &t, &s, &say) {
+                    // Closed by the feed's own stop: not a fallback.
+                    Followed::Closed { ready } => (!h.closed()).then(|| {
+                        let why = if ready { "exited" } else { "exited before it followed the stores" };
+                        format!("the preferences observer {why}")
+                    }),
+                    Followed::Refused(why) => {
+                        h.closed();
+                        Some(why)
+                    }
+                    Followed::FeedEnded => {
+                        h.stop();
+                        None
+                    }
+                    Followed::Unreadable(why) => {
+                        h.stop();
+                        Some(why)
+                    }
+                };
                 lock(&t).unobserved();
-                if let Err(why) = result
+                if let Some(why) = why
                     && s.is_open()
+                    && a()
                 {
-                    eprintln!(
+                    say(format!(
                         "simee: {app}'s preferences feed follows the files from now on (cfprefsd writes them about every 10 s): {why}"
-                    );
+                    ));
                 }
             })
             .map_err(|e| format!("can't start the preferences observer's reader: {e}"))?;
-        stop = Some(stopper);
+        stopper = Some(helper);
     }
     std::thread::Builder::new()
         .name("simee-prefs-ios".into())
@@ -466,10 +591,8 @@ pub fn run_feed(
                     files.set(&tracker.paths());
                 }
             }
-            if let Some(stop) = stop
-                && !exited.load(Ordering::Acquire)
-            {
-                stop();
+            if let Some(helper) = stopper {
+                helper.stop();
             }
         })
         .map_err(|e| format!("can't start the preferences watcher: {e}"))?;
@@ -740,7 +863,7 @@ mod device {
                     eprintln!("simee: {app}'s preferences feed follows the files (cfprefsd writes them about every 10 s): {why}");
                 })
                 .ok();
-            super::run_feed(tracker, sink, Kqueue(watch), move || super::booted(&device_dir), observer)
+            super::run_feed(tracker, sink, Kqueue(watch), move || super::booted(&device_dir), observer, |line| eprintln!("{line}"))
         }
     }
 }

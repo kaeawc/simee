@@ -82,14 +82,20 @@ as it is made, and the store files, which cfprefsd writes about every 10 s.
   so neither can be the signal on its own.
 - Its output is a pipe to the host (`Device::exec_stream`), with no socket. Each line is `snap <i>
   <base64 binary plist>` for store `i` (its first look at each store, then each change), then
-  `ready`, or `error <why>`. While it waits it sits in the run loop with no timer. The feed signals
-  it when the feed ends or the device shuts down. It also exits by itself when the host process
-  exits (a process-exit source on the host's pid), or at its next line once its output is closed.
+  `ready`, or `error <why>`. A store whose values take more than 256 KiB as a binary plist isn't
+  sent: the observer prints `large <i>` once instead, and the feed follows that store's file (with
+  one line on stderr) until a `snap` of it comes again. The feed reads at most 1 MiB of a line. While
+  it waits the observer sits in the run loop with no timer. The feed signals it when the feed ends,
+  the device shuts down, or its output can't be followed (a line that isn't one of these, or too
+  long); a helper that has exited (its output closed) is never signalled. It also exits by itself
+  when the host process exits (a process-exit source on the host's pid), or at its next line once
+  its output is closed. Each wrapped class's handler keeps that class's own original, so a
+  subclass's handler calling `super` runs each original once.
 - **Fallback.** While the observer follows a store, the store's file is not read: the file is
   behind cfprefsd, and reading it would report a newer value changing back. If the observer can't
   be built or started, its runtime lacks one of the SPI (it checks each with `dlsym` or
-  `respondsToSelector:`, and the wrapped method's signature, then prints `error`), or it exits,
-  the feed follows the files as before. It starts again from each file as it is then, and prints
+  `respondsToSelector:`, and the wrapped method's signature, then prints `error`), or it exits
+  (before or after `ready`), the feed follows the files as before. It starts again from each file as it is then, and prints
   one line on stderr saying why. A domain whose file first appears after the feed started is
   followed only by its file.
 
