@@ -209,11 +209,14 @@ enum Cmd {
     /// Create a device as a copy of a shut-down one (iOS: a simulator; Android: an AVD from a
     /// golden booted once under simee); prints its UDID (an AVD's name).
     Clone { template: String, name: String },
-    /// Android: pack a shut-down AVD into a portable bundle (a .tar file, else a new directory)
-    /// with no host path in it; prints its sizes. iOS: not yet.
+    /// Pack a shut-down device into a portable bundle (a .tar file, else a new directory) with no
+    /// host path in it; prints its sizes. Android: an AVD's simee disks; iOS: a simulator's data
+    /// directory, without its caches.
     Export { device: String, to: String },
-    /// Android: create AVD `name` from a bundle, its system image found by content; prints its
-    /// name. The import keeps the exported device's guest identity (ro.serialno, android_id).
+    /// Create device `name` from a bundle, on the platform the bundle names; prints its UDID (an
+    /// AVD's name). Android: its system image found by content; iOS: its runtime by identifier
+    /// and build. Its apps see the exported device (Android: ro.serialno, android_id; iOS: the
+    /// keychain and app data).
     Import {
         from: String,
         name: String,
@@ -999,6 +1002,10 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             )?;
             for d in items(&r["dropped"]) {
                 writeln!(err, "simee: left out {}", text(d))?;
+            }
+            let caches = items(&r["left_out"]).len();
+            if caches > 0 {
+                writeln!(err, "simee: left out the contents of {caches} cache and tmp directories")?;
             }
         }
         Cmd::Import { from, name, allow_mismatch } => {

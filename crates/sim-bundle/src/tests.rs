@@ -33,6 +33,7 @@ fn header() -> Manifest {
         compression: String::new(),
         disks: Vec::new(),
         files: Vec::new(),
+        tree: Vec::new(),
     }
 }
 
