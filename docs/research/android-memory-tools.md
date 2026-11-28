@@ -21,7 +21,7 @@ Issue [#415](https://github.com/kaeawc/simee/issues/415), part of the Android/iO
 | --- | --- | --- |
 | `mem_vmmap` | `/proc/<pid>/smaps`, grouped by mapping kind | Build. Same shape, minus iOS-only columns. Needs root (`su 0`) on most images |
 | `mem_heap` | An `am dumpheap` hprof for the class histogram; `dumpsys meminfo [-d] <pkg>` for the breakdown, as a separate Android-only `mem_meminfo` | Histogram: build (hprof reader, no new dependency). Breakdown: build first (any app, no root) |
-| `mem_leaks` | `dumpsys meminfo --unreachable <pkg>` (libmemunreachable) | Build, narrower than iOS: any app (a release app's bytes are hidden), at most 100 leaks, a 30 s scan cap, leaks as address and size, stacks only with `malloc_debug` |
+| `mem_leaks` | `dumpsys meminfo --unreachable <pkg>` (libmemunreachable) | Build, narrower than iOS: debuggable or shell-profileable apps only (**inferred**), at most 100 leaks, a 30 s scan cap, leaks as address and size, stacks only with `malloc_debug` |
 | `mem_history` | `malloc_debug` `backtrace` dump or `record_allocs` | Not a reliable equivalent: no one mode has both an address and a stack. Stays iOS-only for now; a design is sketched so the decision can be revisited |
 
 ## 1. The mechanisms
@@ -155,13 +155,29 @@ Issue [#415](https://github.com/kaeawc/simee/issues/415), part of the Android/iO
   `contents:`.)
 - **Invocation.** `dumpsys -t 600 meminfo --unreachable [process]`; zygote loads the library.
   **[sourced]** (README)
-- **Needs.** No debuggable flag and no root for the scan. AOSP gates only the leak *contents*:
-  `ActivityThread.dumpMemInfo` passes `showContents = appInfo.flags & FLAG_DEBUGGABLE ||
-  Build.IS_DEBUGGABLE` to `Debug.getUnreachableMemory(100, showContents)`, so a release app on a
-  user build still gets the summary and each `N bytes unreachable at <addr>` line, without the
-  hex dump of its bytes. **[sourced]**
-  ([`ActivityThread.java`](https://android.googlesource.com/platform/frameworks/base/+/main/core/java/android/app/ActivityThread.java),
-  `dumpMemInfo`.) Backtraces need `adb root` and `setprop` on a userdebug device, then an app
+- **Needs.** Two separate gates, one in each direction.
+  - *The report's contents.* `ActivityThread.dumpMemInfo` passes `showContents = appInfo.flags &
+    FLAG_DEBUGGABLE || Build.IS_DEBUGGABLE` to `Debug.getUnreachableMemory(100, showContents)`, so
+    only a debuggable app (or a debuggable build) gets the hex dump of each leak's bytes.
+    **[sourced]**
+    ([`ActivityThread.java`](https://android.googlesource.com/platform/frameworks/base/+/main/core/java/android/app/ActivityThread.java),
+    `dumpMemInfo`.)
+  - *Whether the scan runs at all.* libmemunreachable ptraces the app's threads
+    (`MemUnreachable.cpp`: "ptrace all the threads"), and zygote leaves an app process
+    non-dumpable unless it is debuggable (`DEBUG_ENABLE_PTRACE`, which calls `EnableDebugger()`)
+    or profileable from shell (`PROFILE_FROM_SHELL`, which sets `PR_SET_DUMPABLE` to 1); a
+    non-dumpable process refuses ptrace. **[sourced: the zygote and libmemunreachable code;
+    inferred: the conclusion that the kernel then refuses the scan's ptrace, so a release app
+    that is neither prints `Failed to get unreachable memory`, the failure string in
+    `GetUnreachableMemoryString`. Not run; needs a device.]**
+    ([`com_android_internal_os_Zygote.cpp`](https://android.googlesource.com/platform/frameworks/base/+/main/core/jni/com_android_internal_os_Zygote.cpp).)
+    Those flags come from the app's own manifest: `ProcessList.startProcess` sets
+    `DEBUG_ENABLE_PTRACE` from `FLAG_DEBUGGABLE` and `PROFILE_FROM_SHELL` from
+    `isProfileableByShell()`, not from `Build.IS_DEBUGGABLE`, so a release app on a userdebug image
+    is expected to fail too. **[sourced:
+    [`ProcessList.java`](https://android.googlesource.com/platform/frameworks/base/+/main/services/core/java/com/android/server/am/ProcessList.java);
+    inferred: that nothing else in the zygote path makes it dumpable on a userdebug build.]**
+  - Backtraces need `adb root` and `setprop` on a userdebug device, then an app
   restart. **[sourced]** (README) The target is briefly paused while its threads stop. **[sourced]**
 - **Time and size: two caps.** AMS waits for the app's reply on a `TransferPipe` for **30 000 ms**
   when `--unreachable` is set (5 000 ms otherwise): `tp.go(fd, opts.dumpUnreachable ? 30000 : 5000)`.
@@ -229,7 +245,7 @@ the platform's leak-pattern knowledge) is far past "small PR". Recommendation: o
 | `dumpsys meminfo <pkg>` and `-d` | Yes **[inferred]** | Yes | Yes |
 | `/proc/<pid>/smaps` | Not for another uid; `run-as` for a debuggable app (device check) | Yes | Yes |
 | `am dumpheap` managed | Debuggable app only (profileable is refused) | Yes, any app | Yes |
-| `dumpsys meminfo --unreachable` | Yes, any app; contents hidden for a release app | Yes | Yes |
+| `dumpsys meminfo --unreachable` | Debuggable or shell-profileable app only; others fail with `Failed to get unreachable memory` (**inferred**) | Same: the app's flags decide, not the build (**inferred**) | Same (**inferred**) |
 | heapprofd | Debuggable or profileable app, API 29+ | Nearly any process | Nearly any process |
 | `malloc_debug` `wrap.<pkg>` | No (needs `setprop wrap.*`, root, or `wrap.sh` in the APK) | Yes | Yes |
 
@@ -304,8 +320,10 @@ Source: `dumpsys -t 40 meminfo --unreachable <pkg>` (the client timeout just abo
 wait, so simee reports AMS's `IoException` rather than its own timeout). **No `timeout_s`
 parameter on Android**: it can't extend the scan, and a value above 30 would promise what AMS
 refuses. The method says in `help` that the scan stops after 30 s, and fails with that cause when
-the report has `Got IoException!` or no summary line. Needs no debuggable app and no root (sourced
-above), so it also works on a user build; `raw` is available. Answer matching `{...@mem, leak_count,
+the report has `Got IoException!` or no summary line. It also fails, with `Failed to get
+unreachable memory`, for an app that is neither debuggable nor profileable from shell (**inferred**
+from the zygote source, above; confirm on a device): the method says so and names the manifest
+flags that would allow it, rather than reporting zero leaks. No root is needed; `raw` is available. Answer matching `{...@mem, leak_count,
 stacks, leaks: [object], leaked_bytes?, note?}` plus an Android-only `truncated`:
 
 - `leak_count`, `leaked_bytes` from the summary line (all leaks, not just the listed ones).
@@ -389,8 +407,10 @@ and are confirmed on main):
   error `su` gives without it.
 - Whether `run-as <pkg> cat /proc/<pid>/smaps` is allowed for a debuggable app under SELinux.
 - Whether `showmap` is installed on any image (not needed, but cheap to know).
-- `dumpsys meminfo --unreachable` on a release app (the source says it works with contents hidden),
-  its time on a small and a large heap against AMS's 30 s cap, its effect on the emulator app (the target pauses), and its output with and
+- `dumpsys meminfo --unreachable` on a release app, on a `profileable` (shell) app and on a
+  debuggable app, on a user and on a userdebug image: confirm the inferred failure
+  (`Failed to get unreachable memory`) for the release app. Also its time on a small and a large
+  heap against AMS's 30 s cap, its effect on the app (the target pauses), and its output with and
   without `wrap.<pkg>` backtraces.
 - Whether `wrap.<pkg>` works on API 34–36 images (the README flags an Android 12 bug), and the
   slowdown of `backtrace` on the emulator's app.
