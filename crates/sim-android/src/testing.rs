@@ -352,7 +352,8 @@ impl FakeAdb {
     /// What a Wear OS pairing reads from `serial` (`sim_android::wear`): `what` is `status` (the
     /// text `get-pairing-status` prints after its `Broadcasting:` line), `setting` and `prop` (the
     /// watch's companion choice), `abis`, `primer` (the line `logcat -T 1` prints first),
-    /// `logcat` (the lines the pairing logs once the companion's activity starts), `noactivity`
+    /// `logcat` (the lines the pairing logs once the companion's activity starts), `logcat.exit` (the log
+    /// ends after them instead of staying open), `noactivity`
     /// (the companion has no `EmulatorActivity`: any text), or `pkg.<package>` (what `dumpsys
     /// package` greps: `versionCode=` and `versionName=` lines; a package without one isn't
     /// installed, and Play services without one is version 240000000).
@@ -592,13 +593,15 @@ reverse)
 # sim_android::wear's `logcat -T 1`: prints a primer line at once (as `-T 1` prints the last
 # line), then, once the companion's activity has been started (`wear.logcat.go.<serial>`, which
 # only a start after this reader began creates: a start before it would have lost the lines), the
-# lines in `wear.logcat.<serial>`, then stays open.
+# lines in `wear.logcat.<serial>`, then stays open (or ends, with `wear.logcat.exit.<serial>`).
 logcat)
   touch "$d/wear.logcat.listening.$serial"
   cat "$d/wear.primer.$serial" 2>/dev/null || echo "11-28 10:00:00.000     1     1 I primer: the last line"
   i=0
   while [ ! -e "$d/wear.logcat.go.$serial" ] && [ $i -lt 500 ]; do sleep 0.02; i=$((i + 1)); done
   cat "$d/wear.logcat.$serial" 2>/dev/null
+  # `wear.logcat.exit.<serial>`: the reader ends here, as one does when the device goes away.
+  [ -e "$d/wear.logcat.exit.$serial" ] && exit 0
   exec sleep 30;;
 install)
   case "$*" in

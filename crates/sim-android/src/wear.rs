@@ -600,6 +600,20 @@ mod tests {
     }
 
     #[test]
+    fn handshake_errors_when_the_log_ends_before_the_companion_finishes() {
+        let p = Pair::ready("logend");
+        p.rig.fake.wear_logcat(PHONE, &["STARTED"]);
+        p.rig.fake.wear("logcat.exit", PHONE, "");
+        let err = p.handshake(Duration::from_secs(10)).expect_err("log ended");
+        assert!(err.contains("`adb logcat` on emulator-5554 ended before the companion finished"), "{err}");
+        // A log that ends after a finished state is not an error: the state came first.
+        let p = Pair::ready("logend-done");
+        p.rig.fake.wear_logcat(PHONE, &["STARTED", "SUCCESS"]);
+        p.rig.fake.wear("logcat.exit", PHONE, "");
+        assert_eq!(p.handshake(Duration::from_secs(10)).map(|h| h.end), Ok(End::Finished(PairingProgress::Success)));
+    }
+
+    #[test]
     fn handshake_does_not_take_the_look_back_line_for_a_state() {
         let p = Pair::ready("primer");
         // The last line of the phone's log, from an earlier pairing, is what `logcat -T 1` prints first.
