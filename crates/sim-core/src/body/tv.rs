@@ -13,6 +13,7 @@ pub(super) const ENABLED: bool = false;
 
 /// Whether the generic body's screen is drawn at the dpi simee reports for the Android reference
 /// profile (a TV is sized by its nominal diagonal, not the dpi the AVD reports; its lane may change this). When false, the shared test checks only the aspect.
+#[cfg(test)]
 pub(super) const SIZES_BY_DPI: bool = false;
 
 /// The TV rows of the table (read only while [`ENABLED`]).
