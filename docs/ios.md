@@ -6,8 +6,8 @@ measurements behind each design choice. `docs/api.md` is the reference for the m
 ## App preferences
 
 `prefs_*` on an iOS device (`crates/sim-api/src/prefs/ios.rs`) reads an app's user defaults from
-the simulator's files on the host, writes through the device's cfprefsd, and follows changes by
-watching the files.
+the simulator's files on the host, writes through the device's cfprefsd, and follows changes
+through an in-device observer of cfprefsd, with the files as the fallback.
 
 **Stores.** An app's own domain is `Library/Preferences/<bundle id>.plist` in its data container
 (`data/Containers/Data/Application/<uuid>`). An app-group suite is in the group's container
@@ -64,24 +64,60 @@ file. A write takes 180–187 ms (one key or ten); the device must be booted.
   (`0.10000000149011612` for that float). A date keeps about a microsecond (a plist date is a
   double of seconds since 2001).
 
-**The feed** watches each store's file and the directories that hold them with kqueue
-(`sim_coresim::FileWatch`): cfprefsd replaces a plist by renaming a new file over it, which its
-directory reports. On each wake simee re-reads the files whose inode, size or modification time
-changed and reports each key whose decoded value changed. A file caught half-written is read again
-on the next wake; a new domain file in the app's container is followed from empty. The watcher
-wakes at least every 500 ms to see whether its feed has ended or the device has shut down (from the
-`state` in the device's `device.plist`); a feed on a device that shuts down ends (3.5 s after
-`simctl shutdown` began, measured).
+**The feed** has two sources: an in-device observer, which hears about each change from cfprefsd
+as it is made, and the store files, which cfprefsd writes about every 10 s.
 
-| Feed (same device and app; the app writes a counter every 3 s) | Median |
+- **The observer** (`crates/sim-api/src/prefs/ios/prefswatch.m`, built on first use and cached
+  like the write helper) runs in the device as its own process, started with the feed. It is not
+  injected into the app: no `DYLD_INSERT_LIBRARIES`, no relaunch, and it works for an app that is
+  already running. It opens each store's domain in the container cfprefsd keeps it in
+  (`-[NSUserDefaults _initWithSuiteName:container:]`) and observes one key no app uses with KVO.
+  That makes cfprefsd send the process every other process's changes to the domain. cfprefsd sends
+  them for every key, observed or not, to
+  `-[CFPrefsSearchListSource handleChangeNotificationForDomainIdentifier:isRemote:]`, which the
+  observer wraps in its own process. On each notice it reads the domain
+  (`_CFPreferencesCopyMultipleWithContainer`) and prints its values if they changed. The host diffs
+  them against what it last had and reports each changed key. `NSUserDefaultsDidChangeNotification`
+  doesn't fire for another process's write, and a KVO observer fires only for the keys it names,
+  so neither can be the signal on its own.
+- Its output is a pipe to the host (`Device::exec_stream`), with no socket. Each line is `snap <i>
+  <base64 binary plist>` for store `i` (its first look at each store, then each change), then
+  `ready`, or `error <why>`. A store whose values take more than 256 KiB as a binary plist isn't
+  sent: the observer prints `large <i>` once instead, and the feed follows that store's file (with
+  one line on stderr) until a `snap` of it comes again. The feed reads at most 1 MiB of a line. While
+  it waits the observer sits in the run loop with no timer. The feed signals it when the feed ends,
+  the device shuts down, or its output can't be followed (a line that isn't one of these, or too
+  long); a helper that has exited (its output closed) is never signalled. It also exits by itself
+  when the host process exits (a process-exit source on the host's pid), or at its next line once
+  its output is closed. Each wrapped class's handler keeps that class's own original, so a
+  subclass's handler calling `super` runs each original once.
+- **Fallback.** While the observer follows a store, the store's file is not read: the file is
+  behind cfprefsd, and reading it would report a newer value changing back. If the observer can't
+  be built or started, its runtime lacks one of the SPI (it checks each with `dlsym` or
+  `respondsToSelector:`, and the wrapped method's signature, then prints `error`), or it exits
+  (before or after `ready`), the feed follows the files as before. It starts again from each file as it is then, and prints
+  one line on stderr saying why. A domain whose file first appears after the feed started is
+  followed only by its file.
+
+The files are watched with kqueue (`sim_coresim::FileWatch`) throughout. cfprefsd replaces a plist
+by renaming a new file over it, which its directory reports. On each wake simee re-reads the files
+whose inode, size or modification time changed and reports each key whose decoded value changed. A
+file caught half-written is read again on the next wake, and a new domain file in the app's
+container is followed from empty. The watcher wakes at least every 500 ms to see whether its feed
+has ended or the device has shut down (from the `state` in the device's `device.plist`). A feed on
+a device that shuts down ends 3.5 s after `simctl shutdown` began (measured).
+
+| Feed through the files (2026-11-27; same device and app; the app writes a counter every 3 s) | Median |
 | --- | --- |
 | cfprefsd writes the file to the feed's event | 1.0 ms (0.8–1.1, n=6) |
 | The newest in-app write a flush covers to the event | 1.5 s (0.5–2.5 s, n=6) |
 | The oldest in-app write a flush covers to the event | 8.5 s (7.5–9.5 s, n=6) |
 
-So the feed's latency is cfprefsd's flush: an in-app write shows up within about 10 s, a write
-through `prefs_write` the same way. The app itself sees a cross-process write in about 2 ms (its
-KVO), so an in-device observer would report changes far sooner than the file; it isn't built.
+The observer's mechanism was checked on iOS 27.2 (iPhone 17, 2026-11-28) with a prototype of it in
+the device. The app wrote a counter every 3 s, and the prototype heard each write 1.4 to 2.1 ms after
+the app logged it (n=4). Writes from another process were heard the same way: a new key, a deleted
+key, and the app-group suite. The prototype exited with its host process. The feed's own latency
+from an in-app write to the `prefs_watch` event has not been measured yet.
 
 Reproduce: build a test app that shows its `UserDefaults` and logs its writes and what it sees with
 wall-clock times, entitled to an app group through `-Xlinker -sectcreate -Xlinker __TEXT -Xlinker

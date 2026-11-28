@@ -431,9 +431,11 @@ pub struct Report {
     pub verdict: Decision,
     /// Every reason the verdict is not a plain admit (the same list as `verdict.reasons`).
     pub reasons: Vec<String>,
-    /// Set while the ring holds less than 5 minutes: the 5 and 15 minute averages are partial
-    /// (the sampler runs only while read, so a cold one has no history), and the verdict is the
-    /// newest sample's, with the kernel's own 1-minute load average.
+    /// Set while the ring covers less than 15 minutes: the 15 minute average (and under 5 minutes
+    /// the 5 minute one too) is partial, since the sampler runs only while read and a cold one has
+    /// no history. The verdict is the newest sample's, with the kernel's own 1-minute load
+    /// average; where the host counts throttle events, a resume takes two samples
+    /// [`WAKE_GAP`] apart, so the throttle evidence covers that gap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history_note: Option<String>,
 }
@@ -453,12 +455,9 @@ pub fn report(snapshot: Snapshot, ring: &Ring, thresholds: Thresholds) -> Report
         verdict.reason = verdict.reasons[0].clone();
     }
     let span = ring.span_s();
-    let history_note = (span < 300.0).then(|| {
-        format!(
-            "history covers {span:.0} s ({} samples): the 5 and 15 minute averages are partial; load1 is the kernel's own 1-minute average",
-            ring.len()
-        )
-    });
+    let partial = if span < 300.0 { "the 5 and 15 minute averages are partial" } else { "the 15 minute average is partial" };
+    let history_note = (span < 900.0 && ring.len() < ring::CAPACITY)
+        .then(|| format!("history covers {span:.0} s ({} samples): {partial}; load1 is the kernel's own 1-minute average", ring.len()));
     Report {
         history_note,
         averages: ring.averages(),
@@ -523,7 +522,8 @@ impl State {
 
     /// A reader arrived at `now`. True when the sampler is parked and must take a sample first.
     fn touch(&mut self, now: Duration) -> bool {
-        self.last_read = now;
+        // A reader preempted between reading the clock and here must not shorten the window.
+        self.last_read = self.last_read.max(now);
         self.parked
     }
 
@@ -572,8 +572,9 @@ impl Shared {
     }
 
     /// Every read of the sampler starts here: a parked sampler takes one sample on the caller's
-    /// thread (so the answer is current) and wakes its worker; a running one just notes the read,
-    /// which keeps it running for another linger window.
+    /// thread (so the answer is current; two, [`WAKE_GAP`] apart, where the host counts throttle
+    /// events) and wakes its worker; a running one just notes the read, which keeps it running
+    /// for another linger window.
     fn read(&self) {
         let now = self.clock.now();
         {
@@ -582,16 +583,26 @@ impl Shared {
                 return;
             }
         }
-        // One resumer at a time; the others find it running.
+        // One resumer at a time: it keeps the source until it has restarted the sampler, so the
+        // readers queued behind it find it running and take no sample of their own.
         let mut src = self.source.lock().unwrap_or_else(|e| e.into_inner());
         if !self.state.lock().unwrap_or_else(|e| e.into_inner()).parked {
             return;
         }
         let (s, o) = (src.sample(), src.observe());
-        drop(src);
+        // Throttling shows only as a rise in the kernel's counter, and one sample has no rise:
+        // without a second one, a throttled host would be told to admit on its first check.
+        let second = s.thermal.throttle_count.is_some().then(|| {
+            self.clock.sleep(WAKE_GAP);
+            (self.clock.now(), src.sample())
+        });
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.restart(now, s, o);
+        if let Some((at, s)) = second {
+            st.record(at, s, None);
+        }
         drop(st);
+        drop(src);
         self.stop.notify_all();
         self.tick.notify_all();
     }
@@ -620,6 +631,8 @@ impl Shared {
 trait Clock: Send + Sync {
     /// Time since an arbitrary fixed point.
     fn now(&self) -> Duration;
+    /// Waits `d` on this clock.
+    fn sleep(&self, d: Duration);
 }
 
 struct Monotonic(Instant);
@@ -628,10 +641,17 @@ impl Clock for Monotonic {
     fn now(&self) -> Duration {
         self.0.elapsed()
     }
+    fn sleep(&self, d: Duration) {
+        std::thread::sleep(d);
+    }
 }
 
 /// How long the sampler keeps running after the last read.
 pub const LINGER: Duration = Duration::from_secs(60);
+
+/// On a resume where the host counts throttle events (Linux, Intel), the gap between the two
+/// samples a cold verdict differences: one sample alone has no delta.
+pub const WAKE_GAP: Duration = Duration::from_millis(250);
 
 /// A background sampler: one snapshot per interval into the ring, and one pass over the host's
 /// processes into the per-device usage tracker, but only while someone reads it. It starts
@@ -909,14 +929,19 @@ mod tests {
         fn now(&self) -> Duration {
             Duration::from_millis(self.0.load(std::sync::atomic::Ordering::SeqCst))
         }
+        fn sleep(&self, d: Duration) {
+            self.advance(d);
+        }
     }
 
-    /// A fake source that counts its reads and can report a hot host.
+    /// A fake source that counts its reads and can report a hot host, or (Linux, Intel) a
+    /// throttle counter that rises by `throttle` events per sample.
     #[derive(Clone, Default)]
     struct Counting {
         samples: Arc<std::sync::atomic::AtomicUsize>,
         observes: Arc<std::sync::atomic::AtomicUsize>,
         serious: bool,
+        throttle: Option<u64>,
     }
 
     impl Counting {
@@ -927,8 +952,9 @@ mod tests {
 
     impl Source for Counting {
         fn sample(&mut self) -> Snapshot {
-            self.samples.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let n = self.samples.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as u64 + 1;
             let mut s = snap(self.serious.then_some(ThermalState::Serious).or(Some(ThermalState::Nominal)));
+            s.thermal.throttle_count = self.throttle.map(|k| 1000 + k * n);
             // A roomy host, so that only the thermal state can hold a boot.
             if let Some(m) = s.memory.as_mut() {
                 (m.total_bytes, m.available_bytes, m.free_percent) = (128 << 30, Some(64 << 30), Some(50.0));
@@ -1030,17 +1056,154 @@ mod tests {
         }
     }
 
+    /// A sampler the test drives: no worker thread, a fake clock and a counting source.
+    fn manual(src: &Counting) -> (Sampler, FakeClock) {
+        let clock = FakeClock::default();
+        (Sampler { shared: Shared::new(LINGER, src.clone(), clock.clone()), interval: SECOND, handle: None }, clock)
+    }
+
+    fn admit_one(s: &Sampler) -> admission::Admission {
+        use admission::{Item, Limits, admit, seed};
+        let item = Item { platform: sim_core::platform::Platform::Ios, form_factor: None };
+        admit(&admission::HostState::from_report(&s.report(Thresholds::default())), &[item], 1, seed, &Limits::default())
+    }
+
+    /// Runs a read sampler until it parks, then lets it sit parked for ten minutes.
+    fn park(s: &Sampler, clock: &FakeClock) {
+        s.shared.read();
+        while !parked(&s.shared) {
+            clock.advance(SECOND);
+            s.shared.step();
+        }
+        clock.advance(Duration::from_secs(600));
+    }
+
     #[test]
-    fn a_warm_history_carries_no_note() {
-        let (sh, clock, _) = core(Duration::from_secs(600), false);
+    fn a_throttled_host_is_held_on_the_first_check_after_a_park() {
+        // Linux, Intel: the zones are below their trips (nominal), but the throttle counter rises.
+        let src = Counting { throttle: Some(3), ..Counting::default() };
+        let (s, clock) = manual(&src);
+        park(&s, &clock);
+        let before = src.reads();
+        let a = admit_one(&s);
+        assert_eq!(a.verdict, Verdict::Hold, "{:?}", a.reasons);
+        assert!(a.reasons.iter().any(|r| r.contains("throttle events")), "{:?}", a.reasons);
+        assert_eq!(src.reads(), (before.0 + 2, before.1 + 1), "two samples a gap apart, one pass over the processes");
+        let ring = s.ring();
+        assert_eq!((ring.len(), ring.span_s()), (2, WAKE_GAP.as_secs_f64()), "the gap is on the sampler's clock");
+    }
+
+    #[test]
+    fn a_cold_check_with_flat_throttle_counters_still_admits() {
+        let src = Counting { throttle: Some(0), ..Counting::default() };
+        let (s, clock) = manual(&src);
+        park(&s, &clock);
+        let a = admit_one(&s);
+        assert_eq!(a.verdict, Verdict::Admit, "{:?}", a.reasons);
+    }
+
+    #[test]
+    fn a_host_without_throttle_counters_resumes_on_one_sample() {
+        // macOS reads its thermal state directly: no counter to difference, no wait.
+        let src = Counting::default();
+        let (s, clock) = manual(&src);
+        park(&s, &clock);
+        let before = src.reads();
+        assert_eq!(admit_one(&s).verdict, Verdict::Admit);
+        assert_eq!(src.reads(), (before.0 + 1, before.1 + 1));
+        assert_eq!(s.ring().len(), 1);
+    }
+
+    /// Wraps [`Counting`]: the first pass over the processes (the last read a resume makes)
+    /// says it has sampled, then waits for the test's go.
+    struct Gated {
+        inner: Counting,
+        sampled: std::sync::mpsc::Sender<()>,
+        go: Option<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Source for Gated {
+        fn sample(&mut self) -> Snapshot {
+            self.inner.sample()
+        }
+        fn observe(&mut self) -> Option<usage::Observation> {
+            let o = self.inner.observe();
+            if let Some(go) = self.go.take() {
+                let _ = self.sampled.send(());
+                let _ = go.recv();
+            }
+            o
+        }
+    }
+
+    #[test]
+    fn a_resumer_keeps_the_source_until_it_has_restarted() {
+        let (sampled, sampled_rx) = std::sync::mpsc::channel();
+        let (go_tx, go) = std::sync::mpsc::channel();
+        let counting = Counting::default();
+        let sh = Shared::new(LINGER, Gated { inner: counting.clone(), sampled, go: Some(go) }, FakeClock::default());
+        let first = {
+            let sh = Arc::clone(&sh);
+            std::thread::spawn(move || sh.read())
+        };
+        sampled_rx.recv().expect("the first reader sampled");
+        // Hold the state, so the first reader cannot restart, and let it finish its reads.
+        let st = sh.state.lock().expect("state");
+        go_tx.send(()).expect("go");
+        // If the source comes free while the sampler is still parked, a second reader waiting on
+        // it would find the sampler parked and sample again.
+        let mut free_while_parked = false;
+        for _ in 0..100_000 {
+            if sh.source.try_lock().is_ok() {
+                free_while_parked = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(st.parked);
+        drop(st);
+        first.join().expect("first reader");
+        assert!(!free_while_parked, "the resumer released the source before it restarted the sampler");
+        // Readers after the resume find it running and take nothing.
+        let readers: Vec<_> = (0..8)
+            .map(|_| {
+                let sh = Arc::clone(&sh);
+                std::thread::spawn(move || sh.read())
+            })
+            .collect();
+        for r in readers {
+            r.join().expect("reader");
+        }
+        assert_eq!(counting.reads(), (1, 1), "exactly one sample for the resume");
+    }
+
+    #[test]
+    fn the_last_read_never_moves_back() {
+        let mut st = State::parked(LINGER);
+        st.touch(Duration::from_secs(5));
+        st.touch(Duration::from_secs(3));
+        assert_eq!(st.last_read, Duration::from_secs(5), "a reader preempted after reading the clock");
+    }
+
+    #[test]
+    fn the_note_stays_until_the_15_minute_average_is_whole() {
+        let (sh, clock, _) = core(Duration::from_secs(3600), false);
         sh.read();
+        let note = |sh: &Shared| {
+            let st = sh.state.lock().expect("state");
+            report(st.latest.clone().expect("latest"), &st.ring, Thresholds::default()).history_note
+        };
         for _ in 0..301 {
             clock.advance(SECOND);
             sh.step();
         }
-        let st = sh.state.lock().expect("state");
-        let r = report(st.latest.clone().expect("latest"), &st.ring, Thresholds::default());
-        assert_eq!(r.history_note, None);
+        let n = note(&sh).expect("5 minutes in, the 15 minute average is partial");
+        assert!(n.contains("15 minute average is partial") && !n.contains("5 and 15"), "{n}");
+        for _ in 301..ring::CAPACITY {
+            clock.advance(SECOND);
+            sh.step();
+        }
+        assert_eq!(note(&sh), None, "a full ring");
     }
 
     /// The live host through the real sampler: load-sensitive, so it only runs on request.
