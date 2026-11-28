@@ -285,8 +285,20 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          zygote64, system_server, surfaceflinger, servicemanager, hwservicemanager, vndservicemanager, vold, lmkd, logd, adbd, netd, \
          installd, ueventd, keystore2 and statsd are refused unless force",
     ),
-    ("connections", "device, set?", "Open sockets of device processes"),
-    ("traffic", "device, set?", "Bytes in/out per device process"),
+    (
+        "connections",
+        "device; iOS: set?",
+        "Open sockets of device processes (Android: the guest kernel's /proc/net/tcp, tcp6, udp and udp6, matched to processes by \
+         the socket inodes in /proc/<pid>/fd, as root where the image has su; each row has the socket's uid, and pid is null for \
+         one no process could be matched to, as another user's is without root)",
+    ),
+    (
+        "traffic",
+        "device; iOS: set?",
+        "Bytes in/out per device process (Android: per app uid since boot, from the kernel's eBPF mAppUidStatsMap as dumpsys \
+         prints it, or /proc/net/xt_qtaguid/stats on Android 9 and older; each row has the uid, and pid is the app's own \
+         process, null when it isn't running or the uid is shared)",
+    ),
     // Memory tools on one app (#183): the host's leaks, heap, vmmap and malloc_history on its pid.
     (
         "mem_leaks",
@@ -380,12 +392,29 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("info", "device; iOS: set?", "Paths and identity"),
     (
         "network_shape",
-        "device, preset?(offline|3g|edge|lte|lossy|very-bad|none), offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?, port_base?, port_count?, rules?([{pattern, offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?}]), proxy?(default true), inject?(false|true|\"launchd\"|\"boot\"), set?",
-        "Shape the device's network without root. proxy: a shaping HTTP/SOCKS proxy set in the device's configd_sim. inject: an in-process socket shaper; \"boot\" reboots the device with it in launchd's environment so every process, WebKit included, is shaped live by the profile",
+        "device, preset?(offline|3g|edge|lte|lossy|very-bad|none), offline?, latency_ms?, down_kbps?, up_kbps?; iOS: loss_pct?, port_base?, port_count?, rules?([{pattern, offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?}]), proxy?(default true), inject?(false|true|\"launchd\"|\"boot\"), set?",
+        "Shape the device's network without root. proxy: a shaping HTTP/SOCKS proxy set in the device's configd_sim. inject: an in-process socket shaper; \"boot\" reboots the device with it in launchd's environment so every process, WebKit included, is shaped live by the profile. \
+         Android: the emulator's NAT through its console (`network speed <up>:<down>` kbit/s, `network delay <ms>`; what isn't given keeps the device's value, and only what changes is sent) and offline as airplane mode (`cmd connectivity airplane-mode`), returning the commands sent; \
+         loss_pct (so lossy and very-bad), rules, port ranges, proxy and inject are refused there, as its console shapes speed and latency only",
     ),
-    ("network_state", "device, set?", "Current profile, proxy port and injection state"),
-    ("network_flows", "device, set?", "Connections through the device's shaping proxy (host, bytes, duration, outcome)"),
-    ("network_clear", "device, set?", "Remove shaping: clear the device proxy, stop the proxy, remove injection"),
+    (
+        "network_state",
+        "device; iOS: set?",
+        "Current profile, proxy port and injection state (Android: the console's `network status`, as network_status, and airplane \
+         mode as offline; a latency range set from the console reads as its mean; proxy_port null, injected false)",
+    ),
+    (
+        "network_flows",
+        "device, set?",
+        "Connections through the device's shaping proxy: host, bytes, duration, outcome (not on Android: the emulator's NAT keeps \
+         only its live flows, with no history or byte counts per flow; connections lists the open sockets)",
+    ),
+    (
+        "network_clear",
+        "device; iOS: set?",
+        "Remove shaping: clear the device proxy, stop the proxy, remove injection (Android: `network speed full`, `network delay none` \
+         and airplane mode off)",
+    ),
     (
         "audio_state",
         "device; iOS: set?",
@@ -456,7 +485,12 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          restores the saved link), unsaved (linked from the console only), off, source missing (the host no longer lists the camera: \
          the device shows the test card until it is back) or permission missing, with the fix",
     ),
-    ("network_env", "device, set?", "Environment that makes one app launch shaped (for simctl: prefix each key with SIMCTL_CHILD_)"),
+    (
+        "network_env",
+        "device, set?",
+        "Environment that makes one app launch shaped; for simctl, prefix each key with SIMCTL_CHILD_ (not on Android: an app starts \
+         from an intent with zygote's environment, and the emulator's NAT shapes the whole device, not one app)",
+    ),
     (
         "console",
         "device, command | commands",
@@ -589,6 +623,12 @@ const ALL_PLATFORMS: &[&str] = &[
     "processes",
     "kill",
     "exec",
+    // Over the emulator's console and adb on Android (#416).
+    "connections",
+    "traffic",
+    "network_shape",
+    "network_state",
+    "network_clear",
     // Android: the guest's /proc and package manager over adb; emu's hardware definitions (#420).
     "settle",
     "profile",

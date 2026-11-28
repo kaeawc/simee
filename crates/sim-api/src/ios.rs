@@ -38,39 +38,6 @@ fn with_proxies<T>(f: impl FnOnce(&mut std::collections::HashMap<String, sim_net
     f(guard.get_or_insert_with(Default::default))
 }
 
-fn profile_from(p: &Value, base: sim_netshape::Profile) -> Result<sim_netshape::Profile, String> {
-    let mut profile = match str_param(p, "preset") {
-        Some(name) => sim_netshape::Profile::preset(name).ok_or_else(|| format!("unknown preset `{name}`"))?,
-        None => base,
-    };
-    let num = |key: &str| p.get(key).and_then(Value::as_u64);
-    if let Some(v) = p.get("offline").and_then(Value::as_bool) {
-        profile.offline = v;
-    }
-    if let Some(v) = num("latency_ms") {
-        profile.latency_ms = v as u32;
-    }
-    if let Some(v) = num("down_kbps") {
-        profile.down_kbps = v as u32;
-    }
-    if let Some(v) = num("up_kbps") {
-        profile.up_kbps = v as u32;
-    }
-    if let Some(v) = num("loss_pct") {
-        profile.loss_pct = (v as u32).min(100);
-    }
-    if let Some(v) = num("port_base") {
-        profile.port_base = u16::try_from(v).map_err(err)?;
-    }
-    if let Some(v) = num("port_count") {
-        profile.port_count = u16::try_from(v).map_err(err)?;
-    }
-    if let Some(rules) = p.get("rules") {
-        profile.rules = serde_json::from_value(rules.clone()).map_err(|e| format!("bad rules: {e}"))?;
-    }
-    Ok(profile)
-}
-
 /// A local port nothing listens on.
 fn closed_port() -> Result<u16, String> {
     let l = std::net::TcpListener::bind("127.0.0.1:0").map_err(err)?;
@@ -1101,7 +1068,8 @@ struct BootPlan {
 #[derive(Debug)]
 pub struct Profile {
     pub name: &'static str,
-    /// launchd labels (in the device's `system` domain) disabled and stopped.
+    /// launchd labels (in the device's `system` domain) disabled and stopped: the labels of the
+    /// profile's table in `sim_core::launchd_profiles`, in order.
     pub disabled: &'static [&'static str],
 }
 
@@ -1121,120 +1089,14 @@ pub struct Profile {
 /// `Disabled` in their own plists; nanoregistrylaunchd enables all 17 each time it runs (one to
 /// three minutes after a boot, measured on iOS 27.2), which is why they came back on every boot.
 /// The profile disables nanoregistrylaunchd itself, and the ones that run once enabled.
-pub const PROFILES: &[Profile] = &[Profile { name: "slim", disabled: SLIM }];
-
-/// The `slim` profile: daemons that burn CPU or memory on an idle booted device and that no
-/// AutoMobile tool needs (measured on iOS 27.2, iPhone 17; see docs/farm.md).
 ///
-/// Kept on purpose: SpringBoard, backboardd, InputUI (the keyboard), AccessibilityUIServer and
-/// the accessibility daemons (AutoMobile reads the screen through accessibility), installd,
-/// lsd and runningboardd (install, launch), tccd (privacy), usernotificationsd, locationd
-/// (`location`), sharingd, webbookmarksd (Safari, `open_url`), assetsd (the photo library),
-/// syslogd/logd (`logs`), configd_sim and nsurlsessiond (networking), and what simee's own
-/// methods reach in the device: carkitd (`carplay`), biometrickitd (`biometric`), apsd (`push`),
-/// securityd (`reset_keychain`), cfprefsd (`defaults_*`, `keyboard_language`), notifyd (`notify`,
-/// `memory_warning`), mediaserverd (audio). Also kept though a slim clone spends 1-6 CPU-s on each
-/// in its first two minutes: donotdisturbd and liveactivitiesd (notification delivery, Live
-/// Activities), AuthenticationServicesAgent (password AutoFill, passkeys), callservicesd
-/// (CallKit), calaccessd (EventKit), mobileassetd (keyboard and font assets), identityservicesd
-/// and diagnosticd (the log stream).
-const SLIM: &[&str] = &[
-    // Lock and home screen wallpapers: PosterBoard and the ~15 poster extensions it keeps alive.
-    "com.apple.PosterBoard",
-    // Widgets.
-    "com.apple.chronod",
-    // Siri, dictation and suggestions.
-    "com.apple.assistantd",
-    "com.apple.assistant_cdmd",
-    "com.apple.siriactionsd",
-    "com.apple.siriinferenced",
-    "com.apple.siriknowledged",
-    "com.apple.sirittsd",
-    "com.apple.siri.context.service",
-    "com.apple.corespeechd",
-    "com.apple.voicebankingd",
-    "com.apple.suggestd",
-    "com.apple.textunderstandingd",
-    "com.apple.generativeexperiencesd",
-    "com.apple.spotlightknowledged.updater",
-    "com.apple.parsecd",
-    // Photo and media analysis.
-    "com.apple.photoanalysisd",
-    "com.apple.mediaanalysisd",
-    // Health, home, fitness. Not sleepd: without it SpringBoard and mobiletimerd retry
-    // `com.apple.sleepd.sleepserver` in a tight loop on every later boot (~350 % of a core, and
-    // the device never settles; measured on iOS 27.2).
-    "com.apple.healthd",
-    "com.apple.homed",
-    "com.apple.homeeventsd",
-    "com.apple.fitnesscoachingd",
-    "com.apple.fitnessintelligenced",
-    // Store, iCloud sync, mail, news, weather, wallet, games, finance.
-    "com.apple.appstored",
-    "com.apple.itunesstored",
-    "com.apple.itunescloudd",
-    "com.apple.amsengagementd",
-    "com.apple.ap.adprivacyd",
-    "com.apple.ap.promotedcontentd",
-    "com.apple.cloudd",
-    "com.apple.email.maild",
-    "com.apple.icloudmailagent",
-    "com.apple.newsd",
-    "com.apple.weatherd",
-    "com.apple.passd",
-    "com.apple.financed",
-    "com.apple.gamed",
-    "com.apple.SafariBookmarksSyncAgent",
-    "com.apple.followupd",
-    "com.apple.remindd",
-    // Location history, maps analytics, people and social. Not carkitd: `carplay` needs it.
-    "com.apple.routined",
-    "com.apple.geoanalyticsd",
-    "com.apple.navd",
-    "com.apple.peopled",
-    "com.apple.sociallayerd",
-    // Screen Time.
-    "com.apple.ScreenTimeAgent",
-    "com.apple.UsageTrackingAgent",
-    "com.apple.FamilyControlsAgent",
-    // Paired-watch and Find My companions: nanoregistrylaunchd enables the paired-watch daemons
-    // (see `PROFILES`); the rest are those that then run on an idle phone.
-    "com.apple.nanoregistrylaunchd",
-    "com.apple.addressbooksyncd",
-    "com.apple.bulletindistributord",
-    "com.apple.pairedsyncd",
-    "com.apple.NPKCompanionAgent",
-    "com.apple.companionappd",
-    "com.apple.wcd",
-    "com.apple.brook.brookcompaniond",
-    "com.apple.findmy.findmylocated",
-    // Experiments, ML hosting and asset prefetch.
-    "com.apple.triald",
-    "com.apple.mlhostd",
-    "com.apple.jetpackassetd",
-    "com.apple.replicatord",
-    "com.apple.diagnosticextensionsd",
-    // What a slim clone still spent its first two minutes on (measured per job, iOS 27.2 and
-    // 18.6; docs/farm.md). App Intents: linkd runs donotdisturbd's Focus-filter first-launch task,
-    // which starts the Calendar, Safari and Messages intents extensions and Calendar itself
-    // 13-38 s after the boot (~8 CPU-s, the burst that held the settle window open).
-    "com.apple.linkd",
-    // Watch faces and settings sync, with no watch paired.
-    "com.apple.nanotimekitcompaniond",
-    "com.apple.nanoprefsyncd.2",
-    // Exchange/CalDAV/CardDAV account sync (no accounts) and Safari's breached-password lookups.
-    "com.apple.dataaccess.dataaccessd",
-    "com.apple.Safari.passwordbreachd",
-    // Fitness: activity sharing, awards, Fitness+ (healthd is off already).
-    "com.apple.activitysharingd",
-    "com.apple.activityawardsd",
-    "com.apple.fitcore",
-    // Focus status sharing, Memoji, Apple Intelligence's model catalog, Family Sharing alerts.
-    "com.apple.StatusKitAgent",
-    "com.apple.avatarsd",
-    "com.apple.modelcatalogd",
-    "com.apple.familynotification",
-];
+/// What each profile turns off, why, what it was measured to save and what breaks without it, and
+/// what is kept on purpose, is data: `sim_core::launchd_profiles` (docs/ios.md, "Launchd job
+/// profiles").
+pub const PROFILES: &[Profile] = &[Profile { name: "slim", disabled: &SLIM }];
+
+/// The `slim` profile's labels, from its table.
+const SLIM: [&str; sim_core::launchd_profiles::SLIM.len()] = sim_core::launchd_profiles::labels(sim_core::launchd_profiles::SLIM);
 
 fn profile(name: &str) -> Result<&'static Profile, String> {
     PROFILES.iter().find(|p| p.name == name).ok_or_else(|| {
@@ -1531,11 +1393,21 @@ fn apply_profile(device: &Device, profile: &Profile, undo: bool) -> Result<Appli
     // has no shell, so each call is its own spawn (~0.1-0.4 s), and `exec` reports no exit
     // status: a failed call is one that printed an error, and the effect is read back from
     // launchd's own lists.
-    let run = |args: &[&str]| device.exec("launchctl", &args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>(), &[]);
+    apply_jobs(profile.disabled, undo, |args| {
+        device.exec("launchctl", &args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>(), &[]).map_err(err)
+    })
+}
+
+/// [`apply_profile`] for `labels` over `run`, one launchctl call (its arguments) at a time.
+fn apply_jobs(
+    labels: &[&str],
+    undo: bool,
+    mut run: impl FnMut(&[&str]) -> Result<sim_coresim::ExecOutput, String>,
+) -> Result<Applied, String> {
     let loaded = if undo { String::new() } else { run(&["list"]).map(|o| o.stdout).unwrap_or_default() };
     let before = if undo { String::new() } else { run(&["print-disabled", "system"]).map(|o| o.stdout).unwrap_or_default() };
-    let todo = if undo { profile.disabled.to_vec() } else { still_on(profile.disabled, &loaded, &before) };
-    let already: Vec<&str> = profile.disabled.iter().copied().filter(|l| !todo.contains(l)).collect();
+    let todo = if undo { labels.to_vec() } else { still_on(labels, &loaded, &before) };
+    let already: Vec<&str> = labels.iter().copied().filter(|l| !todo.contains(l)).collect();
     let mut refused = Vec::new();
     for label in &todo {
         let target = format!("system/{label}");
@@ -1550,8 +1422,8 @@ fn apply_profile(device: &Device, profile: &Profile, undo: bool) -> Result<Appli
     }
     // Nothing changed (a device whose disables were preset before its boot): the listing read
     // before is the one after.
-    let disabled = if todo.is_empty() { before } else { run(&["print-disabled", "system"]).map_err(err)?.stdout };
-    Ok(profile_outcome(profile.disabled, &loaded, &already, &refused, &disabled, undo))
+    let disabled = if todo.is_empty() { before } else { run(&["print-disabled", "system"])?.stdout };
+    Ok(profile_outcome(labels, &loaded, &already, &refused, &disabled, undo))
 }
 
 /// Writes `profile`'s disables into the shut-down device `udid`'s launchd overrides file (see
@@ -2094,7 +1966,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "network_shape" => {
             let d = s.device(p)?;
             let udid = d.info().udid;
-            let profile = profile_from(p, sim_netshape::read_profile(&udid))?;
+            let profile = crate::params::shape_profile(p, sim_netshape::read_profile(&udid))?;
             let use_proxy = p.get("proxy").and_then(Value::as_bool).unwrap_or(true);
             // inject: false | true (launchd setenv: new processes) | "boot" (reboot: every process).
             let inject_mode = match p.get("inject") {
@@ -3875,6 +3747,138 @@ mod tests {
         assert_eq!(still_on(&labels, idle, enabled), labels, "not disabled yet: disabled");
         let r = profile_outcome(&labels, idle, &["com.apple.siri.context.service"], &[], disabled, false);
         assert_eq!(r, Applied { changed: 2, failed: vec![], not_loaded: vec![], already: 1 });
+    }
+
+    /// `boot {profile: "slim"}` as it was when the profile became a table (#199): the same 74
+    /// labels in the same order, each written disabled before the boot. A change to the profile
+    /// changes this pin on purpose, with its evidence in the table.
+    const SLIM_AT_199: &str = "com.apple.PosterBoard com.apple.chronod com.apple.assistantd com.apple.assistant_cdmd \
+        com.apple.siriactionsd com.apple.siriinferenced com.apple.siriknowledged com.apple.sirittsd com.apple.siri.context.service \
+        com.apple.corespeechd com.apple.voicebankingd com.apple.suggestd com.apple.textunderstandingd com.apple.generativeexperiencesd \
+        com.apple.spotlightknowledged.updater com.apple.parsecd com.apple.photoanalysisd com.apple.mediaanalysisd com.apple.healthd \
+        com.apple.homed com.apple.homeeventsd com.apple.fitnesscoachingd com.apple.fitnessintelligenced com.apple.appstored \
+        com.apple.itunesstored com.apple.itunescloudd com.apple.amsengagementd com.apple.ap.adprivacyd com.apple.ap.promotedcontentd \
+        com.apple.cloudd com.apple.email.maild com.apple.icloudmailagent com.apple.newsd com.apple.weatherd com.apple.passd \
+        com.apple.financed com.apple.gamed com.apple.SafariBookmarksSyncAgent com.apple.followupd com.apple.remindd com.apple.routined \
+        com.apple.geoanalyticsd com.apple.navd com.apple.peopled com.apple.sociallayerd com.apple.ScreenTimeAgent \
+        com.apple.UsageTrackingAgent com.apple.FamilyControlsAgent com.apple.nanoregistrylaunchd com.apple.addressbooksyncd \
+        com.apple.bulletindistributord com.apple.pairedsyncd com.apple.NPKCompanionAgent com.apple.companionappd com.apple.wcd \
+        com.apple.brook.brookcompaniond com.apple.findmy.findmylocated com.apple.triald com.apple.mlhostd com.apple.jetpackassetd \
+        com.apple.replicatord com.apple.diagnosticextensionsd com.apple.linkd com.apple.nanotimekitcompaniond com.apple.nanoprefsyncd.2 \
+        com.apple.dataaccess.dataaccessd com.apple.Safari.passwordbreachd com.apple.activitysharingd com.apple.activityawardsd \
+        com.apple.fitcore com.apple.StatusKitAgent com.apple.avatarsd com.apple.modelcatalogd com.apple.familynotification";
+
+    #[test]
+    fn boot_with_the_slim_profile_is_unchanged() {
+        let none = || -> Result<Shapers, String> { Err("unused".into()) };
+        let plan = boot_plan(&json!({"profile": "slim"}), 1, false, none).expect("boot");
+        let slim = plan.profile.expect("a profile");
+        assert_eq!((slim.name, slim.disabled.join(" ")), ("slim", SLIM_AT_199.to_owned()));
+        // What the boot of a shut-down device hands CoreSimulator (no earlier overrides): each disabled.
+        let missing = std::env::temp_dir().join(format!("simee-no-such-{}/disabled.plist", std::process::id()));
+        let jobs = boot_jobs_from(&missing, slim.disabled);
+        assert_eq!(jobs.len(), 74);
+        assert!(jobs.iter().zip(SLIM_AT_199.split(' ')).all(|((label, off), want)| label == want && *off));
+        assert!(boot_plan(&json!({}), 1, false, none).expect("boot").profile.is_none(), "no profile unless named");
+        assert_eq!(boot_plan(&json!({"profile": "lean"}), 1, false, none).expect_err("unknown"), "unknown profile `lean` (slim)");
+    }
+
+    #[test]
+    fn the_table_drives_the_slim_profile() {
+        let slim = profile("slim").expect("slim");
+        let table: Vec<&str> = sim_core::launchd_profiles::SLIM.iter().map(|j| j.label).collect();
+        assert_eq!(slim.disabled, table, "the table's labels, in its order");
+        // Every job a simee method reaches is on the keep list the table is checked against.
+        for (method, jobs) in NEEDED_BY_METHODS {
+            for job in *jobs {
+                assert!(sim_core::launchd_profiles::KEPT.iter().any(|k| k.label == *job), "`{method}` needs {job}: kept");
+            }
+        }
+    }
+
+    /// A device's launchctl as far as a profile uses it: `list`, `print-disabled system`,
+    /// `disable`/`enable`/`bootout system/<label>`, with every call recorded.
+    struct FakeLaunchctl {
+        /// Loaded jobs: label → PID (None: loaded, not running).
+        loaded: std::collections::BTreeMap<String, Option<i32>>,
+        disabled: std::collections::BTreeMap<String, bool>,
+        refuse: Vec<String>,
+        calls: Vec<String>,
+    }
+
+    impl FakeLaunchctl {
+        fn new(loaded: &[&str]) -> Self {
+            let loaded = loaded.iter().enumerate().map(|(i, l)| ((*l).to_owned(), Some(100 + i as i32))).collect();
+            Self { loaded, disabled: Default::default(), refuse: Vec::new(), calls: Vec::new() }
+        }
+
+        fn run(&mut self, args: &[&str]) -> Result<sim_coresim::ExecOutput, String> {
+            self.calls.push(args.join(" "));
+            let out = |stdout: String, stderr: &str| Ok(sim_coresim::ExecOutput { pid: 1, stdout, stderr: stderr.to_owned() });
+            let label = args.get(1).and_then(|t| t.strip_prefix("system/")).unwrap_or_default().to_owned();
+            match args[0] {
+                "list" => {
+                    let rows: String =
+                        self.loaded.iter().map(|(l, pid)| format!("{}\t0\t{l}\n", pid.map_or("-".to_owned(), |p| p.to_string()))).collect();
+                    out(format!("PID\tStatus\tLabel\n{rows}"), "")
+                }
+                "print-disabled" => {
+                    let rows: String = self
+                        .disabled
+                        .iter()
+                        .map(|(l, off)| format!("\t\t\"{l}\" => {}\n", if *off { "disabled" } else { "enabled" }))
+                        .collect();
+                    out(format!("\tdisabled services = {{\n{rows}\t}}\n"), "")
+                }
+                _ if self.refuse.contains(&label) => out(String::new(), "Could not find service in domain for system\n"),
+                "disable" | "enable" => {
+                    self.disabled.insert(label, args[0] == "disable");
+                    out(String::new(), "")
+                }
+                "bootout" => {
+                    self.loaded.remove(&label);
+                    out(String::new(), "Boot-out failed: 5: Input/output error\n")
+                }
+                other => Err(format!("the fake launchctl has no `{other}`")),
+            }
+        }
+
+        fn count(&self, verb: &str) -> usize {
+            self.calls.iter().filter(|c| c.starts_with(&format!("{verb} "))).count()
+        }
+    }
+
+    #[test]
+    fn a_profile_applies_and_undoes_the_tables_jobs_through_launchctl() {
+        let slim = profile("slim").expect("slim");
+        // A fresh clone: every job of the table loaded and running, plus SpringBoard.
+        let mut loaded = slim.disabled.to_vec();
+        loaded.push("com.apple.SpringBoard");
+        let mut lc = FakeLaunchctl::new(&loaded);
+        let r = apply_jobs(slim.disabled, false, |a| lc.run(a)).expect("applied");
+        assert_eq!(r, Applied { changed: 74, failed: vec![], not_loaded: vec![], already: 0 });
+        assert_eq!((lc.count("disable"), lc.count("bootout"), lc.count("enable")), (74, 74, 0));
+        assert!(lc.disabled.values().all(|off| *off) && lc.disabled.len() == 74);
+        assert_eq!(lc.loaded.keys().collect::<Vec<_>>(), ["com.apple.SpringBoard"], "only the table's jobs were stopped");
+
+        // Applied again on a later boot where nothing came back: two reads, no spawn per job.
+        lc.calls.clear();
+        let r = apply_jobs(slim.disabled, false, |a| lc.run(a)).expect("again");
+        assert_eq!((r.changed, r.already, r.failed.len()), (74, 74, 0));
+        assert_eq!(lc.calls, ["list", "print-disabled system"]);
+
+        // Undo enables each of the table's jobs (they run from the next boot) and stops none.
+        lc.calls.clear();
+        let r = apply_jobs(slim.disabled, true, |a| lc.run(a)).expect("undone");
+        assert_eq!(r.to_json(true), json!({"enabled": 74, "failed": []}));
+        assert_eq!((lc.count("enable"), lc.count("disable"), lc.count("bootout")), (74, 0, 0));
+        assert!(lc.disabled.values().all(|off| !*off));
+
+        // A job launchctl refuses is reported, the rest still applied.
+        let mut lc = FakeLaunchctl::new(&loaded);
+        lc.refuse.push("com.apple.linkd".to_owned());
+        let r = apply_jobs(slim.disabled, false, |a| lc.run(a)).expect("applied");
+        assert_eq!((r.changed, r.failed), (73, vec!["com.apple.linkd".to_owned()]));
     }
 
     #[test]

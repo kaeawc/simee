@@ -104,12 +104,6 @@ impl Adb {
         Ok(after)
     }
 
-    /// The device's API level (`ro.build.version.sdk`).
-    pub fn api_level(&self) -> Result<u32, String> {
-        let out = self.shell("getprop ro.build.version.sdk", self.deadlines.query)?;
-        out.trim().parse().map_err(|_| failure("getprop ro.build.version.sdk", &out))
-    }
-
     /// Mutes (or unmutes) the media stream, then reads back whether it is muted.
     pub fn set_media_mute(&self, on: bool) -> Result<bool, String> {
         // `cmd audio` on API 33 and 34 prints nothing and exits 0 for a command it doesn't know, and

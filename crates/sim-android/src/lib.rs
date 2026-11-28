@@ -16,6 +16,7 @@ pub mod display;
 pub mod files;
 pub mod host;
 pub mod listing;
+pub mod net;
 pub mod procs;
 pub mod profile;
 pub mod settle;
