@@ -23,7 +23,9 @@ Two scripts produce everything below; nothing here was typed from memory.
   quiet-host gate before the build and before every round of boots, and exits 4 when the host stays
   busy (`BENCH_QUIET_WAIT`, 300 s). Without #468's `lib.sh` it falls back to one check, a 1-minute
   load below 0.5 per CPU; `--no-quiet-gate` runs anyway with a warning, for numbers that are not
-  published. Tested here by loading all 4 CPUs (1-minute load 7.7): it refuses with exit 4 and the
+  published. #468 has merged; the runs below used the fallback (they ran before the rebase onto it),
+  and a smoke run on the rebased tree passed the shared gate (`Quiet gate: passed`, and a host
+  record with `thermal: unavailable`, no sensors in a VM). The fallback was tested here by loading all 4 CPUs (1-minute load 7.7): it refuses with exit 4 and the
   message. The host profile is written at the start and the end of every run beside the results.
 
 ## The host measured: a Hive worker VM
