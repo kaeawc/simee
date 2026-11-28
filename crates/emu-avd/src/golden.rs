@@ -184,7 +184,9 @@ impl Env {
     /// path, size, inode and modification and change times: an image is multi-gigabyte, and
     /// hashing it takes as long as reading it from disk (20 s of a 25 s `-create-avd` that finds a
     /// golden). Any write to the file changes its change time, which a program can't set back, so
-    /// an edited file is hashed again; a remembered hash that doesn't look like one is ignored.
+    /// an edited file is hashed again; a remembered hash that doesn't look like one is ignored. A change
+    /// time has the kernel's tick granularity, so a same-length edit in the very tick of the last
+    /// change (and the old modification time put back) is the one edit this can't see.
     fn image_file_hash(&self, path: &Path) -> Result<String> {
         let io = |p: &Path, e| Error::Io(p.to_path_buf(), e);
         let meta = std::fs::metadata(path).map_err(|e| io(path, e))?;
@@ -465,9 +467,35 @@ mod tests {
         (tmp, env)
     }
 
+    /// Waits until the kernel's coarse file clock has moved past `path`'s change time, so a write
+    /// after this call gets a different one. A change time has the granularity of a kernel tick
+    /// (several ms), and an edit in the same tick as the last change leaves the stamp as it was:
+    /// the tests that edit a file in place must not depend on how fast the host is.
+    fn tick_past(path: &Path) {
+        use std::os::unix::fs::MetadataExt;
+        let probe = path.with_extension("tick");
+        let ctime = |p: &Path| {
+            let m = std::fs::metadata(p).expect("meta");
+            (m.ctime(), m.ctime_nsec())
+        };
+        let before = ctime(path);
+        for _ in 0..10_000 {
+            std::fs::write(&probe, b"tick").expect("probe");
+            if ctime(&probe) != before {
+                let _ = std::fs::remove_file(&probe);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the file clock didn't move past {before:?}");
+    }
+
     fn install_image(env: &Env, rev: &str, system: &str) {
         let sys = env.sdk_root.as_deref().expect("sdk").join(SYSDIR);
         std::fs::create_dir_all(&sys).expect("mkdir");
+        if sys.join("system.img").exists() {
+            tick_past(&sys.join("system.img"));
+        }
         for f in IMAGE_FILES {
             std::fs::write(sys.join(f), if f == "system.img" { system.as_bytes() } else { f.as_bytes() }).expect("image file");
         }
@@ -706,9 +734,19 @@ mod tests {
         let system = env.sdk_root.as_deref().expect("sdk").join(SYSDIR).join("system.img");
         let mtime = std::fs::metadata(&system).expect("meta").modified().expect("mtime");
         let len = std::fs::metadata(&system).expect("meta").len() as usize;
+        tick_past(&system);
         std::fs::write(&system, vec![b'x'; len]).expect("edit");
         File::options().write(true).open(&system).expect("open").set_modified(mtime).expect("mtime back");
-        assert_ne!(env.golden_key(&a).expect("edited").image, first.image);
+        let edited = env.golden_key(&a).expect("edited");
+        assert_ne!(edited.image, first.image);
+        // A change of length is seen with no help from the clocks: the same modification time
+        // and a file a byte longer is another image.
+        let mtime = std::fs::metadata(&system).expect("meta").modified().expect("mtime");
+        let mut longer = vec![b'x'; len + 1];
+        longer[0] = b'y';
+        std::fs::write(&system, longer).expect("grow");
+        File::options().write(true).open(&system).expect("open").set_modified(mtime).expect("mtime back");
+        assert_ne!(env.golden_key(&a).expect("grown").image, edited.image);
         let _ = std::fs::remove_dir_all(tmp);
     }
 
