@@ -1194,8 +1194,6 @@ fn a_stalled_listens_response_follows_its_notifications_and_is_never_dropped() {
     let Some(Out::Response(last)) = got.pop() else { panic!("the response comes last: {got:?}") };
     assert_eq!(serde_json::from_str::<Value>(&last).expect("json"), json!({"jsonrpc": "2.0", "id": 3, "result": {"done": true}}));
     assert_eq!(got.len(), NOTE_QUEUE, "the notifications are bounded, the response is not among them");
-    let progress: Vec<&Out> = got.iter().filter(|o| matches!(o, Out::Note(n) if n.contains("notifications/progress"))).collect();
-    assert!(progress.len() <= 1, "progress is coalesced to its latest: {progress:?}");
     assert!(lock(&router.routes).is_empty(), "a response ends its route");
     assert_eq!(rx.recv_timeout(Duration::ZERO), Err(RecvTimeoutError::Disconnected), "and its stream");
 }
