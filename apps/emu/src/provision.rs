@@ -53,7 +53,10 @@ pub fn provision(env: &Env, api: &str, opts: &Opts) -> Result<()> {
     let sdk = sdk(env)?;
     let tag = opts.tag.as_deref().unwrap_or(DEFAULT_TAG);
     let abi = opts.abi.as_deref().unwrap_or(DEFAULT_ABI);
-    // Refuse before a multi-gigabyte download, not after.
+    // Refuse before a multi-gigabyte download, not after (also under -dry-run, which says so).
+    if let Some(profile) = &opts.profile {
+        emu_avd::check_profile(profile, tag)?;
+    }
     if let Some(name) = &opts.create_avd
         && (env.avd_home.join(format!("{name}.avd")).exists() || env.avd_home.join(format!("{name}.ini")).exists())
     {
@@ -208,4 +211,28 @@ fn install_renderer(sdk: &Sdk, opts: &Opts, update: bool) -> Result<()> {
         emu_sdk::format_size(d.size)
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts(line: &str) -> Opts {
+        crate::args::parse(line.split(' ').map(String::from)).expect("parse")
+    }
+
+    #[test]
+    fn a_profile_the_tag_refuses_is_refused_before_anything_is_fetched() {
+        let root = std::env::temp_dir().join(format!("emu-provision-profile-{}", std::process::id()));
+        let env = Env { sdk_root: Some(root.join("sdk")), avd_home: root.join("avd") };
+        for dry in ["", " -dry-run"] {
+            let line = format!("-provision 34 -tag android-tv -create-avd tv -profile software-lite{dry}");
+            let err = provision(&env, "34", &opts(&line)).expect_err("a TV has no screen to shrink").to_string();
+            assert!(err.contains("software-lite") && err.contains("android-tv"), "{err}");
+        }
+        // No manifest was fetched and nothing was installed: the SDK directory has no files.
+        let files = |d: &std::path::Path| std::fs::read_dir(d).map(|r| r.count()).unwrap_or(0);
+        assert_eq!(files(&root.join("sdk")), 0, "nothing under the SDK");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -165,6 +165,7 @@ emu -provision 34 -tag android-automotive               # no plain 34 image: pic
 emu -provision-renderer                                 # install or update just the renderer
 emu -create-avd NAME -sysdir system-images/android-36/google_apis/arm64-v8a -lcd 720x1280@320
 emu -create-avd NAME -sysdir ... -no-golden             # a pristine first boot: no golden user data
+emu -create-avd NAME -sysdir ... -profile software-lite # a phone for software mode: 540x960, 30 Hz (below)
 ```
 
 `-create-avd` (and `-provision ... -create-avd`) also keeps one settled "golden" user data per
@@ -265,7 +266,8 @@ emu -avd phone -accel off   # TCG even where /dev/kvm is usable (-accel on: KVM 
   natively there.
 
 - **Host:** x86_64 Linux with QEMU 11.1 or newer and the SDK's Linux renderer
-  (`emu -provision-renderer`); no GPU. The smallest host it has run on is 4 cores and 8 GiB.
+  (`emu -provision-renderer`); no GPU. The smallest host it has run on is 4 cores and 3.8 GiB (a
+  3.3 GiB cgroup limit), with a 1.5 GB guest (emu and QEMU at 2.3 GB PSS); the research host had 8 GiB.
   QEMU's peak RSS is about 3 GB for a 2 GB guest, and emu's about 0.25 GB (measured under TCG).
 - **What runs where:** `emu_vmm::soft` builds QEMU's command line for stock's x86 board, serves
   every device but the disks, and supervises QEMU. QEMU resets the machine itself when the guest
@@ -298,6 +300,29 @@ emu -avd phone -accel off   # TCG even where /dev/kvm is usable (-accel on: KVM 
   `hw.lcd.vsync=30` in the AVD's `config.ini` (emu honours it as stock does) settles 0.12 cores
   lower, with no frames lost at software mode's rate
   ([benchmarks](benchmarks.md#software-mode-through-emu--avd)).
+- **The software-lite profile** (`emu -create-avd NAME -sysdir system-images/android-36/default/x86_64
+  -profile software-lite`, also with `-provision … -create-avd`): a 540x960 screen at 240 dpi and
+  `hw.lcd.vsync=30` together, for hosts where the guest and SwiftShader share a few cores. Measured
+  against the default 720x1280 at 60 Hz on one 4-vCPU host (2026-11-28, median of 3 warm boots
+  each, [benchmarks](benchmarks.md#software-mode-a-smaller-screen-and-30-hz)):
+
+  | | default | software-lite |
+  | --- | --- | --- |
+  | Idle host CPU | 0.59 cores | 0.53 (30 Hz alone: 0.49) |
+  | Host CPU while swiping | 2.43 cores | 2.01 (the screen alone: 2.15) |
+  | Launcher frames in 20 swipes, warm / cold | 185 / 121 | 185 / 118 (the same) |
+  | p90 frame time | 300 ms | 200 ms |
+  | Warm boot to `sys.boot_completed` | 169.8 s | 181.9 s (spreads overlap) |
+  | Memory (PSS) | 2868 MB | 2828 MB (no real change) |
+
+  The two halves do not add: 30 Hz is what lowers the idle cost and the smaller screen is what
+  lowers the swiping cost and frame times, and the profile gets about a tenth less idle CPU and
+  about 17% less swiping CPU, with no more frames and no faster boot or less memory. It is
+  opt-in because apps see the smaller, slower display; a default AVD stays 720x1280 at 60 Hz. It
+  applies to phone images only (the other form factors have screens of their own and are refused),
+  RAM and vCPUs stay as `-memory` and `-cores` say, and an explicit `-lcd` wins over its screen. An image's
+  golden user data is keyed by screen size, so the first software-lite AVD of an image boots once
+  to settle its own golden. `scripts/bench/software-profile.sh --arms "default lcd540 vsync30 lite shipped"` reproduces the table (the software-lite column is its `shipped` arm).
 - **KFENCE sampling off** (`kfence.sample_interval=0` on the x86 board's command line). These
   kernels build KFENCE with static keys, so every 500 ms its sampler flips a branch inside every
   slab allocation, live-patching kernel text through an `int3`. Under multi-threaded TCG another

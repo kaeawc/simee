@@ -102,6 +102,10 @@ fn main() -> ExitCode {
 /// image's golden user data (`golden.rs`) unless `-no-golden`.
 fn create_avd(env: &emu_avd::Env, name: &str, sysdir: &str, opts: &args::Opts) -> Result<()> {
     let mut spec = emu_avd::NewAvd::for_image(name, sysdir);
+    // The profile first, so an explicit -lcd, -cores or -memory still wins over it.
+    if let Some(profile) = &opts.profile {
+        spec = spec.with_profile(profile)?;
+    }
     if let Some(lcd) = opts.lcd {
         spec.lcd = lcd;
     }

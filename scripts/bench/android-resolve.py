@@ -2,7 +2,7 @@
 """Android device resolution: the time a call spends finding its device (#256).
 
     python3 -I scripts/bench/android-resolve.py [--avds N] [--running N] [--calls N] [--baseline SIMEE]
-        [--simee BIN] [--rounds N] [--quick] [--out DIR]
+        [--simee BIN] [--rounds N] [--quick] [--no-quiet-gate] [--out DIR]
     python3 -I scripts/bench/android-resolve.py --make-home DIR [--avds N]
 
 Builds a private SDK and AVD home with --avds AVDs (default 44: phones, tablets, watches, TVs and
@@ -240,6 +240,7 @@ def main():
     p.add_argument('--simee')
     p.add_argument('--rounds', type=int, default=3)
     p.add_argument('--quick', action='store_true')
+    p.add_argument('--no-quiet-gate', action='store_true', help='skip the quiet-host gate (a smoke run; its numbers are not published)')
     p.add_argument('--make-home')
     p.add_argument('--out', default=os.path.join(REPO, 'bench', 'results'))
     a = p.parse_args()
@@ -250,6 +251,7 @@ def main():
         return 0
     rounds = 1 if a.quick else a.rounds
     n = 10 if a.quick else a.calls
+    summarize.quiet_gate(a.no_quiet_gate)
     host_start = summarize.host()
     simee = a.simee
     if not simee:

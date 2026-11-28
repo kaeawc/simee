@@ -84,6 +84,15 @@ dependency that a hot loop in `emu` or `simee` calls into belongs on that list, 
 gets slow. The desktop's `cargo test` builds Rune unoptimized too; its `cargo build`/`run` keep
 opt-level 2. Numbers and what was tried are in [benchmarks.md](benchmarks.md#build-times-local).
 
+## Benchmarks
+
+Every script under `scripts/bench/` waits for a quiet host (`scripts/bench/quiet.sh`) before it
+measures, refuses with exit status 4 and a list of what is busy when the host stays busy, and writes
+a host record beside its results. `--no-quiet-gate` skips the gate for a smoke run, and `run-all.sh
+--quiet` is the run whose numbers get published. The protocol, the record's fields and the noise
+budgets are in [research/bench-protocol.md](research/bench-protocol.md); its tests are
+`scripts/bench/test-quiet.sh`, `test-run-all.sh` and `test-renderers.sh`, which need no device.
+
 ## Harness
 
 [auto-mobile](https://github.com/kaeawc/auto-mobile) maps both the public and private Apple
