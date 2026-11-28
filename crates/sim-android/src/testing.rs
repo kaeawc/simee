@@ -227,7 +227,7 @@ impl FakeAdb {
 
     /// Makes the fake answer as another kind of image from now on: `api34` (its `cmd audio` has
     /// no `adj-mute`), `old-media` (no `cmd media_session volume`: only the `media` tool, as on
-    /// API 29).
+    /// API 29), `fixed-volume` (a volume set is ignored), `mute-ignored` (so is a mute).
     pub fn image(&self, kind: &str) {
         std::fs::write(self.log.with_file_name(kind), b"").expect("image flag");
     }
@@ -278,7 +278,7 @@ volume_ctrl() {
         printf '[V] will set volume\n[V] will get volume\n[V] Connecting to AudioService\n'
         echo "Error: invalid volume index $n for stream 3 (should be in [0..25])" >&2; return 0
       fi
-      echo "$n" > "$here/music.volume"; printf '[V] will set volume\n';;
+      [ -e "$here/fixed-volume" ] || echo "$n" > "$here/music.volume"; printf '[V] will set volume\n';;
     *) echo "fake adb: unhandled volume: $1" >&2; return 2;;
   esac
   printf '[V] will get volume\n[V] Connecting to AudioService\n[V] volume is %s in range [0..25]\n' "$(music_volume)"
@@ -382,10 +382,12 @@ shell)
       if [ ! -e "$here/old-media" ]; then echo "/system/bin/sh: media: inaccessible or not found" >&2; exit 127; fi
       volume_ctrl "${2#media volume }";;
     "dumpsys audio") dumpsys_audio;;
-    # `cmd audio adj-mute` arrived in API 35; API 34's AudioManagerShellCommand doesn't know it.
+    "getprop ro.build.version.sdk") if [ -e "$here/api34" ]; then echo 34; else echo 36; fi;;
+    # `cmd audio adj-mute` arrived in API 35. AOSP 13 and 14's AudioManagerShellCommand has no
+    # default case: an unknown command prints nothing and exits 0.
     "cmd audio adj-mute 3"|"cmd audio adj-unmute 3")
       verb=${2#cmd audio }; verb=${verb% 3}
-      if [ -e "$here/api34" ]; then echo "Unknown command: $verb"; exit 255; fi
+      if [ -e "$here/api34" ] || [ -e "$here/mute-ignored" ]; then exit 0; fi
       if [ "$verb" = adj-mute ]; then touch "$here/music.muted"; else rm -f "$here/music.muted"; fi;;
     # Every other signal succeeds, and is only logged: the fake never signals a host process.
     "kill -"*) ;;

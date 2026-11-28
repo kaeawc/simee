@@ -20,7 +20,8 @@ pub struct Stream {
     /// The index the stream plays at now (its device's), `None` when the dump doesn't say.
     pub volume: Option<u32>,
     pub min: u32,
-    pub max: u32,
+    /// `None` when the dump has no `Max:` line.
+    pub max: Option<u32>,
     /// The output devices it plays on now (`speaker`).
     pub devices: Vec<String>,
 }
@@ -93,11 +94,33 @@ impl Adb {
     pub fn set_media_volume(&self, level: u8) -> Result<Volume, String> {
         let now = self.media_volume()?;
         let index = index_for(level, now.min, now.max);
-        self.volume_ctrl(&format!("--stream {MUSIC} --set {index} --get"))
+        let after = self.volume_ctrl(&format!("--stream {MUSIC} --set {index} --get"))?;
+        if after.index != index {
+            return Err(format!(
+                "the media volume didn't change: asked for index {index} of {}..{}, it is {} (a fixed-volume device, or a cap on the stream)",
+                after.min, after.max, after.index
+            ));
+        }
+        Ok(after)
+    }
+
+    /// The device's API level (`ro.build.version.sdk`).
+    pub fn api_level(&self) -> Result<u32, String> {
+        let out = self.shell("getprop ro.build.version.sdk", self.deadlines.query)?;
+        out.trim().parse().map_err(|_| failure("getprop ro.build.version.sdk", &out))
     }
 
     /// Mutes (or unmutes) the media stream, then reads back whether it is muted.
     pub fn set_media_mute(&self, on: bool) -> Result<bool, String> {
+        // `cmd audio` on API 33 and 34 prints nothing and exits 0 for a command it doesn't know, and
+        // earlier images have no such shell command, so only API 35 on is sent the command.
+        let api = self.api_level()?;
+        if api < 35 {
+            return Err(format!(
+                "muting needs Android 15 (API 35) or later: this image is API {api}, whose `cmd audio` has no adj-mute \
+                 and which has no shell command that mutes a stream"
+            ));
+        }
         let command = format!("cmd audio {} {MUSIC}", if on { "adj-mute" } else { "adj-unmute" });
         let (ok, text) = self.run(&["shell", &command], self.deadlines.query)?;
         if text.contains("Unknown command") || text.contains("No shell command implementation") {
@@ -111,7 +134,11 @@ impl Adb {
             return Err(failure(&command, &text));
         }
         let state = self.audio_state()?;
-        state.stream("music").map(|s| s.muted).ok_or_else(|| "`dumpsys audio` doesn't list STREAM_MUSIC".to_owned())
+        let muted = state.stream("music").map(|s| s.muted).ok_or("`dumpsys audio` doesn't list STREAM_MUSIC")?;
+        if muted != on {
+            return Err(format!("`{command}` ran, but the media stream is still {}", if muted { "muted" } else { "not muted" }));
+        }
+        Ok(muted)
     }
 
     /// What `dumpsys audio` says about the streams, the ringer and focus.
@@ -120,6 +147,9 @@ impl Adb {
         let state = parse_dumpsys(&out);
         if state.streams.is_empty() {
             return Err(failure("dumpsys audio", "no stream volumes in its output"));
+        }
+        if state.stream("music").is_some_and(|m| m.max.is_none()) {
+            return Err(failure("dumpsys audio", "STREAM_MUSIC has no `Max:` line"));
         }
         Ok(state)
     }
@@ -196,8 +226,10 @@ fn parse_streams<'a>(lines: &mut std::iter::Peekable<impl Iterator<Item = &'a st
     while let Some(line) = lines.next_if(|l| l.trim().is_empty() || l.starts_with(' ') || l.starts_with("- STREAM_")) {
         let t = line.trim();
         if let Some(name) = t.strip_prefix("- STREAM_").and_then(|n| n.strip_suffix(':')) {
+            // Newer images print `STREAM_SYSTEM (aliased to: STREAM_RING):`.
+            let name = name.split(' ').next().unwrap_or(name);
             finish(&mut streams, &mut current);
-            streams.push(Stream { name: name.to_ascii_lowercase(), muted: false, volume: None, min: 0, max: 0, devices: Vec::new() });
+            streams.push(Stream { name: name.to_ascii_lowercase(), muted: false, volume: None, min: 0, max: None, devices: Vec::new() });
             continue;
         }
         let Some(s) = streams.last_mut() else { continue };
@@ -206,7 +238,7 @@ fn parse_streams<'a>(lines: &mut std::iter::Peekable<impl Iterator<Item = &'a st
         } else if let Some(v) = t.strip_prefix("Min:") {
             s.min = number(v).unwrap_or(0);
         } else if let Some(v) = t.strip_prefix("Max:") {
-            s.max = number(v).unwrap_or(0);
+            s.max = number(v);
         } else if let Some(v) = t.strip_prefix("streamVolume:") {
             s.volume = number(v);
         } else if let Some(v) = t.strip_prefix("Current:") {
@@ -264,7 +296,7 @@ mod tests {
         assert_eq!(parse_volume("[V] volume is x in range [0..25]"), None);
     }
 
-    /// An API 29 dump: no `Min:` or `streamVolume:`, devices without their codes.
+    /// A dump without `Min:` or `streamVolume:`, devices without their codes.
     #[test]
     fn an_older_dump_takes_the_index_of_the_device_it_plays_on() {
         let dump = "Stream volumes (device: index)\n- STREAM_MUSIC:\n   Muted: true\n   Max: 15\n   \
@@ -273,11 +305,20 @@ mod tests {
         let state = parse_dumpsys(dump);
         assert_eq!(
             state.streams[0],
-            Stream { name: "music".into(), muted: true, volume: Some(9), min: 0, max: 15, devices: vec!["speaker".into()] }
+            Stream { name: "music".into(), muted: true, volume: Some(9), min: 0, max: Some(15), devices: vec!["speaker".into()] }
         );
         assert_eq!(state.streams[1].volume, None, "no index for the device it plays on");
         assert_eq!(state.streams.len(), 2, "the section ends at the first line outside a stream");
         assert_eq!((state.ringer_mode, state.focus), (None, vec![]));
+    }
+
+    #[test]
+    fn aliased_stream_names_are_cut_and_a_missing_max_is_kept() {
+        let dump = "Stream volumes (device: index)\n- STREAM_SYSTEM (aliased to: STREAM_RING):\n   Muted: false\n   Max: 7\n   \
+                    Devices: speaker\n- STREAM_MUSIC:\n   Muted: false\n   Devices: speaker\n";
+        let state = parse_dumpsys(dump);
+        assert_eq!(state.streams[0].name, "system");
+        assert_eq!((state.streams[0].max, state.streams[1].max), (Some(7), None));
     }
 
     #[test]

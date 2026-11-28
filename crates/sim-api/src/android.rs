@@ -214,7 +214,7 @@ fn audio(android: &Android, d: &sim_android::Device, method: &str, p: &Value) ->
                 state.focus.iter().map(|f| json!({"package": f.package, "uid": f.uid, "gain": f.gain, "client": f.client})).collect();
             Ok(json!({
                 "settings": {
-                    "volume": music.and_then(|m| Some(sim_android::audio::level(m.volume?, m.min, m.max))),
+                    "volume": music.and_then(|m| Some(sim_android::audio::level(m.volume?, m.min, m.max?))),
                     "streams": streams,
                     "ringer_mode": state.ringer_mode,
                     "focus": focus,
@@ -838,7 +838,7 @@ mod tests {
     fn audio_mute_mutes_the_media_stream_and_reads_it_back() {
         let (mut s, root, adb, _emulator) = session("audiomute");
         assert_eq!(run(&mut s, "audio_mute", json!({"on": true})), Ok(json!({"muted": true})));
-        assert_eq!(adb.calls(), ["shell cmd audio adj-mute 3", "shell dumpsys audio"]);
+        assert_eq!(adb.calls(), ["shell getprop ro.build.version.sdk", "shell cmd audio adj-mute 3", "shell dumpsys audio"]);
         assert_eq!(run(&mut s, "audio_state", json!({})).expect("state")["muted"], json!(true));
         assert_eq!(run(&mut s, "audio_mute", json!({"on": false})), Ok(json!({"muted": false})));
         assert_eq!(run(&mut s, "audio_state", json!({})).expect("state")["muted"], json!(false));
@@ -853,10 +853,23 @@ mod tests {
         let (mut s, root, adb, _emulator) = session("audio34");
         adb.image("api34");
         let err = run(&mut s, "audio_mute", json!({"on": true})).expect_err("no adj-mute");
-        assert!(err.contains("API 35") && err.contains("adj-mute"), "{err}");
+        assert!(err.contains("API 35") && err.contains("API 34"), "{err}");
+        assert!(!adb.calls().iter().any(|c| c.contains("adj-mute")), "refused before sending it: {:?}", adb.calls());
         // The volume and the state still work there.
         assert_eq!(run(&mut s, "audio_volume", json!({"level": 40})), Ok(Value::Null));
         assert_eq!(run(&mut s, "audio_state", json!({})).expect("state")["muted"], json!(false));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_volume_or_mute_that_does_not_apply_is_an_error() {
+        let (mut s, root, adb, _emulator) = session("audionoapply");
+        adb.image("fixed-volume");
+        let err = run(&mut s, "audio_volume", json!({"level": 40})).expect_err("not applied");
+        assert!(err.contains("didn't change"), "{err}");
+        adb.image("mute-ignored");
+        let err = run(&mut s, "audio_mute", json!({"on": true})).expect_err("not applied");
+        assert!(err.contains("still not muted"), "{err}");
         std::fs::remove_dir_all(root).ok();
     }
 
