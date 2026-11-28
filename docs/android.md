@@ -400,16 +400,23 @@ so far, and what it doesn't:
   binder_linux` gives an empty one), memfd, the unified cgroup hierarchy, user namespaces (also for
   root: the container's process runs unprivileged), and, for an unprivileged user, `newuidmap` and
   `newgidmap` with a 65,536-id range in `/etc/subuid` and `/etc/subgid`; overlayfs on Linux 5.11
-  or newer (`userxattr`). Reported but not blocking: cgroup memory/cpu/pids controllers, DMA-BUF
+  or newer (`userxattr`); and a way to give the container a network namespace of its own: `ip`,
+  plus `pasta` or `slirp4netns` with `/dev/net/tun`, or root for a veth pair. Reported but not blocking: cgroup memory/cpu/pids controllers, DMA-BUF
   heaps. Each missing piece prints its fix.
 - **Image.** One pinned image: `redroid/redroid:15.0.0_64only-250627`, by per-architecture
   manifest digest and layer digest (`image.rs`). It is downloaded only when asked (`skopeo copy` of
   the manifest by digest) and every blob is hashed against the pin before it is unpacked.
-- **Launcher.** `unshare` into new user, mount, pid, uts, ipc and cgroup namespaces (not network).
-  Container root is never host root: an unprivileged user is their own container root with their
-  `/etc/subuid` range above it (`newuidmap`); run as host root, the container's process drops to a
+- **Launcher.** `unshare` into new user, mount, pid, uts, ipc, cgroup and network namespaces.
+  Container root is never host root and never the launching user: an unprivileged user's container
+  ids are their `/etc/subuid` range (`newuidmap`), so container root is its first subordinate id
+  and the user's own uid is not in the map; run as host root, the container's process drops to a
   range of its own (root's `/etc/subuid` range, else 2,000,000,000 + 65,536) before it creates the
-  namespace, and the state directory is handed to that range. The script mounts an overlay of the
+  namespace. Either way the state directory is handed to that range. The unprivileged process has
+  an uid the map doesn't contain, so `unshare --keep-caps` keeps its capabilities across `exec`
+  and the helper's `become-root` waits for the maps, clears the supplementary groups and becomes
+  uid and gid 0 before the script runs. `chown` and `rm` on the container's files run in a short
+  admin namespace where the user is root and container id `n` is id `n + 1` (no guest code runs
+  there; the user's uid appears in that map only). The script mounts an overlay of the
   unpacked image over a per-device writable layer, a `/dev` tmpfs with the nodes Redroid's init
   expects, binderfs (checked for the three devices, linked at `/dev/*`), `/proc` with runc's masked
   and read-only paths (`kcore`, `/proc/sys`, `sysrq-trigger`...), and the host's `/sys` with every
@@ -419,20 +426,48 @@ so far, and what it doesn't:
   `emu` itself under a hidden subcommand (`helper::main`) or the crate's `simee-container-helper`
   binary, and it also sets `PR_SET_PDEATHSIG` so a crashed `emu` takes the container down with it
   (start containers from a thread that outlives them: the kernel ties the signal to the thread);
-  dropping a `Container` kills it. Removing a rootfs the container made runs `rm` inside the
+  dropping a `Container` kills it. Removing a rootfs the container made runs `rm` in the admin
   namespace.
+- **Network and adb (`net.rs`).** The pinned image's adbd listens on port 5555 on every address and
+  the image ships with adb authentication off (`ro.adb.secure=0`, in
+  `/system_ext/etc/build.prop`: "GSI always disables adb authentication"; `ro.secure=1`,
+  `ro.debuggable=1`; read from the pinned layer, 2026-11-28), and Redroid's own docs say never to
+  expose the port on a public network. So the container's namespace is its own and the host
+  reaches adb through `127.0.0.1:<port>` only, with nothing in the host's namespace listening on a
+  non-loopback address. Uplink, in order: `pasta` (attached to the container's namespaces by pid,
+  `eth0` named as Redroid's init expects, one `-t 127.0.0.1/<port>:5555` rule and every other
+  direction off: `-T none -U none -u none --no-map-gw`, because pasta's defaults forward every port the
+  guest binds on every host address and splice the guest's loopback to the host's), then
+  `slirp4netns` (`--disable-host-loopback`; the forward is added through its API socket), then,
+  for root, a veth pair (a /30 from 100.64.0.0/10 per container, a proxy thread on the loopback
+  port). Root prefers pasta to the veth pair because it gives the guest an uplink without changing
+  the host's routing or firewall. The veth pair has no uplink (the guest reaches the host's end of
+  the pair and nothing further; services the host binds on all addresses are reachable from it
+  there). Authentication: `AdbAuth::Keys` sets `ro.adb.secure=1` as an init argument and writes the
+  host's `adbkey.pub` lines to `/data/misc/adb/adb_keys` before the container starts;
+  `AdbAuth::Disabled` keeps the image's setting, which leaves the loopback port open to every
+  local user. The caller chooses; there is no default.
 - **Verified:** the plan, the script, the probe and the selection against fake hosts; and on a Linux
   VM without binder, as root and as an unprivileged user, a real user namespace with the id maps,
   the overlay, `/dev`, devpts, `/proc` and its masks, `/sys` read-only throughout, and the pivot:
   the container's mount table has the overlay as its only root, no host device, no path to the
   host's files, and uid 0 maps to a non-zero host id; setup stops at binderfs with its message
   there. Also that a helper's child dies when its parent is killed, and that a tree owned by
-  subordinate ids is removed from inside the namespace.
+  subordinate ids is removed from inside the namespace. Unprivileged, container root maps to the
+  first subordinate id (`0 165536 65536`, not the user's uid), the process is uid 0, gid 0 with no
+  groups, and the unpack and removal go through the admin namespace. As root, with the veth pair
+  (this VM has no `/dev/net/tun`): the guest's namespace differs from the host's, it has only `lo`
+  and `eth0`, the host listens on the adb port on `127.0.0.1` and nowhere else, a connection from
+  the host reaches a listener in the guest over the pair, and the listener is gone when the
+  container stops.
 - **Not verified:** a boot. No binder host has run this launcher, so whether Redroid's `/init`
-  starts unprivileged in this namespace set, and how long it takes, are open. It is not wired into
-  `emu` yet, so nothing boots through it; there is no display, input or console for it, no
-  network namespace (adbd listens on the host's port 5555, so one container per host), no cgroup
-  limits, and no `docs/benchmarks.md` row (nothing measured). `SIMEE_E2E_CONTAINER=1 cargo
+  starts unprivileged in this namespace set (as a subordinate id, with `eth0` configured by the
+  uplink), and how long it takes, are open; so is whether `ro.adb.secure=1` as an init argument
+  overrides the image's `ro.adb.secure=0` and whether adbd reads the seeded key under the image's
+  SELinux labels. pasta and slirp4netns were not run end to end (no `/dev/net/tun` on the VM):
+  their command lines are asserted as data and pasta's accepted the flags and printed the one
+  loopback rule. It is not wired into `emu` yet, so nothing boots through it; there is no display,
+  input or console for it, no cgroup limits, and no `docs/benchmarks.md` row (nothing measured). `SIMEE_E2E_CONTAINER=1 cargo
   nextest run -p simee-emu-container` runs the namespace tests against the host's kernel;
   `cargo run -p simee-emu-container --example probe` prints what a host offers.
 

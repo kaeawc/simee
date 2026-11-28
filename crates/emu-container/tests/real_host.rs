@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use simee_emu_container::launch::{self, Display, GpuMode, Helper, IdMap, Plan, Spec, Step};
+use simee_emu_container::launch::{self, AdbAuth, Display, GpuMode, Helper, IdMap, Plan, Spec, Step};
 use simee_emu_container::probe::{FsView, HostView, probe};
 
 fn enabled() -> bool {
@@ -30,12 +30,10 @@ fn tmp(tag: &str) -> PathBuf {
     d
 }
 
-/// A root filesystem holding only the host's shell and the libraries it links, so a script can
-/// run after the pivot.
-fn shell_rootfs(rootfs: &Path) -> String {
-    let sh = std::fs::canonicalize("/bin/sh").expect("sh");
-    let ldd = Command::new("ldd").arg(&sh).output().expect("ldd");
-    let mut files = vec![sh.clone()];
+/// Copies `bin` and the libraries it links into `rootfs`, at the same paths.
+fn copy_with_libs(rootfs: &Path, bin: &Path) {
+    let ldd = Command::new("ldd").arg(bin).output().expect("ldd");
+    let mut files = vec![bin.to_path_buf()];
     for l in String::from_utf8_lossy(&ldd.stdout).lines() {
         if let Some(p) = l.split_whitespace().find(|w| w.starts_with('/')) {
             files.push(PathBuf::from(p));
@@ -46,10 +44,54 @@ fn shell_rootfs(rootfs: &Path) -> String {
         std::fs::create_dir_all(dest.parent().expect("parent")).expect("mkdir");
         std::fs::copy(&f, &dest).expect("copy");
     }
+}
+
+/// A root filesystem holding only the host's shell and `sleep` and the libraries they link, so a
+/// script can run after the pivot. Returns the shell's path.
+fn shell_rootfs(rootfs: &Path) -> String {
+    let sh = std::fs::canonicalize("/bin/sh").expect("sh");
+    copy_with_libs(rootfs, &sh);
+    copy_with_libs(rootfs, &std::fs::canonicalize("/bin/sleep").expect("sleep"));
     sh.display().to_string()
 }
 
-fn plan_in(dir: &Path, rootfs: PathBuf) -> (Plan, IdMap) {
+/// A loopback port nothing listens on (for the adb forward).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr").port()
+}
+
+/// The real host, except that it claims pasta and `/dev/net/tun`: for planning a container whose
+/// network is never attached (the id mapping and mounts don't need it).
+struct PretendNet(FsView);
+
+impl HostView for PretendNet {
+    fn read(&self, path: &str) -> Option<String> {
+        self.0.read(path)
+    }
+    fn exists(&self, path: &str) -> bool {
+        path == "/dev/net/tun" || self.0.exists(path)
+    }
+    fn on_path(&self, name: &str) -> bool {
+        name == "pasta" || self.0.on_path(name)
+    }
+    fn memfd_create(&self) -> bool {
+        self.0.memfd_create()
+    }
+    fn euid(&self) -> u32 {
+        self.0.euid()
+    }
+    fn arch(&self) -> String {
+        self.0.arch()
+    }
+    fn binderfs_devices(&self) -> Option<Vec<String>> {
+        self.0.binderfs_devices()
+    }
+}
+
+/// The plan for this host and user, and whether its network can really be attached here. An
+/// unprivileged user with no pasta or slirp4netns, or no `/dev/net/tun`, can't (said on stderr);
+/// the plan is then made as if it could, for the tests that never start its network.
+fn plan_in(dir: &Path, rootfs: PathBuf) -> (Plan, IdMap, bool) {
     let idmap = IdMap::for_host(&FsView, rustix::process::getegid().as_raw()).expect("an id mapping for this user");
     let spec = Spec {
         dir: dir.join("device"),
@@ -58,17 +100,57 @@ fn plan_in(dir: &Path, rootfs: PathBuf) -> (Plan, IdMap) {
         display: Display { width: 720, height: 1280, dpi: 320, fps: None },
         gpu: GpuMode::Guest,
         props: vec![],
+        adb_port: free_port(),
+        adb_auth: AdbAuth::Disabled,
     };
-    (launch::plan(&spec, &FsView, idmap.clone(), helper()).expect("plan"), idmap)
+    match launch::plan(&spec, &FsView, idmap.clone(), helper()) {
+        Ok(p) => (p, idmap, true),
+        Err(launch::Error::Net(why)) => {
+            eprintln!("no network namespace for the container on this host ({why}): its network isn't attached in these tests");
+            (launch::plan(&spec, &PretendNet(FsView), idmap.clone(), helper()).expect("plan"), idmap, false)
+        }
+        Err(e) => panic!("plan: {e}"),
+    }
 }
 
-/// What a script run in the container's namespaces prints.
-fn run(p: &Plan, argv: &[String]) -> (bool, String, String) {
+/// Where the network helpers' files go: next to the state directory, which belongs to container
+/// root.
+fn run_dir(p: &Plan) -> &Path {
+    p.state_dir.parent().expect("a parent")
+}
+
+/// `p` without the binderfs steps, for a host with no binder: the rest of the setup still runs.
+fn without_binder(p: &Plan) -> Plan {
+    let mut rest = p.clone();
+    rest.steps.retain(|s| match s {
+        Step::Mount(m) => m.fstype != Some("binder"),
+        Step::Require { .. } => false,
+        Step::Symlink { link, .. } => !link.to_string_lossy().contains("binder"),
+        _ => true,
+    });
+    rest
+}
+
+/// What a script run in the container's namespaces (with its network attached) prints.
+fn run(p: &Plan, argv: &[String], net: bool) -> (bool, String, String) {
     p.prepare_host().expect("state dir");
-    let out = launch::spawn_isolated(&p.idmap, &p.script_with(argv), Some(&p.helper), Stdio::piped(), Stdio::piped())
-        .expect("spawn")
-        .wait_with_output()
-        .expect("wait");
+    let mut p = p.clone();
+    if !net {
+        // No network namespace of its own: the plan's loopback and `eth0` commands would act on
+        // the host's.
+        p.steps.retain(|s| !matches!(s, Step::Run(_)));
+    }
+    let p = &p;
+    let script = p.script_with(argv);
+    // With the network namespace when this host can attach one; without otherwise (the script
+    // doesn't need it).
+    let (child, _net) = if net {
+        let (c, n) = launch::spawn_container(p, &script, run_dir(p), Stdio::piped(), Stdio::piped()).expect("spawn");
+        (c, Some(n))
+    } else {
+        (launch::spawn_isolated(&p.idmap, &script, Some(&p.helper), Stdio::piped(), Stdio::piped()).expect("spawn"), None)
+    };
+    let out = child.wait_with_output().expect("wait");
     (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
 }
 
@@ -82,6 +164,7 @@ while read -r l; do echo "UID $l"; done < /proc/self/uid_map
 [ -s /proc/kcore ] && echo KCORE_VISIBLE
 [ -e /dev/null ] && echo devnull
 [ -L /dev/ptmx ] && echo ptmx
+while read -r k v; do case "$k" in Uid:|Gid:|Groups:) echo "PROC $k $v";; esac; done < /proc/self/status
 "#;
 
 #[test]
@@ -92,11 +175,11 @@ fn real_host_mounts_pivots_and_leaves_no_path_to_the_host() {
     let tmp = tmp("mounts");
     let rootfs = tmp.join("rootfs");
     let sh = shell_rootfs(&rootfs);
-    let (p, idmap) = plan_in(&tmp, rootfs);
-    // The state directory belongs to container root (root-run), whose range the maps give.
+    let (p, idmap, net) = plan_in(&tmp, rootfs);
+    // The state directory belongs to container root, whose range the maps give.
     let argv = vec![sh.clone(), "-c".into(), INSPECT.into()];
     let binder = probe(&FsView).get(simee_emu_container::probe::Feature::Binder).is_some_and(|c| c.ok());
-    let (ok, stdout, stderr) = run(&p, &argv);
+    let (ok, stdout, stderr) = run(&p, &argv, net);
     eprintln!("binder on this host: {binder}\nstdout: {stdout}\nstderr: {stderr}");
     let (stdout, stderr) = if binder {
         assert!(ok, "{stderr}");
@@ -107,14 +190,7 @@ fn real_host_mounts_pivots_and_leaves_no_path_to_the_host() {
             stderr.contains("emu: container setup failed: mount -t binder binder"),
             "a host without binder stops at binderfs, naming it: {stderr}"
         );
-        let mut rest = p.clone();
-        rest.steps.retain(|s| match s {
-            Step::Mount(m) => m.fstype != Some("binder"),
-            Step::Require { .. } => false,
-            Step::Symlink { link, .. } => !link.to_string_lossy().contains("binder"),
-            _ => true,
-        });
-        let (ok, stdout, stderr) = run(&rest, &argv);
+        let (ok, stdout, stderr) = run(&without_binder(&p), &argv, net);
         eprintln!("without binderfs:\nstdout: {stdout}\nstderr: {stderr}");
         assert!(ok, "{stderr}");
         (stdout, stderr)
@@ -150,9 +226,96 @@ fn real_host_mounts_pivots_and_leaves_no_path_to_the_host() {
     assert_eq!(first[0], "0");
     match idmap {
         IdMap::Root { uid, .. } => assert_eq!((first[1], first[2]), (uid.0.to_string().as_str(), uid.1.to_string().as_str())),
-        IdMap::Rootless { uid, .. } => assert_eq!(first[1], uid.to_string()),
+        // An unprivileged user's container root is the first subordinate id, and no line of the
+        // map reaches the user's own uid.
+        IdMap::Rootless { uid, sub_uid, .. } => {
+            assert_eq!((first[1], first[2]), (sub_uid.0.to_string().as_str(), sub_uid.1.to_string().as_str()));
+            for line in &map {
+                let (outside, count): (u32, u32) = (line[1].parse().expect("outside"), line[2].parse().expect("count"));
+                assert!(!(outside..outside + count).contains(&uid), "the map reaches the invoking uid {uid}: {map:?}");
+            }
+        }
     }
     assert_ne!(first[1], "0", "the container's root is not the host's root: {map:?}");
+    // The process itself is that root: uid 0 and gid 0 inside, with no supplementary groups of the
+    // host user carried in.
+    let proc_line =
+        |k: &str| stdout.lines().find_map(|l| l.strip_prefix(&format!("PROC {k}"))).map(|v| v.split_whitespace().collect::<Vec<_>>());
+    assert_eq!(proc_line("Uid:"), Some(vec!["0"; 4]), "{stdout}");
+    assert_eq!(proc_line("Gid:"), Some(vec!["0"; 4]), "{stdout}");
+    assert_eq!(proc_line("Groups:"), Some(vec![]), "no host groups: {stdout}");
+}
+
+/// The listening TCP sockets on `port` in this namespace's `/proc/net/tcp{,6}`, as the local
+/// address (hex) of each.
+fn listeners_on(port: u16) -> Vec<String> {
+    let mut found = vec![];
+    for file in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        for l in std::fs::read_to_string(file).unwrap_or_default().lines().skip(1) {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let Some((addr, p)) = f.get(1).and_then(|a| a.rsplit_once(':')) else { continue };
+            if f.get(3) == Some(&"0A") && u16::from_str_radix(p, 16) == Ok(port) {
+                found.push(format!("{file} {addr}"));
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn real_host_the_container_has_its_own_network_and_adb_only_on_loopback() {
+    if !enabled() {
+        return;
+    }
+    let tmp = tmp("net");
+    let rootfs = tmp.join("rootfs");
+    let sh = shell_rootfs(&rootfs);
+    let (p, _, net) = plan_in(&tmp, rootfs);
+    if !net {
+        return;
+    }
+    let p = if probe(&FsView).get(simee_emu_container::probe::Feature::Binder).is_some_and(|c| c.ok()) { p } else { without_binder(&p) };
+    let port = p.net.adb_port;
+    p.prepare_host().expect("state dir");
+    // Print the guest's interfaces, then stay up so the host side can be looked at.
+    let script = "echo started; while read -r l; do echo NET $l; done < /proc/net/dev; echo NETDONE; exec sleep 60";
+    let (mut child, net) =
+        launch::spawn_container(&p, &p.script_with(&[sh, "-c".into(), script.into()]), run_dir(&p), Stdio::piped(), Stdio::piped())
+            .expect("spawn with its network");
+    let mut out = std::io::BufReader::new(child.stdout.take().expect("stdout"));
+    let mut guest = vec![];
+    loop {
+        let mut line = String::new();
+        if std::io::BufRead::read_line(&mut out, &mut line).expect("line") == 0 || line.trim() == "NETDONE" {
+            break;
+        }
+        guest.push(line.trim().to_string());
+    }
+    eprintln!("uplink {:?}, guest says: {guest:#?}", p.net.uplink);
+
+    // The container's namespace is its own.
+    let theirs = std::fs::read_link(format!("/proc/{}/ns/net", child.id())).expect("their netns");
+    assert_ne!(theirs, std::fs::read_link("/proc/self/ns/net").expect("our netns"), "the container shares the host's network namespace");
+    // Its interfaces are loopback and the uplink's `eth0`, none of the host's.
+    let ifaces: Vec<&str> =
+        guest.iter().filter_map(|l| l.strip_prefix("NET ")).filter_map(|l| l.split_once(':')).map(|(name, _)| name.trim()).collect();
+    assert_eq!(ifaces, ["lo", "eth0"], "the guest sees its own interfaces and none of the host's");
+
+    // On the host, the adb port listens on loopback and nowhere else.
+    let host = listeners_on(port);
+    assert!(!host.is_empty(), "nothing listens on 127.0.0.1:{port}");
+    for l in &host {
+        assert!(l.ends_with(" 0100007F"), "adb is published beyond loopback: {l}");
+    }
+    assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(), "the loopback port accepts");
+    // The guest's own port 5555 isn't a listener in the host's namespace.
+    assert!(listeners_on(5555).iter().all(|l| l.ends_with(" 0100007F")) || port == 5555, "{:?}", listeners_on(5555));
+
+    // Stopping the container stops the forward.
+    child.kill().expect("kill");
+    child.wait().expect("wait");
+    drop(net);
+    assert!(listeners_on(port).is_empty(), "the forward outlived the container: {:?}", listeners_on(port));
 }
 
 #[test]

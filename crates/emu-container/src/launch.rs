@@ -9,14 +9,16 @@
 //! a root filesystem that is an overlay of the image (the writable layer is the device's own
 //! directory), a `/dev` populated with the nodes `redroid.common.rc` chmods, binderfs mounted with
 //! its three devices linked where older images look for them, `/proc`, and the host's `/sys`.
-//! The network namespace is the host's: the container's adbd listens on the host's port 5555 until
-//! a network namespace with forwarding exists (docs/android.md, "Container backend").
+//! The container has a network namespace of its own (`crate::net`): its adbd is reached only
+//! through `127.0.0.1:<adb_port>` on the host, never on the host's other addresses. Its root is a
+//! subordinate id, never the launching user's own uid or the host's root ([`IdMap`]).
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::net::{NetPlan, Session};
 use crate::probe::{HostView, subordinate_range};
 
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +29,8 @@ pub enum Error {
     Io { what: String, err: std::io::Error },
     #[error("mapping the container's ids: {0}")]
     Map(String),
+    #[error("the container's network: {0}")]
+    Net(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -78,6 +82,40 @@ pub struct Spec {
     /// Extra `key=value` arguments for `/init`: Redroid turns `ro.xxx=value` into a property
     /// override and `androidboot.xxx` into `ro.boot.xxx`.
     pub props: Vec<String>,
+    /// The host's loopback port that reaches the guest's adbd (`127.0.0.1:<adb_port>` only).
+    pub adb_port: u16,
+    pub adb_auth: AdbAuth,
+}
+
+/// Whether the guest's adbd asks for an authorized key. The pinned image ships with it off
+/// (`ro.adb.secure=0`), which is safe only because the port is on loopback; with keys, other users
+/// of the same host can't use the loopback port either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdbAuth {
+    /// The image's setting: any process that can reach the loopback port gets a shell.
+    Disabled,
+    /// `ro.adb.secure=1`, and these public keys (`adbkey.pub` lines) in the guest's
+    /// `/data/misc/adb/adb_keys`.
+    Keys(Vec<String>),
+}
+
+/// Where the guest's adbd reads authorized keys.
+pub const ADB_KEYS_PATH: &str = "data/misc/adb/adb_keys";
+
+impl AdbAuth {
+    /// The keys adb on this host presents: the lines of `<android_dir>/adbkey.pub` (`~/.android`,
+    /// or `$ANDROID_USER_HOME`).
+    pub fn host_keys(android_dir: &Path) -> Result<AdbAuth> {
+        let path = android_dir.join("adbkey.pub");
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            Error::Invalid(format!("{}: {e}: start the adb server once (`adb start-server`) so it creates its key", path.display()))
+        })?;
+        let keys: Vec<String> = text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+        if keys.is_empty() {
+            return Err(Error::Invalid(format!("{} holds no key", path.display())));
+        }
+        Ok(AdbAuth::Keys(keys))
+    }
 }
 
 /// How the container's ids map to the host's. Container root is never the host's root: a guest
@@ -89,9 +127,12 @@ pub enum IdMap {
     /// `start..start+count`, a range of their own (root's `/etc/subuid` range, else
     /// [`DEDICATED_RANGE`]). The container's files are owned by that range.
     Root { uid: (u32, u32), gid: (u32, u32) },
-    /// An unprivileged user: id 0 is that user (it has no host power to lose) and ids 1.. are its
-    /// subordinate range, as `/etc/subuid` and `/etc/subgid` grant, written through `newuidmap`
-    /// and `newgidmap`.
+    /// An unprivileged user: container ids `0..count` are the user's subordinate range, as
+    /// `/etc/subuid` and `/etc/subgid` grant, written through `newuidmap` and `newgidmap`. The
+    /// user's own uid (`uid`, `gid`) is *not* in the container's map: a guest that got out would
+    /// be an unprivileged id of no use against the user's sockets and files (the simee server's
+    /// socket, ssh-agent). It is in the admin map ([`IdMap::admin_actions`]), a short-lived
+    /// namespace that runs only `chown` and `rm` for the container's directories.
     Rootless { uid: u32, gid: u32, sub_uid: (u32, u32), sub_gid: (u32, u32) },
 }
 
@@ -121,13 +162,13 @@ impl IdMap {
         Ok(IdMap::Rootless { uid, gid, sub_uid: need("/etc/subuid")?, sub_gid: need("/etc/subgid")? })
     }
 
-    /// The host ids that container root (and so every file the container creates as root) has,
-    /// when they aren't the launching user's own: the directories the container writes in are
-    /// handed to them first (`Plan::prepare_host`).
-    pub fn container_root_owner(&self) -> Option<(u32, u32)> {
+    /// The host ids that container root (and so every file the container creates as root) has:
+    /// the directories the container writes in are handed to them first (`Plan::prepare_host`).
+    /// Never the launching user's own ids, nor root's.
+    pub fn container_root_owner(&self) -> (u32, u32) {
         match self {
-            IdMap::Root { uid, gid } => Some((uid.0, gid.0)),
-            IdMap::Rootless { .. } => None,
+            IdMap::Root { uid, gid } => (uid.0, gid.0),
+            IdMap::Rootless { sub_uid, sub_gid, .. } => (sub_uid.0, sub_gid.0),
         }
     }
 
@@ -141,18 +182,35 @@ impl IdMap {
                     text: format!("0 {start} {count}\n"),
                 })
                 .collect(),
-            IdMap::Rootless { uid, gid, sub_uid, sub_gid } => [("newuidmap", *uid, *sub_uid), ("newgidmap", *gid, *sub_gid)]
+            IdMap::Rootless { sub_uid, sub_gid, .. } => [("newuidmap", *sub_uid), ("newgidmap", *sub_gid)]
                 .iter()
-                .map(|&(tool, own, (start, _))| {
-                    let mut argv = vec![tool.to_string(), pid.to_string()];
-                    for (inside, outside, count) in [(0, own, 1), (1, start, MAPPED_IDS - 1)] {
-                        argv.extend([inside.to_string(), outside.to_string(), count.to_string()]);
-                    }
-                    Action::Run(argv)
-                })
+                .map(|&(tool, (start, _))| map_command(tool, pid, &[(0, start, MAPPED_IDS)]))
                 .collect(),
         }
     }
+
+    /// The admin namespace's maps: the user is root there (so it may `chown` to and delete files
+    /// of the container's ids), and container id `n` is id `n + 1`. No guest code runs in it. Run
+    /// by host root there is nothing to administer (root can do both directly): the container's
+    /// own maps.
+    pub fn admin_actions(&self, pid: u32) -> Vec<Action> {
+        match self {
+            IdMap::Root { .. } => self.actions(pid),
+            IdMap::Rootless { uid, gid, sub_uid, sub_gid } => [("newuidmap", *uid, *sub_uid), ("newgidmap", *gid, *sub_gid)]
+                .iter()
+                .map(|&(tool, own, (start, _))| map_command(tool, pid, &[(0, own, 1), (1, start, MAPPED_IDS - 1)]))
+                .collect(),
+        }
+    }
+}
+
+/// `newuidmap`/`newgidmap <pid> <inside> <outside> <count>…`.
+fn map_command(tool: &str, pid: u32, ranges: &[(u32, u32, u32)]) -> Action {
+    let mut argv = vec![tool.to_string(), pid.to_string()];
+    for (inside, outside, count) in ranges {
+        argv.extend([inside.to_string(), outside.to_string(), count.to_string()]);
+    }
+    Action::Run(argv)
 }
 
 /// The helper executable (`crate::helper`): `emu` itself under a hidden subcommand, or this
@@ -210,6 +268,14 @@ pub enum Step {
         target: String,
         link: PathBuf,
     },
+    /// A command run as written (`ip link set lo up`).
+    Run(Vec<String>),
+    /// A file with `content` and `mode`, replacing any there.
+    Write {
+        path: PathBuf,
+        content: String,
+        mode: u32,
+    },
     /// Fails the setup with `message` unless `path` exists.
     Require {
         path: PathBuf,
@@ -229,9 +295,12 @@ pub struct Plan {
     pub steps: Vec<Step>,
     /// `/init` and its arguments, run as the container's pid 1.
     pub init: Vec<String>,
+    /// The container's network namespace and how adb gets out of it.
+    pub net: NetPlan,
 }
 
-/// The namespaces `unshare` creates. Not the network namespace: see the module docs.
+/// The namespaces `unshare` creates, besides the network namespace a container adds
+/// ([`unshare_command`]).
 pub const NAMESPACES: [&str; 6] = ["--user", "--mount", "--pid", "--uts", "--ipc", "--cgroup"];
 
 /// The nodes `redroid.common.rc` chmods, which a container runtime normally provides.
@@ -273,6 +342,9 @@ impl Spec {
         args.push(format!("androidboot.redroid_gpu_mode={}", self.gpu.name()));
         // ashmem left the kernel in 5.18; memfd replaces it.
         args.push("androidboot.use_memfd=true".into());
+        if matches!(self.adb_auth, AdbAuth::Keys(_)) {
+            args.push("ro.adb.secure=1".into());
+        }
         args.extend(self.props.iter().cloned());
         args
     }
@@ -285,6 +357,16 @@ impl Spec {
         }
         for a in self.entrypoint.iter().skip(1).chain(&self.props) {
             check_prop(a)?;
+        }
+        if let AdbAuth::Keys(keys) = &self.adb_auth {
+            if keys.is_empty() {
+                return Err(Error::Invalid("adb authentication with no key would lock every client out".into()));
+            }
+            for k in keys {
+                if k.trim().is_empty() || !k.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+                    return Err(Error::Invalid(format!("adb key {k:?} must be one line of printable text")));
+                }
+            }
         }
         if self.display.width == 0 || self.display.height == 0 || self.display.dpi == 0 {
             return Err(Error::Invalid(format!(
@@ -299,6 +381,7 @@ impl Spec {
 /// The plan for `spec` on the host `view` describes (which optional device nodes it has).
 pub fn plan(spec: &Spec, view: &dyn HostView, idmap: IdMap, helper: Helper) -> Result<Plan> {
     spec.validate()?;
+    let net = NetPlan::for_host(view, spec.adb_port)?;
     let root = spec.dir.join("merged");
     let at = |sub: &str| root.join(sub);
     let (upper, work) = (spec.dir.join("upper"), spec.dir.join("work"));
@@ -328,6 +411,17 @@ pub fn plan(spec: &Spec, view: &dyn HostView, idmap: IdMap, helper: Helper) -> R
         ],
         recursive: false,
     }));
+
+    // The guest's adbd asks for these keys when `ro.adb.secure=1` (see `Spec::init_args`).
+    if let AdbAuth::Keys(keys) = &spec.adb_auth {
+        let file = at(ADB_KEYS_PATH);
+        steps.push(Step::Mkdir(file.parent().expect("the keys file has a directory").to_path_buf()));
+        steps.push(Step::Write { path: file, content: keys.iter().map(|k| format!("{k}\n")).collect(), mode: 0o644 });
+    }
+
+    // The container's own network namespace is empty (loopback only, and down) until the parent
+    // attaches the uplink; this brings the guest's end up.
+    steps.extend(net.guest_commands().into_iter().map(Step::Run));
 
     // /dev: a tmpfs holding the nodes Redroid's init expects to find (it only chmods them).
     steps.push(Step::Mkdir(at("dev")));
@@ -429,7 +523,7 @@ pub fn plan(spec: &Spec, view: &dyn HostView, idmap: IdMap, helper: Helper) -> R
 
     let mut init = vec!["/init".to_string()];
     init.extend(spec.init_args());
-    Ok(Plan { root, state_dir: spec.dir.clone(), idmap, helper, steps, init })
+    Ok(Plan { root, state_dir: spec.dir.clone(), idmap, helper, steps, init, net })
 }
 
 /// Files under `/proc` that expose the host kernel: bound over with `/dev/null`.
@@ -508,6 +602,15 @@ impl Plan {
                 Step::ReadOnly(t) => format!("step {}", words(&read_only_argv(t))),
                 Step::ReadOnlyTree(t) => read_only_tree_script(t),
                 Step::Symlink { target, link } => format!("step ln -sf {} {}", quote(target), quote(&link.display().to_string())),
+                Step::Run(argv) => format!("step {}", words(argv)),
+                Step::Write { path, content, mode } => {
+                    let p = quote(&path.display().to_string());
+                    format!(
+                        "printf %s {} > {p} || {{ echo {} >&2; exit 1; }}\nstep chmod {mode:o} {p}",
+                        quote(content),
+                        quote(&format!("emu: container setup failed: writing {}", path.display()))
+                    )
+                }
                 Step::Require { path, message } => format!(
                     "[ -e {} ] || {{ echo {} >&2; exit 1; }}",
                     quote(&path.display().to_string()),
@@ -523,8 +626,8 @@ impl Plan {
     }
 
     /// The `unshare` command line that runs [`Plan::script`] in fresh namespaces.
-    pub fn command(&self) -> Vec<String> {
-        unshare_command(&self.script())
+    pub fn command(&self) -> Result<Vec<String>> {
+        unshare_command(&self.idmap, Some(&self.helper), &self.script(), true)
     }
 
     /// Creates the state directory and hands it to container root (see [`prepare_dir`]), so the
@@ -536,11 +639,10 @@ impl Plan {
     }
 }
 
-/// Fails when container root couldn't reach `path`: run by host root, the container is another
-/// user (a range of its own), and every directory above `path` must let others search it. Nothing
-/// to check for an unprivileged user, whose container root is that user.
+/// Fails when container root couldn't reach `path`: the container is another user (a range of its
+/// own, never the launching user), and every directory above `path` must let others search it.
 pub fn check_searchable(idmap: &IdMap, path: &Path) -> Result<()> {
-    let Some((uid, _)) = idmap.container_root_owner() else { return Ok(()) };
+    let (uid, _) = idmap.container_root_owner();
     for dir in path.ancestors().skip(1) {
         let mode = std::fs::metadata(dir).map_err(io(format!("reading {}", dir.display())))?.permissions();
         if std::os::unix::fs::PermissionsExt::mode(&mode) & 0o001 == 0 {
@@ -555,22 +657,55 @@ pub fn check_searchable(idmap: &IdMap, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Creates `dir` and, when container root is not the launching user, hands it over: the container
-/// writes in it as an id range of its own.
+/// Creates `dir` and hands it to container root: the container writes in it as an id range of its
+/// own. Root `chown`s directly; an unprivileged user does it from the admin namespace
+/// ([`IdMap::admin_actions`]), where container root is id 1.
 pub fn prepare_dir(idmap: &IdMap, dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(io(format!("creating {}", dir.display())))?;
-    let Some((uid, gid)) = idmap.container_root_owner() else { return Ok(()) };
     check_searchable(idmap, dir)?;
-    std::os::unix::fs::chown(dir, Some(uid), Some(gid)).map_err(io(format!("handing {} to container root", dir.display())))
+    match idmap {
+        IdMap::Root { uid, gid } => {
+            std::os::unix::fs::chown(dir, Some(uid.0), Some(gid.0)).map_err(io(format!("handing {} to container root", dir.display())))
+        }
+        IdMap::Rootless { .. } => {
+            run_admin(idmap, &format!("exec chown 1:1 -- {}", quote(&dir.display().to_string())), "handing it to container root", dir)
+        }
+    }
 }
 
 /// `unshare` with the container's namespaces around `sh -c <script>`. `--fork` makes the script
-/// pid 1 of the new pid namespace; `--kill-child` takes it down with `unshare`.
-pub fn unshare_command(script: &str) -> Vec<String> {
+/// pid 1 of the new pid namespace; `--kill-child` takes it down with `unshare`. `net` adds a
+/// network namespace of its own (a container always has one; the id mapping's own helpers run
+/// without).
+///
+/// For an unprivileged user the process `unshare` starts has an uid that isn't in the container's
+/// map (container root is a subordinate id, not the user), so it would lose its capabilities at
+/// `exec`: `--keep-caps` keeps them, and the helper's `become-root` waits for the maps and takes
+/// the namespace's uid 0 before the script runs. That needs the `helper`.
+pub fn unshare_command(idmap: &IdMap, helper: Option<&Helper>, script: &str, net: bool) -> Result<Vec<String>> {
     let mut argv = vec!["unshare".to_string()];
     argv.extend(NAMESPACES.iter().map(|s| s.to_string()));
-    argv.extend(["--fork".into(), "--kill-child".into(), "--".into(), "sh".into(), "-c".into(), script.into(), "simee-container".into()]);
-    argv
+    if net {
+        argv.push("--net".into());
+    }
+    let rootless = matches!(idmap, IdMap::Rootless { .. });
+    if rootless {
+        argv.push("--keep-caps".into());
+    }
+    argv.extend(["--fork".into(), "--kill-child".into(), "--".into()]);
+    if rootless {
+        let helper =
+            helper.ok_or_else(|| Error::Invalid("an unprivileged container needs the helper: it becomes the namespace's root".into()))?;
+        argv.extend(helper.argv(&["become-root".to_string(), "--".to_string()]));
+    }
+    argv.extend(["sh".into(), "-c".into(), script.into(), "simee-container".into()]);
+    Ok(argv)
+}
+
+/// `unshare` with only a user namespace, for the admin maps: `chown` and `rm` on the container's
+/// files, as the launching user who is root there.
+pub fn admin_command(script: &str) -> Vec<String> {
+    ["unshare", "--user", "--fork", "--kill-child", "--", "sh", "-c", script, "simee-admin"].map(String::from).to_vec()
 }
 
 /// `argv` run under the helper's `die-with-parent`, so it is killed when the process `parent`
@@ -585,12 +720,42 @@ pub fn supervised(helper: &Helper, parent: u32, argv: &[String]) -> Vec<String> 
 /// milliseconds; this only bounds a hung or never-started child.
 pub const NAMESPACE_DEADLINE: Duration = Duration::from_secs(30);
 
+/// Which of the id mapping's namespaces a process runs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Container,
+    Admin,
+}
+
 /// Runs `script` (which starts by reading a line from stdin: see [`Plan::script`]) in the
-/// namespaces, maps its ids, and releases it. Returns the running `unshare`. With a `helper` the
-/// child dies if this process does (the thread calling this must outlive the child: see
-/// `crate::helper`).
+/// container's namespaces, maps its ids, and releases it. Returns the running `unshare`. With a
+/// `helper` the child dies if this process does (the thread calling this must outlive the child:
+/// see `crate::helper`). No network namespace: for the work that needs none (an unpack).
 pub fn spawn_isolated(idmap: &IdMap, script: &str, helper: Option<&Helper>, stdout: Stdio, stderr: Stdio) -> Result<Child> {
-    let mut argv = unshare_command(script);
+    let argv = unshare_command(idmap, helper, script, false)?;
+    spawn_in(idmap, Role::Container, argv, helper, stdout, stderr, |_| Ok(())).map(|(child, ())| child)
+}
+
+/// [`spawn_isolated`] with the network namespace of `plan`: once the namespaces exist and their
+/// ids are mapped, the uplink is attached (`dir` is where its files go: somewhere the launching
+/// user can write) and only then is the container released, so `/init` finds its `eth0`.
+pub fn spawn_container(plan: &Plan, script: &str, dir: &Path, stdout: Stdio, stderr: Stdio) -> Result<(Child, Session)> {
+    let argv = unshare_command(&plan.idmap, Some(&plan.helper), script, true)?;
+    spawn_in(&plan.idmap, Role::Container, argv, Some(&plan.helper), stdout, stderr, |pid| {
+        Session::start(&plan.net, pid, dir, Some(&plan.helper))
+    })
+}
+
+/// Starts `argv` (an `unshare` command), maps its ids, runs `attach` with its pid, releases it.
+fn spawn_in<T>(
+    idmap: &IdMap,
+    role: Role,
+    mut argv: Vec<String>,
+    helper: Option<&Helper>,
+    stdout: Stdio,
+    stderr: Stdio,
+    attach: impl FnOnce(u32) -> Result<T>,
+) -> Result<(Child, T)> {
     if let Some(h) = helper {
         argv = supervised(h, std::process::id(), &argv);
     }
@@ -599,10 +764,11 @@ pub fn spawn_isolated(idmap: &IdMap, script: &str, helper: Option<&Helper>, stdo
     // Run by host root, the container's process must itself be the user its root maps to: the one
     // that calls unshare(CLONE_NEWUSER) is the one that is root inside it, and host root's own
     // uid is not in the map (it would be nobody there, with no capabilities). So drop to the
-    // container's range first; unprivileged users already are their own container root.
-    if let Some((uid, gid)) = idmap.container_root_owner() {
+    // container's range first. An unprivileged user can't change uid: its process keeps its
+    // capabilities with `--keep-caps` and becomes root through the helper instead.
+    if let (Role::Container, IdMap::Root { uid, gid }) = (role, idmap) {
         use std::os::unix::process::CommandExt;
-        cmd.uid(uid).gid(gid);
+        cmd.uid(uid.0).gid(gid.0);
     }
     let mut child = cmd
         .stdin(Stdio::piped())
@@ -610,20 +776,29 @@ pub fn spawn_isolated(idmap: &IdMap, script: &str, helper: Option<&Helper>, stdo
         .stderr(stderr)
         .spawn()
         .map_err(|e| Error::Io { what: format!("starting {}", argv[0]), err: e })?;
-    if let Err(e) = map_and_release(idmap, &mut child, NAMESPACE_DEADLINE) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(e);
+    match map_and_release(idmap, role, &mut child, NAMESPACE_DEADLINE, attach) {
+        Ok(attached) => Ok((child, attached)),
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(e)
+        }
     }
-    Ok(child)
 }
 
 /// `unshare` creates the user namespace in its own process, so its pid is the one to map. The
-/// script waits on stdin until the maps are written.
-fn map_and_release(idmap: &IdMap, child: &mut Child, deadline: Duration) -> Result<()> {
+/// script waits on stdin until the maps are written and `attach` has run.
+fn map_and_release<T>(
+    idmap: &IdMap,
+    role: Role,
+    child: &mut Child,
+    deadline: Duration,
+    attach: impl FnOnce(u32) -> Result<T>,
+) -> Result<T> {
     use std::io::Write;
     wait_for_namespace(child, deadline)?;
-    for action in idmap.actions(child.id()) {
+    let actions = if role == Role::Admin { idmap.admin_actions(child.id()) } else { idmap.actions(child.id()) };
+    for action in actions {
         match action {
             Action::Write { path, text } => std::fs::write(&path, text).map_err(io(format!("writing {}", path.display())))?,
             Action::Run(argv) => {
@@ -634,11 +809,12 @@ fn map_and_release(idmap: &IdMap, child: &mut Child, deadline: Duration) -> Resu
             }
         }
     }
+    let attached = attach(child.id())?;
     let stdin = child.stdin.as_mut().ok_or_else(|| Error::Map("no stdin to release the container with".into()))?;
     stdin.write_all(b"go\n").map_err(io("releasing the container"))?;
     // Closing stdin: the script reads one line and never again.
     drop(child.stdin.take());
-    Ok(())
+    Ok(attached)
 }
 
 /// Waits until the child has made its user namespace (its `ns/user` link differs from ours), so
@@ -663,6 +839,21 @@ fn wait_for_namespace(child: &mut Child, deadline: Duration) -> Result<()> {
     }
 }
 
+/// Runs `script` in the admin namespace of an unprivileged user (see [`IdMap::admin_actions`]);
+/// errors carry what the script said. `what` and `path` describe it for the message.
+fn run_admin(idmap: &IdMap, script: &str, what: &str, path: &Path) -> Result<()> {
+    let script = format!("set -eu\nread -r _go\n{script}\n");
+    let (child, ()) = spawn_in(idmap, Role::Admin, admin_command(&script), None, Stdio::null(), Stdio::piped(), |_| Ok(()))?;
+    let out = child.wait_with_output().map_err(io("waiting for the admin namespace's command"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(Error::Io {
+        what: format!("{what} ({}) from inside the user namespace", path.display()),
+        err: std::io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+    })
+}
+
 /// Deletes `path` from inside the container's user namespace, where the files the container made
 /// are owned by ids the host user can't touch (subordinate ids). Errors are returned, with what
 /// `rm` said.
@@ -672,13 +863,20 @@ pub fn remove_tree(idmap: &IdMap, helper: Option<&Helper>, path: &Path) -> Resul
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(_) => {}
     }
-    let script = format!("set -eu\nread -r _go\nexec rm -rf -- {}\n", quote(&path.display().to_string()));
-    let out = spawn_isolated(idmap, &script, helper, Stdio::null(), Stdio::piped())?.wait_with_output().map_err(io("waiting for rm"))?;
-    if !out.status.success() {
-        return Err(Error::Io {
-            what: format!("removing {} from inside the user namespace", path.display()),
-            err: std::io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_string()),
-        });
+    let rm = format!("exec rm -rf -- {}", quote(&path.display().to_string()));
+    match idmap {
+        IdMap::Rootless { .. } => run_admin(idmap, &rm, "removing it", path)?,
+        IdMap::Root { .. } => {
+            let script = format!("set -eu\nread -r _go\n{rm}\n");
+            let out =
+                spawn_isolated(idmap, &script, helper, Stdio::null(), Stdio::piped())?.wait_with_output().map_err(io("waiting for rm"))?;
+            if !out.status.success() {
+                return Err(Error::Io {
+                    what: format!("removing {} from inside the user namespace", path.display()),
+                    err: std::io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+                });
+            }
+        }
     }
     match path.try_exists() {
         Ok(false) => Ok(()),
@@ -689,6 +887,8 @@ pub fn remove_tree(idmap: &IdMap, helper: Option<&Helper>, path: &Path) -> Resul
 /// A running container. Dropping it kills it.
 pub struct Container {
     child: Child,
+    /// The network helpers and the loopback forward; dropped (and stopped) after the child.
+    net: Session,
 }
 
 impl Container {
@@ -699,6 +899,11 @@ impl Container {
     /// Whether `/init` is still running.
     pub fn running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Whether the container's network helpers are still running.
+    pub fn network_healthy(&mut self) -> bool {
+        self.net.healthy()
     }
 
     /// Waits for the container to exit.
@@ -722,14 +927,17 @@ impl Drop for Container {
     }
 }
 
-/// Starts `/init` for `plan`, its console and boot output going to `log`. Call it from a thread
-/// that lives as long as the container: the kernel's parent-death signal follows the thread that
-/// spawned the child (`crate::helper`).
+/// Starts `/init` for `plan`, its console and boot output going to `log` (the network helpers'
+/// files go next to it, which must be a directory the launching user can write). Call it from a
+/// thread that lives as long as the container: the kernel's parent-death signal follows the thread
+/// that spawned the child (`crate::helper`).
 pub fn start(plan: &Plan, log: &Path) -> Result<Container> {
     plan.prepare_host()?;
+    let dir = log.parent().ok_or_else(|| Error::Invalid(format!("the log {} has no directory", log.display())))?;
     let file = std::fs::File::create(log).map_err(io(format!("creating {}", log.display())))?;
     let err = file.try_clone().map_err(io("duplicating the log handle"))?;
-    Ok(Container { child: spawn_isolated(&plan.idmap, &plan.script(), Some(&plan.helper), Stdio::from(file), Stdio::from(err))? })
+    let (child, net) = spawn_container(plan, &plan.script(), dir, Stdio::from(file), Stdio::from(err))?;
+    Ok(Container { child, net })
 }
 
 #[cfg(test)]
@@ -745,6 +953,8 @@ mod tests {
             display: Display { width: 720, height: 1280, dpi: 320, fps: None },
             gpu: GpuMode::Guest,
             props: vec![],
+            adb_port: 5557,
+            adb_auth: AdbAuth::Disabled,
         }
     }
 
@@ -1024,15 +1234,102 @@ mod tests {
     }
 
     #[test]
-    fn the_network_namespace_is_the_hosts() {
-        assert!(!NAMESPACES.contains(&"--net"));
+    fn the_container_has_namespaces_of_its_own_including_the_network() {
         for ns in ["--user", "--mount", "--pid", "--uts", "--ipc", "--cgroup"] {
             assert!(NAMESPACES.contains(&ns), "{ns}");
         }
-        let cmd = plan_of(&spec(), &host()).command();
+        let cmd = plan_of(&spec(), &host()).command().expect("command");
         assert_eq!(cmd[0], "unshare");
+        assert_eq!(cmd.iter().filter(|a| *a == "--net").count(), 1, "a network namespace of its own: {cmd:?}");
         assert!(cmd.contains(&"--fork".to_string()) && cmd.contains(&"--kill-child".to_string()));
         assert_eq!(cmd[cmd.len() - 4..cmd.len() - 2], ["sh", "-c"]);
+        assert!(!cmd.contains(&"--keep-caps".to_string()), "root maps its own range and needs no help: {cmd:?}");
+        // The id mapping's own helpers (an unpack, a `chown`) need no network.
+        let bare = unshare_command(&root_map(), None, "true", false).expect("command");
+        assert!(!bare.contains(&"--net".to_string()), "{bare:?}");
+    }
+
+    #[test]
+    fn the_guests_loopback_comes_up_before_init_and_a_veth_guest_is_configured() {
+        let steps = |p: &Plan| -> Vec<String> {
+            p.steps.iter().filter_map(|s| if let Step::Run(a) = s { Some(a.join(" ")) } else { None }).collect()
+        };
+        let veth = plan_of(&spec(), &host());
+        assert_eq!(veth.net.uplink, crate::net::Uplink::Veth, "root without pasta");
+        let g = steps(&veth);
+        assert_eq!(g[0], "ip link set lo up");
+        assert!(g[1].starts_with("ip addr add 100.64.") && g[1].ends_with("/30 dev eth0"), "{g:?}");
+        assert_eq!(g[2], "ip link set eth0 up");
+        let script = veth.script();
+        assert!(script.contains("step 'ip' 'link' 'set' 'lo' 'up'"), "{script}");
+        assert!(script.find("'lo' 'up'").expect("lo") < script.find("exec ").expect("exec"));
+        // With pasta the tool configures the guest's interface from outside.
+        let user_mode = plan(&spec(), &host().tool("pasta"), root_map(), helper()).expect("plan");
+        assert_eq!(user_mode.net.uplink, crate::net::Uplink::Pasta);
+        assert_eq!(steps(&user_mode), ["ip link set lo up"]);
+        assert_eq!(user_mode.net.adb_port, 5557);
+    }
+
+    #[test]
+    fn a_host_that_cant_give_the_container_a_network_namespace_is_refused_with_the_fix() {
+        let mut v = host().euid(1000);
+        v.tools.remove("ip");
+        let e = plan(&spec(), &v, root_map(), helper()).expect_err("no network").to_string();
+        assert!(e.contains("fix: sudo apt install iproute2"), "{e}");
+        let v = host().euid(1000);
+        let e = plan(&spec(), &v, root_map(), helper()).expect_err("no tool").to_string();
+        assert!(e.contains("neither pasta nor slirp4netns") && e.contains("passt"), "{e}");
+        let mut s = spec();
+        s.adb_port = 0;
+        assert!(plan(&s, &host(), root_map(), helper()).expect_err("port 0").to_string().contains("not 0"));
+    }
+
+    #[test]
+    fn adb_authentication_is_off_in_the_image_and_on_with_keys() {
+        // Disabled: the image's own setting, nothing added.
+        let off = plan_of(&spec(), &host());
+        assert!(!off.init.iter().any(|a| a.starts_with("ro.adb.secure")), "{:?}", off.init);
+        assert!(!off.steps.iter().any(|s| matches!(s, Step::Write { .. })));
+        // Keys: the property, and the keys where adbd reads them, before the container starts.
+        let mut s = spec();
+        s.adb_auth = AdbAuth::Keys(vec!["QAAAA host-key user@host".into(), "QBBBB other".into()]);
+        let on = plan_of(&s, &host());
+        assert!(on.init.contains(&"ro.adb.secure=1".to_string()), "{:?}", on.init);
+        let file = on.root.join("data/misc/adb/adb_keys");
+        assert!(on.steps.contains(&Step::Write {
+            path: file.clone(),
+            content: "QAAAA host-key user@host\nQBBBB other\n".into(),
+            mode: 0o644
+        }));
+        assert!(on.steps.contains(&Step::Mkdir(file.parent().expect("dir").to_path_buf())));
+        let script = on.script();
+        assert!(script.contains("printf %s 'QAAAA host-key user@host\nQBBBB other\n' > '"), "{script}");
+        assert!(script.contains(&format!("step chmod 644 '{}'", file.display())), "{script}");
+        assert!(script.find("adb_keys").expect("keys") < script.find("exec ").expect("exec"));
+    }
+
+    #[test]
+    fn adb_keys_that_would_lock_everyone_out_or_break_the_file_are_refused() {
+        let bad = |keys: Vec<String>| {
+            let mut s = spec();
+            s.adb_auth = AdbAuth::Keys(keys);
+            plan(&s, &host(), root_map(), helper()).expect_err("refused").to_string()
+        };
+        assert!(bad(vec![]).contains("lock every client out"));
+        assert!(bad(vec!["two\nlines".into()]).contains("one line"));
+        assert!(bad(vec!["   ".into()]).contains("one line"));
+        assert!(bad(vec!["nul\0".into()]).contains("one line"));
+    }
+
+    #[test]
+    fn the_hosts_adb_keys_are_read_from_its_android_directory() {
+        let dir = tmp("adbkeys");
+        let e = AdbAuth::host_keys(&dir).expect_err("no key yet").to_string();
+        assert!(e.contains("adb start-server"), "{e}");
+        std::fs::write(dir.join("adbkey.pub"), "QAAAA key user@host\n\n").expect("write");
+        assert_eq!(AdbAuth::host_keys(&dir).expect("keys"), AdbAuth::Keys(vec!["QAAAA key user@host".into()]));
+        std::fs::write(dir.join("adbkey.pub"), "\n").expect("write");
+        assert!(AdbAuth::host_keys(&dir).expect_err("empty").to_string().contains("no key"));
     }
 
     #[test]
@@ -1108,7 +1405,7 @@ mod tests {
             assert_ne!(host_start, 0, "container root must not be host root: {text}");
             assert!(!text.starts_with("0 0 "), "{text}");
         }
-        assert_eq!(map.container_root_owner(), Some((2_000_000_000, 2_000_000_000)));
+        assert_eq!(map.container_root_owner(), (2_000_000_000, 2_000_000_000));
         // Nothing maps the whole id space onto itself any more.
         assert!(DEDICATED_RANGE.0 > 1_878_982_656, "above systemd-nspawn's container ranges");
         assert!(u64::from(DEDICATED_RANGE.0) + u64::from(DEDICATED_RANGE.1) < 1 << 31);
@@ -1127,21 +1424,65 @@ mod tests {
     }
 
     #[test]
-    fn an_unprivileged_user_is_their_own_container_root() {
-        let map = IdMap::Rootless { uid: 1000, gid: 1000, sub_uid: (100000, 65536), sub_gid: (100000, 65536) };
-        assert_eq!(map.container_root_owner(), None, "nothing to hand over: the user already owns what it makes");
+    fn an_unprivileged_users_container_root_is_a_subordinate_id_never_their_own() {
+        let map = IdMap::Rootless { uid: 1000, gid: 1001, sub_uid: (100000, 65536), sub_gid: (200000, 65536) };
+        assert_eq!(map.container_root_owner(), (100000, 200000), "the first subordinate ids");
+        assert_eq!(
+            map.actions(7),
+            [
+                Action::Run(["newuidmap", "7", "0", "100000", "65536"].map(String::from).to_vec()),
+                Action::Run(["newgidmap", "7", "0", "200000", "65536"].map(String::from).to_vec()),
+            ]
+        );
+        // Whatever the user's ids and ranges, the container's map never reaches the user's own.
+        for (uid, gid, sub) in [(1000, 1000, 100000), (1000, 1000, 165536), (0, 0, 100000), (65534, 65534, 1_000_000)] {
+            let map = IdMap::Rootless { uid, gid, sub_uid: (sub, 65536), sub_gid: (sub, 65536) };
+            for (action, own) in map.actions(1).iter().zip([uid, gid]) {
+                let Action::Run(argv) = action else { panic!("{action:?}") };
+                let ranges: Vec<u32> = argv[2..].iter().map(|n| n.parse().expect("number")).collect();
+                for r in ranges.chunks(3) {
+                    let (outside, count) = (r[1], r[2]);
+                    assert!(!(outside..outside + count).contains(&own), "{argv:?} maps the user's own id {own}");
+                }
+            }
+        }
     }
 
     #[test]
-    fn an_unprivileged_user_maps_itself_to_0_and_its_range_above() {
+    fn the_admin_namespace_makes_the_user_root_and_the_containers_ids_start_at_1() {
         let map = IdMap::Rootless { uid: 1000, gid: 1001, sub_uid: (100000, 65536), sub_gid: (200000, 65536) };
         assert_eq!(
-            map.actions(7),
+            map.admin_actions(7),
             [
                 Action::Run(["newuidmap", "7", "0", "1000", "1", "1", "100000", "65535"].map(String::from).to_vec()),
                 Action::Run(["newgidmap", "7", "0", "1001", "1", "1", "200000", "65535"].map(String::from).to_vec()),
             ]
         );
+        // Container root is admin id 1, which is what `prepare_dir` chowns to; no guest code runs
+        // there.
+        let cmd = admin_command("exec chown 1:1 -- /d");
+        assert_eq!(cmd[..2], ["unshare", "--user"]);
+        assert!(!cmd.iter().any(|a| a == "--net" || a == "--keep-caps" || a == "--mount"), "{cmd:?}");
+        // For root the admin and container maps are the same: there is nothing to administer.
+        assert_eq!(root_map().admin_actions(7), root_map().actions(7));
+    }
+
+    #[test]
+    fn an_unprivileged_container_keeps_its_capabilities_and_becomes_root_through_the_helper() {
+        let map = IdMap::Rootless { uid: 1000, gid: 1000, sub_uid: (100000, 65536), sub_gid: (100000, 65536) };
+        let cmd = unshare_command(&map, Some(&helper()), "true", true).expect("command");
+        let at = |flag: &str| cmd.iter().position(|a| a == flag).unwrap_or_else(|| panic!("{flag} missing: {cmd:?}"));
+        assert!(at("--user") < at("--keep-caps") && at("--keep-caps") < at("--fork"), "--keep-caps comes with --user: {cmd:?}");
+        let dashdash = at("--");
+        assert_eq!(cmd[dashdash + 1..dashdash + 5], ["/usr/bin/emu", "__container-helper", "become-root", "--"]);
+        assert_eq!(cmd[dashdash + 5..dashdash + 7], ["sh", "-c"]);
+        assert_eq!(
+            crate::helper::parse(&cmd[dashdash + 3..]),
+            Ok(crate::helper::Request::BecomeRoot { command: vec!["sh".into(), "-c".into(), "true".into(), "simee-container".into()] })
+        );
+        // Without the helper there is nothing to become root.
+        let e = unshare_command(&map, None, "true", true).expect_err("needs the helper").to_string();
+        assert!(e.contains("needs the helper"), "{e}");
     }
 
     #[test]
@@ -1181,7 +1522,7 @@ mod tests {
     #[test]
     fn the_container_is_started_under_die_with_parent() {
         let p = plan_of(&spec(), &host());
-        let argv = supervised(&p.helper, 77, &p.command());
+        let argv = supervised(&p.helper, 77, &p.command().expect("command"));
         assert_eq!(argv[..6], ["/usr/bin/emu", "__container-helper", "die-with-parent", "--parent", "77", "--"]);
         assert_eq!(argv[6], "unshare");
         assert_eq!(
@@ -1195,20 +1536,21 @@ mod tests {
     }
 
     #[test]
-    fn prepare_host_makes_the_state_dir_and_refuses_one_container_root_cant_reach() {
+    fn prepare_host_refuses_a_directory_container_root_cant_reach_for_either_kind_of_user() {
         use std::os::unix::fs::PermissionsExt;
         let base = tmp("prepare");
         let mut p = plan_of(&spec(), &host());
-        p.idmap = IdMap::Rootless { uid: 1000, gid: 1000, sub_uid: (100000, 65536), sub_gid: (100000, 65536) };
         p.state_dir = base.join("a/b");
-        p.prepare_host().expect("rootless: just creates it");
-        assert!(p.state_dir.is_dir());
-        // Run by root, the container is another user: a private ancestor stops it.
-        p.idmap = root_map();
-        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-        let e = p.prepare_host().expect_err("unsearchable").to_string();
-        assert!(e.contains(&base.display().to_string()), "names the private directory: {e}");
-        assert!(e.contains("isn't searchable") && e.contains("chmod o+x"), "{e}");
+        // The container's root is never the launching user, so a private ancestor stops both: the
+        // user's home directory is often 0750.
+        for idmap in [root_map(), IdMap::Rootless { uid: 1000, gid: 1000, sub_uid: (100000, 65536), sub_gid: (100000, 65536) }] {
+            p.idmap = idmap;
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+            let e = p.prepare_host().expect_err("unsearchable").to_string();
+            assert!(e.contains(&base.display().to_string()), "names the private directory: {e}");
+            assert!(e.contains("isn't searchable") && e.contains("chmod o+x"), "{e}");
+        }
+        assert!(p.state_dir.is_dir(), "the directory is created before the check");
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     }
 
@@ -1236,7 +1578,7 @@ mod tests {
         let alive = |pid: u32| rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid as i32).expect("pid")).is_ok();
         let child = Command::new("sleep").arg("600").spawn().expect("sleep");
         let pid = child.id();
-        let c = Container { child };
+        let c = Container { child, net: Session::default() };
         assert!(alive(pid));
         drop(c);
         assert!(!alive(pid));

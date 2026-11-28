@@ -1,4 +1,4 @@
-//! The two things the container's launcher needs a process for that a shell script can't do, and
+//! The three things the container's launcher needs a process for that a shell script can't do, and
 //! that safe Rust can through `rustix`'s wrappers (so this crate still has no `unsafe`):
 //!
 //! - `die-with-parent --parent <pid> -- <command…>`: asks the kernel to SIGKILL this process when
@@ -7,6 +7,12 @@
 //!   `unshare --kill-child` takes the container's pid namespace down with it: a crashed `emu` leaves
 //!   no orphaned Android holding the host's adb port. The kernel's "parent" is the *thread* that
 //!   spawned the child, so the container must be started from a thread that outlives it.
+//! - `become-root -- <command…>`: for an unprivileged user's container, whose root is a subordinate
+//!   id and never the user's own uid. `unshare --user --keep-caps` leaves the process with its
+//!   capabilities (as ambient ones) but an unmapped uid, since the user's uid isn't in the map.
+//!   This waits until `newuidmap` and `newgidmap` have written the maps, clears the supplementary
+//!   groups, becomes uid and gid 0 (the subordinate range's first id) and execs the command, which
+//!   as root of the namespace has its capabilities in full.
 //! - `pivot <root> -- <init…>`: `pivot_root` into `root` and lazily unmount the old root, so no
 //!   path to the host's filesystem is left in the container's mount namespace (a `chroot` leaves
 //!   one, and root inside it can walk out). Then exec `/init` with a clean environment. It runs
@@ -22,6 +28,7 @@ use std::process::ExitCode;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     DieWithParent { parent: u32, command: Vec<String> },
+    BecomeRoot { command: Vec<String> },
     Pivot { root: String, init: Vec<String> },
 }
 
@@ -38,13 +45,14 @@ pub fn parse(args: &[String]) -> Result<Request, String> {
         [cmd, flag, pid, sep, rest @ ..] if cmd == "die-with-parent" && flag == "--parent" && sep == "--" => {
             Ok(Request::DieWithParent { parent: pid.parse().map_err(|_| format!("--parent {pid}: not a pid"))?, command: split(rest)? })
         }
+        [cmd, sep, rest @ ..] if cmd == "become-root" && sep == "--" => Ok(Request::BecomeRoot { command: split(rest)? }),
         [cmd, root, sep, rest @ ..] if cmd == "pivot" && sep == "--" => {
             if !root.starts_with('/') {
                 return Err(format!("pivot root {root} must be an absolute path"));
             }
             Ok(Request::Pivot { root: root.clone(), init: split(rest)? })
         }
-        _ => Err("usage: die-with-parent --parent <pid> -- <command…> | pivot <root> -- <init…>".into()),
+        _ => Err("usage: die-with-parent --parent <pid> -- <command…> | become-root -- <command…> | pivot <root> -- <init…>".into()),
     }
 }
 
@@ -72,6 +80,18 @@ fn run(req: &Request) -> Result<(), String> {
             let err = Command::new(&command[0]).args(&command[1..]).exec();
             Err(format!("running {}: {err}", command[0]))
         }
+        Request::BecomeRoot { command } => {
+            use rustix::process::{Gid, Uid};
+            use rustix::thread::{set_thread_groups, set_thread_res_gid, set_thread_res_uid};
+            wait_for_maps(MAP_DEADLINE)?;
+            let at = |what: &'static str| move |e: rustix::io::Errno| format!("{what}: {e}");
+            // Groups, then gid, then uid: after the uid change the process may not be allowed the rest.
+            set_thread_groups(&[]).map_err(at("clearing the supplementary groups"))?;
+            set_thread_res_gid(Gid::ROOT, Gid::ROOT, Gid::ROOT).map_err(at("becoming gid 0"))?;
+            set_thread_res_uid(Uid::ROOT, Uid::ROOT, Uid::ROOT).map_err(at("becoming uid 0"))?;
+            let err = Command::new(&command[0]).args(&command[1..]).exec();
+            Err(format!("running {}: {err}", command[0]))
+        }
         Request::Pivot { root, init } => {
             use rustix::mount::{MountPropagationFlags, UnmountFlags, mount_change, unmount};
             let at = |what: &'static str| move |e: rustix::io::Errno| format!("{what}: {e}");
@@ -86,6 +106,27 @@ fn run(req: &Request) -> Result<(), String> {
             let err = Command::new(&init[0]).args(&init[1..]).env_clear().env("PATH", INIT_PATH).exec();
             Err(format!("running {}: {err}", init[0]))
         }
+    }
+}
+
+/// How long `become-root` waits for the parent to write the id maps (milliseconds in practice).
+#[cfg(target_os = "linux")]
+const MAP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Waits until this process's user namespace has a uid and a gid map, which the parent writes
+/// after `unshare` made the namespace. Polls every millisecond.
+#[cfg(target_os = "linux")]
+fn wait_for_maps(deadline: std::time::Duration) -> Result<(), String> {
+    let start = std::time::Instant::now();
+    loop {
+        let mapped = |f: &str| std::fs::read_to_string(f).is_ok_and(|s| !s.trim().is_empty());
+        if mapped("/proc/self/uid_map") && mapped("/proc/self/gid_map") {
+            return Ok(());
+        }
+        if start.elapsed() >= deadline {
+            return Err(format!("the launcher wrote no id maps within {deadline:?}"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 
@@ -108,6 +149,7 @@ mod tests {
             parse(&a("die-with-parent --parent 42 -- unshare --user -- sh")),
             Ok(Request::DieWithParent { parent: 42, command: a("unshare --user -- sh") })
         );
+        assert_eq!(parse(&a("become-root -- sh -c true")), Ok(Request::BecomeRoot { command: a("sh -c true") }));
         assert_eq!(parse(&a("pivot /r -- /init qemu=1")), Ok(Request::Pivot { root: "/r".into(), init: a("/init qemu=1") }));
     }
 
@@ -121,6 +163,9 @@ mod tests {
             "pivot /r /init",
             "die-with-parent --parent x -- sh",
             "die-with-parent --parent 1 --",
+            "become-root",
+            "become-root --",
+            "become-root sh",
             "frobnicate",
         ] {
             assert!(parse(&a(bad)).is_err(), "{bad:?}");

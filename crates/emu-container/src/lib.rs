@@ -13,6 +13,7 @@
 pub mod helper;
 pub mod image;
 pub mod launch;
+pub mod net;
 pub mod probe;
 pub mod select;
 
@@ -178,12 +179,19 @@ mod tests {
         let (img, pin) = (hello_image(), HELLO);
         copy_dir(Path::new(HELLO_LAYOUT), &image::paths(&c, &img, &pin).layout);
         let req = request(&c, image::Fetch::Denied, &idmap);
-        let paths = ensure_pinned(&img, &pin, &req, None).expect("unpacked");
+        // The helper binary sits next to the test executable's `deps` directory. An unprivileged
+        // user's container needs it to become the namespace's root.
+        let program =
+            std::env::current_exe().expect("test exe").parent().and_then(Path::parent).expect("target dir").join("simee-container-helper");
+        assert!(program.is_file(), "{} isn't built: run `cargo test` for the whole package", program.display());
+        let helper = launch::Helper { program, prefix: vec![] };
+        let helper = Some(&helper);
+        let paths = ensure_pinned(&img, &pin, &req, helper).expect("unpacked");
         assert!(paths.rootfs.join("hello").is_file(), "the layer's one file");
         assert_eq!(std::fs::read_to_string(&paths.unpacked).expect("marker").trim(), pin.layer);
         assert_eq!(image::next_step(&paths, &pin, image::Fetch::Denied).expect("step"), image::Step::Ready);
         // Ready means no work: a second call changes nothing.
-        let again = ensure_pinned(&img, &pin, &req, None).expect("ready");
+        let again = ensure_pinned(&img, &pin, &req, helper).expect("ready");
         assert_eq!(again, paths);
 
         // Files the container owns as other ids (id 1 is a subordinate id for a user) can't be
@@ -194,12 +202,12 @@ mod tests {
             launch::quote(&paths.rootfs.display().to_string())
         );
         let out =
-            launch::spawn_isolated(&idmap, &mk, None, Stdio::null(), Stdio::piped()).expect("spawn").wait_with_output().expect("wait");
+            launch::spawn_isolated(&idmap, &mk, helper, Stdio::null(), Stdio::piped()).expect("spawn").wait_with_output().expect("wait");
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         std::fs::remove_file(&paths.unpacked).expect("forget the marker");
-        let again = ensure_pinned(&img, &pin, &req, None).expect("re-unpacked over a tree with foreign owners");
+        let again = ensure_pinned(&img, &pin, &req, helper).expect("re-unpacked over a tree with foreign owners");
         assert!(again.rootfs.join("hello").is_file() && !again.rootfs.join("x").exists(), "the stale tree is gone");
-        launch::remove_tree(&idmap, None, &again.rootfs).expect("removed from inside the namespace");
+        launch::remove_tree(&idmap, helper, &again.rootfs).expect("removed from inside the namespace");
         assert!(!again.rootfs.exists());
     }
 }

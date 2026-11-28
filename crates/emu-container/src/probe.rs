@@ -43,9 +43,12 @@ pub enum Feature {
     CgroupLimits,
     /// User namespaces: the container's root is not the host's.
     UserNamespaces,
-    /// Subordinate uid and gid ranges, so Android's many uids exist inside an unprivileged
-    /// user namespace.
+    /// Subordinate uid and gid ranges: an unprivileged user's container root is a subordinate
+    /// id, never the user's own, and Android's many uids exist in the same range.
     SubordinateIds,
+    /// A network namespace of its own with a loopback-only way in for adb (`crate::net`): without
+    /// one the guest's adbd would listen on the host's own addresses.
+    Networking,
     /// overlayfs, for a per-device writable layer over the shared image.
     Overlayfs,
     /// DMA-BUF heaps (or ION): graphics buffers.
@@ -62,6 +65,7 @@ impl Feature {
             Feature::CgroupLimits => "cgroup limits",
             Feature::UserNamespaces => "user namespaces",
             Feature::SubordinateIds => "subordinate ids",
+            Feature::Networking => "networking",
             Feature::Overlayfs => "overlayfs",
             Feature::DmaBufHeaps => "dma-buf heaps",
         }
@@ -172,6 +176,7 @@ pub fn probe(view: &dyn HostView) -> Report {
             cgroup_limits(view),
             user_namespaces(view),
             subordinate_ids(view),
+            networking(view),
             overlayfs(&release, &filesystems),
             dma_buf_heaps(view),
         ],
@@ -373,6 +378,15 @@ fn subordinate_ids(view: &dyn HostView) -> Check {
     ok(Feature::SubordinateIds, "newuidmap, newgidmap and subordinate ranges are set up")
 }
 
+/// The container's own network namespace needs a way to give it an uplink and a loopback port:
+/// pasta or slirp4netns (with `/dev/net/tun`), or root for a veth pair (`crate::net::Uplink`).
+fn networking(view: &dyn HostView) -> Check {
+    match crate::net::Uplink::choose(view) {
+        Ok(uplink) => ok(Feature::Networking, format!("a network namespace of its own through {}; adb only on 127.0.0.1", uplink.name())),
+        Err(m) => missing(Feature::Networking, m.why, m.fix),
+    }
+}
+
 /// The oldest kernel whose overlayfs can be mounted inside a user namespace (`userxattr`).
 pub const OVERLAY_USERNS_KERNEL: (u32, u32) = (5, 11);
 
@@ -528,6 +542,8 @@ pub(crate) mod fake {
             .file("/proc/sys/user/max_user_namespaces", "63704\n")
             .path("/dev/dma_heap")
             .path("/dev/dma_heap/system")
+            .tool("ip")
+            .path("/dev/net/tun")
             .path("/proc/kcore")
             .path("/proc/keys")
             .path("/proc/timer_list")
@@ -717,6 +733,7 @@ mod tests {
             .file("/etc/subgid", "1000:100000:65536\n")
             .tool("newuidmap")
             .tool("newgidmap")
+            .tool("pasta")
     }
 
     #[test]
@@ -740,6 +757,31 @@ mod tests {
         let v = unprivileged().file("/etc/subgid", "someone-else:100000:65536\n");
         assert!(fix_of(&probe(&v), Feature::SubordinateIds).contains("--add-subgids"));
         assert!(!probe(&v).usable());
+    }
+
+    #[test]
+    fn networking_names_the_uplink_it_will_use() {
+        let line = |v: &FakeView| probe(v).get(Feature::Networking).map(Check::line).expect("a networking check");
+        assert!(line(&unprivileged()).contains("through pasta"), "{}", line(&unprivileged()));
+        assert!(line(&FakeView::container_host()).contains("through a veth pair"), "root without pasta uses a veth pair");
+        assert!(line(&FakeView::container_host()).contains("adb only on 127.0.0.1"));
+    }
+
+    #[test]
+    fn an_unprivileged_host_with_no_way_to_a_network_namespace_is_not_usable() {
+        let mut v = unprivileged();
+        v.tools.remove("pasta");
+        let r = probe(&v);
+        assert!(!r.usable(), "the container would share the host's network");
+        assert!(fix_of(&r, Feature::Networking).contains("apt install passt"));
+        // A tool without /dev/net/tun can't work either.
+        let mut v = unprivileged();
+        v.paths.remove("/dev/net/tun");
+        assert!(fix_of(&probe(&v), Feature::Networking).contains("modprobe tun"));
+        // Root has the veth pair to fall back on, but still needs ip.
+        let mut v = FakeView::container_host();
+        v.tools.remove("ip");
+        assert!(fix_of(&probe(&v), Feature::Networking).contains("iproute2"));
     }
 
     #[test]

@@ -64,7 +64,7 @@ flate2 = { version = "1", default-features = false, features = ["zlib-rs", "runt
 libc = { version = "0.2", default-features = false }
 # Safe syscall wrappers (plain fsync: std's sync_data is F_FULLFSYNC on macOS; the adb bridge's
 # non-blocking send).
-rustix = { version = "1", default-features = false, features = ["event", "fs", "mount", "net", "process", "std"] }
+rustix = { version = "1", default-features = false, features = ["event", "fs", "mount", "net", "process", "std", "thread"] }
 # SIGINT/SIGTERM for `simee serve` and `simee mcp` (sim-api's `shutdown`, #388): its iterator's
 # handler only writes to a self-pipe; a thread of the server's own does the shutdown.
 signal-hook = { version = "0.4.6", default-features = false, features = ["iterator"] }
