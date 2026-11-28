@@ -112,7 +112,7 @@ client of that name. A client's rules are the default's with its own fields on t
 | Field | Meaning |
 | --- | --- |
 | `read_only` | Only tools that change nothing run, and only those are listed (the catalog's `Read` effect in `sim-api`; a tool nobody classified counts as changing something) |
-| `devices` | UDID or name patterns, where `*` matches any run of characters and `?` one; `@created` is the devices this client made. A device outside the list is left out of what the client lists and refused when named. An empty list allows none |
+| `devices` | UDID or name patterns, where `*` matches any run of characters and `?` one; `@created` is the devices this client made. A device outside the list is left out of what the client lists and refused when named. A named device is looked up in the call's `set` (an iOS device has another UDID in each set). An empty list allows none |
 | `toolsets` | The toolsets this client may use, within what the server serves (`SIMEE_MCP_TOOLSETS`): the client gets the tools that are in both. Tools outside it aren't listed and are refused, naming the toolset |
 | `confirm` | More tools that need confirmation |
 | `admission` | `refuse` (default) or `ignore`, below |

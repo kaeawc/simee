@@ -24,6 +24,9 @@ sim-android = { package = "simee-android", path = "../crates/sim-android" }
 sim-netshape = { package = "simee-netshape", path = "../crates/sim-netshape" }
 serde = "1"
 serde_json = "1"
+# SIGINT and SIGTERM quit the app like ⌘Q (`src/signals.rs`). The root workspace's entry,
+# repeated here because this is a workspace of its own.
+signal-hook = { version = "0.4.6", default-features = false, features = ["iterator"] }
 # The 3D view's own pipeline (`src/scene/`) in a Rune compositor, which hands it Rune's wgpu
 # device. Rune doesn't re-export wgpu: this is the version and features Rune already builds, so
 # it adds no crate (its backends come from Rune's per-target features). Bump it with Rune's.
