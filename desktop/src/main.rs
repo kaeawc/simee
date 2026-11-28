@@ -41,6 +41,7 @@ mod scan;
 mod scene;
 mod settings;
 mod shot_preview;
+mod signals;
 mod stylus;
 #[cfg(target_os = "macos")]
 mod surface;
@@ -1331,6 +1332,13 @@ fn main() {
             Some(options) => app.window_options(options),
             None => app,
         };
+        // SIGINT and SIGTERM quit like ⌘Q (#553): `on_quit` saves and stops what the window owns.
+        if !headless() {
+            let handle = app.handle();
+            if let Err(e) = signals::watch(move || handle.quit()) {
+                eprintln!("simee-desktop: not watching SIGINT/SIGTERM: {e}");
+            }
+        }
         let app = match gpu_backend(setting.as_deref()) {
             Ok(Some(backend)) => app.gpu_backend(backend),
             Ok(None) => app,

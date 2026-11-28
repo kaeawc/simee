@@ -3711,6 +3711,7 @@ dependencies = [
  "rune",
  "serde",
  "serde_json",
+ "signal-hook",
  "simee-android",
  "simee-api",
  "simee-core",
