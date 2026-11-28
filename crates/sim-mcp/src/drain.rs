@@ -69,6 +69,14 @@ impl Drain {
         Some(Held(self.clone()))
     }
 
+    /// Counts something that has to finish before the process may exit, whether or not it is
+    /// draining: a transport that sends a reply on a thread of its own holds it from the request
+    /// until the reply is written, since a call's reply is only queued when the call ends.
+    pub fn hold(self: &Arc<Drain>) -> Held {
+        *self.running() += 1;
+        Held(self.clone())
+    }
+
     /// Marks the process draining, then waits up to `limit` for the calls in flight to end;
     /// whether they all did.
     pub fn finish(&self, limit: Duration) -> bool {
@@ -114,6 +122,17 @@ mod tests {
         assert!(drain.draining() && drain.enter().is_none(), "no call enters once draining");
         drop(held);
         assert!(drain.finish(DEADLINE), "nothing in flight now");
+    }
+
+    #[test]
+    fn a_hold_counts_even_while_draining() {
+        let drain = Arc::new(Drain::default());
+        drain.finish(Duration::ZERO);
+        let held = drain.hold();
+        assert!(drain.draining() && drain.enter().is_none());
+        assert!(!drain.finish(SHORT), "the hold is still in flight");
+        drop(held);
+        assert!(drain.finish(DEADLINE));
     }
 
     #[test]

@@ -1513,6 +1513,8 @@ impl Exchange<'_> {
             }
             Incoming::Request { id, method, mut params } => {
                 let _running = session.as_ref().map(InFlight::new);
+                // A tool call's reply is written here, after the server queued it: a shutdown waits for that.
+                let _held = (method == "tools/call").then(|| crate::Drain::shared().hold());
                 let key = self.shared.router.key();
                 let token =
                     params.get_mut("_meta").and_then(|m| m.get_mut("progressToken")).map(|t| std::mem::replace(t, key.clone().into()));
