@@ -285,8 +285,36 @@ impl Drop for Running {
             IpAddr::V6(ip) if ip.is_unspecified() => SocketAddr::new(Ipv6Addr::LOCALHOST.into(), self.addr.port()),
             _ => self.addr,
         };
-        let _ = TcpStream::connect_timeout(&wake, Duration::from_secs(1));
-        let _ = accept.join();
+        let wake = || {
+            let _ = TcpStream::connect_timeout(&wake, Duration::from_millis(500));
+        };
+        if !stop_accepting(accept, wake, STOP_LIMIT) {
+            eprintln!("simee mcp: the accept loop did not stop within {STOP_LIMIT:?}; leaving it");
+        }
+    }
+}
+
+/// How long dropping a [`Running`] waits for its accept loop to see the wake connection.
+const STOP_LIMIT: Duration = Duration::from_secs(5);
+
+/// Wakes the accept loop until its thread ends, for at most `limit`: one wake connection can fail
+/// (its connect timing out on a busy host) and a join after it would then block forever. Joins the
+/// thread and says true once it has ended; past the limit, leaves it running and says false.
+fn stop_accepting(accept: JoinHandle<()>, mut wake: impl FnMut(), limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        wake();
+        let settle = (Instant::now() + Duration::from_millis(100)).min(deadline);
+        while !accept.is_finished() && Instant::now() < settle {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if accept.is_finished() {
+            let _ = accept.join();
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
     }
 }
 

@@ -397,6 +397,9 @@ mod tests {
 
     use super::*;
 
+    /// How long one side of a test waits for the other before it fails.
+    const WAIT: Duration = Duration::from_secs(10);
+
     fn gated() -> (Sender<()>, impl FnOnce() -> Value + Send + 'static) {
         let (release, wait) = channel::<()>();
         (release, move || {
@@ -481,18 +484,20 @@ mod tests {
     #[test]
     fn a_tasks_status_is_its_calls_last_step_and_a_cancelled_one_keeps_its_partial_result() {
         let tasks = Tasks::default();
-        let (said, step) = (std::sync::Arc::new(std::sync::Barrier::new(2)), std::sync::Arc::new(std::sync::Barrier::new(2)));
-        let (s, t) = (said.clone(), step.clone());
+        // Each side waits on the other with a deadline, never a bare barrier: a side that panics
+        // fails the test instead of leaving the other waiting forever (#533).
+        let (said_tx, said) = channel::<()>();
+        let (go, go_rx) = channel::<()>();
         let id = tasks
             .create_with("boot_many", move |ctl| {
                 sim_api::with_call_hooks(ctl.hooks(), || {
-                    // Each says something, then waits while the test reads it (two barriers).
+                    // Each says something, then waits while the test reads it.
                     sim_api::call_step("booted", 4, 8, "4 of 8 done");
-                    s.wait();
-                    s.wait();
+                    said_tx.send(()).ok();
+                    go_rx.recv_timeout(WAIT).expect("the test read the step");
                     sim_api::call_progress("boot_many: 2 waiting at 5 s, admission hold: memory");
-                    s.wait();
-                    t.wait();
+                    said_tx.send(()).ok();
+                    go_rx.recv_timeout(WAIT).expect("the test cancelled");
                     // Cancelled meanwhile: it stops and says what it finished.
                     assert!(sim_api::call_cancelled());
                     json!({"content": [{"type": "text", "text": "partial"}], "structuredContent": {"cancelled": true, "failed": 4},
@@ -503,16 +508,16 @@ mod tests {
             .as_str()
             .expect("id")
             .to_owned();
-        said.wait();
+        said.recv_timeout(WAIT).expect("the step");
         let message = tasks.get(&id).expect("task")["statusMessage"].as_str().expect("message").to_owned();
         assert!(message.starts_with("boot_many has been running for ") && message.ends_with(" s: 4 of 8 done"), "{message}");
-        said.wait();
-        said.wait();
+        go.send(()).expect("go");
+        said.recv_timeout(WAIT).expect("the note");
         // A note after a step keeps the count beside it.
         let message = tasks.get(&id).expect("task")["statusMessage"].as_str().expect("message").to_owned();
         assert!(message.ends_with("admission hold: memory (4 of 8 done)"), "{message}");
         assert!(tasks.cancel(&id));
-        step.wait();
+        go.send(()).expect("go");
         let task = wait_for_result(&tasks, &id);
         assert_eq!((task["status"].as_str(), task["result"]["structuredContent"]["failed"].as_u64()), (Some("cancelled"), Some(4)));
         assert!(task["statusMessage"].as_str().is_some_and(|m| m.contains("returned what it had done")), "{task}");

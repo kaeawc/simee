@@ -248,8 +248,10 @@ mod tests {
         let gate = fake.gate("info");
         let caller = fake.clone();
         let call = std::thread::spawn(move || caller.call("info", &json!({})));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while fake.called("info").is_empty() {
-            std::thread::yield_now();
+            assert!(std::time::Instant::now() < deadline, "the call never started");
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         // Started but not answered: an answer set now is the one it returns.
         assert_eq!(fake.answered("info"), 0);
@@ -284,12 +286,15 @@ mod tests {
         let (tx, rx) = channel();
         executor.submit(|| panic!("a method panicked"));
         // More jobs than workers still finish, and two of them wait for each other: they run at once.
-        let barrier = Arc::new(std::sync::Barrier::new(2));
-        for _ in 0..2 {
-            let (tx, barrier) = (tx.clone(), barrier.clone());
+        // Each signals that it is running and waits, bounded, for the other's signal (a bare
+        // `Barrier` would hang forever if they ever ran one after the other).
+        let ((a_tx, a_rx), (b_tx, b_rx)) = (channel::<()>(), channel::<()>());
+        for (mine, theirs) in [(a_tx, b_rx), (b_tx, a_rx)] {
+            let tx = tx.clone();
             executor.submit(move || {
-                barrier.wait();
-                tx.send(1).ok();
+                mine.send(()).ok();
+                let met = theirs.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+                tx.send(usize::from(met)).ok();
             });
         }
         for n in 0..Executor::WORKERS + 2 {
@@ -301,5 +306,6 @@ mod tests {
         let done: Vec<usize> =
             (0..Executor::WORKERS + 4).map(|_| rx.recv_timeout(std::time::Duration::from_secs(10)).expect("job")).collect();
         assert_eq!(done.len(), Executor::WORKERS + 4);
+        assert!(!done.contains(&0), "the two waiting jobs did not run at once: {done:?}");
     }
 }
