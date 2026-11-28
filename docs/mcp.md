@@ -12,6 +12,7 @@ look at their screens, read their logs, and watch them change.
 | Prompts | Common workflows (boot and install, reproduce a bug, audit contrast, find slowness, test across form factors) that name the tools to call and their toolsets |
 | Tasks | `boot`, `boot_many`, `create`, `clone`, `install`, `settle`, `erase`, `shutdown`, `export`, `import`, `mem_leaks`, `mem_heap` as pollable, cancellable tasks |
 | App | `device_view`: a device's screen with tap, swipe, type and button controls, in the conversation |
+| Safety | Confirmations for destructive tools, a per-client device and toolset policy, a read-only mode, host admission for boots and an audit log ([mcp-safety.md](mcp-safety.md)) |
 
 The default transport is stdio: nothing on the network can reach it. `simee mcp --http` serves the
 same server over HTTP for agents in other processes, containers or machines ([Over HTTP](#over-http)).
