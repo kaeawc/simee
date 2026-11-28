@@ -131,10 +131,11 @@ impl Sdk {
     /// program made executable (the docs say to, and zip may not keep the bit), then moved into
     /// place whole. `accepted` names the license ids the user accepted; the package's must be one.
     pub fn install_dhu(&self, plan: &Plan, accepted: &[&str]) -> Result<PathBuf> {
-        if let Some(l) = &plan.license
-            && !accepted.contains(&l.id.as_str())
-        {
-            return Err(Error::License(l.id.clone()));
+        // A manifest that lists no license doesn't make the package free: it is always under
+        // the Android SDK license.
+        let id = plan.license.as_ref().map_or(SDK_LICENSE, |l| l.id.as_str());
+        if !accepted.contains(&id) {
+            return Err(Error::License(id.to_owned()));
         }
         self.install_with(&plan.download, true, |top| {
             make_executable(&top.join(EXECUTABLE))?;

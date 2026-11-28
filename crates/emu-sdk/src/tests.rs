@@ -1,5 +1,5 @@
 use super::*;
-use crate::testing::{stored_zip, symlink_zip};
+use crate::testing::stored_zip;
 
 const SYS_IMG: &str = include_str!("../testdata/sys-img2-3.xml");
 const REPO: &str = include_str!("../testdata/repository2-3.xml");
@@ -789,6 +789,19 @@ mod dhu_tests {
     }
 
     #[test]
+    fn a_package_the_manifest_lists_no_license_for_still_needs_the_sdk_license_accepted() {
+        let work = scratch("dhu-nolicense");
+        let mut p = plan(served(&work, &dhu_zip()));
+        p.license = None;
+        let sdk = sdk_in(&work);
+        let e = sdk.install_dhu(&p, &[]).expect_err("refused");
+        assert!(matches!(e, Error::License(ref id) if id == dhu::SDK_LICENSE), "{e}");
+        assert!(!sdk.downloads().exists(), "refused before any download");
+        sdk.install_dhu(&p, &["android-sdk-license"]).expect("accepted");
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
     fn a_checksum_mismatch_installs_nothing_and_keeps_the_old_install() {
         let work = scratch("dhu-sha1");
         let bytes = dhu_zip();
@@ -935,16 +948,14 @@ mod dhu_tests {
     #[test]
     fn a_program_that_is_a_symlink_is_refused() {
         let work = scratch("dhu-symlink");
-        let target = work.join("victim");
-        std::fs::write(&target, b"x").expect("victim");
-        std::fs::set_permissions(&target, std::os::unix::fs::PermissionsExt::from_mode(0o600)).expect("mode");
-        // A zip with a symlink member: mode 0120777 in the external attributes.
-        let zip = symlink_zip("desktop-head-unit", target.to_str().expect("utf8"));
+        // The program is a symlink (mode 0120777) to a file in the archive: a relative target,
+        // which every unzip creates, so the refusal is ours and not the extractor's.
+        let zip =
+            crate::testing::stored_zip_modes(&[("auto/real", b"#!/bin/sh\n", 0o100600), ("auto/desktop-head-unit", b"real", 0o120777)]);
         let sdk = sdk_in(&work);
         let e = sdk.install_dhu(&plan(served(&work, &zip)), &["android-sdk-license"]).expect_err("symlink refused");
         assert!(e.to_string().contains("not a regular file"), "{e}");
-        let mode = std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&target).expect("meta").permissions());
-        assert_eq!(mode & 0o777, 0o600, "the target's mode is untouched");
+        assert!(dhu::executable(sdk.root()).is_none());
         let _ = std::fs::remove_dir_all(work);
     }
 

@@ -6,13 +6,8 @@ pub fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     stored_zip_modes(&entries)
 }
 
-/// A zip holding one symlink `name` to `target` (Unix mode 0120777).
-pub fn symlink_zip(name: &str, target: &str) -> Vec<u8> {
-    stored_zip_modes(&[(name, target.as_bytes(), 0o120777)])
-}
-
-/// [`stored_zip`] with each entry's Unix mode (`0o100644` a file, `0o120777` a symlink).
-fn stored_zip_modes(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+/// [`stored_zip`] with each entry's Unix mode (`0o100644` a file, `0o120777` a symlink whose data is its target).
+pub fn stored_zip_modes(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
     let (mut out, mut central) = (Vec::new(), Vec::new());
     for (name, data, mode) in entries {
         let mut crc = flate2::Crc::new();
