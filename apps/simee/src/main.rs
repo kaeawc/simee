@@ -1408,6 +1408,8 @@ mod tests {
     /// #409: `--set` goes with every method a command calls, as an absolute path, before or after
     /// the subcommand; a `set` the params already have stays; with no set at all (a test's
     /// transport) nothing is added.
+    // Unix paths; device sets are iOS (macOS) only.
+    #[cfg(unix)]
     #[test]
     fn the_set_flag_goes_with_every_call_as_an_absolute_path() {
         let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).expect("arguments");
