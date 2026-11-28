@@ -10,7 +10,10 @@ use std::time::Duration;
 use emu_gfxstream::Icd;
 
 /// How long a probe child may take before it is killed and the boot goes on without its verdict.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A cold probe compiles in about 4 s on an idle Mac. The limit is generous so that a slow probe on a
+/// loaded farm host still gets its verdict instead of sending the boot to lavapipe; it only has to
+/// end a probe that hangs.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long `-warm-renderer` may take (about 4 s with Metal's shader cache cold).
 const WARM_TIMEOUT: Duration = Duration::from_secs(120);

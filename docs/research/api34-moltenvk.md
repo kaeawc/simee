@@ -127,7 +127,7 @@ renderer without GL. `-gpu lavapipe`, `software` and `off` are unchanged.
 
 The probes (`apps/emu/src/vkprobe.rs`):
 
-- each child has 10 s. At the deadline it is killed by its PID and reaped, and the boot goes
+- each child has 60 s, so a slow probe on a loaded host still gets its verdict. At the deadline it is killed by its PID and reaped, and the boot goes
   on: MoltenVK in place of KosmicKrisp, lavapipe in place of MoltenVK, with a notice.
 - only a clean verdict is cached: exit 0 (Vulkan came up) or 3 (it didn't, `PROBE_FAILED`). A
   timeout, a signal (a crash, jetsam, a process group's SIGTERM) or any other status (a panic's
@@ -155,7 +155,7 @@ environment a probe child sees, and the cache key and file.
   ANGLE on SwiftShader, against 1.5 s on MoltenVK.
 - Concurrent first boots on one renderer build each run their own probe (no lock); each writes
   the same verdict.
-- A KosmicKrisp probe that hangs on every boot costs each API 34 or 35 boot its 10 s before
+- A KosmicKrisp probe that hangs on every boot costs each API 34 or 35 boot its 60 s before
   MoltenVK; one that always crashes costs about 1 s. Neither is cached, by design.
 - #355 saw two slow warm boots on KosmicKrisp with ANGLE on SwiftShader on API 36 (9.5 and
   10.8 s, against 3.7 to 4.1 s). The cause is unexplained (its footnote 1). Watch API 34's warm
