@@ -9,6 +9,7 @@
 //! gate their iOS backend on `target_os = "macos"` and the shared core still builds and tests.
 #![cfg(target_os = "macos")]
 
+mod bundle;
 mod carplay;
 mod display;
 mod error;
@@ -23,6 +24,7 @@ pub mod surface_port;
 pub mod videotoolbox;
 mod watch;
 
+pub use bundle::Bundles;
 pub use display::{Display, FrameWatch, Surface};
 pub use error::{Error, Result};
 pub use hid::{Hid, track_sends, wait_sent};

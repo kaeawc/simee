@@ -1858,6 +1858,35 @@ fn check_form_factor(ctx: &Context, device_type: &str, form_factor: FormFactor) 
     }
 }
 
+/// `import` of an iOS bundle (#421): a new simulator `name` in the call's device set, of the
+/// bundle's device type on its runtime (identifier and build, refused when not installed), with
+/// the bundle's data directory. Like `create`, it makes the set's directory.
+fn import(s: &mut Session, p: &Value) -> Result<Value, String> {
+    if let Some(set) = s.set()? {
+        std::fs::create_dir_all(&set).map_err(|e| format!("the device set {set}: {e}"))?;
+    }
+    let ctx = s.ctx()?;
+    let (from, name) = (need_str(p, "from")?, need_str(p, "name")?);
+    if p.get("allow_mismatch").and_then(Value::as_bool) == Some(true) {
+        return Err("`allow_mismatch` is Android's: an iOS bundle needs its runtime's build".into());
+    }
+    let reader = sim_bundle::Reader::open(Path::new(from)).map_err(err)?;
+    let im = sim_bundle::ios::import(&sim_coresim::Bundles(ctx), reader, name).map_err(err)?;
+    let info = ctx.device(&im.device.udid).map_err(err)?.info();
+    let m = &im.manifest;
+    Ok(json!({
+        "device": info,
+        "runtime": {"identifier": im.runtime.identifier, "name": im.runtime.name, "version": im.runtime.version,
+            "build": im.runtime.build},
+        "dropped": m.dropped,
+        "extracted": im.extracted,
+        "exported_as": m.device.name,
+        "guest_identity": m.guest_identity,
+        "note": sim_bundle::ios::DUPLICATED_IDENTITY,
+        "resume": m.resume,
+    }))
+}
+
 /// Dispatches one device method.
 pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
     let ok = |r: sim_coresim::Result<()>| r.map(|()| Value::Null).map_err(err);
@@ -1940,6 +1969,26 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             let d = s.ctx()?.clone_device(&template, need_str(p, "name")?).map_err(err)?;
             serde_json::to_value(d.info()).map_err(err)
         }
+        "export" => {
+            let udid = s.device(p)?.info().udid;
+            let to = need_str(p, "to")?;
+            let opts = sim_bundle::Options::default();
+            let ex = sim_bundle::ios::export(&sim_coresim::Bundles(s.ctx()?), &udid, Path::new(to), &opts).map_err(err)?;
+            let m = &ex.manifest;
+            Ok(json!({
+                "device": udid,
+                "to": to,
+                "summary": ex.summary,
+                "identity": m.identity,
+                "captures": m.captures,
+                "resume": m.resume,
+                "secrets": m.secrets,
+                "guest_identity": m.guest_identity,
+                "dropped": m.dropped,
+                "left_out": ex.left_out,
+            }))
+        }
+        "import" => import(s, p),
         // A device that stops (or is erased, which removes its socket) takes its camera feed with it.
         "shutdown" | "erase" => {
             let d = s.device(p)?;
@@ -2675,6 +2724,8 @@ mod tests {
                 // A link joins two devices; `links`' state is a link state's name.
                 "link" => p["devices"] = json!(["409409A0-0000-4000-8000-000000000409", "409409A0-0000-4000-8000-000000000410"]),
                 "links" => p["state"] = json!("active"),
+                // A bundle's manifest says whose it is; with none to read, `platform` does.
+                "import" => p["platform"] = json!("ios"),
                 _ => {}
             }
             let result = crate::methods::call(&mut s, method, &p);

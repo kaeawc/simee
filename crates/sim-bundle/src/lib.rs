@@ -10,6 +10,7 @@
 //! crate packs, unpacks and verifies: every chunk against its hash, every disk and file against
 //! its whole hash, every path (relative, no `..`), and the format's major version.
 
+pub mod ios;
 mod manifest;
 mod store;
 mod tar;
@@ -22,8 +23,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 pub use manifest::{
-    AndroidImage, Base, CHUNK_SIZE, COLD_BOOT, COMPRESSION, Captures, Device, Disk, Extent, FORMAT, File, GuestIdentity, Identity,
-    Manifest, Secret, is_hash, safe_path,
+    AndroidImage, Base, CHUNK_SIZE, COLD_BOOT, COMPRESSION, Captures, Device, Disk, Entry, EntryKind, Extent, FORMAT, File, GuestIdentity,
+    Identity, IosSimulator, Manifest, Secret, is_hash, safe_path,
 };
 pub use store::{ChunkStore, chunk_name, compress, decompress_verified, hash, hash_file, max_compressed, parse_chunk_name, read_regular};
 pub use tar::{TarReader, TarWriter};
@@ -62,6 +63,9 @@ pub enum Error {
     Changed(String),
     #[error("{0} already exists")]
     Exists(PathBuf),
+    /// A device or host that can't take part as asked (running, missing a runtime): why.
+    #[error("{0}")]
+    Refused(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

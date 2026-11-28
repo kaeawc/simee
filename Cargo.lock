@@ -2062,6 +2062,7 @@ dependencies = [
  "signal-hook",
  "simee-android",
  "simee-audio",
+ "simee-bundle",
  "simee-camera",
  "simee-core",
  "simee-coresim",
@@ -2130,6 +2131,7 @@ dependencies = [
  "libc",
  "objc2",
  "objc2-foundation",
+ "simee-bundle",
  "simee-core",
  "thiserror 2.0.21",
 ]

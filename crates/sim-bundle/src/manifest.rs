@@ -47,6 +47,10 @@ pub struct Manifest {
     pub compression: String,
     pub disks: Vec<Disk>,
     pub files: Vec<File>,
+    /// A file tree's directories and symlinks, and its files' modes (an iOS data directory):
+    /// what `disks` and `files` don't say. Empty for a bundle of disk images.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tree: Vec<Entry>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,12 +61,52 @@ pub struct Device {
     pub form_factor: Option<String>,
 }
 
-/// The system image (Android) a device needs. iOS's runtime and device type come in its own
-/// variant.
+/// What a device needs on the receiving host: the system image (Android), or the runtime and
+/// device type (iOS).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Identity {
     Android(AndroidImage),
+    Ios(IosSimulator),
+}
+
+/// An iOS simulator's device type and runtime, by the service's identifiers. An import needs the
+/// same runtime build; the version and name only say what to install when it is missing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IosSimulator {
+    /// `com.apple.CoreSimulator.SimDeviceType.iPhone-17`.
+    pub device_type: String,
+    /// `com.apple.CoreSimulator.SimRuntime.iOS-26-1`.
+    pub runtime: String,
+    /// The runtime's build (`23B80`).
+    pub build: String,
+    /// The runtime's version (`26.1`).
+    pub version: String,
+    /// The runtime's name (`iOS 26.1`).
+    pub runtime_name: String,
+}
+
+/// What a [tree](Manifest::tree) entry is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryKind {
+    Dir,
+    /// A regular file, stored as the disk (or file) at the same path.
+    File,
+    Symlink,
+}
+
+/// One directory, file or symlink of a file tree, at its path in the bundle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Entry {
+    pub path: String,
+    pub kind: EntryKind,
+    /// Permission bits (at most `0o7777`) of a directory or file; none for a symlink.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+    /// A symlink's target, as the link holds it (relative, or a path inside the device).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 /// An Android system image by content: `source.properties`'s API level, tag, ABI and revision,
@@ -260,6 +304,54 @@ impl Manifest {
             }
             if f.chunks.len() as u64 != f.size.div_ceil(self.chunk_size) {
                 return bad(format!("{}: {} chunks for {} bytes", f.path, f.chunks.len(), f.size));
+            }
+        }
+        self.validate_tree(&seen)
+    }
+
+    /// The tree's checks: each entry's path is safe and appears once; a file entry is a disk or
+    /// file of the bundle and no other entry is; a symlink has a target and no mode, and nothing
+    /// lies under one (extracting through a link would write outside the destination).
+    fn validate_tree(&self, stored: &BTreeSet<&str>) -> Result<()> {
+        let bad = |s: String| Err(Error::Manifest(s));
+        let mut paths = BTreeSet::new();
+        let mut links = BTreeSet::new();
+        for e in &self.tree {
+            if !safe_path(&e.path) {
+                return Err(Error::Path(e.path.clone()));
+            }
+            if !paths.insert(e.path.as_str()) {
+                return bad(format!("tree: `{}` appears twice", e.path));
+            }
+            let is_stored = stored.contains(e.path.as_str());
+            if (e.kind == EntryKind::File) != is_stored {
+                let what = if is_stored { "stored" } else { "not stored" };
+                return bad(format!("tree: `{}` is a {:?} entry but {what} in the bundle", e.path, e.kind));
+            }
+            match (e.kind, &e.target, e.mode) {
+                (EntryKind::Symlink, Some(t), None) if !t.is_empty() && !t.contains('\0') => {
+                    links.insert(e.path.as_str());
+                }
+                (EntryKind::Symlink, ..) => return bad(format!("tree: the symlink `{}` needs a target and no mode", e.path)),
+                (_, Some(_), _) => return bad(format!("tree: `{}` has a target but isn't a symlink", e.path)),
+                (_, None, Some(m)) if m > 0o7777 => return bad(format!("tree: `{}` has mode {m:o}", e.path)),
+                _ => {}
+            }
+        }
+        if !self.tree.is_empty()
+            && let Some(p) = stored.iter().find(|p| !paths.contains(*p))
+        {
+            return bad(format!("tree: `{p}` is stored but not in the tree"));
+        }
+        if !links.is_empty() {
+            for p in paths.iter().chain(stored.iter()) {
+                let mut at = *p;
+                while let Some((parent, _)) = at.rsplit_once('/') {
+                    if links.contains(parent) {
+                        return bad(format!("tree: `{p}` lies under the symlink `{parent}`"));
+                    }
+                    at = parent;
+                }
             }
         }
         Ok(())

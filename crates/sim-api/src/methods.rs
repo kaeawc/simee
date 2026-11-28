@@ -128,21 +128,27 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "export",
-        "device, to",
+        "device, to; iOS: set?",
         "Pack a shut-down device into a portable bundle at `to` (a .tar file, else a new directory) with no host path in it: \
          manifest.json and content-addressed chunks (1 MiB, BLAKE3, each LZ4-compressed; zero ranges stored as extents). \
          Android: an AVD that has booted under simee (its simee disks, config.ini without host paths, boot.prop) and \
-         its system image's identity; captures disks, not RAM (resume is a cold boot). Returns sizes, the identity and the \
-         secrets inventory. iOS simulators: not yet (the next step of #170)",
+         its system image's identity. iOS: the simulator's data directory (settings, apps and their containers, keychain) \
+         as data/, its directories, symlinks and modes in the manifest's tree, without the contents of Library/Caches \
+         and tmp (listed in `left_out`) or symlinks to host paths (in `dropped`), and its device type and runtime \
+         (identifier and build); only reads the device, refusing one that is booted or a `to` inside it. Captures disks, \
+         not RAM (resume is a cold boot). Returns sizes, the identity and the secrets inventory",
     ),
     (
         "import",
-        "from, name, allow_mismatch?(false)",
-        "Create device `name` from a bundle `export` wrote. Android: finds the system image by content (API, tag, ABI, revision, \
-         BLAKE3 of its images, fingerprint) and refuses, naming what to install, when none matches (allow_mismatch: use another \
-         installed revision of the same API, tag and ABI, named in `mismatch`); checks every chunk and disk hash; drops \
-         config.ini keys holding host paths (listed in `dropped`); writes nothing unless it all succeeds. The import keeps the \
-         exported device's guest identity (ro.serialno, android_id). iOS: not yet",
+        "from, name; iOS: set?; Android: allow_mismatch?(false)",
+        "Create device `name` from a bundle `export` wrote, on the platform its manifest names (`platform` only checks it). \
+         Checks every chunk and file hash and writes nothing unless it all succeeds. Android: finds the system image by \
+         content (API, tag, ABI, revision, BLAKE3 of its images, fingerprint) and refuses, naming what to install, when none \
+         matches (allow_mismatch: use another installed revision of the same API, tag and ABI, named in `mismatch`); drops \
+         config.ini keys holding host paths (listed in `dropped`); keeps the exported device's guest identity (ro.serialno, \
+         android_id). iOS: finds the runtime by identifier and build and refuses, naming what to install, when it isn't \
+         installed; creates a simulator of the bundle's device type in the set and puts the bundle's data directory in as \
+         its own (a new UDID; the keychain and app data come along)",
     ),
     ("shutdown", "device; iOS: set?", "Shut down"),
     (
@@ -692,6 +698,9 @@ const ALL_PLATFORMS: &[&str] = &[
     "boot_many",
     "admission_check",
     "clone",
+    // Portable bundles: an AVD's disks, a simulator's data directory (#170, #421).
+    "export",
+    "import",
     "shutdown",
     // Device state, on Android over adb and the AVD's disks (#418).
     "erase",
@@ -769,7 +778,7 @@ const ALL_PLATFORMS: &[&str] = &[
     "audio_mute",
 ];
 /// Methods only Android devices have.
-const ANDROID_ONLY: &[&str] = &["console", "xr", "vehicle", "touchpad", "export", "import"];
+const ANDROID_ONLY: &[&str] = &["console", "xr", "vehicle", "touchpad"];
 
 /// The platforms whose devices `method` works on.
 pub fn platforms(method: &str) -> &'static [Platform] {
@@ -1669,10 +1678,19 @@ fn dispatch(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         // Streams outlive the call: the process's own registry, which resolves `device` itself.
         m if crate::stream::is_method(m) => crate::stream::call(s, m, p),
         // Makes a device from a bundle; the bundle's manifest says whose.
-        "import" => match opt_platform(p)? {
-            Some(Platform::Ios) => Err("`import` takes Android bundles for now; iOS bundles are the next step of #170".into()),
-            _ => crate::android::import(&mut s.android, p),
-        },
+        "import" => {
+            let asked = opt_platform(p)?;
+            let theirs = str_param(p, "from")
+                .and_then(|from| sim_bundle::Reader::open(std::path::Path::new(from)).ok())
+                .map(|bundle| bundle.manifest().platform);
+            match (asked, theirs) {
+                (Some(asked), Some(theirs)) if asked != theirs => {
+                    Err(format!("the bundle is an {} device's, not an {} one", theirs.label(), asked.label()))
+                }
+                (Some(Platform::Ios), _) | (None, Some(Platform::Ios)) => crate::ios::call(&mut s.ios, method, p),
+                _ => crate::android::import(&mut s.android, p),
+            }
+        }
         "boot_many" => boot_many_hooked(s, p, &crate::progress::Unwatched),
         m if crate::prefs::is_method(m) => {
             let (platform, udid) = resolve(s, p)?;
@@ -2959,6 +2977,21 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// docs/api.md has the bundle methods' rows as `help` writes them (#421: both platforms).
+    #[test]
+    fn the_docs_agree_with_the_bundle_rows() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let Ok(api) = std::fs::read_to_string(root.join("docs/api.md")) else {
+            eprintln!("skipped: not in the simee workspace, so docs/api.md isn't here");
+            return;
+        };
+        for (method, params, doc) in METHODS.iter().filter(|(m, ..)| matches!(*m, "export" | "import")) {
+            assert_eq!(platforms(method), Platform::ALL, "{method}");
+            let row = format!("| `{method}` | Android, iOS | {} | {} |", params.replace('|', "\\|"), doc.replace('|', "\\|"));
+            assert!(api.lines().any(|l| l == row), "docs/api.md's row for `{method}` differs from METHODS; it should be\n{row}");
+        }
+    }
+
     #[test]
     fn android_devices_export_to_bundles_and_import_under_new_names() {
         let (mut s, root) = short_android_session("bundle");
@@ -2988,7 +3021,7 @@ pub(crate) mod tests {
         assert!(bad.contains("allow_mismatch"), "{bad}");
         assert_eq!(std::fs::read(emu_avd::state_dir(&root.join("avd/copy.avd")).join("userdata.img")).expect("imported"), b"settled");
         let err = call(&mut s, "import", &json!({"from": to, "name": "copy2", "platform": "ios"})).expect_err("ios");
-        assert!(err.contains("Android bundles"), "{err}");
+        assert_eq!(err, "the bundle is an Android device's, not an iOS one");
         // A running device is refused before anything is written.
         let _fake = sim_android::testing::fake_emulator(s.android.backend(), "golden");
         let err = call(&mut s, "export", &json!({"device": "golden", "to": root.join("again.tar")})).expect_err("running");

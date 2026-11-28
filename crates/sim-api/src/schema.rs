@@ -394,6 +394,12 @@ mod tests {
         assert_eq!(create["required"], json!(["name"]));
         assert_eq!(create["properties"]["device_type"]["description"], "iOS only");
         assert_eq!(create["properties"]["system_image"]["description"], "Android only");
+        // #421: bundles on both platforms; `allow_mismatch` is Android's, a device set iOS's.
+        let (export, import) = (schema("export"), schema("import"));
+        assert_eq!((&export["required"], &export["properties"]["to"]["type"]), (&json!(["device", "to"]), &json!("string")));
+        assert_eq!((&import["required"], &import["properties"]["from"]["type"]), (&json!(["from", "name"]), &json!("string")));
+        assert_eq!(import["properties"]["allow_mismatch"]["description"], "Android only");
+        assert_eq!((&export["properties"]["set"]["type"], &import["properties"]["set"]["type"]), (&json!("string"), &json!("string")));
         let boot = schema("boot");
         assert_eq!(boot["required"], json!(["device"]));
         assert_eq!(boot["properties"]["env"]["type"], "object");
