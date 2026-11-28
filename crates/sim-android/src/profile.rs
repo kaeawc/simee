@@ -285,6 +285,7 @@ mod tests {
 
     /// An adb to a fake guest (the `slim` packages: turbo and wellbeing can go off, partnersetup is
     /// refused, restore is absent) and the fake's call log.
+    #[cfg(unix)]
     fn guest(tag: &str) -> (std::path::PathBuf, Adb, crate::testing::FakeAdb, crate::testing::FakeEmulator) {
         let root = std::path::PathBuf::from("/tmp").join(format!("sa-profile-{tag}-{}", std::process::id()));
         let image = root.join("sdk/system-images/android-36/google_apis/arm64-v8a");
@@ -300,6 +301,7 @@ mod tests {
         (root, adb, calls, emulator)
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_change_waits_for_the_guest_to_write_its_state_then_syncs() {
         let (root, adb, calls, _emulator) = guest("flush");
@@ -320,6 +322,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_undo_flushes_too_and_a_call_that_changes_nothing_waits_for_nothing() {
         let (root, adb, calls, _emulator) = guest("undo");
@@ -337,6 +340,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_guest_that_never_writes_is_reported_at_the_deadline() {
         let (root, adb, calls, _emulator) = guest("stuck");
@@ -347,6 +351,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_guest_without_root_waits_out_the_debounce_and_says_so() {
         let (root, adb, calls, _emulator) = guest("blind");
