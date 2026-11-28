@@ -9,7 +9,8 @@
 //! The device has two third-party apps: `com.example.app`, debuggable, with `files/notes.txt`
 //! (`hello`), `shared_prefs/a.xml`, `cache/c.bin`, a `lib` dir (as the system leaves one) and
 //! `files/out`, a symlink to a directory outside the container holding `secret.txt`; and
-//! `com.example.release`, a release build with `files/r.txt` (`release`). Each has an APK
+//! `com.example.release`, a release build with `files/r.txt` (`release`) and, for user 10,
+//! `data/user/10/com.example.release/files/r10.txt`. Each has an APK
 //! (`data/app/~~<x>==/<package>-<y>==/base.apk`), `data/data` links to `data/user/0`, and
 //! `com.example.app` has `sdcard/Android/data/com.example.app/files/ext.txt`.
 
@@ -68,6 +69,7 @@ pub fn fake_files_adb(android: &Android, root: Root) -> FakeFiles {
     file("data/user/0/com.example.app/cache/c.bin", &[0, 1, 2]);
     file("data/user/0/com.example.app/lib/.keep", b"");
     file("data/user/0/com.example.release/files/r.txt", b"release");
+    file("data/user/10/com.example.release/files/r10.txt", b"user 10");
     file("sdcard/Android/data/com.example.app/files/ext.txt", b"external");
     file("data/app/~~Ab==/com.example.app-Cd==/base.apk", b"PK\x03\x04app");
     file("data/app/~~Ef==/com.example.release-Gh==/base.apk", b"PK\x03\x04release");
@@ -78,13 +80,15 @@ pub fn fake_files_adb(android: &Android, root: Root) -> FakeFiles {
     std::fs::write(tools.join("debuggable"), "com.example.app\n").expect("debuggable");
     std::fs::write(tools.join("owner"), "10123:10123:660\n").expect("owner");
     let _ = std::fs::remove_file(tools.join("rooted"));
-    let _ = std::fs::remove_file(tools.join("adb.log"));
+    for state in ["adb.log", "chown.log", "restorecon.log", "attack", "chown-fails"] {
+        let _ = std::fs::remove_file(tools.join(state));
+    }
     std::fs::write(tools.join("root"), root.name()).expect("root");
     let bin = tools.join("fakebin");
     std::fs::create_dir_all(&bin).expect("fakebin");
     write_script(&bin.join("stat"), FAKE_STAT);
-    write_script(&bin.join("chown"), "exit 0\n");
-    write_script(&bin.join("restorecon"), "exit 0\n");
+    write_script(&bin.join("chown"), FAKE_CHOWN);
+    write_script(&bin.join("restorecon"), FAKE_RESTORECON);
     write_script(&tools.join("adb"), FAKE_ADB);
     FakeFiles { tools, device, outside }
 }
@@ -106,6 +110,34 @@ impl FakeFiles {
         self.device.join(path.trim_start_matches('/'))
     }
 
+    /// Each `chown` as `<uid:gid> <path>`: the path it changed (a symlink's target, unless `-h`),
+    /// relative to the device's `/` with symlinks resolved (`data/user/0`, not `data/data`).
+    pub fn chowns(&self) -> Vec<String> {
+        self.changed("chown.log")
+    }
+
+    /// Each path `restorecon` relabelled, as [`FakeFiles::chowns`] has them.
+    pub fn restorecons(&self) -> Vec<String> {
+        self.changed("restorecon.log")
+    }
+
+    fn changed(&self, log: &str) -> Vec<String> {
+        let device = format!("{}/", std::fs::canonicalize(&self.device).expect("device").display());
+        let text = std::fs::read_to_string(self.tools.join(log)).unwrap_or_default();
+        text.lines().map(|l| l.replace(&device, "")).collect()
+    }
+
+    /// From now on a hostile app swaps each temp file a write makes for a symlink to
+    /// `outside/victim`, as soon as `exec-in` has written it.
+    pub fn swap_temp_files(&self) {
+        std::fs::write(self.tools.join("attack"), "swap").expect("attack");
+    }
+
+    /// From now on `chown` fails.
+    pub fn fail_chown(&self) {
+        std::fs::write(self.tools.join("chown-fails"), "").expect("chown-fails");
+    }
+
     /// Whether `adb root` restarted adbd as root.
     pub fn rooted(&self) -> bool {
         Path::new(&self.tools.join("rooted")).exists()
@@ -125,6 +157,29 @@ done
 exit $rc
 "#;
 
+/// Logs what it changes to `chown.log`: with `-h` the link itself, otherwise what it points at.
+const FAKE_CHOWN: &str = r#"here=$(dirname "$0")/..
+h=; [ "$1" = -h ] && { h=1; shift; }
+[ -e "$here/chown-fails" ] && { echo "chown: Operation not permitted" >&2; exit 1; }
+ids=$1; shift; rc=0
+for f in "$@"; do
+  { [ -e "$f" ] || [ -L "$f" ]; } || { echo "chown: $f: No such file or directory" >&2; rc=1; continue; }
+  if [ -n "$h" ]; then r="$(cd "$(dirname "$f")" && pwd -P)/$(basename "$f")"; else r=$(realpath "$f"); fi
+  echo "$ids $r" >> "$here/chown.log"
+done
+exit $rc
+"#;
+
+/// Logs what it relabels to `restorecon.log`, never following a symlink (toybox's doesn't).
+const FAKE_RESTORECON: &str = r#"here=$(dirname "$0")/..
+rc=0
+for f in "$@"; do
+  { [ -e "$f" ] || [ -L "$f" ]; } || { echo "restorecon: $f: No such file or directory" >&2; rc=1; continue; }
+  echo "$(cd "$(dirname "$f")" && pwd -P)/$(basename "$f")" >> "$here/restorecon.log"
+done
+exit $rc
+"#;
+
 const FAKE_ADB: &str = r#"here=$(dirname "$0")
 echo "$*" >> "$here/adb.log"
 [ "$1" = "-s" ] && shift 2
@@ -137,7 +192,7 @@ root)
   if [ "$mode" = adb-root ]; then touch "$here/rooted"; echo "restarting adbd as root"; exit 0; fi
   echo "adbd cannot run as root in production builds"; exit 1;;
 wait-for-device) exit 0;;
-shell|exec-out|exec-in) ;;
+shell|exec-out|exec-in) verb=$1;;
 *) echo "fake adb: unhandled: $*" >&2; exit 2;;
 esac
 shift
@@ -151,9 +206,11 @@ case "$cmd" in
   done
   exit 0;;
 "pm clear "*)
-  pkg=${cmd#pm clear }
-  if [ -d "$dev/data/user/0/$pkg" ]; then
-    find "$dev/data/user/0/$pkg" -mindepth 1 -maxdepth 1 ! -name lib -exec rm -rf {} +
+  # pm clear [--user <n>] <package>: user 0 when no --user is given, as pm's.
+  pkg=${cmd#pm clear }; user=0
+  case "$pkg" in "--user "*) pkg=${pkg#--user }; user=${pkg%% *}; pkg=${pkg#"$user" };; esac
+  if [ -d "$dev/data/user/$user/$pkg" ]; then
+    find "$dev/data/user/$user/$pkg" -mindepth 1 -maxdepth 1 ! -name lib -exec rm -rf {} +
     echo Success
   else
     echo Failed
@@ -176,5 +233,10 @@ esac
 # Every device path the client sends is quoted: map those (and only those, not the `/data/` in
 # `/sdcard/Android/data/`) into the device's directory.
 cmd=$(printf '%s' "$cmd" | sed -e "s#'/data/#'$dev/data/#g" -e "s#'/sdcard/#'$dev/sdcard/#g" -e "s#'/storage/emulated/0/#'$dev/sdcard/#g")
+if [ "$verb" = exec-in ] && [ -e "$here/attack" ]; then
+  PATH="$here/fakebin:$PATH" sh -c "$cmd"; rc=$?
+  find "$dev" -name '.simee-write-*' ! -type l | while read -r t; do rm -f "$t"; ln -s "$here/outside/victim" "$t"; done
+  exit $rc
+fi
 PATH="$here/fakebin:$PATH" exec sh -c "$cmd"
 "#;

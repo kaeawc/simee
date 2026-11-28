@@ -187,13 +187,13 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `mem_heap` | iOS | device, bundle_id \| pid, raw?, timeout_s?(120) | A running app's heap by class (the host's `heap`): zones, node and byte totals, and every class with its count, bytes and average size, most instances first. raw adds the report as printed |
 | `mem_vmmap` | iOS | device, bundle_id \| pid, raw?, timeout_s?(120) | A running app's memory regions (the host's `vmmap --summary`): each region type's virtual, resident, dirty, swapped, volatile and empty bytes and count, the malloc zones with allocations and fragmentation, and the totals. raw adds the report as printed |
 | `mem_history` | iOS | device, bundle_id \| pid, address, raw?, timeout_s?(120) | The allocation stack of an address in a running app (the host's `malloc_history`), as events with their stacks; needs the app launched with malloc_stack_logging (MallocStackLogging=1 logs live allocations only). raw adds the report as printed |
-| `containers` | Android, iOS | device, sizes? | App data and bundle containers. Android: each third-party app's data dir (`data/user/0/<package>`) and APK dir; the file methods take paths in one app's container (`data/data/<package>`, `data/user/<n>/<package>`, `sdcard/Android/data/<package>`, the APK dir read only) and reach it through run-as for a debuggable app, root otherwise |
-| `ls` | Android, iOS | device, path? | List a directory under the device data dir (Android: in an app's container) |
-| `read` | Android, iOS | device, path | Read a file (base64) |
-| `write` | Android, iOS | device, path, text \| base64 | Write a file |
-| `rm` | Android, iOS | device, path | Remove a file or directory |
-| `du` | Android, iOS | device, path? | Size in bytes (Android: of a path in an app's container) |
-| `clear_container` | Android, iOS | device, path | Empty a container (an app's data) without deleting it (Android: or a directory in one; an app's data dir that neither run-as nor root reaches is cleared with `pm clear`, which also clears its external dir and stops it) |
+| `containers` | Android, iOS | device, sizes?; Android: root? | App data and bundle containers. Android: each third-party app's data dir (`data/user/0/<package>`) and APK dir; the file methods take paths in one app's container (`data/data/<package>`, `data/user/<n>/<package>`, `sdcard/Android/data/<package>`, the APK dir read only) and reach it through run-as for a debuggable app, otherwise as root when adbd is root or `su 0` works. None of them runs `adb root` unless given root: true, since it restarts adbd and drops the device's adb forwards and open shells |
+| `ls` | Android, iOS | device, path?; Android: root? | List a directory under the device data dir (Android: in an app's container) |
+| `read` | Android, iOS | device, path; Android: root? | Read a file (base64; Android: at most 128 MiB) |
+| `write` | Android, iOS | device, path, text \| base64; Android: root? | Write a file |
+| `rm` | Android, iOS | device, path; Android: root? | Remove a file or directory |
+| `du` | Android, iOS | device, path?; Android: root? | Size in bytes (Android: of a path in an app's container) |
+| `clear_container` | Android, iOS | device, path; Android: root?, pm_clear? | Empty a container (an app's data) without deleting it (Android: or a directory in one. pm_clear: true clears an app's whole data dir with `pm clear --user <n>` instead, which reaches a release app without root but also stops the app, wipes its external dir and resets its runtime permissions) |
 | `defaults_read` | iOS | device, domain | Read a preferences domain |
 | `defaults_write` | iOS | device, domain, key, value, type? | Write a preference (type: string\|int\|float\|bool) |
 | `prefs_stores` | Android, iOS | device, bundle_id | An app's preference stores, each with the id the other prefs_* methods take: Android `shared_prefs/<name>.xml` and DataStore `datastore/<name>.preferences_pb`, iOS the app's domain (its bundle id) and its app-group suites; any other iOS domain is reachable by its name |

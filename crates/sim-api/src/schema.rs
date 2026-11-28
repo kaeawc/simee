@@ -72,6 +72,8 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         | "settle_ms" => Int,
         "booted" | "on" | "suppressed" | "undo" | "shaped" | "settle" | "settle_foreground" | "audio" | "mute" | "sizes" | "offline"
         | "proxy" | "face" | "foreground" | "eraser" | "folded" | "restart" | "stream" | "all" | "allow_mismatch" | "fresh" => Bool,
+        // The Android file methods' opt-ins: `adb root` and `pm clear`.
+        "root" | "pm_clear" => Bool,
         "env" => StrMap,
         "payload" | "region" => Obj,
         "rules" => Objects,

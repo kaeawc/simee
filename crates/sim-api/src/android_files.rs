@@ -1,10 +1,11 @@
 //! The app-file methods (`containers`, `ls`, `read`, `write`, `rm`, `du`, `clear_container`) on
 //! Android devices, with iOS's parameters and results: `sim_android::files` does the work, over
-//! adb (`run-as` for a debuggable app, root otherwise; paths confined to one app's container,
-//! relative to the device's `/` as iOS's are to its data dir).
+//! adb (`run-as` for a debuggable app, root otherwise, `adb root` only with `root: true`; paths
+//! confined to one app's container, relative to the device's `/` as iOS's are to its data dir).
 
 use base64::Engine;
 use serde_json::{Value, json};
+use sim_android::files::Allow;
 use sim_android::{Android, Device};
 
 use crate::params::{need_str, opt_bool, str_param};
@@ -19,10 +20,16 @@ pub(crate) fn call(android: &Android, d: &Device, method: &str, p: &Value) -> Re
     // `ls` and `du` without a path mean the root, as iOS's do: here the device's `/`, which is in
     // no app's container, so it is refused as any path outside one is.
     let root_or_path = str_param(p, "path").unwrap_or("");
+    // `root: true` lets a call run `adb root` (it restarts adbd, dropping the device's forwards);
+    // `pm_clear: true` lets clear_container run `pm clear`. Neither is done unasked.
+    let allow = Allow {
+        adb_root: opt_bool(p, "root")?.unwrap_or(false),
+        pm_clear: method == "clear_container" && opt_bool(p, "pm_clear")?.unwrap_or(false),
+    };
     match method {
         "containers" => {
             let sizes = opt_bool(p, "sizes")?.unwrap_or(false);
-            let apps = d.adb(android)?.containers(sizes)?;
+            let apps = d.adb(android)?.containers(sizes, allow)?;
             Ok(Value::Array(
                 apps.into_iter()
                     .map(|a| {
@@ -33,12 +40,12 @@ pub(crate) fn call(android: &Android, d: &Device, method: &str, p: &Value) -> Re
             ))
         }
         "ls" => {
-            let entries = d.adb(android)?.ls(root_or_path)?;
+            let entries = d.adb(android)?.ls(root_or_path, allow)?;
             Ok(Value::Array(entries.into_iter().map(|e| json!({"name": e.name, "dir": e.dir, "bytes": e.bytes})).collect()))
         }
         "read" => {
             let path = need_str(p, "path")?;
-            let bytes = d.adb(android)?.read_file(path)?;
+            let bytes = d.adb(android)?.read_file(path, allow)?;
             Ok(json!({"bytes": bytes.len(), "base64": b64.encode(&bytes), "text": String::from_utf8(bytes).ok()}))
         }
         "write" => {
@@ -48,16 +55,16 @@ pub(crate) fn call(android: &Android, d: &Device, method: &str, p: &Value) -> Re
                 (None, Some(b)) => b64.decode(b).map_err(|e| e.to_string())?,
                 (None, None) => return Err("give `text` or `base64`".into()),
             };
-            null(d.adb(android)?.write_file(path, &bytes))
+            null(d.adb(android)?.write_file(path, &bytes, allow))
         }
         "rm" => {
             let path = need_str(p, "path")?;
-            null(d.adb(android)?.remove(path))
+            null(d.adb(android)?.remove(path, allow))
         }
-        "du" => Ok(json!({"bytes": d.adb(android)?.du(root_or_path)?})),
+        "du" => Ok(json!({"bytes": d.adb(android)?.du(root_or_path, allow)?})),
         _ => {
             let path = need_str(p, "path")?;
-            null(d.adb(android)?.clear_container(path))
+            null(d.adb(android)?.clear_container(path, allow))
         }
     }
 }
@@ -168,5 +175,44 @@ mod tests {
         );
         let err = run(&mut f, "read", json!({"path": "data/data/com.example.release/files/r.txt"})).expect_err("no access");
         assert!(err.starts_with("can't reach com.example.release's files"), "{err}");
+    }
+
+    #[test]
+    fn the_api_md_rows_agree_with_the_method_table() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let Ok(api) = std::fs::read_to_string(root.join("docs/api.md")) else {
+            eprintln!("skipped: not in the simee workspace, so docs/api.md isn't here");
+            return;
+        };
+        for (method, params, doc) in crate::METHODS.iter().filter(|(m, ..)| super::METHODS.contains(m)) {
+            let platforms: Vec<&str> = crate::platforms(method).iter().map(|p| p.label()).collect();
+            let row = format!("| `{method}` | {} | {} | {} |", platforms.join(", "), params.replace('|', "\\|"), doc.replace('|', "\\|"));
+            assert!(api.contains(&row), "docs/api.md's row for `{method}` differs from METHODS; it should be\n{row}");
+        }
+    }
+
+    #[test]
+    fn adb_root_and_pm_clear_run_only_when_asked_for() {
+        let mut f = fixture("consent", Root::AdbRoot);
+        let release = "data/data/com.example.release/files/r.txt";
+        for p in [json!({"path": release, "root": "yes"}), json!({"path": "data/data/com.example.release", "pm_clear": 1})] {
+            let method = if p.get("pm_clear").is_some() { "clear_container" } else { "read" };
+            assert!(run(&mut f, method, p).is_err());
+        }
+        assert!(f.fake.calls().is_empty(), "checked before adb: {:?}", f.fake.calls());
+        let err = run(&mut f, "read", json!({"path": release})).expect_err("no consent");
+        assert!(err.contains("`root: true`"), "{err}");
+        assert!(!f.fake.rooted());
+        assert_eq!(
+            run(&mut f, "read", json!({"path": release, "root": true})),
+            Ok(json!({"bytes": 7, "base64": "cmVsZWFzZQ==", "text": "release"}))
+        );
+        assert!(f.fake.rooted());
+
+        let mut f = fixture("consentpm", Root::None);
+        let err = run(&mut f, "clear_container", json!({"path": "data/user/10/com.example.release"})).expect_err("no way in");
+        assert!(err.contains("`pm_clear: true`") && err.contains("pm clear --user 10 com.example.release"), "{err}");
+        assert_eq!(run(&mut f, "clear_container", json!({"path": "data/user/10/com.example.release", "pm_clear": true})), Ok(Value::Null));
+        assert!(f.fake.calls().contains(&"shell pm clear --user 10 com.example.release".to_owned()), "{:?}", f.fake.calls());
     }
 }
