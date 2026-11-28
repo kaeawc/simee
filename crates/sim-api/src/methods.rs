@@ -250,7 +250,15 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("appearance", "device, mode(light|dark), set?", "Light or dark UI"),
     ("location", "device, latitude, longitude; iOS: set?", "Simulated location"),
     ("privacy", "device, action(grant|revoke), service, bundle_id, set?", "Privacy permission"),
-    ("push", "device, bundle_id, payload, set?", "Deliver an APNs payload (object)"),
+    (
+        "push",
+        "device, bundle_id, payload; iOS: set?",
+        "Deliver a push to an app. iOS: an APNs payload (object). Android: an FCM message, {data, notification}: delivered to the \
+         app's Firebase receiver (com.google.android.c2dm.intent.RECEIVE) as Google Play services delivers one, as root (adbd's or \
+         `su 0`, which google_apis images have); data values are sent as strings, and notification's fields (FCM v1's names: title, \
+         body, channel_id, ..., sent as gcm.n.<field>, channel_id as gcm.n.android_channel_id) make it a notification message the Firebase SDK shows as the app's own while the app is in the \
+         background. It is delivered as a normal-priority message, and a force-stopped app gets nothing, as with real FCM",
+    ),
     (
         "status_bar",
         "device, time?, data_network?, wifi_mode?, wifi_bars?, cellular_mode?, cellular_bars?, operator?, battery_state?, battery_level?; iOS: set?",
@@ -290,8 +298,22 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "Simulate a memory warning (Android: `am send-trim-memory` RUNNING_CRITICAL to bundle_id's process, by default the \
          foreground app's)",
     ),
-    ("notify", "device, name, state?, set?", "Post a Darwin notification (optionally setting its state)"),
-    ("biometric", "device, action(match|nomatch|enroll|unenroll), face?, set?", "Touch ID / Face ID"),
+    (
+        "notify",
+        "device, name; iOS: state?, set?; Android: bundle_id?, extras?",
+        "Post a Darwin notification (optionally setting its state). Android: a broadcast, `am broadcast -a <name>` as the shell \
+         user, to bundle_id's receivers or every registered one (since Android 8 a manifest receiver hears an implicit broadcast \
+         only with bundle_id; only an exported receiver hears the shell user, so one with android:exported=\"false\" or registered \
+         RECEIVER_NOT_EXPORTED gets nothing while the call still succeeds), with extras by JSON type (string, null, boolean, \
+         integer: int or long, other numbers: float); a protected system broadcast is refused, and a broadcast has no state",
+    ),
+    (
+        "biometric",
+        "device, action(match|nomatch|enroll|unenroll), face?; iOS: set?; Android: finger_id?",
+        "Touch ID / Face ID. Android: the fingerprint sensor (the console's `finger touch <id>` then `finger remove`): match \
+         touches an enrolled finger (finger_id, default 1), nomatch one that isn't (default 99); enroll, unenroll and face are \
+         iOS's (Android enrolls fingers in Settings, each touch a match)",
+    ),
     (
         "exec",
         "device, program, args?, env?; iOS: set?; Android: timeout_s?, max_bytes?",
@@ -705,6 +727,10 @@ const ALL_PLATFORMS: &[&str] = &[
     "camera_link",
     "camera_unlink",
     "camera_links",
+    // Android: an FCM message, a broadcast and the fingerprint sensor (`android_notify.rs`, #419).
+    "push",
+    "notify",
+    "biometric",
     // Android: the guest's media stream, over adb (#417).
     "audio_state",
     "audio_volume",
@@ -1624,7 +1650,12 @@ fn dispatch(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             if !platforms(m).contains(&platform) {
                 ios_device_exists(s, platform, str_param(p, "device").unwrap_or("booted"))?;
                 let on: Vec<&str> = platforms(m).iter().map(|p| p.label()).collect();
-                return Err(format!("`{m}` isn't available on {} devices (it works on {})", platform.label(), on.join(", ")));
+                let why = match platform {
+                    Platform::Android => crate::android_notify::UNSUPPORTED_WHY.iter().find(|(name, _)| *name == m).map(|(_, why)| *why),
+                    Platform::Ios => None,
+                };
+                let why = why.map(|w| format!(": {w}")).unwrap_or_default();
+                return Err(format!("`{m}` isn't available on {} devices (it works on {}){why}", platform.label(), on.join(", ")));
             }
             match platform {
                 Platform::Ios => {

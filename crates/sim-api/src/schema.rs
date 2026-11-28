@@ -84,6 +84,9 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         "root" | "pm_clear" => Bool,
         "env" => StrMap,
         "payload" | "region" => Obj,
+        // Android notify and biometric (#419)
+        "extras" => Obj,
+        "finger_id" => Int,
         "rules" => Objects,
         _ => return None,
     })

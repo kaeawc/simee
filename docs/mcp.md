@@ -124,8 +124,8 @@ crate:
 - Annotations follow what the method does, from one table in `crates/sim-api/src/catalog.rs` that
   classifies every method (a test fails for one that isn't listed). Read-only means it changes
   nothing on the device or the host: listings, reads, `screenshot`. Settings are idempotent;
-  `exec`, `launch`, `push`, `network_shape`, `console`, `kill`, `export`, `audio_capture_start` and
-  `stream_start` are marked destructive (they run code, reboot or restart things, write a file, or
+  `exec`, `launch`, `push`, `notify`, `network_shape`, `console`, `kill`, `export`, `audio_capture_start`
+  and `stream_start` are marked destructive (they run code, reboot or restart things, write a file, or
   send the screen elsewhere), and so are
   `delete`, `erase`, `shutdown`, `rm`, `uninstall`, `terminate`, `clear_container`,
   `reset_keychain`, `write`, `defaults_write`, `prefs_write`, `prefs_delete`, `prefs_batch` and
@@ -204,7 +204,8 @@ reverse):
 | `connections`, `traffic`, `network_shape`, `network_state`, `network_clear` | Android, iOS (Android: the emulator console's `network speed` and `network delay`, simee's `network loss` (not on the stock emulator; `loss_pct` is the percent of packets dropped in each direction, where on iOS it is the percent of new connections that time out), airplane mode for offline, and the guest's socket tables and per-uid counters over adb; rules, proxy and inject are iOS's) |
 | `erase`, `status_bar`, `clear_status_bar`, `increase_contrast`, `hardware_keyboard`, `memory_warning` | Android, iOS (Android: SystemUI's demo mode, settings and `am send-trim-memory` over adb; `erase` on the AVD's disks) |
 | `containers`, `ls`, `read`, `write`, `rm`, `du`, `clear_container` | Android, iOS (Android: in an app's container, through `run-as` for a debuggable app, root otherwise; `adb root` only with `root: true`, `pm clear` only with `pm_clear: true`) |
-| `wait_idle`, `appearance`, `privacy`, `push`, `content_size`, `dynamic_island`, `backlight`, `keyboard_language`, `ca_debug`, `ca_debug_state`, `reset_keychain`, `notify`, `biometric`, `logs`, `defaults_read`, `defaults_write`, `crash_reports`, `network_flows`, `network_env`, `audio_route`, `audio_capture_start`, `audio_capture_stop`, `watch_gesture`, `remote_swipe`, `pointer`, `carplay` | iOS |
+| `push`, `notify`, `biometric` | Android, iOS (Android: an FCM message to the app's Firebase receiver, sent as root; an `am broadcast`; the fingerprint sensor through the console's `finger touch`. `reset_keychain` has no Android counterpart; see [android-notify-biometric.md](research/android-notify-biometric.md)) |
+| `wait_idle`, `appearance`, `privacy`, `content_size`, `dynamic_island`, `backlight`, `keyboard_language`, `ca_debug`, `ca_debug_state`, `reset_keychain`, `logs`, `defaults_read`, `defaults_write`, `crash_reports`, `network_flows`, `network_env`, `audio_route`, `audio_capture_start`, `audio_capture_stop`, `watch_gesture`, `remote_swipe`, `pointer`, `carplay` | iOS |
 | `mem_leaks`, `mem_heap`, `mem_vmmap`, `mem_history` | iOS (the host's memory tools on one app; Android answers that they aren't available there) |
 
 A test keeps this page honest: it fails if a tool isn't named here.

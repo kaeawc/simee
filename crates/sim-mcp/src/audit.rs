@@ -244,6 +244,7 @@ fn content_fields(tool: &str) -> &'static [&'static str] {
         "defaults_write" | "prefs_write" => &["value"],
         "prefs_batch" => &["ops"],
         "push" => &["payload"],
+        "notify" => &["extras"],
         _ => &[],
     }
 }
