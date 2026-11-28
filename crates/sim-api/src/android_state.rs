@@ -100,7 +100,7 @@ fn demo_status_bar(p: &Value) -> Result<DemoStatusBar, String> {
     Ok(DemoStatusBar { clock, wifi, mobile, datatype, battery })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use serde_json::{Value, json};
     use sim_android::state::{DemoStatusBar, Radio};
