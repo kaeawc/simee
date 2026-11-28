@@ -124,3 +124,41 @@ fn a_call_is_filed_by_how_it_ended() {
     assert_eq!(outcome(&Err("admission backoff: memory".into())).0, audit::status::REFUSED);
     assert_eq!(outcome(&Err("device is gone".into())).0, audit::status::ERROR);
 }
+
+/// The device `phone` in two sets: `U-A-PHONE` in the default set, `U-B-PHONE` in set `B`.
+struct TwoSets;
+
+impl Backend for TwoSets {
+    fn call(&self, method: &str, params: &Value) -> Result<Value, String> {
+        let set = params.get("set").and_then(Value::as_str).unwrap_or("A");
+        match method {
+            "info" => {
+                let q = params["device"].as_str().unwrap_or("");
+                let udid = format!("U-{set}-{}", q.to_uppercase());
+                Ok(json!({"device": {"udid": udid, "name": q, "state": "Shutdown"}}))
+            }
+            "links" => Ok(json!([])),
+            _ => Ok(json!({})),
+        }
+    }
+}
+
+#[test]
+fn the_policy_judges_a_named_device_in_the_set_the_call_acts_in() {
+    let policy = Policy::parse(r#"{"default": {"devices": ["U-A-PHONE"]}}"#).expect("policy");
+    let safety = Arc::new(Safety::new(policy, None));
+    // Confirmation's check: the default set's `phone` is allowed, set B's is not.
+    assert!(matches!(safety.check(&TwoSets, "agent", "erase", &json!({"device": "phone"})), Verdict::Confirm(..)));
+    for set in [json!(null), json!("A")] {
+        assert!(matches!(safety.check(&TwoSets, "agent", "erase", &json!({"device": "phone", "set": set})), Verdict::Confirm(..)), "{set}");
+    }
+    match safety.check(&TwoSets, "agent", "erase", &json!({"device": "phone", "set": "B"})) {
+        Verdict::Refuse(why) => assert!(why.starts_with(REFUSED), "{why}"),
+        _ => panic!("set B's `phone` is not a device this client may touch"),
+    }
+    // The guarded backend, for every call: the same.
+    let guarded = safety.guard(Arc::new(TwoSets), "agent");
+    assert!(guarded.call("tap", &json!({"device": "phone", "x": 1, "y": 1})).is_ok());
+    let refused = guarded.call("tap", &json!({"device": "phone", "set": "B", "x": 1, "y": 1})).expect_err("set B");
+    assert!(refused.starts_with(REFUSED), "{refused}");
+}

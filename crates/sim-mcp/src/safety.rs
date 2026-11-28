@@ -195,8 +195,10 @@ impl Safety {
         }
         // Devices whose state decides what this call is (and what it leaves behind).
         let wants_state = asks || matches!(tool, "boot" | "boot_many");
+        // In the call's set: a name or alias is another device (another UDID) in each set.
+        let set = call_set(args);
         let resolved: Vec<(String, Result<Resolved, String>)> = if wants_state {
-            device_queries(tool, args).into_iter().map(|q| (q.clone(), resolve(backend, &q))).collect()
+            device_queries(tool, args).into_iter().map(|q| (q.clone(), resolve_in(backend, &q, set))).collect()
         } else {
             Vec::new()
         };
@@ -417,13 +419,13 @@ struct Resolved {
     running: bool,
 }
 
-/// The device `query` names (a UDID, a name, `booted`), by the API's own lookup.
-fn resolve(backend: &dyn Backend, query: &str) -> Result<Resolved, String> {
-    resolve_in(backend, query, None)
+/// The device set a call acts in (iOS methods take `set?`); `None` is the default set.
+fn call_set(params: &Value) -> Option<&Value> {
+    params.get("set").filter(|s| !s.is_null())
 }
 
-/// [`resolve`] in the device set `set` (a device has a different UDID in each set); `None` is the
-/// default lookup.
+/// The device `query` names (a UDID, a name, `booted`) in the device set `set`, by the API's own
+/// lookup (a device has a different UDID in each set); `None` is the default lookup.
 fn resolve_in(backend: &dyn Backend, query: &str, set: Option<&Value>) -> Result<Resolved, String> {
     let mut params = json!({"device": query});
     if let Some(set) = set {
@@ -505,7 +507,7 @@ fn linked_members(backend: &dyn Backend, method: &str, params: &Value) -> Result
         return Ok(Vec::new());
     }
     let mut query = json!({});
-    let set = params.get("set").filter(|s| !s.is_null());
+    let set = call_set(params);
     if let Some(set) = set {
         query["set"] = set.clone();
     }
@@ -695,9 +697,10 @@ impl Guard {
 }
 
 impl Guard {
-    /// Whether this client may touch the device `query` names, as the error that says why not.
-    fn permit(&self, method: &str, query: &str) -> Result<(), String> {
-        let device = resolve(&*self.inner, query).map_err(|e| unresolved_refusal(method, &e))?;
+    /// Whether this client may touch the device `query` names in the call's device set `set`, as
+    /// the error that says why not.
+    fn permit(&self, method: &str, query: &str, set: Option<&Value>) -> Result<(), String> {
+        let device = resolve_in(&*self.inner, query, set).map_err(|e| unresolved_refusal(method, &e))?;
         if self.safety.may_touch(&self.client, &self.policy, &device) {
             Ok(())
         } else {
@@ -734,8 +737,9 @@ impl Guard {
                 "{REFUSED}`{method}` without `device` lists every device's, and this client may touch only some: name a device"
             ));
         }
+        let set = call_set(params);
         for query in queries {
-            self.permit(method, &query)?;
+            self.permit(method, &query, set)?;
         }
         // A link is named by its id, and an unlink by device removes every link of it: each member
         // of each is judged.
@@ -756,7 +760,7 @@ impl Guard {
             let streams = self.inner.call("streams", &json!({}))?;
             let owner = streams.as_array().into_iter().flatten().find(|s| s["stream_id"] == id).and_then(|s| s["device"].as_str());
             if let Some(device) = owner {
-                self.permit(method, device)?;
+                self.permit(method, device, set)?;
             }
         }
         Ok(())
