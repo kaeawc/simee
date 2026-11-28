@@ -476,9 +476,10 @@ enum Cmd {
         #[arg(long, alias = "insecure", requires = "http")]
         insecure_remote: bool,
         #[command(flatten)]
-        safety: mcp_safety::McpSafety,
+        // Boxed: these two make `mcp` the enum's one large variant (more so where a path is wider, as on Windows).
+        safety: Box<mcp_safety::McpSafety>,
         #[command(flatten)]
-        tls: McpTls,
+        tls: Box<McpTls>,
     },
     /// Read the audit log `simee mcp` keeps of every tool call: client, tool, arguments (secrets
     /// removed), how it ended and how long it took (docs/mcp-safety.md).
@@ -1767,7 +1768,7 @@ mod tests {
             token_file: None,
             no_auth: false,
             insecure_remote: false,
-            tls: McpTls::default(),
+            tls: Box::default(),
             safety: Default::default(),
         };
         let e = run(stdio, &mut transport, &mut Vec::new(), &mut Vec::new()).expect_err("served by main, not run");
