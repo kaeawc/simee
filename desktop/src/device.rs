@@ -20,6 +20,12 @@ pub struct Shared {
     /// On a device with two built-in screens (the iPhone Duo), the screen ID of the one shown (the
     /// one in use), whose digitizer touches go to; 0 for the main digitizer.
     pub screen_id: AtomicU32,
+    /// An iPhone's CarPlay display is attached and the view should show it (the window sets it
+    /// once the API's `carplay` attached it, and clears it to show the iPhone again).
+    pub carplay: AtomicBool,
+    /// The capture thread presents the CarPlay display now (it follows [`Shared::carplay`] once
+    /// that display has rendered): the size, touches and body are CarPlay's.
+    pub showing_carplay: AtomicBool,
     /// Wakes the window the device is in, which changes as it pops out and back in.
     waker: Mutex<Option<rune::Waker>>,
 }

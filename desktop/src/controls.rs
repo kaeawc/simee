@@ -1,5 +1,5 @@
 //! Which controls a device gets, by platform and form factor: an iPhone or iPad its hardware
-//! buttons, rotation and appearance; an Apple Watch its crown (press and turn) and side button; an
+//! buttons, rotation and appearance (an iPhone on iOS 26 or earlier its CarPlay display too); an Apple Watch its crown (press and turn) and side button; an
 //! Apple TV the Siri Remote; Android devices Back/Home/Recents and power, a foldable its hinge
 //! postures, a watch its rotary input, a TV its D-pad, an XR headset head turns and recentering,
 //! a head unit only what it has.
@@ -60,6 +60,7 @@ pub fn for_device(d: &DeviceInfo) -> Vec<Control> {
                 out.push(control("rotate-button", &icons::ROTATE, "Rotate", Action::Rotate));
                 out.push(control("appearance-button", &icons::MOON, "Appearance", Action::ToggleAppearance));
                 out.extend(apple_fold(d));
+                out.extend(carplay(d));
             }
         },
         Platform::Android => {
@@ -122,6 +123,15 @@ fn apple_fold(d: &DeviceInfo) -> Vec<Control> {
         control("fold-half", &icons::FOLD_HALF, "Half open", Action::Fold(Posture::HalfOpened)),
         control("fold-opened", &icons::FOLD_OPEN, "Unfold", Action::Fold(Posture::Opened)),
     ]
+}
+
+/// An iPhone's CarPlay display, on and off (the API's `carplay`): the view shows the car display
+/// in the iPhone's place while it is on. iPhones on iOS 26 runtimes or earlier, as `carplay`
+/// itself requires (`sim_core::carplay::runtime_supports`: iOS 27 renders it black).
+fn carplay(d: &DeviceInfo) -> Option<Control> {
+    let iphone = matches!(d.form_factor, Some(FormFactor::Phone | FormFactor::Foldable));
+    (iphone && sim_core::carplay::runtime_supports(&d.runtime_id).is_ok())
+        .then(|| control("carplay-button", &icons::CAR, "CarPlay", Action::ToggleCarPlay))
 }
 
 /// How a running device takes drags that start on its bezel (`crate::bezel`): an iPhone, iPad or
@@ -242,6 +252,50 @@ mod tests {
         let keys: Vec<&str> = for_device(&duo).iter().map(|c| c.key).collect();
         assert!(keys.ends_with(&["fold-closed", "fold-half", "fold-opened", "screenshot-button", "shutdown-button"]), "{keys:?}");
         assert!(!self::keys(Platform::Ios, FormFactor::Phone).contains(&"fold-closed"), "other iPhones don't fold");
+    }
+
+    /// The CarPlay display attaches to an iPhone on an iOS 26 runtime or earlier (iOS 27 renders it
+    /// black), so only those get the toggle; the rest of the iPhone's toolbar stays as it was.
+    #[test]
+    fn the_carplay_toggle_shows_only_on_iphones_running_ios_26_or_earlier() {
+        let on = |platform, form_factor, runtime: &str| {
+            let mut d = device(platform, form_factor);
+            d.runtime_id = runtime.into();
+            for_device(&d).iter().map(|c| c.key).collect::<Vec<_>>()
+        };
+        let ios = |version: &str| format!("com.apple.CoreSimulator.SimRuntime.iOS-{version}");
+        for version in ["26-5", "26-0", "18-4"] {
+            let keys = on(Platform::Ios, FormFactor::Phone, &ios(version));
+            assert_eq!(
+                keys,
+                [
+                    "home-button",
+                    "lock-button",
+                    "rotate-button",
+                    "appearance-button",
+                    "carplay-button",
+                    "screenshot-button",
+                    "shutdown-button"
+                ],
+                "{version}"
+            );
+        }
+        let carplay = |p, f, r: &str| on(p, f, r).contains(&"carplay-button");
+        assert!(carplay(Platform::Ios, FormFactor::Foldable, &ios("26-5")), "an iPhone Duo is an iPhone");
+        assert!(!carplay(Platform::Ios, FormFactor::Phone, &ios("27-0")), "iOS 27 renders CarPlay black");
+        assert!(!carplay(Platform::Ios, FormFactor::Tablet, &ios("26-5")), "CarPlay attaches to an iPhone");
+        assert!(!carplay(Platform::Ios, FormFactor::Watch, "com.apple.CoreSimulator.SimRuntime.watchOS-26-0"));
+        assert!(!carplay(Platform::Android, FormFactor::Phone, "system-images;android-36;google_apis;arm64-v8a"));
+        assert!(!carplay(Platform::Android, FormFactor::Auto, "system-images;android-34;android-automotive;arm64-v8a"));
+        let toggle = for_device(&{
+            let mut d = device(Platform::Ios, FormFactor::Phone);
+            d.runtime_id = ios("26-5");
+            d
+        })
+        .into_iter()
+        .find(|c| c.key == "carplay-button")
+        .map(|c| c.action);
+        assert_eq!(toggle, Some(Action::ToggleCarPlay));
     }
 
     #[test]

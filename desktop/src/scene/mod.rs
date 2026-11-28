@@ -59,6 +59,9 @@ pub const ON: &str = "3D view on: drag beside the device to orbit, ⇧-drag to p
 pub const SCREEN_DRAG: &str = "Touches on the 3D screen come with #156: drag beside the device, or hold ⌥, to move the camera";
 /// What ⌘3 says for a device with no body.
 pub const NO_BODY: &str = "The 3D view has bodies for phones, tablets, foldables and watches";
+/// The body row of an iPhone's CarPlay display (a car head unit, `sim_core::body`'s car rows):
+/// drawn while the display shows ([`body_for`]). Without that row the view stays flat.
+pub const CARPLAY_BODY: &str = "CarPlay-800x480";
 
 /// Whether this process has the scene's compositor, set once in `main` before the window opens
 /// (live Rust editing has none; tests leave it false unless they set it).
@@ -339,9 +342,13 @@ impl View {
 }
 
 /// The selected device's body: the table's row for its device type (an Apple identifier, an
-/// AVD's `hw.device.name`) when it has one, else a generic body for its screen.
+/// AVD's `hw.device.name`) when it has one, else a generic body for its screen. While an iPhone's
+/// CarPlay display shows in its place, the car head unit's ([`CARPLAY_BODY`]), never the iPhone's.
 pub fn body_for(s: &State) -> Option<Arc<Body>> {
     let d = s.selected_info()?;
+    if s.carplay_shown() {
+        return body::get(CARPLAY_BODY);
+    }
     match d.platform {
         Platform::Ios => body::get(&d.device_type_id).or_else(|| body::for_profile(&d.kind()?.profile())),
         Platform::Android => {

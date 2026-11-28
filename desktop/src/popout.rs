@@ -670,12 +670,12 @@ fn window_key(w: &mut Window, k: &KeyEvent, tx: &mut Tx) -> bool {
     true
 }
 
-/// The toolbar controls a pop-out performs: the device's own, without the stylus (a main-window
-/// mode) or the 3D view's.
+/// The toolbar controls a pop-out performs: the device's own, without the stylus or CarPlay
+/// (main-window modes) or the 3D view's.
 pub fn controls(d: &DeviceInfo) -> Vec<crate::controls::Control> {
     crate::controls::for_device(d)
         .into_iter()
-        .filter(|c| !matches!(c.action, Action::ToggleStylus | Action::ToggleView3d | Action::View3d(_)))
+        .filter(|c| !matches!(c.action, Action::ToggleStylus | Action::ToggleCarPlay | Action::ToggleView3d | Action::View3d(_)))
         .collect()
 }
 
