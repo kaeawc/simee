@@ -123,9 +123,10 @@ record_boot() {
     echo "media: AVD $avd does not exist; boot loop not recorded" >&2
     return 1
   }
-  slot=$(find /Users/jason/.claude/plugins/marketplaces/waaagh/skills/orchestrate/scripts -name boot-slot.sh | head -n 1)
-  [[ -x $slot ]] || {
-    echo "media: boot-slot.sh not found; boot loop not recorded" >&2
+  # A boot gate (one boot at a time while the host has room): BOOT_SLOT names its command.
+  slot=${BOOT_SLOT:-$(command -v boot-slot.sh || true)}
+  [[ -n $slot && -x $slot ]] || {
+    echo "media: set BOOT_SLOT to a boot-slot.sh (or put one on PATH); boot loop not recorded" >&2
     return 75
   }
   need screencapture || return 1
