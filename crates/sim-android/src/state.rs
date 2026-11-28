@@ -172,10 +172,16 @@ impl Android {
     /// the golden it was restored from, if any.
     pub fn erase(&self, device: &Device) -> Result<Option<String>, String> {
         let name = &device.info.name;
-        if let Some(r) = &device.running {
-            return Err(format!("{name} is running ({}, PID {}); shut it down before erasing it", r.serial(), r.pid));
-        }
         let avd = device.avd()?;
+        // The check delete makes, made now rather than from the device's earlier look: an
+        // advertisement under any name for this directory, stock's held locks, and a `-read-only`
+        // boot (no instance lock) that advertised since the device was listed.
+        let busy = emu_avd::running_blocker(&device.info.udid, &avd.dir, self.running_dir.as_deref())
+            .map(|b| b.to_string())
+            .or_else(|| device.running.as_ref().map(|r| format!("is running ({}, PID {})", r.serial(), r.pid)));
+        if let Some(busy) = busy {
+            return Err(format!("{name} {busy}; shut it down before erasing it"));
+        }
         let disks = emu_avd::state_dir(&avd.dir);
         let io = |p: &std::path::Path, e: std::io::Error| format!("{}: {e}", p.display());
         std::fs::create_dir_all(&disks).map_err(|e| io(&disks, e))?;
@@ -467,10 +473,70 @@ esac
         assert_eq!(disk(&dir, "userdata.img").as_deref(), Some("used userdata.img"), "nothing was removed");
         // Running but not advertised: its instance lock is held.
         let stopped = Device { running: None, ..device };
+        let ad = f.android.running_dir.clone().expect("running").join(format!("pid_{}.ini", std::process::id()));
+        std::fs::remove_file(ad).expect("unadvertise");
         let lock = File::create(emu_avd::state_dir(&dir).join("instance.lock")).expect("lock");
         lock.try_lock().expect("hold it");
         let err = f.android.erase(&stopped).expect_err("locked");
-        assert_eq!(err, "phone is running (its instance lock is held); shut it down before erasing it");
+        assert!(err.starts_with("phone is running (") && err.contains("instance.lock is held"), "{err}");
+        assert!(err.ends_with("shut it down before erasing it"), "{err}");
+        assert_eq!(disk(&dir, "userdata.img").as_deref(), Some("used userdata.img"), "nothing was removed");
+    }
+
+    /// An erase of `phone` refused for `why`, with the disks left as they were.
+    fn refused(f: &Fixture, dir: &Path, why: &str) {
+        let device = Device { running: None, ..f.android.device("phone").expect("phone") };
+        let err = f.android.erase(&device).expect_err(why);
+        assert!(err.starts_with("phone is running ("), "{why}: {err}");
+        assert!(err.ends_with("shut it down before erasing it"), "{why}: {err}");
+        assert_eq!(disk(dir, "userdata.img").as_deref(), Some("used userdata.img"), "{why}: nothing was removed");
+    }
+
+    #[test]
+    fn erase_refuses_an_advertisement_for_the_same_directory_under_another_name() {
+        let f = fixture("otherad", 36, false);
+        let dir = f.android.device("phone").expect("phone").avd.as_ref().expect("avd").dir.clone();
+        settle(&dir, "used");
+        let running = f.android.running_dir.clone().expect("running");
+        std::fs::create_dir_all(&running).expect("running");
+        let ad = format!("port.serial=5600\navd.name=alias\navd.dir={}\nemulator=simee\n", dir.display());
+        std::fs::write(running.join(format!("pid_{}.ini", std::process::id())), ad).expect("ad");
+        let device = Device { running: None, ..f.android.device("phone").expect("phone") };
+        let err = f.android.erase(&device).expect_err("aliased");
+        assert!(err.contains("emulator-5600"), "{err}");
+        refused(&f, &dir, "same dir, other name");
+    }
+
+    #[test]
+    fn erase_refuses_stocks_held_lock_files() {
+        let f = fixture("stocklocks", 36, false);
+        let dir = f.android.device("phone").expect("phone").avd.as_ref().expect("avd").dir.clone();
+        settle(&dir, "used");
+        let held = File::create(dir.join("multiinstance.lock")).expect("lock");
+        held.lock().expect("hold it");
+        refused(&f, &dir, "multiinstance.lock");
+        drop(held);
+        // A PID lock whose process is alive; a stale one doesn't refuse.
+        std::fs::write(dir.join("hardware-qemu.ini.lock"), format!("{}\0", std::process::id())).expect("pid lock");
+        refused(&f, &dir, "hardware-qemu.ini.lock");
+        std::fs::write(dir.join("hardware-qemu.ini.lock"), b"999999999\0").expect("stale");
+        let device = Device { running: None, ..f.android.device("phone").expect("phone") };
+        assert_eq!(f.android.erase(&device), Ok(None), "a stale lock is not a running emulator");
+    }
+
+    #[test]
+    fn erase_refuses_a_read_only_boot_the_device_snapshot_missed() {
+        // `-read-only` skips instance.lock, and the device was listed before the emulator
+        // advertised: only a fresh look at the advertisements sees it.
+        let f = fixture("readonly", 36, false);
+        let device = f.android.device("phone").expect("phone");
+        assert!(device.running.is_none());
+        let dir = device.avd.as_ref().expect("avd").dir.clone();
+        settle(&dir, "used");
+        assert!(!emu_avd::state_dir(&dir).join("instance.lock").exists());
+        let _booting = fake_emulator(&f.android, "phone");
+        let err = f.android.erase(&device).expect_err("booting read-only");
+        assert!(err.starts_with("phone is running (emulator-"), "{err}");
         assert_eq!(disk(&dir, "userdata.img").as_deref(), Some("used userdata.img"), "nothing was removed");
     }
 }

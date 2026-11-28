@@ -212,6 +212,41 @@ fn held_lock(dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Why an AVD counts as running, from [`running_blocker`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Busy {
+    /// An emulator advertised in the running directory for it.
+    Advertised(Running),
+    /// A lock file in its directory that is held.
+    Locked(PathBuf),
+}
+
+impl std::fmt::Display for Busy {
+    /// `is running (emulator-5554, PID 7)` or `is running (<lock file> is held)`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Busy::Advertised(r) => write!(f, "is running ({}, PID {})", r.serial(), r.pid),
+            Busy::Locked(path) => write!(f, "is running ({} is held)", path.display()),
+        }
+    }
+}
+
+/// Whether any emulator, simee's or stock's, runs the AVD `name` whose directory is `dir`: one
+/// advertised in `running` (when given) under that name or for that directory (by path, or once
+/// both are canonical) whatever name it carries, or a lock file in `dir` that is held
+/// ([`held_lock`]). The check every operation that rewrites an AVD's files makes (delete, erase):
+/// a `-read-only` emu skips `simee/instance.lock`, so that lock alone misses it.
+pub fn running_blocker(name: &str, dir: &Path, running: Option<&Path>) -> Option<Busy> {
+    let real = dir.canonicalize().ok();
+    let advertised = running.map(running_instances_in).unwrap_or_default().into_iter().find(|r| {
+        r.avd_name == name || r.avd_dir.as_deref().is_some_and(|d| d == dir || (real.is_some() && d.canonicalize().ok() == real))
+    });
+    if let Some(r) = advertised {
+        return Some(Busy::Advertised(r));
+    }
+    held_lock(dir).map(Busy::Locked)
+}
+
 /// A resolved AVD: its directory, config and system image.
 #[derive(Clone, Debug)]
 pub struct Avd {
@@ -679,15 +714,8 @@ impl Env {
         if dir.exists() && !dir.join("config.ini").is_file() {
             return Err(Error::Config(format!("{} has no config.ini; not deleting a directory that isn't an AVD", dir.display())));
         }
-        let real = dir.canonicalize().ok();
-        let advertised = running.map(running_instances_in).unwrap_or_default().into_iter().find(|r| {
-            r.avd_name == name || r.avd_dir.as_deref().is_some_and(|d| d == dir || (real.is_some() && d.canonicalize().ok() == real))
-        });
-        if let Some(r) = advertised {
-            return Err(Error::Config(format!("{name} is running ({}, PID {}); stop it before deleting it", r.serial(), r.pid)));
-        }
-        if let Some(lock) = held_lock(&dir) {
-            return Err(Error::Config(format!("{name} is running ({} is held); stop it before deleting it", lock.display())));
+        if let Some(busy) = running_blocker(name, &dir, running) {
+            return Err(Error::Config(format!("{name} {busy}; stop it before deleting it")));
         }
         if dir.exists() {
             std::fs::remove_dir_all(&dir).map_err(|e| Error::Io(dir.clone(), e))?;
