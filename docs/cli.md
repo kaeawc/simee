@@ -47,6 +47,22 @@ external display of an iPhone simulator rather than a device type: `--form-facto
 and `carplay on` attaches it. See [docs/form-factors.md](form-factors.md) for how each
 Apple input is sent.
 
+**Headless devices (`--set`).** Simulator.app opens a window for every device of the default
+device set that boots, which slows each warm boot. `--set <dir>` (any command, or
+`SIMEE_IOS_DEVICE_SET=<dir>` for every command and for `simee serve` / `simee mcp`) works in another
+CoreSimulator device set, the directory `simctl --set` takes (`create` makes it; other commands
+refuse one that doesn't exist); no window ever attaches to its devices, and Simulator.app's own
+devices stay where they are. `--set ''` is the default set. The command's set goes with every call,
+so a running server works in it whatever its own environment says.
+
+```bash
+simee --set ~/farm/sims create farm-1 "iPhone 17" "iOS 27.2"
+simee --set ~/farm/sims boot farm-1          # no Simulator.app window
+simee --set ~/farm/sims screenshot farm-1 shot.png
+simee --set ~/farm/sims list
+simee --set ~/farm/sims shutdown farm-1 && simee --set ~/farm/sims delete farm-1
+```
+
 ## Android
 
 ```bash
