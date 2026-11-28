@@ -937,17 +937,20 @@ mod tests {
         // (Can only false-pass: a ticker that never ran also reads 0.)
         assert_eq!(posts.0.load(Ordering::Relaxed), 0, "no fence, no notice");
 
-        // A steady stream of fences for 100 ms: notices keep coming, at most one per interval.
+        // A steady stream of fences until three notices have come (and for at least 50 ms, so the
+        // rate cap is tested): the stream ends on a count, with a timeout only so a hang fails.
+        // How long that takes says nothing, so a ticker thread that is late on a loaded host
+        // passes.
         let start = Instant::now();
-        while start.elapsed() < Duration::from_millis(100) {
+        while posts.0.load(Ordering::Relaxed) < 3 || start.elapsed() < Duration::from_millis(50) {
+            assert!(start.elapsed() < Duration::from_secs(5), "timed out waiting for notices while fences come");
             ticker.poke();
             std::thread::sleep(Duration::from_millis(1));
         }
         let during = posts.0.load(Ordering::Relaxed);
-        // Sleeps run long on a loaded CI runner, so bound the count by the time that really
-        // passed: more than one notice, never more than one per interval.
+        // Never more than one notice per interval, by the time that really passed.
         let most = (start.elapsed().as_millis() / interval.as_millis()) as usize + 1;
-        assert!((2..=most).contains(&during), "{during} notices in {:?} (at most {most})", start.elapsed());
+        assert!(during <= most, "{during} notices in {:?} (at most {most})", start.elapsed());
 
         // The tail: notices go on for the tail after the last fence, then stop.
         wait_for("the frame posted after the last fence to be noticed", || posts.0.load(Ordering::Relaxed) > during);
