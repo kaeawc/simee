@@ -163,7 +163,7 @@ in `SIMEE_MCP_TOOLSETS` (commas between names; `all` for every tool). Unset, it 
 | `apps` | `open_url`, `install`, `uninstall`, `launch`, `terminate`, `apps`, `privacy`, `push` |
 | `input` | `tap`, `swipe`, `touch`, `button`, `type`, `key`, `rotate`, `fold`, `xr`, `touchpad`, `stylus`, `rotary`, `watch_gesture`, `remote_swipe`, `pointer`, `biometric` |
 | `observe` | `screen`, `screenshot`, `wait_idle`, `contrast_check`, `logs`, `device_view` |
-| `settings` | `appearance`, `location`, `status_bar`, `clear_status_bar`, `content_size`, `increase_contrast`, `dynamic_island`, `backlight`, `keyboard_language`, `hardware_keyboard`, `memory_warning`, `notify`, `carplay`, `vehicle` |
+| `settings` | `appearance`, `location`, `status_bar`, `clear_status_bar`, `content_size`, `increase_contrast`, `dynamic_island`, `backlight`, `keyboard_language`, `hardware_keyboard`, `memory_warning`, `notify`, `carplay`, `vehicle`, `car_start`, `car_stop` |
 | `debug` | `ca_debug`, `ca_debug_state`, `exec`, `processes`, `kill`, `connections`, `traffic`, `mem_leaks`, `mem_heap`, `mem_vmmap`, `mem_history`, `crash_reports`, `console` |
 | `files` | `containers`, `ls`, `read`, `write`, `rm`, `du`, `clear_container`, `defaults_read`, `defaults_write`, `reset_keychain` |
 | `prefs` | `prefs_stores`, `prefs_read`, `prefs_write`, `prefs_delete`, `prefs_batch`, `prefs_watch` |
@@ -196,6 +196,7 @@ reverse):
 | --- | --- |
 | `help`, `identity`, `host`, `devices_usage`, `form_factors`, `devices`, `runtimes`, `create`, `delete`, `boot`, `boot_many`, `admission_check`, `clone`, `shutdown`, `screen`, `screenshot`, `contrast_check`, `tap`, `swipe`, `touch`, `button`, `type`, `key`, `open_url`, `install`, `uninstall`, `launch`, `terminate`, `apps`, `location`, `info`, `rotate`, `rotary`, `stylus`, `processes`, `kill`, `exec`, `settle`, `profile`, `device_types`, `device_view` | Android, iOS |
 | `console`, `fold`, `xr`, `vehicle`, `touchpad`, `export`, `import` | Android (iOS bundles: the next step of #170) |
+| `car_start`, `car_stop` | Android (Android Auto: Google's Desktop Head Unit against the phone, then `display: "car"` on `screenshot`, `tap` and `swipe`, and `vehicle` for speed, gear, night and parking-brake; see [research/car-pairing.md](research/car-pairing.md)) |
 | `stream_start`, `stream_status`, `stream_stop`, `streams` | Android, iOS (macOS: VideoToolbox, both platforms; Linux: Android only, in a build with `--features openh264`) |
 | `camera_sources` | Android, iOS (the host's cameras and the synthetic sources; needs no device) |
 | `camera_link`, `camera_unlink`, `camera_links` | Android, iOS (iOS: device-wide shim injection, needs `simee serve`; see [camera.md](camera.md)) |

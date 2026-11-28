@@ -18,6 +18,7 @@
 //! macOS hosts; elsewhere they fail with a clear reason.
 
 mod android;
+mod android_car;
 mod android_files;
 mod android_net;
 mod android_notify;

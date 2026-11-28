@@ -12,6 +12,7 @@
 pub mod apps;
 pub mod audio;
 pub mod console;
+pub mod dhu;
 pub mod display;
 pub mod files;
 pub mod host;

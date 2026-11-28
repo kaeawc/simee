@@ -265,6 +265,25 @@ pub struct FakeAdb {
 }
 
 impl FakeAdb {
+    /// Android Auto on the phone at `version` (`None`: not installed), as `dumpsys package` says.
+    pub fn android_auto(&self, version: Option<&str>) {
+        let flag = self.log.with_file_name("gearhead");
+        match version {
+            Some(v) => std::fs::write(flag, v).expect("gearhead flag"),
+            None => drop(std::fs::remove_file(flag)),
+        }
+    }
+
+    /// Whether the head unit server listens on the phone's port 5277.
+    pub fn head_unit_server(&self, listening: bool) {
+        let flag = self.log.with_file_name("gearhead.server");
+        if listening {
+            std::fs::write(flag, b"").expect("server flag");
+        } else {
+            let _ = std::fs::remove_file(flag);
+        }
+    }
+
     /// Each invocation's arguments, in order, without the leading `-s <serial>`.
     pub fn calls(&self) -> Vec<String> {
         let text = std::fs::read_to_string(&self.log).unwrap_or_default();
@@ -412,6 +431,8 @@ stat() { echo "$1 ($2) S $3 1 1 0 -1 4194560 100 0 0 0 $4 $5 0 0 20 0 1 0 100 0 
 d="$(dirname "$0")"
 installed() { printf 'package:android\npackage:com.android.systemui\npackage:com.google.android.apps.turbo\npackage:com.google.android.apps.wellbeing\npackage:com.google.android.partnersetup\n'; }
 case "$1" in
+# `forward tcp:<host> tcp:<device>` and `forward --remove tcp:<host>` (sim_android::dhu): logged only.
+forward) ;;
 install)
   case "$*" in
     *broken.apk*) echo "Performing Streamed Install" >&2; echo "adb: failed to install broken.apk: Failure [INSTALL_PARSE_FAILED_NOT_APK: Failed to parse /data/app/vmdl1.tmp/base.apk]" >&2; exit 1;;
@@ -497,6 +518,19 @@ shell)
       if [ "$verb" = adj-mute ]; then touch "$here/music.muted"; else rm -f "$here/music.muted"; fi;;
     # Every other signal succeeds, and is only logged: the fake never signals a host process.
     "kill -"*) ;;
+    # sim_android::dhu: Android Auto's version is the text in `gearhead` beside the script (not
+    # installed without it); `gearhead.server` makes the head unit server listen on 5277.
+    "dumpsys package com.google.android.projection.gearhead")
+      if [ -e "$d/gearhead" ]; then
+        printf 'Packages:\n  Package [com.google.android.projection.gearhead] (1a2b3c):\n    versionCode=1 minSdk=26\n    versionName=%s\n' "$(cat "$d/gearhead")"
+      else
+        echo "Unable to find package: com.google.android.projection.gearhead"
+      fi;;
+    "cat /proc/net/tcp /proc/net/tcp6")
+      echo '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode'
+      echo '   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1 1 0'
+      [ -e "$d/gearhead.server" ] && echo '   1: 00000000:149D 00000000:0000 0A 00000000:00000000 00:00000000 00000000 10170        0 2 1 0'
+      true;;
     "settings get global airplane_mode_on") cat "$(dirname "$0")/airplane" 2>/dev/null || echo 0;;
     "settings put global airplane_mode_on "*) echo "${2##* }" > "$(dirname "$0")/airplane";;
     # After the airplane-mode arm above: case takes the first match.
