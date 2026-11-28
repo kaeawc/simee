@@ -93,6 +93,9 @@ pub fn boot(
     {
         anyhow::bail!(why);
     }
+    if opts.net_segment.is_some() {
+        anyhow::bail!("-net-segment isn't available in software mode yet (a second NIC would need QEMU's vhost-user net; #539)");
+    }
     let qemu = emu_vmm::soft::find_qemu(std::env::var("EMU_QEMU").ok().as_deref(), &std::env::var("PATH").unwrap_or_default())
         .context(NEED_QEMU)?;
     let (major, minor) = emu_vmm::soft::check_qemu(&qemu)?;

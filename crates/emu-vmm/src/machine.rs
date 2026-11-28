@@ -345,6 +345,9 @@ pub struct MachineConfig {
     pub telephony: Arc<telephony::Telephony>,
     /// The console's network conditions: the guest's NAT shapes its traffic by them, live.
     pub network: Arc<Mutex<sim_core::network::Conditions>>,
+    /// `net-segment` (#539): a second NIC, `eth1`, on a link subnet whose frames are relayed to
+    /// the other members' emu processes. `None`: the guest has the NAT's `eth0` alone.
+    pub net_segment: Option<sim_core::segment::SegmentSpec>,
     /// The vehicle HAL channel (`qemud:car`, console `car`). Like stock, only for car images;
     /// other guests asking for the pipe are refused.
     pub car: Option<Arc<pipe::car::Car>>,
@@ -536,6 +539,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         cmdline: &cfg.cmdline,
         initrd,
         virtio_slots: VIRTIO_MMIO_SLOTS,
+        late_slot: cfg.net_segment.is_some().then_some(slots::SEGMENT),
         pci: cfg.gpu.is_some(),
         goldfish_pipe: cfg.gpu.is_some(),
         rng_seed: random_bytes(),
@@ -640,6 +644,16 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         }
     };
     slots[slots::NET as usize] = Some(Box::new(virtio::net::Net::new(net)));
+    // The segment's NIC, a second virtio-net: no NAT, no gateway, only the other members.
+    if let Some(spec) = &cfg.net_segment {
+        match crate::net::segment::SegmentPort::open(spec) {
+            Ok(port) => {
+                slots[slots::SEGMENT as usize] = Some(Box::new(virtio::net::Net::with_mac(spec.mac(), Box::new(port))));
+                eprintln!("emu: net-segment: member {} of {} at {}", spec.member, spec.dir.display(), spec.ip());
+            }
+            Err(e) => eprintln!("emu: net-segment: not joined ({e}); the guest has no second NIC"),
+        }
+    }
     if let Some(opts) = cfg.sound {
         slots[slots::SOUND as usize] = Some(Box::new(virtio::snd::Snd::with_tap(opts, cfg.sound_tap.clone())));
     }

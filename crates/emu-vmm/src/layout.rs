@@ -82,6 +82,10 @@ pub mod slots {
     pub const VSOCK: u32 = 24;
     pub const RNG: u32 = 25;
     pub const NET: u32 = 26;
+    /// The second virtio-net, `net-segment`'s NIC on a link subnet (#539). Not on the stock board.
+    /// Below `NET`, so the board describes it after the others (`BoardInfo::late_slot`): the guest
+    /// then names the NAT's NIC `eth0` (the radio HAL configures that name) and this one `eth1`.
+    pub const SEGMENT: u32 = 15;
     /// virtio-console with named ports (`modem`); stock puts its consoles on PCI.
     pub const VPORTS: u32 = 19;
     /// virtio-snd (images that enable `VirtioSndCard`, and Automotive); stock puts it on PCI, and the guest driver
@@ -129,8 +133,10 @@ mod tests {
     #[test]
     fn every_slot_is_taken_once() {
         use slots::*;
-        let mut all =
-            [GPU, TOUCH, KEYBOARD, ROTARY, MOUSE, TOUCHPAD, VSOCK, RNG, NET, VPORTS, SOUND, SYSTEM, CACHE, USERDATA, METADATA, VENDOR];
+        let mut all = [
+            GPU, TOUCH, KEYBOARD, ROTARY, MOUSE, TOUCHPAD, VSOCK, RNG, NET, SEGMENT, VPORTS, SOUND, SYSTEM, CACHE, USERDATA, METADATA,
+            VENDOR,
+        ];
         all.sort_unstable();
         assert!(all.windows(2).all(|w| w[0] != w[1]) && all.iter().all(|s| *s < 32), "{all:?}");
     }

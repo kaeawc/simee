@@ -79,6 +79,10 @@ options:
                     isn't shaped yet
   -netdelay D       initial network latency: gsm, gprs, edge, umts, ..., none (default), <ms> or
                     <min>:<max>; reported the same way
+  -net-segment SPEC join a link segment (#539): a second NIC, eth1, on a link subnet whose frames
+                    go to the other members' emu processes, multicast included, so mDNS reaches them.
+                    SPEC is dir=PATH,subnet=N,member=K (one directory per segment, member 0..15;
+                    `simee` makes it); the NAT and eth0 are unchanged. Apple silicon only
   -camera-back S    the back camera's source: emulated (the test card), webcam0 (the host's first
                     camera; webcam1, ...), none, or a simee source id (pattern:testcard, qr:TEXT,
                     text:TEXT, image:PATH, solid:COLOUR, webcam:NAME); default hw.camera.back
@@ -161,6 +165,8 @@ pub struct Opts {
     pub metal_present: bool,
     /// `-netspeed`, `-netdelay` (`-netfast`: both unlimited, the default).
     pub network: sim_core::network::Conditions,
+    /// `-net-segment dir=PATH,subnet=N,member=K`: the segment NIC (#539), checked.
+    pub net_segment: Option<sim_core::segment::SegmentSpec>,
     /// `-disk-cache unsafe|fsync`: whether guest disk flushes fsync on the host.
     pub disk_fsync: bool,
     pub create_avd: Option<String>,
@@ -270,6 +276,10 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Opts> {
                 }
             }
             "netfast" => o.network = Default::default(),
+            "net-segment" => {
+                let v = value(flag)?;
+                o.net_segment = Some(v.parse().map_err(|e| anyhow::anyhow!("invalid -net-segment value '{v}': {e}"))?);
+            }
             "disk-cache" => {
                 o.disk_fsync = match value(flag)?.as_str() {
                     "fsync" | "writethrough" | "safe" => true,
@@ -509,6 +519,19 @@ mod tests {
         assert!(!p("-avd pixel").network.is_shaped());
         assert!(parse(["-netspeed".to_string(), "warp".to_string()]).is_err());
         assert!(parse(["-netdelay".to_string(), "slow".to_string()]).is_err());
+    }
+
+    #[test]
+    fn net_segment_names_the_directory_subnet_and_member() {
+        let o = p("-avd pixel -net-segment dir=/tmp/seg/pair,subnet=3,member=1");
+        let spec = o.net_segment.expect("segment");
+        assert_eq!((spec.dir.to_str(), spec.subnet, spec.member), (Some("/tmp/seg/pair"), 3, 1));
+        assert!(p("-avd pixel").net_segment.is_none(), "unlinked devices get no second NIC");
+        for bad in ["dir=/x,subnet=3", "dir=/x,subnet=0,member=0", "dir=/x,subnet=3,member=16", "/tmp/seg"] {
+            let err = parse(["-net-segment".to_string(), bad.to_string()]).expect_err(bad).to_string();
+            assert!(err.contains("invalid -net-segment value"), "{err}");
+        }
+        assert!(parse(["-net-segment".to_string()]).is_err(), "a value is required");
     }
 
     #[test]

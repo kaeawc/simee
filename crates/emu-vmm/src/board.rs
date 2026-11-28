@@ -12,6 +12,10 @@ pub struct BoardInfo<'a> {
     pub initrd: Option<(u64, u64)>,
     /// Slots that hold a device; the rest are still described (and answer as empty), like stock.
     pub virtio_slots: u32,
+    /// A slot described after every other, so the guest probes it last: the second NIC (`eth1`)
+    /// must not be probed before the first, whose slot is higher. Still described in place of
+    /// its own entry, never twice.
+    pub late_slot: Option<u32>,
     /// Describe the PCIe host (goldfish address space lives there).
     pub pci: bool,
     /// Describe the goldfish pipe device.
@@ -110,7 +114,8 @@ pub fn build(b: &BoardInfo) -> Result<Vec<u8>, emu_fdt::FdtError> {
     f.prop_str("clock-names", "apb_pclk");
     f.end_node();
 
-    for slot in 0..b.virtio_slots {
+    let in_order = (0..b.virtio_slots).filter(|s| Some(*s) != b.late_slot);
+    for slot in in_order.chain(b.late_slot.filter(|s| *s < b.virtio_slots)) {
         let addr = virtio_slot_addr(slot);
         f.begin_node(&format!("virtio_mmio@{addr:x}"));
         f.prop_str("compatible", "virtio,mmio");
@@ -209,6 +214,7 @@ mod tests {
             cmdline: "console=ttyAMA0",
             initrd: Some((INITRD_ADDR, INITRD_ADDR + 100)),
             virtio_slots: VIRTIO_MMIO_SLOTS,
+            late_slot: None,
             pci: true,
             goldfish_pipe: true,
             rng_seed: [0; 64],
@@ -221,5 +227,43 @@ mod tests {
         assert!(text.contains("arm,gic-v3"));
         assert!(text.contains("pci-host-ecam-generic"));
         assert!(text.contains("google,goldfish-battery"));
+    }
+
+    /// Where a slot's node sits in the tree, which is the order the guest probes the devices in.
+    fn position(dtb: &[u8], slot: u32) -> usize {
+        let text = String::from_utf8_lossy(dtb);
+        text.find(&format!("virtio_mmio@{:x}", virtio_slot_addr(slot))).expect("slot described")
+    }
+
+    fn board(late_slot: Option<u32>) -> Vec<u8> {
+        build(&BoardInfo {
+            cpus: 1,
+            ram_bytes: 1 << 30,
+            gic_dist: (GIC_DIST_BASE, 0x10000),
+            gic_redist: (GIC_REDIST_BASE, 0x20000),
+            cmdline: "console=ttyAMA0",
+            initrd: None,
+            virtio_slots: VIRTIO_MMIO_SLOTS,
+            late_slot,
+            pci: false,
+            goldfish_pipe: false,
+            rng_seed: [0; 64],
+            kaslr_seed: 1,
+        })
+        .expect("dtb")
+    }
+
+    #[test]
+    fn the_segment_nic_is_described_after_the_nat_nic_so_it_probes_second() {
+        let plain = board(None);
+        assert!(position(&plain, slots::SEGMENT) < position(&plain, slots::NET), "address order, as stock");
+        let late = board(Some(slots::SEGMENT));
+        assert!(position(&late, slots::SEGMENT) > position(&late, slots::NET));
+        assert!(position(&late, slots::SEGMENT) > position(&late, 31), "after every slot");
+        // Neighbouring behaviour: every slot is still described once, and nothing else moved.
+        let text = String::from_utf8_lossy(&late).into_owned();
+        assert_eq!(text.matches("virtio_mmio@").count(), VIRTIO_MMIO_SLOTS as usize);
+        assert!(position(&late, 0) < position(&late, slots::NET) && position(&late, slots::NET) < position(&late, 31));
+        assert_eq!(late.len(), plain.len(), "same nodes, different order");
     }
 }
