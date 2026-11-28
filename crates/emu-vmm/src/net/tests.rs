@@ -624,6 +624,10 @@ fn cond(up: f64, down: f64, min: i32, max: i32) -> sim_core::network::Conditions
 }
 
 /// A host server that answers its first datagram with `count` datagrams of `size` bytes.
+///
+/// Loopback UDP is not reliable on a loaded host: macOS's `sendto` can fail with ENOBUFS and a
+/// datagram can be dropped on the way in (#569). The server retries a failed send and leaves a
+/// moment between datagrams, and [`arrivals`] tolerates the few that are still lost.
 fn burst_server(count: usize, size: usize) -> (u16, std::thread::JoinHandle<()>) {
     let server = UdpSocket::bind("127.0.0.1:0").expect("bind");
     let port = server.local_addr().expect("addr").port();
@@ -631,21 +635,64 @@ fn burst_server(count: usize, size: usize) -> (u16, std::thread::JoinHandle<()>)
         let mut b = [0u8; 64];
         let (_, from) = server.recv_from(&mut b).expect("recv");
         for i in 0..count {
-            server.send_to(&vec![i as u8; size], from).expect("send");
+            let d = vec![i as u8; size];
+            let mut tries = 0;
+            while let Err(e) = server.send_to(&d, from) {
+                tries += 1;
+                assert!(tries < 1000, "send {i}: {e}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_micros(200));
         }
     });
     (port, h)
 }
 
-/// Receives `count` datagrams, returning when each arrived since `start`.
-fn arrivals(n: &mut Nat, count: usize, start: Instant, mut each: impl FnMut(&mut Nat, usize)) -> Vec<Duration> {
+/// How long the link stays silent, with the server done sending, before [`arrivals`] decides the
+/// rest of the burst was lost. A throttled burst here releases a datagram every 80 ms at most.
+const QUIET: Duration = Duration::from_secs(2);
+
+/// The fewest datagrams of a burst of `count` that must arrive: loopback may lose a few.
+fn enough(count: usize) -> usize {
+    count - count / 5
+}
+
+/// Receives up to `count` datagrams from `server`'s burst, returning when each arrived since
+/// `start`. It stops early once the server has sent everything and nothing has arrived for
+/// [`QUIET`], and fails if fewer than [`enough`] arrived. `each` sees every arrival's ordinal.
+fn arrivals(
+    n: &mut Nat,
+    count: usize,
+    server: &std::thread::JoinHandle<()>,
+    start: Instant,
+    mut each: impl FnMut(&mut Nat, usize),
+) -> Vec<Duration> {
     let mut at = Vec::new();
+    let mut last = Instant::now();
     while at.len() < count {
-        let f = next_frame(n, Duration::from_secs(10), |f| matches!(packet::parse(f), Frame::Udp { .. })).expect("datagram");
-        assert!(matches!(packet::parse(&f), Frame::Udp { .. }));
-        at.push(start.elapsed());
-        each(n, at.len());
+        // Drain before looking at the clock, so a descheduled thread still takes what is there.
+        let mut got = false;
+        while let Some(f) = n.receive() {
+            if matches!(packet::parse(&f), Frame::Udp { .. }) {
+                at.push(start.elapsed());
+                got = true;
+                each(n, at.len());
+                if at.len() == count {
+                    break;
+                }
+            }
+        }
+        if got {
+            last = Instant::now();
+            continue;
+        }
+        if server.is_finished() && last.elapsed() >= QUIET {
+            break;
+        }
+        assert!(last.elapsed() < Duration::from_secs(10), "no datagram for 10 s after {} of {count}", at.len());
+        std::thread::sleep(Duration::from_millis(1));
     }
+    assert!(at.len() >= enough(count), "only {} of {count} datagrams arrived", at.len());
     at
 }
 
@@ -656,19 +703,22 @@ fn download_is_throttled_to_the_rate_and_unlimited_is_unchanged() {
     let (_, mut n) = shaped(cond(0.0, 200_000.0, 0, 0));
     let t0 = Instant::now();
     n.transmit(&udp_frame(SocketAddrV4::new(GUEST, 40001), SocketAddrV4::new(GW, port), b"go"));
-    let at = arrivals(&mut n, 20, t0, |_, _| {});
+    let at = arrivals(&mut n, 20, &server, t0, |_, _| {});
     server.join().expect("server");
-    assert!(at[19] >= Duration::from_millis(500), "throttled: {:?}", at[19]);
-    assert!(at[19] <= Duration::from_secs(5), "{:?}", at[19]);
+    // With as few as `enough(20)` = 16 arriving, the last still waits over 0.6 s.
+    let last = *at.last().expect("arrivals");
+    assert!(last >= Duration::from_millis(500), "throttled: {last:?}");
+    assert!(last <= Duration::from_secs(5), "{last:?}");
 
     // Pin: 0 = unlimited delivers the same burst whole, with nothing held back.
     let (port, server) = burst_server(20, 1000);
     let (_, mut n) = shaped(cond(0.0, 0.0, 0, 0));
     let t0 = Instant::now();
     n.transmit(&udp_frame(SocketAddrV4::new(GUEST, 40002), SocketAddrV4::new(GW, port), b"go"));
-    let at = arrivals(&mut n, 20, t0, |_, _| {});
+    let at = arrivals(&mut n, 20, &server, t0, |_, _| {});
     server.join().expect("server");
-    assert!(at[19] < Duration::from_millis(400), "unshaped: {:?}", at[19]);
+    let last = *at.last().expect("arrivals");
+    assert!(last < Duration::from_millis(400), "unshaped: {last:?}");
 }
 
 #[test]
@@ -678,13 +728,14 @@ fn lifting_the_throttle_mid_stream_frees_what_is_held() {
     let (shared, mut n) = shaped(cond(0.0, 100_000.0, 0, 0));
     let t0 = Instant::now();
     n.transmit(&udp_frame(SocketAddrV4::new(GUEST, 40003), SocketAddrV4::new(GW, port), b"go"));
-    let at = arrivals(&mut n, 20, t0, |_, got| {
+    let at = arrivals(&mut n, 20, &server, t0, |_, got| {
         if got == 3 {
             shared.lock().expect("conditions").download_bps = 0.0;
         }
     });
     server.join().expect("server");
-    assert!(at[19] < Duration::from_millis(1300), "{:?}", at[19]);
+    let last = *at.last().expect("arrivals");
+    assert!(last < Duration::from_millis(1300), "{last:?}");
 }
 
 #[test]
