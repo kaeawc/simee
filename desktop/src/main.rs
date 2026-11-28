@@ -5,7 +5,7 @@
 //! from the emulator's display socket. Clicks and drags become touches, typing goes to the device
 //! keyboard, and the toolbar has the controls the device's form factor has (Back/Home/Recents, a
 //! foldable's hinge, a watch's rotary input, a TV's D-pad). ⌘⇧H is Home, ⌘L Lock, ⌘S saves a
-//! screenshot to the Desktop, ⌘3 switches the 3D device view on and off ([`scene`], wgpu only),
+//! screenshot to the Desktop, ⌘3 switches the 3D device view on and off ([`scene`]),
 //! ⌘⇧O pops the device out into a window of its own and back ([`popout`]).
 //!
 //! Handlers only queue [`Action`]s and [`Input`]s; `poll` performs them. That keeps handlers pure,
@@ -1193,18 +1193,20 @@ fn main() {
     #[cfg(not(feature = "hot"))]
     {
         let setting = std::env::var("SIMEE_GPU_BACKEND").ok();
-        // Before the window's state is made: it reads whether the 3D view can draw.
-        let wgpu = scene::wgpu_backend(std::env::var("RUNE_GPU_BACKEND").ok().as_deref(), setting.as_deref(), cfg!(target_os = "macos"));
-        scene::set_supported(wgpu);
+        // Before the window's state is made: it reads whether the 3D view can draw. Both
+        // backends draw it (Rune's native Metal one since anomalyco/rune#2563, #193).
+        scene::set_supported(true);
         // Headless runs and scenes never read or write the user's settings.
         let store = if headless() { settings::Store::default() } else { settings::Store::open_default() };
         let opened_at = panes::open_at(&mut spec, &store);
+        // With the view off the compositor draws Rune's default frame.
         let app = rune::App::new(spec)
             .on_visibility(on_visibility)
             .on_window(panes::remember_window)
             .on_close(popout::on_main_close)
             .on_quit(popout::on_main_close)
-            .init(move || init_with(store));
+            .init(move || init_with(store))
+            .compositor(scene::Scene::default());
         let app = match opened_at {
             Some(options) => app.window_options(options),
             None => app,
@@ -1217,18 +1219,15 @@ fn main() {
                 app
             }
         };
-        // Only a backend that can draw the scene gets its compositor; with the view off it draws
-        // Rune's default frame.
-        let app = if wgpu { app.compositor(scene::Scene::default()) } else { app };
         app.run();
     }
 }
 
 /// The GPU backend `SIMEE_GPU_BACKEND` chooses on macOS: `metal` (Rune's native Metal backend,
-/// what the window draws with when it is unset) or `wgpu` (wgpu's Metal backend, which a depth
-/// buffer and MSAA resolves need, anomalyco/rune#2547). Unset or empty keeps Rune's default; an
-/// unknown name is an error the caller reports before keeping it. `RUNE_GPU_BACKEND` still wins
-/// over either. The cost of `wgpu` for the flat view is in docs/benchmarks.md.
+/// what the window and the 3D view draw with when it is unset) or `wgpu` (wgpu's Metal backend).
+/// Unset or empty keeps Rune's default; an unknown name is an error the caller reports before
+/// keeping it. `RUNE_GPU_BACKEND` still wins over either. What each costs is in docs/desktop.md
+/// and docs/benchmarks.md.
 #[cfg_attr(feature = "hot", allow(dead_code))]
 fn gpu_backend(setting: Option<&str>) -> Result<Option<rune::GpuBackend>, String> {
     match setting.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
@@ -1323,7 +1322,7 @@ mod tests {
     }
 
     #[test]
-    fn cmd_3_toggles_the_3d_view_where_the_backend_draws_it() {
+    fn cmd_3_toggles_the_3d_view_where_the_compositor_draws_it() {
         let mut rt = polled_runtime(demo);
         rt.on_key = Some(on_key);
         rt.state.view3d.supported = true;
@@ -1337,7 +1336,7 @@ mod tests {
         assert!(!rt.state.view3d.on);
         assert!(rt.find("scene-3d").is_none());
         assert_eq!(rt.state.status, None, "off says nothing");
-        // Rune's native Metal backend: the toggle says why it does nothing.
+        // No compositor (live Rust editing): the toggle says why it does nothing.
         rt.state.view3d.supported = false;
         rt.key(cmd('3'));
         rt.frame(1.0 / 60.0);

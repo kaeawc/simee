@@ -11,9 +11,10 @@
 //! with no CPU copy of any pixel: the copy is one GPU texture copy per drawn frame. Rune can't
 //! hand a compositor a `NativeSurface`'s texture yet (anomalyco/rune#2546, simee#192).
 //!
-//! Depth attachments and MSAA resolves need Rune's wgpu backend (`SIMEE_GPU_BACKEND=wgpu`):
-//! the native Metal backend panics on them (anomalyco/rune#2547, simee#193), so on it the toggle
-//! says why it does nothing. With the view off the window draws exactly as without it.
+//! Both of Rune's backends draw it: its native Metal backend (macOS's default) has depth
+//! attachments and MSAA resolves since anomalyco/rune#2563 (simee#193), and wgpu's
+//! (`SIMEE_GPU_BACKEND=wgpu`) always had them. With the view off the window draws exactly as
+//! without it.
 //!
 //! The user moves the camera (#155, [`View`]): a drag beside the drawn screen orbits, ⇧-drag or a
 //! two-finger trackpad drag pans, a mouse wheel, ⌘-scroll or a pinch zooms. A drag that starts on
@@ -49,9 +50,8 @@ use crate::State;
 /// The slot's `El::effect` mark.
 const MARK: u32 = 152;
 
-/// What ⌘3 says on a backend that can't draw the scene.
-pub const UNAVAILABLE: &str = "The 3D view needs SIMEE_GPU_BACKEND=wgpu: Rune's native Metal backend can't draw a depth buffer \
-                               or MSAA yet (anomalyco/rune#2547)";
+/// What ⌘3 says where no compositor draws the scene (live Rust editing runs without one).
+pub const UNAVAILABLE: &str = "The 3D view needs the scene's compositor, which live Rust editing (the hot feature) runs without";
 /// What ⌘3 says once the view is on.
 pub const ON: &str = "3D view on: drag beside the device to orbit, ⇧-drag to pan, scroll or pinch to zoom; ⌘0 face on, \
                       ⌘1 ⌘2 ⌘4 ⌘5 3/4, front, side, back, ⌘F flip, ⌘[ ⌘] turn. Touches on its screen come with #156";
@@ -60,34 +60,20 @@ pub const SCREEN_DRAG: &str = "Touches on the 3D screen come with #156: drag bes
 /// What ⌘3 says for a device with no body.
 pub const NO_BODY: &str = "The 3D view has bodies for phones, tablets, foldables and watches";
 
-/// Whether this process draws with a backend the scene can use, set once in `main` before the
-/// window opens (headless scenes and tests leave it false unless they set it).
+/// Whether this process has the scene's compositor, set once in `main` before the window opens
+/// (live Rust editing has none; tests leave it false unless they set it).
 static SUPPORTED: AtomicBool = AtomicBool::new(false);
 
 pub fn set_supported(on: bool) {
     SUPPORTED.store(on, Ordering::Relaxed);
 }
 
-/// Whether the backend `RUNE_GPU_BACKEND` (which wins) and `SIMEE_GPU_BACKEND` choose can draw
-/// the scene: wgpu's. macOS draws with Rune's native Metal backend when neither says; other
-/// hosts always draw with wgpu. Rune matches its variable exactly (`wgpu` or `metal`; anything
-/// else is ignored), while simee's is trimmed and lowercased (`crate::gpu_backend`): each is read
-/// the way its owner reads it, so this agrees with the backend Rune draws with.
-pub fn wgpu_backend(rune: Option<&str>, simee: Option<&str>, macos: bool) -> bool {
-    let rune = rune.filter(|s| matches!(*s, "wgpu" | "metal"));
-    let simee = simee.map(|s| s.trim().to_ascii_lowercase()).filter(|s| s == "wgpu" || s == "metal");
-    match rune.or(simee.as_deref()) {
-        Some(b) => b == "wgpu" || !macos,
-        None => !macos,
-    }
-}
-
 /// The 3D view's switch, and the view itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Toggle {
-    /// Asked for (⌘3, `SIMEE_VIEW=3d`) on a backend that can draw it.
+    /// Asked for (⌘3, `SIMEE_VIEW=3d`) where the compositor can draw it.
     pub on: bool,
-    /// The backend can draw it.
+    /// The compositor is there to draw it.
     pub supported: bool,
     /// The view it started in (`SIMEE_SCENE_CAMERA`).
     pub preset: Preset,
@@ -527,27 +513,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_wgpu_draws_the_scene_on_macos() {
-        assert!(!wgpu_backend(None, None, true));
-        assert!(wgpu_backend(None, Some("wgpu"), true));
-        assert!(wgpu_backend(None, Some(" WGPU "), true));
-        assert!(!wgpu_backend(None, Some("metal"), true));
-        assert!(!wgpu_backend(None, Some("vulkan"), true));
-        // Rune's own variable wins over simee's.
-        assert!(!wgpu_backend(Some("metal"), Some("wgpu"), true));
-        assert!(wgpu_backend(Some("wgpu"), Some("metal"), true));
-        // Rune matches its variable exactly: `WGPU` or ` wgpu` is no choice, so Rune draws with
-        // simee's setting (else the default).
-        assert!(!wgpu_backend(Some("WGPU"), None, true));
-        assert!(!wgpu_backend(Some(" wgpu"), Some("metal"), true));
-        assert!(wgpu_backend(Some("WGPU"), Some("wgpu"), true));
-        // Elsewhere there's only wgpu.
-        assert!(wgpu_backend(None, None, false));
-        assert!(wgpu_backend(Some("metal"), None, false));
-    }
-
-    #[test]
-    fn toggle_starts_from_the_environment_and_explains_metal() {
+    fn toggle_starts_from_the_environment_and_explains_a_missing_compositor() {
         let still = |p| View::new(p);
         assert_eq!(
             Toggle::from_env(None, None, true),
@@ -572,9 +538,9 @@ mod tests {
         assert!(t.on);
         assert_eq!(t.flip(), None);
         assert!(!t.on);
-        let mut metal = Toggle::default();
-        assert_eq!(metal.flip().as_deref(), Some(UNAVAILABLE));
-        assert!(!metal.on);
+        let mut hot = Toggle::default();
+        assert_eq!(hot.flip().as_deref(), Some(UNAVAILABLE));
+        assert!(!hot.on);
     }
 
     #[test]

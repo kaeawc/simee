@@ -33,7 +33,7 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -134,15 +134,36 @@ fn private_dir_in(base: &Path, name: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// This process's user id, read off a file created (exclusively) in `dir`.
+/// How many probe names `own_uid` tries before giving up on `EEXIST`.
+const PROBE_ATTEMPTS: usize = 8;
+
+/// This process's user id, read off a file created (exclusively) in `dir`. Safe to call from many
+/// threads at once: the name carries a process-wide counter, and a name already taken is retried.
 fn own_uid(dir: &Path) -> io::Result<u32> {
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-    let probe = dir.join(format!(".simee-uid-{}-{nanos}", std::process::id()));
-    let file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&probe)?;
-    let uid = file.metadata().map(|m| m.uid());
-    drop(file);
-    let _ = std::fs::remove_file(&probe);
-    uid
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    own_uid_with(dir, || {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        format!(".simee-uid-{}-{}-{nanos}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed))
+    })
+}
+
+/// `own_uid` with the probe names from `next_name`: up to `PROBE_ATTEMPTS` of them, moving on
+/// when one already exists. The probe this call created is removed on every path.
+fn own_uid_with(dir: &Path, mut next_name: impl FnMut() -> String) -> io::Result<u32> {
+    for _ in 0..PROBE_ATTEMPTS {
+        let probe = dir.join(next_name());
+        match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&probe) {
+            Ok(file) => {
+                let uid = file.metadata().map(|m| m.uid());
+                drop(file);
+                let _ = std::fs::remove_file(&probe);
+                return uid;
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(ErrorKind::AlreadyExists, format!("no free probe name in {} after {PROBE_ATTEMPTS} tries", dir.display())))
 }
 
 /// The launch environment that gives an app the camera: the shim inserted, and the feed's socket.
@@ -987,6 +1008,71 @@ mod tests {
         let data = Path::new("/Users/someone-with-a-long-name/Library/Developer/CoreSimulator/Devices/0053A2F9-1FD0/data/x/y/zz");
         assert_eq!(socket_path(data).ok(), socket_path_in(data, "cam.sock").ok(), "the iOS feed's path is unchanged");
         assert!(socket_path(data).is_ok_and(|p| p.file_name().is_some_and(|n| !n.to_string_lossy().contains('-'))));
+    }
+
+    /// A scratch directory for one test, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Scratch {
+            let dir = std::env::temp_dir().join(format!("simee-{tag}-{}-{:?}", std::process::id(), SystemTime::now()));
+            std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+            Scratch(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `own_uid` is called concurrently by every `socket_path`: threads in one process must not
+    /// pick the same probe name (#490), and none may leave a probe file behind.
+    #[test]
+    fn own_uid_succeeds_from_many_threads_at_once_and_leaves_nothing_behind() {
+        let scratch = Scratch::new("own-uid");
+        let threads = 32;
+        let gate = Arc::new(std::sync::Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let (dir, gate) = (scratch.0.clone(), gate.clone());
+                thread::spawn(move || {
+                    gate.wait();
+                    (0..20).map(|_| own_uid(&dir)).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut uids = Vec::new();
+        for h in handles {
+            for r in h.join().unwrap_or_else(|_| panic!("a thread panicked")) {
+                uids.push(r.unwrap_or_else(|e| panic!("own_uid failed: {e}")));
+            }
+        }
+        assert!(uids.windows(2).all(|w| w[0] == w[1]), "one uid for one process");
+        let left: Vec<_> = std::fs::read_dir(&scratch.0).map(|d| d.flatten().map(|e| e.file_name()).collect()).unwrap_or_default();
+        assert!(left.is_empty(), "probe files left behind: {left:?}");
+    }
+
+    /// A pinned clock gives every call the same name: the taken ones are skipped without removing
+    /// someone else's file, and a directory with no free name is an error, not a hang.
+    #[test]
+    fn own_uid_skips_taken_probe_names_and_gives_up_after_a_bounded_number() {
+        let scratch = Scratch::new("own-uid-retry");
+        let taken = scratch.0.join("taken");
+        std::fs::write(&taken, b"theirs").unwrap_or_else(|e| panic!("{e}"));
+        let mut names = vec!["taken", "taken", "free"].into_iter().map(String::from);
+        let uid = own_uid_with(&scratch.0, || names.next().unwrap_or_else(|| panic!("asked for a fourth name")));
+        assert_eq!(uid.ok(), std::fs::metadata(&taken).ok().map(|m| m.uid()), "found the uid after two collisions");
+        assert!(taken.exists() && !scratch.0.join("free").exists(), "the other's file stays, ours goes");
+
+        let mut asked = 0;
+        let err = own_uid_with(&scratch.0, || {
+            asked += 1;
+            "taken".to_string()
+        });
+        assert!(err.is_err_and(|e| e.kind() == ErrorKind::AlreadyExists));
+        assert_eq!(asked, PROBE_ATTEMPTS);
     }
 
     /// The fallback is in `/tmp/simee-<uid>`, whatever TMPDIR or USER say: short enough for any

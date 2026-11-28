@@ -211,7 +211,7 @@ impl Adb {
 /// never one reusing its PID) and the error names `what`. Output is read as it comes, so the
 /// call returns once the command exits even when a process it started still holds its pipes.
 fn output_within(command: &mut Command, limit: Duration, what: &str) -> Result<(bool, String, String), String> {
-    let ran = capture(command, limit, [usize::MAX; 2], what)?;
+    let ran = capture(command, None, limit, [usize::MAX; 2], what)?;
     if ran.timed_out {
         return Err(format!("`{what}` timed out after {limit:?}; stopped it"));
     }
@@ -237,17 +237,31 @@ pub(crate) struct Captured {
 /// [`output_within`]'s run, keeping at most `caps` bytes of stdout and of stderr: a stream that
 /// reaches its cap while the command runs stops it (`truncated`, `stopped`), as running past `limit`
 /// does (`timed_out`, `stopped`). One that reaches it in what is read after the command exited is
-/// only cut (`truncated`), the command's status kept.
-pub(crate) fn capture(command: &mut Command, limit: Duration, caps: [usize; 2], what: &str) -> Result<Captured, String> {
+/// only cut (`truncated`), the command's status kept. `stdin`, when given, is written to the
+/// command's input from a thread of its own (so a command that writes before it reads can't stall
+/// it) and then closed; without it the input is null.
+pub(crate) fn capture(
+    command: &mut Command,
+    stdin: Option<Vec<u8>>,
+    limit: Duration,
+    caps: [usize; 2],
+    what: &str,
+) -> Result<Captured, String> {
     /// How often a quiet command is checked for having exited.
     const TICK: Duration = Duration::from_millis(20);
     let deadline = Instant::now().checked_add(limit).ok_or_else(|| format!("`{what}`: a time limit of {limit:?} is too long"))?;
     let mut child = command
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("couldn't run {}: {e}", Path::new(command.get_program()).display()))?;
+    if let (Some(bytes), Some(mut input)) = (stdin, child.stdin.take()) {
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = input.write_all(&bytes);
+        });
+    }
     let (tx, rx) = mpsc::channel::<(usize, Option<Vec<u8>>)>();
     let pipes: [Option<Box<dyn Read + Send>>; 2] = [
         child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>),

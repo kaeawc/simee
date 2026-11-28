@@ -77,7 +77,10 @@ simee create Wear    --platform android --system-image "system-images;android-34
 simee create TV      --platform android --system-image "system-images;android-34;google-tv;arm64-v8a"
 simee create Car     --platform android --system-image "system-images;android-34-ext9;android-automotive;arm64-v8a"
 simee create XR      --platform android --system-image "system-images;android-34;google-xr;arm64-v8a"
+simee device-types                           # Android's too: phone, tablet, pixel_fold, surface_duo, ...
 simee boot Pixel                             # starts emu; waits for sys.boot_completed
+simee settle Pixel                           # then until the guest's processes are quiet
+simee profile Pixel slim                     # packages a farm doesn't need, off for good (--undo)
 adb -s emulator-5554 shell                    # it is an ordinary emulator to every tool
 simee fold Fold fold                         # the outer screen; `unfold`, a posture or an angle
 simee rotary Wear 3                          # the rotary input (watches only)

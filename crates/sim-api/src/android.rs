@@ -43,11 +43,11 @@ const BUTTON_HOLD: Duration = Duration::from_millis(80);
 
 /// `boot` and `boot_many` parameters only iOS devices take, and why.
 const IOS_BOOT_PARAMS: &[(&str, &str)] = &[
-    ("settle", "a settle wait reads a simulator's process tree; an Android boot waits for sys.boot_completed"),
+    ("settle", "an Android boot waits for sys.boot_completed; call `settle` after it"),
     ("settle_cpu_pct", "it tunes the settle wait"),
     ("settle_window_s", "it tunes the settle wait"),
     ("settle_timeout_s", "it tunes the settle wait"),
-    ("profile", "profiles are sets of a simulator's launchd jobs"),
+    ("profile", "on Android, call `profile` on the booted device"),
     ("shaped", "the network shaper is injected into a simulator's processes"),
     ("env", "it is a simulator launchd's environment"),
 ];
@@ -343,6 +343,53 @@ impl crate::contrast::Target for ContrastTarget<'_> {
     }
 }
 
+/// The guest's processes as a settle wait reads them: each one's CPU (all of it counts as
+/// foreground: Android has no QoS split a probe can read, and a guest's background work still
+/// costs the host its vCPU time), with "SpringBoard running" read as the framework up:
+/// `sys.boot_completed` and `system_server` running.
+fn settle_tree(sample: &sim_android::settle::CpuSample) -> crate::settle::Tree {
+    crate::settle::Tree {
+        cpu: sample.procs.iter().map(|p| (p.pid, crate::settle::Cpu { total_s: p.cpu_s, background_s: 0.0 })).collect(),
+        springboard: sample.boot_completed && sample.running("system_server"),
+    }
+}
+
+/// `settle` on a running AVD: iOS's rule, parameters and result, over the guest's own process
+/// table (one adb probe a second, timed on the guest's clock), so it measures the device and not
+/// the emulator around it.
+fn settle(android: &Android, d: &sim_android::Device, p: &Value) -> Result<Value, String> {
+    let (rule, timeout) = crate::settle::options(p)?;
+    if d.running.is_none() {
+        return Err(format!("{} isn't booted", d.info.name));
+    }
+    let adb = d.adb(android)?;
+    let mut clock = crate::settle::Host(std::time::Instant::now());
+    let sample = || adb.cpu_sample().ok().map(|s| (s.uptime_s, settle_tree(&s)));
+    let crate::settle::Settled { at, settler } = crate::settle::wait(rule, timeout, false, sample, &mut clock);
+    let settle_s = at.ok_or_else(|| crate::settle::not_settled(&settler, rule, timeout))?;
+    let mut result = json!({"settle_s": crate::settle::round(settle_s)});
+    crate::settle::put_load(&mut result, &settler);
+    Ok(result)
+}
+
+/// `profile` on a running AVD: the named set of packages off for user 0 (or with `undo`, on), in
+/// iOS's result shape (`not_loaded`: packages this image doesn't have).
+fn profile(android: &Android, d: &sim_android::Device, p: &Value) -> Result<Value, String> {
+    let profile = sim_android::profile::profile(need_str(p, "name")?)?;
+    let undo = opt_bool(p, "undo")?.unwrap_or(false);
+    if d.running.is_none() {
+        return Err(format!("{} isn't booted", d.info.name));
+    }
+    let a = d.adb(android)?.apply_profile(profile, undo)?;
+    let key = if undo { "enabled" } else { "disabled" };
+    let mut r = json!({(key): a.changed, "failed": a.failed, "name": profile.name});
+    if !undo {
+        r["not_loaded"] = json!(a.not_loaded);
+        r["already"] = json!(a.already);
+    }
+    Ok(r)
+}
+
 /// Dispatches one device method for the AVD named `udid`.
 pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Value, String> {
     let android = s.backend().clone();
@@ -416,7 +463,13 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             null(d.key(usage, Direction::Up))
         }
         "install" | "uninstall" | "launch" | "terminate" | "apps" | "open_url" => app(&android, &d, method, p),
+        m if crate::android_files::METHODS.contains(&m) => crate::android_files::call(&android, &d, m, p),
         "processes" | "kill" | "exec" => debug(&android, &d, method, p),
+        "network_shape" | "network_state" | "network_clear" | "connections" | "traffic" => {
+            crate::android_net::call(&android, &d, method, p)
+        }
+        "settle" => settle(&android, &d, p),
+        "profile" => profile(&android, &d, p),
         "location" => {
             let (lat, lon) = (crate::params::need_f64(p, "latitude")?, crate::params::need_f64(p, "longitude")?);
             null(d.set_location(lat, lon))
@@ -685,6 +738,103 @@ mod tests {
         }
         assert!(adb.calls().is_empty(), "{:?}", adb.calls());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn settle_profile_and_device_types_work_on_both_platforms() {
+        let help = call(&mut Session::default(), "help", &Value::Null).expect("help");
+        for method in ["settle", "profile", "device_types"] {
+            let row = help.as_array().and_then(|a| a.iter().find(|x| x["method"] == method)).expect(method);
+            assert_eq!(row["platforms"], json!(["android", "ios"]), "{method}");
+        }
+    }
+
+    #[test]
+    fn settle_waits_for_a_quiet_guest_and_answers_in_the_ios_shape() {
+        let (mut s, root, adb, _emulator) = session("settle");
+        // The fake guest: system_server at 60% of a core over the first second, 2% after.
+        let r = run(&mut s, "settle", json!({"window_s": 1, "cpu_pct": 10, "timeout_s": 30})).expect("settled");
+        let mut keys: Vec<&str> = r.as_object().expect("object").keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["background_cpu_pct", "background_cpu_s", "cpu_pct", "cpu_s", "foreground_cpu_pct", "procs", "settle_s"]);
+        // init, system_server and System UI: the probe's own shell and cat are left out.
+        assert_eq!(r["procs"], 3);
+        assert_eq!((&r["cpu_pct"], &r["foreground_cpu_pct"], &r["background_cpu_pct"]), (&json!(2.0), &json!(2.0), &json!(0.0)));
+        // 0.6 s then 0.02 s of system_server's CPU over the wait; nothing runs at a background QoS.
+        assert_eq!((&r["cpu_s"], &r["background_cpu_s"]), (&json!(0.6), &json!(0.0)));
+        assert!(r["settle_s"].as_f64().is_some_and(|t| t < 30.0), "{r}");
+        let probes = adb.calls().iter().filter(|c| c.starts_with("shell echo @self")).count();
+        assert_eq!(probes, 3, "busy, then one quiet window");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn settle_checks_its_parameters_and_the_device() {
+        let (mut s, root, adb, emulator) = session("settleparams");
+        assert_eq!(run(&mut s, "settle", json!({"cpu_pct": -1})), Err("cpu_pct must be a number of % of a core, not -1".into()));
+        assert_eq!(run(&mut s, "settle", json!({"window_s": 1.5})), Err("window_s must be whole seconds, not 1.5".into()));
+        assert!(adb.calls().is_empty(), "{:?}", adb.calls());
+        // No longer advertised: the device is shut down.
+        drop(emulator);
+        std::fs::remove_dir_all(root.join("running")).ok();
+        assert_eq!(run(&mut s, "settle", json!({})), Err("phone isn't booted".into()));
+        assert_eq!(run(&mut s, "profile", json!({"name": "slim"})), Err("phone isn't booted".into()));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_guest_counts_as_up_once_it_booted_with_the_framework_running() {
+        let proc = |pid, name: &str| sim_android::settle::ProcCpu { pid, ppid: 1, name: name.into(), cpu_s: 2.5 };
+        let sample = |boot_completed, procs| sim_android::settle::CpuSample { uptime_s: 9.0, boot_completed, procs };
+        let up = super::settle_tree(&sample(true, vec![proc(1, "init"), proc(612, "system_server")]));
+        assert!(up.springboard);
+        assert_eq!(up.cpu[&612], crate::settle::Cpu { total_s: 2.5, background_s: 0.0 }, "no background split on Android");
+        assert!(!super::settle_tree(&sample(false, vec![proc(612, "system_server")])).springboard, "still booting");
+        assert!(!super::settle_tree(&sample(true, vec![proc(1, "init")])).springboard, "the framework restarting");
+    }
+
+    #[test]
+    fn the_slim_profile_turns_packages_off_and_undo_turns_them_on() {
+        let (mut s, root, adb, _emulator) = session("profile");
+        let restore = "com.google.android.apps.restore";
+        let partner = "com.google.android.partnersetup";
+        let applied = run(&mut s, "profile", json!({"name": "slim"})).expect("applied");
+        assert_eq!(applied, json!({"name": "slim", "disabled": 2, "already": 0, "failed": [partner], "not_loaded": [restore]}));
+        // Again: the two that are off are left alone, the refused one is asked again.
+        let again = run(&mut s, "profile", json!({"name": "slim"})).expect("again");
+        assert_eq!(again, json!({"name": "slim", "disabled": 2, "already": 2, "failed": [partner], "not_loaded": [restore]}));
+        let calls = adb.calls();
+        assert_eq!(
+            calls[1],
+            format!(
+                "shell pm disable-user --user 0 com.google.android.apps.turbo; pm disable-user --user 0 com.google.android.apps.wellbeing; pm disable-user --user 0 {partner}; echo @disabled; pm list packages -d"
+            )
+        );
+        assert_eq!(calls[3], format!("shell pm disable-user --user 0 {partner}; echo @disabled; pm list packages -d"));
+        let undone = run(&mut s, "profile", json!({"name": "slim", "undo": true})).expect("undone");
+        assert_eq!(undone, json!({"name": "slim", "enabled": 3, "failed": []}));
+        assert_eq!(
+            adb.calls()[5],
+            "shell pm enable --user 0 com.google.android.apps.turbo; pm enable --user 0 com.google.android.apps.wellbeing; echo @disabled; pm list packages -d"
+        );
+        assert_eq!(run(&mut s, "profile", json!({"name": "tiny"})), Err("unknown profile `tiny` (slim)".into()));
+        assert_eq!(run(&mut s, "profile", json!({})), Err("missing string parameter `name`".into()));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn device_types_lists_the_android_hardware_in_the_ios_shape() {
+        let types = call(&mut Session::default(), "device_types", &json!({"platform": "android"})).expect("types");
+        let types = types.as_array().expect("array");
+        assert_eq!(types.len(), 9);
+        let fold = types.iter().find(|t| t["identifier"] == "pixel_fold").expect("pixel_fold");
+        assert_eq!(
+            fold,
+            &json!({"identifier": "pixel_fold", "name": "Pixel Fold", "model": "pixel_fold", "product_family": "Android",
+                "screen_width": 2208.0, "screen_height": 1840.0, "screen_scale": 2.625, "platform": "android", "form_factor": "foldable"})
+        );
+        let families: std::collections::BTreeSet<&str> = types.iter().filter_map(|t| t["form_factor"].as_str()).collect();
+        assert_eq!(families, ["auto", "foldable", "phone", "tablet", "tv", "vision", "watch"].into_iter().collect());
     }
 
     #[test]
