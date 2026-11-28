@@ -1472,7 +1472,9 @@ mod tests {
 
     #[test]
     fn a_device_with_no_body_stays_flat_and_says_so() {
-        let mut rt = polled_runtime(auto_scene);
+        // The Vision Pro has no body yet; when headsets get one, pick a device with none.
+        assert!(!sim_core::body::has_body(sim_core::form_factor::FormFactor::Vision));
+        let mut rt = polled_runtime(vision_pro_scene);
         rt.on_key = Some(on_key);
         rt.state.view3d.supported = true;
         rt.key(cmd('3'));

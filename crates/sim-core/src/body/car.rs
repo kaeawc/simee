@@ -16,8 +16,8 @@ use super::*;
 /// Car head units have bodies ([`super::has_body`]).
 pub(super) const ENABLED: bool = true;
 
-/// The generic body's screen is drawn at the dpi simee reports (a head unit is as big as its
-/// profile (a head unit is sized at the dpi the AVD reports; its lane may change this). When false, the shared test checks only the aspect.
+/// The generic body's screen is drawn at the dpi simee reports: a head unit is as big as its
+/// pixels at that density say.
 #[cfg(test)]
 pub(super) const SIZES_BY_DPI: bool = true;
 
@@ -33,22 +33,25 @@ struct Unit {
     platform: Platform,
     px: (u32, u32),
     ppi: f32,
-    /// The density is the profile's own (else an estimate): the row publishes its screen.
-    sdk_density: bool,
+    /// The diagonal the SDK profile gives, inches: the row publishes its screen. None where only
+    /// a density is known (or estimated), and the row is `Generic`.
+    diagonal: Option<f32>,
     source: &'static str,
 }
 
 /// The SDK's automotive profiles (landscape, portrait, ultrawide) and CarPlay's reference
-/// display. The profiles publish pixels; the densities other than the 1024p profile's 160 are
-/// estimates that put each screen at a plausible size in a car, so those rows are `Generic`.
+/// display. The 1024p profile gives a diagonal (8.4 inches), so its density is the one that makes
+/// its pixels that size. The others give a density in `automotive.xml` (ldpi 120 for the 1080p
+/// landscape and portrait profiles, mdpi 160 for the large portrait); the ultrawide's 240 and
+/// CarPlay's 7.5 inch panel are estimates. Those rows are `Generic`.
 const UNITS: [Unit; 6] = [
     Unit {
         id: "automotive_1024p_landscape",
         name: "Automotive (1024p landscape)",
         platform: Platform::Android,
         px: (1024, 768),
-        ppi: 160.0,
-        sdk_density: true,
+        ppi: 152.38,
+        diagonal: Some(8.4),
         source: AAOS,
     },
     Unit {
@@ -56,8 +59,8 @@ const UNITS: [Unit; 6] = [
         name: "Automotive (1080p landscape)",
         platform: Platform::Android,
         px: (1080, 600),
-        ppi: 160.0,
-        sdk_density: false,
+        ppi: 120.0,
+        diagonal: None,
         source: AAOS,
     },
     Unit {
@@ -65,8 +68,8 @@ const UNITS: [Unit; 6] = [
         name: "Automotive Portrait",
         platform: Platform::Android,
         px: (800, 1280),
-        ppi: 160.0,
-        sdk_density: false,
+        ppi: 120.0,
+        diagonal: None,
         source: AAOS,
     },
     Unit {
@@ -74,8 +77,8 @@ const UNITS: [Unit; 6] = [
         name: "Automotive Large Portrait",
         platform: Platform::Android,
         px: (1280, 1606),
-        ppi: 240.0,
-        sdk_density: false,
+        ppi: 160.0,
+        diagonal: None,
         source: AAOS,
     },
     Unit {
@@ -84,7 +87,7 @@ const UNITS: [Unit; 6] = [
         platform: Platform::Android,
         px: (3904, 1320),
         ppi: 240.0,
-        sdk_density: false,
+        diagonal: None,
         source: AAOS,
     },
     // 800x480 is 933 px on the diagonal: 7.5 inches is 124.4 ppi.
@@ -94,7 +97,7 @@ const UNITS: [Unit; 6] = [
         platform: Platform::Ios,
         px: (800, 480),
         ppi: 124.4,
-        sdk_density: false,
+        diagonal: None,
         source: CARPLAY,
     },
 ];
@@ -105,11 +108,9 @@ pub(super) fn rows() -> Vec<Body> {
         .iter()
         .map(|u| {
             let shape = reference_shape(u.platform, FormFactor::Auto);
-            let (source, published) = if u.sdk_density {
-                let diagonal = (u.px.0 as f32).hypot(u.px.1 as f32) / u.ppi;
-                (Source::Published(u.source), Some(Published::Diagonal(diagonal)))
-            } else {
-                (Source::Generic(u.source), None)
+            let (source, published) = match u.diagonal {
+                Some(inches) => (Source::Published(u.source), Some(Published::Diagonal(inches))),
+                None => (Source::Generic(u.source), None),
             };
             head_unit(u.id, u.name, u.platform, source, published, u.px, u.ppi, shape)
         })
@@ -146,18 +147,25 @@ fn head_unit(
     let soft = Corner { radius: 2.0, exponent: 2.0 };
 
     let mut extras = Vec::new();
-    // Home, back and volume keys, left to right from the housing's left edge, standing 2.75 mm
-    // off the front face.
+    // Home, back and volume keys from the housing's left edge, 2.75 mm off the front face, and
+    // the rotary knob at the strip's right end. They need 78 mm between the side bezels; a
+    // narrower unit (a small CarPlay panel) shrinks them all so none touches another.
+    let f = ((w - 2.0 * side) / 78.0).min(1.0);
     for i in 0..3 {
-        let x = -w / 2.0 + side + 10.0 + i as f32 * 18.0;
-        extras.push(Block { role: Role::Button, center: [x, strip_y, t / 2.0 + 1.0], size: [14.0, 9.0, 3.5], corner: soft, bevel: 0.8 });
+        let x = -w / 2.0 + side + 7.0 * f + i as f32 * 18.0 * f;
+        extras.push(Block {
+            role: Role::Button,
+            center: [x, strip_y, t / 2.0 + 1.0],
+            size: [14.0 * f, 9.0 * f, 3.5],
+            corner: soft,
+            bevel: 0.8,
+        });
     }
-    // The rotary knob at the strip's right end.
     extras.push(Block {
         role: Role::Knob,
-        center: [w / 2.0 - side - 14.0, strip_y, t / 2.0 + 5.0],
-        size: [22.0, 22.0, 14.0],
-        corner: round(22.0),
+        center: [w / 2.0 - side - 11.0 * f, strip_y, t / 2.0 + 5.0],
+        size: [22.0 * f, 22.0 * f, 14.0],
+        corner: round(22.0 * f),
         bevel: 1.5,
     });
     // The dash: a slab behind the unit's front, wider than it on every side, with three vent slots
@@ -227,7 +235,9 @@ mod tests {
         let s = &b.screens[0];
         assert_eq!(s.px, (1024, 768));
         let [w, h] = s.size();
-        assert!(close(w, 162.56, 0.01) && close(h, 121.92, 0.01), "{w}x{h}");
+        // The SDK's 8.4 inch diagonal: 170.7 x 128.0 mm.
+        assert!(close(w, 170.7, 0.1) && close(h, 128.0, 0.1), "{w}x{h}");
+        assert!(close(s.diagonal_inches(), 8.4, 0.01));
         assert!(close(w / h, 4.0 / 3.0, 1e-3));
         // The housing is the screen plus its bezels and the control strip.
         assert!(b.size[0] > w && b.size[1] > h);
@@ -260,7 +270,7 @@ mod tests {
 
     #[test]
     fn keys_and_knob_stand_outside_the_screen_on_the_front() {
-        for b in all().iter().filter(|b| b.form_factor == FormFactor::Auto).cloned().chain(generic_unit()) {
+        for b in all().iter().filter(|b| b.form_factor == FormFactor::Auto).cloned().chain(generic_units()) {
             let s = &b.screens[0];
             let count = |role| b.extras.iter().filter(|x| x.role == role).count();
             assert_eq!((count(Role::Button), count(Role::Knob)), (3, 1), "{}: home, back, volume and a knob", b.id);
@@ -270,6 +280,14 @@ mod tests {
                 let [w, h, t] = b.size;
                 assert!(x.center[2] + x.size[2] / 2.0 > t / 2.0, "{}: {:?} stands off the front", b.id, x.role);
                 assert!(x.center[0].abs() + x.size[0] / 2.0 < w / 2.0 && x.center[1].abs() + x.size[1] / 2.0 < h / 2.0, "{}", b.id);
+            }
+            // No two controls touch, even on a narrow unit.
+            let controls: Vec<&Block> = b.extras.iter().filter(|x| matches!(x.role, Role::Button | Role::Knob)).collect();
+            for (i, a) in controls.iter().enumerate() {
+                for c in &controls[i + 1..] {
+                    let apart = (a.center[0] - c.center[0]).abs() >= (a.size[0] + c.size[0]) / 2.0;
+                    assert!(apart, "{}: {:?} at {:?} touches {:?} at {:?}", b.id, a.role, a.center, c.role, c.center);
+                }
             }
             let knob = b.extras.iter().find(|x| x.role == Role::Knob).expect("knob");
             assert_eq!(knob.size[0], knob.size[1], "{}: the knob is round", b.id);
@@ -312,9 +330,15 @@ mod tests {
         assert!(matches!(g.source, Source::Generic(_)));
     }
 
-    fn generic_unit() -> Option<Arc<Body>> {
+    /// Unlisted screens: a wide Android one, and the narrow one an iOS scale gives a small CarPlay
+    /// panel (800x480 at the 2x density a generic body assumes is 62 mm wide).
+    fn generic_units() -> Vec<Arc<Body>> {
         let android = Kind::new(Platform::Android, FormFactor::Auto).expect("automotive").profile();
-        for_profile(&android.with_screen(1920, 720, Density::Dpi(213)))
+        let carplay = Kind::new(Platform::Ios, FormFactor::Auto).expect("carplay").profile();
+        [for_profile(&android.with_screen(1920, 720, Density::Dpi(213))), for_profile(&carplay.with_screen(800, 480, Density::Scale(2)))]
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     #[test]
