@@ -33,8 +33,10 @@ pub struct FcmMessage {
 
 impl FcmMessage {
     /// The broadcast's string extras, as Play services sends them: each data pair under its own
-    /// key, each notification field as `gcm.notification.<field>` with `gcm.n.e=1`, the marker
-    /// the SDK reads as "this message has a notification".
+    /// key, each notification field as `gcm.n.<wire name>` with `gcm.n.e=1`, the marker the SDK
+    /// reads as "this message has a notification". A field takes FCM v1's `AndroidNotification`
+    /// name; where the wire key differs (`channel_id` is `gcm.n.android_channel_id`) it is mapped,
+    /// and the wire name is accepted too. Keys: firebase-android-sdk `Constants.MessageNotificationKeys`.
     pub fn extras(&self) -> Result<Vec<(String, String)>, String> {
         if self.data.is_empty() && self.notification.is_empty() {
             return Err("an FCM message needs `data` or `notification`".into());
@@ -54,11 +56,20 @@ impl FcmMessage {
                 if field.is_empty() || !field.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
                     return Err(format!("`{field}` isn't an FCM notification field (like title, body or channel_id)"));
                 }
-                out.push((format!("gcm.notification.{field}"), value.clone()));
+                out.push((format!("gcm.n.{}", wire_field(field)), value.clone()));
             }
             out.push(("gcm.n.e".into(), "1".into()));
         }
         Ok(out)
+    }
+}
+
+/// A notification field's key suffix on the wire: FCM v1's `AndroidNotification` names, except
+/// those the SDK reads under another name (`channel_id` is `android_channel_id`).
+fn wire_field(field: &str) -> &str {
+    match field {
+        "channel_id" => "android_channel_id",
+        other => other,
     }
 }
 
@@ -189,12 +200,17 @@ mod tests {
     #[test]
     fn an_fcm_message_is_the_extras_play_services_sends() {
         let m = FcmMessage { data: pairs(&[("order", "42")]), notification: pairs(&[("title", "Hi"), ("body", "It's here")]) };
-        assert_eq!(
-            m.extras(),
-            Ok(pairs(&[("order", "42"), ("gcm.notification.title", "Hi"), ("gcm.notification.body", "It's here"), ("gcm.n.e", "1")]))
-        );
+        assert_eq!(m.extras(), Ok(pairs(&[("order", "42"), ("gcm.n.title", "Hi"), ("gcm.n.body", "It's here"), ("gcm.n.e", "1")])));
         let data_only = FcmMessage { data: pairs(&[("k", "v")]), notification: Vec::new() };
         assert_eq!(data_only.extras(), Ok(pairs(&[("k", "v")])), "a data message has no notification marker");
+    }
+
+    #[test]
+    fn a_notification_channel_reaches_the_key_the_sdk_reads() {
+        for field in ["channel_id", "android_channel_id"] {
+            let m = FcmMessage { data: Vec::new(), notification: pairs(&[(field, "orders")]) };
+            assert_eq!(m.extras(), Ok(pairs(&[("gcm.n.android_channel_id", "orders"), ("gcm.n.e", "1")])), "{field}");
+        }
     }
 
     #[test]
@@ -281,7 +297,7 @@ mod tests {
             let m = FcmMessage { data: vec![("order".into(), "42".into())], notification: vec![("title".into(), "Hi".into())] };
             assert_eq!(f.adb.push("com.example.app", &m), Ok(()));
             let am = "am broadcast -n 'com.example.app/com.google.firebase.iid.FirebaseInstanceIdReceiver' -a com.google.android.c2dm.intent.RECEIVE \
-                      --es 'order' '42' --es 'gcm.notification.title' 'Hi' --es 'gcm.n.e' '1'";
+                      --es 'order' '42' --es 'gcm.n.title' 'Hi' --es 'gcm.n.e' '1'";
             assert_eq!(
                 f.calls.calls(),
                 [

@@ -200,8 +200,8 @@ mod tests {
             "--es 'note' 'x'",
             "--es 'order' '42'",
             "--es 'paid' 'true'",
-            "--es 'gcm.notification.title' 'Hi'",
-            "--es 'gcm.notification.body' 'Sent'",
+            "--es 'gcm.n.title' 'Hi'",
+            "--es 'gcm.n.body' 'Sent'",
             "--es 'gcm.n.e' '1'",
         ] {
             assert!(calls[1].contains(extra), "{extra}: {}", calls[1]);

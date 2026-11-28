@@ -72,12 +72,14 @@ pub fn effect(method: &str) -> Option<Effect> {
         | "backlight" | "keyboard_language" | "hardware_keyboard" | "ca_debug" | "network_clear" | "audio_volume" | "audio_route"
         | "audio_mute" | "fold" | "carplay" | "profile" | "privacy" => Set,
         "create" | "boot" | "boot_many" | "clone" | "tap" | "swipe" | "touch" | "button" | "type" | "key" | "open_url" | "install"
-        | "memory_warning" | "notify" | "biometric" | "rotate" | "rotary" | "watch_gesture" | "remote_swipe" | "xr" | "touchpad"
-        | "stylus" | "pointer" | "vehicle" | "audio_capture_stop" | "contrast_check" | "import" => Act,
+        | "memory_warning" | "biometric" | "rotate" | "rotary" | "watch_gesture" | "remote_swipe" | "xr" | "touchpad" | "stylus"
+        | "pointer" | "vehicle" | "audio_capture_stop" | "contrast_check" | "import" => Act,
         // Runs programs, starts apps with an environment, replaces a network profile (inject "boot"
         // reboots the device), delivers a payload, writes a recording or a bundle to a path, drives
-        // the console, signals a process.
-        "exec" | "launch" | "push" | "network_shape" | "console" | "audio_capture_start" | "kill" | "export" => Danger,
+        // the console, signals a process. `notify` is here for Android, where it is an `am broadcast`
+        // with arbitrary typed extras, sent as the shell user (who holds many development
+        // permissions) to any exported receiver of any app: closer to `push` than to a tap.
+        "exec" | "launch" | "push" | "notify" | "network_shape" | "console" | "audio_capture_start" | "kill" | "export" => Danger,
         "delete" | "erase" | "shutdown" | "rm" | "uninstall" | "terminate" | "reset_keychain" | "clear_container" | "write"
         | "defaults_write" => Destroy,
         _ => return None,

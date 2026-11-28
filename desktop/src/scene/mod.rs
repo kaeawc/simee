@@ -58,6 +58,9 @@ pub const ON: &str = "3D view on: drag beside the device to orbit, ⇧-drag to p
                       ⌘1 ⌘2 ⌘4 ⌘5 3/4, front, side, back, ⌘F flip, ⌘[ ⌘] turn. Touches on its screen come with #156";
 /// What a drag on the drawn screen says.
 pub const SCREEN_DRAG: &str = "Touches on the 3D screen come with #156: drag beside the device, or hold ⌥, to move the camera";
+/// The body row of an iPhone's CarPlay display (a car head unit, `sim_core::body`'s car rows):
+/// drawn while the display shows ([`body_for`]). Without that row the view stays flat.
+pub const CARPLAY_BODY: &str = "CarPlay-800x480";
 /// What ⌘3 says for a device with no body: the form factors that have one ([`body::has_body`]).
 pub static NO_BODY: LazyLock<String> = LazyLock::new(|| no_body(body::has_body));
 
@@ -363,9 +366,14 @@ impl View {
 
 /// The selected device's body: the table's row for its device type (an Apple identifier, an
 /// AVD's `hw.device.name`) when it has one, else a generic body for its screen. An Android
-/// device not running here gets the reference screen of its system image (AI glasses' own).
+/// device not running here gets the reference screen of its system image (AI glasses' own). While
+/// an iPhone's CarPlay display shows in its place, the car head unit's ([`CARPLAY_BODY`]), never
+/// the iPhone's.
 pub fn body_for(s: &State) -> Option<Arc<Body>> {
     let d = s.selected_info()?;
+    if s.carplay_shown() {
+        return body::get(CARPLAY_BODY);
+    }
     match d.platform {
         Platform::Ios => body::get(&d.device_type_id).or_else(|| body::for_profile(&d.kind()?.profile())),
         Platform::Android => {

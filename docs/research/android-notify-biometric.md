@@ -20,7 +20,7 @@ the alert as the app's own, and the app's delegate is called.
 
 | Route | What the app sees | Faithful? |
 | --- | --- | --- |
-| `cmd notification post [-t title] <tag> <text>` | Nothing. The notification is posted by `com.android.shell` and shown under the Shell app, not the target app. | No: it tests the system tray, not the app. |
+| `cmd notification post [-t title] <tag> <text>` | Nothing. The notification is posted by `com.android.shell` and shown under the Shell app, not the target app ([`NotificationShellCmd`][notif-shell] posts as the calling package). | No: it tests the system tray, not the app. |
 | FCM through Google's servers | A real message. But it needs Play services on the image, a server key, and the app's registration token, which only the app itself can read. | Not host-side. |
 | `am broadcast -n <pkg>/<FCM receiver> -a com.google.android.c2dm.intent.RECEIVE --es k v ...` as root | The Firebase SDK's `FirebaseInstanceIdReceiver` gets the same broadcast Play services sends for each message. `FirebaseMessagingService.onMessageReceived` runs with the data. A notification message is shown by the SDK as the app's own while the app is in the background. | Yes. |
 
@@ -28,16 +28,22 @@ The broadcast is the faithful route. Play services delivers every FCM message to
 `com.google.android.c2dm.intent.RECEIVE` broadcast to the receiver that the Firebase SDK puts in the
 app's manifest. That receiver is protected by `com.google.android.c2dm.permission.SEND`, which only
 Play services holds, so the shell user (uid 2000) can't send to it. Root can:
-`ActivityManager.checkComponentPermission` grants every permission to uid 0 and to the system uid.
+[`ActivityManager.checkComponentPermission`][am-perm] grants every permission to uid 0 and to the
+system uid.
 On a google_apis image (the default image here) `su 0` is there, and adbd can be root.
 
 The extras are FCM's wire format:
 
 - Each `data` pair is a string extra under its own key. FCM data values are always strings, so a
   JSON number or boolean is sent as its text.
-- Each `notification` field is sent as `gcm.notification.<field>` (`title`, `body`,
-  `channel_id`, `image` and so on). `gcm.n.e=1` is added too: the SDK's `NotificationParams` reads
-  that marker as "this message carries a notification".
+- Each `notification` field is sent as `gcm.n.<field>` (`title`, `body`, `image` and so on), the
+  prefix the SDK reads ([`Constants.MessageNotificationKeys`][fcm-constants]: `NOTIFICATION_PREFIX`
+  is `gcm.n.`; the older `gcm.notification.` is a fallback marked for removal). Fields take FCM
+  v1's `AndroidNotification` names, and the one whose wire key differs is mapped: `channel_id` is
+  sent as `gcm.n.android_channel_id` (`CHANNEL`), the key the SDK takes the channel from. The
+  SDK's [`NotificationParams`][fcm-params] tries the old prefix only for the same suffix, so
+  `gcm.notification.channel_id` would be dropped without an error. `gcm.n.e=1` is added too:
+  `NotificationParams.isNotification` reads that marker as "this message carries a notification".
 - The keys FCM's server refuses are refused here too: `from`, `message_type`, `collapse_key`, and
   any key that starts with `google.` or `gcm.`.
 
@@ -57,8 +63,13 @@ nothing, which is what real FCM does.
 
 - A local notification with no FCM in the app (`cmd notification post`), because it isn't the app's
   notification.
-- Message priority and TTL, which affect only how Google's servers queue a message, not what the
-  app receives.
+- Message priority and TTL. TTL only affects how Google's servers queue a message. Priority
+  matters on the device too: Play services sends a high-priority message with
+  `FLAG_RECEIVER_FOREGROUND` and a temporary power allowlist entry, and the SDK's
+  [`FcmBroadcastProcessor`][fcm-processor] reads that flag (as does `google.delivered_priority`).
+  Without it, an app on Android 8 or later gets the message by binding to its service, not by
+  starting it, and can't start a foreground service from `onMessageReceived`. simee always
+  delivers as a normal-priority message: no flag, no allowlist entry.
 
 ## notify
 
@@ -72,8 +83,17 @@ differences between the two:
 - A broadcast carries typed extras instead of one integer state. `state` is refused on Android, and
   extras take its place.
 - Since Android 8, a receiver declared in an app's manifest hears an implicit broadcast only when
-  the broadcast names its package (`-p`). Receivers registered at runtime hear it either way. So
-  `bundle_id` matters on Android in a way it has no counterpart for on iOS.
+  the broadcast names its package (`-p`) ([background execution limits][bg-broadcasts]). Receivers
+  registered at runtime hear it either way, subject to the export rule below. So `bundle_id`
+  matters on Android in a way it has no counterpart for on iOS.
+- The shell user (uid 2000) is another uid to every app, so only an exported receiver hears the
+  broadcast. A manifest receiver with `android:exported="false"` never hears `notify`
+  ([`<receiver>`][receiver-exported]). An app targeting Android 14 (API 34) or later must
+  register a runtime receiver with `RECEIVER_EXPORTED` or `RECEIVER_NOT_EXPORTED`
+  ([runtime-registered receivers][a14-receivers]), and one registered with
+  `RECEIVER_NOT_EXPORTED` doesn't hear it either. In both cases `am` still prints
+  `Broadcast completed`, so `notify` succeeds with nothing received: simee can't tell the two
+  apart from the host.
 - The shell user may not send protected system broadcasts (`BOOT_COMPLETED`, battery and so on).
   The activity manager refuses them with a `SecurityException`, and that error is returned.
 
@@ -118,7 +138,15 @@ This is the stock emulator's "Fingerprint" control. Its UI offers fingers 1 to 1
 - `nomatch` sends the same with id 99 by default, an id the emulator's controls never enroll.
 - `enroll` and `unenroll` are refused. Android enrolls a fingerprint only through Settings'
   enrollment flow (Security, after a screen lock is set). Each touch that flow asks for is a
-  `biometric` `match` with the finger's id. No host-side switch flips the enrolled state.
+  `biometric` `match` with the finger's id. The screen lock itself can be set host-side with
+  `locksettings set-pin <pin>` ([`LockSettingsShellCommand`][locksettings]), so only the
+  enrollment taps need Settings. No host-side switch flips goldfish's enrolled state.
+- Considered and rejected: AOSP's virtual fingerprint HAL enrolls without UI
+  (`settings put secure biometric_virtual_enabled 1`, then
+  `setprop persist.vendor.fingerprint.virtual.enrollments 1` and `cmd fingerprint sync`;
+  [its README][virtual-hal]). It doesn't fit here: it ships as a debug-only vendor APEX
+  (`PRODUCT_PACKAGES_DEBUG`), so SDK images don't carry it; it is ignored while a real HAL is
+  installed, as goldfish's is; and it still wants a screen lock set.
 - `face: true` is refused, because the emulator has no face sensor.
 
 ## reset_keychain
@@ -129,14 +157,22 @@ store.
 **Android.** Android has no device-wide keychain. The candidates, and why none of them is
 `reset_keychain`:
 
-- **App KeyStore keys.** Android Keystore keys belong to one app's uid. Only that app can delete
-  them, or uninstalling it does. Deleting keystore2's database rows from the host, as root, would
-  corrupt the daemon's state. It is not an operation the platform offers.
-- **`locksettings clear --old <credential>`.** This removes the screen lock. It also invalidates
-  keys bound to user authentication, but it doesn't delete keys, and it needs the current
-  credential.
+- **App KeyStore keys.** Android Keystore keys belong to one app's uid (its keystore2 namespace).
+  They go when the app deletes them, when it is uninstalled, or when its data is cleared:
+  `pm clear` clears the namespace too (`AppDataHelper.clearKeystoreData` calls
+  `AndroidKeyStoreMaintenance.clearNamespace`; keystore2's [`maintenance.rs`][ks-maintenance]).
+  That is one app's keys, not a device-wide store. Deleting keystore2's database rows from the
+  host, as root, would corrupt the daemon's state. It is not an operation the platform offers.
+- **`cmd keystore`.** There is no such shell command: keystore2 registers none. The only command
+  line client is `keystore_cli_v2` ([search][ks-cli]), on userdebug images, and its `delete-all`
+  deletes the caller's own namespace (the shell's or root's), not every app's.
+- **`locksettings clear --old <credential>`.** This removes the screen lock, and it needs the
+  current credential. Since Android 14, LockSettingsService then calls keystore2's
+  `onUserLskfRemoved`, which deletes the user's auth-bound keys
+  (`unbind_auth_bound_keys_for_user` in [`maintenance.rs`][ks-maintenance]). Keys not bound to
+  authentication stay. It is a side effect of removing the lock, not a reset of credentials.
 - **`pm clear <package>` (`clear_container` with `pm_clear: true`).** This erases one app's data,
-  not a credential store.
+  its keystore namespace included (above), not a device-wide credential store.
 
 **What simee does.** `reset_keychain` stays iOS-only. On an Android device it fails with
 "isn't available on Android devices (it works on iOS)" followed by the reason above
@@ -156,3 +192,29 @@ Run these on a booted google_apis AVD (Apple silicon, or software mode):
 - **`biometric`.** Enroll finger 1 in Settings, using `biometric match` for each touch. Then
   `biometric match` should unlock a fingerprint-locked screen, and `biometric nomatch` should show
   "Not recognized". Repeat on the stock emulator.
+
+## Sources
+
+[am-perm]: https://cs.android.com/android/platform/superproject/main/+/main:frameworks/base/core/java/android/app/ActivityManager.java
+[notif-shell]: https://cs.android.com/android/platform/superproject/main/+/main:frameworks/base/services/core/java/com/android/server/notification/NotificationShellCmd.java
+[fcm-constants]: https://github.com/firebase/firebase-android-sdk/blob/main/firebase-messaging/src/main/java/com/google/firebase/messaging/Constants.java
+[fcm-params]: https://github.com/firebase/firebase-android-sdk/blob/main/firebase-messaging/src/main/java/com/google/firebase/messaging/NotificationParams.java
+[fcm-processor]: https://github.com/firebase/firebase-android-sdk/blob/main/firebase-messaging/src/main/java/com/google/firebase/messaging/FcmBroadcastProcessor.java
+[bg-broadcasts]: https://developer.android.com/about/versions/oreo/background#broadcasts
+[receiver-exported]: https://developer.android.com/guide/topics/manifest/receiver-element#exported
+[a14-receivers]: https://developer.android.com/about/versions/14/behavior-changes-14#runtime-receivers-exported
+[locksettings]: https://cs.android.com/android/platform/superproject/main/+/main:frameworks/base/services/core/java/com/android/server/locksettings/LockSettingsShellCommand.java
+[virtual-hal]: https://cs.android.com/android/platform/superproject/main/+/main:hardware/interfaces/biometrics/fingerprint/aidl/default/README.md
+[ks-maintenance]: https://cs.android.com/android/platform/superproject/main/+/main:system/security/keystore2/src/maintenance.rs
+[ks-cli]: https://cs.android.com/search?q=keystore_cli_v2&ss=android%2Fplatform%2Fsuperproject%2Fmain
+
+- AOSP `ActivityManager.checkComponentPermission`: [ActivityManager.java][am-perm].
+- `cmd notification post`: [NotificationShellCmd.java][notif-shell].
+- FCM wire keys and the notification marker: firebase-android-sdk [Constants.java][fcm-constants],
+  [NotificationParams.java][fcm-params], [FcmBroadcastProcessor.java][fcm-processor].
+- Broadcast delivery rules: [background broadcast limits (8.0)][bg-broadcasts],
+  [`<receiver android:exported>`][receiver-exported],
+  [runtime-registered receivers must say whether they are exported (14)][a14-receivers].
+- Screen lock from the shell: [LockSettingsShellCommand.java][locksettings].
+- Virtual fingerprint HAL: [README.md][virtual-hal].
+- keystore2: [maintenance.rs][ks-maintenance]; `keystore_cli_v2`: [code search][ks-cli].

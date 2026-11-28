@@ -80,7 +80,7 @@ matches through, so a name `emu` accepts for a deletion can't be one this layer 
 | Doesn't confirm | Why not, and what to do |
 | --- | --- |
 | `write`, `defaults_write`, `prefs_write`, and a `prefs_batch` that only sets | They replace a value with another: the work of a test run, which an agent does constantly. Add them to `confirm` for a client that shouldn't |
-| `exec`, `launch`, `push`, `network_shape`, the rest of `console` | They run code or change state, but delete nothing by themselves. `exec` can do anything its program can: put it in `confirm`, or out of the client's toolsets, where that matters |
+| `exec`, `launch`, `push`, `notify`, `network_shape`, the rest of `console` | They run code or change state, but delete nothing by themselves. `exec` can do anything its program can: put it in `confirm`, or out of the client's toolsets, where that matters |
 | `terminate`, `stream_stop`, `camera_unlink` | They stop something that starts again |
 | `export`, `audio_capture_start` | They write a file on the host where the caller says. The policy has no path rules yet |
 
@@ -217,7 +217,7 @@ for a tool that doesn't exist is logged as refused with the name the client gave
   `api_key`, `api-key`, `authorization`, `credential`, `cookie`, `private_key` or `bearer` (any case,
   at any depth: `env`, `args`) becomes `[redacted]`;
 - text typed, written or delivered (`type`'s `text`, `write`'s `text` and `base64`, `defaults_write`
-  and `prefs_write`'s `value`, `prefs_batch`'s `ops`, `push`'s `payload`) is logged as its size;
+  and `prefs_write`'s `value`, `prefs_batch`'s `ops`, `push`'s `payload`, `notify`'s `extras`) is logged as its size;
 - inside any string, the value after `password=`, `token:`, `Bearer`, `Authorization:` and the like,
   and the user and password of a URL, are masked;
 - a string longer than 256 characters is cut, saying how long it was.

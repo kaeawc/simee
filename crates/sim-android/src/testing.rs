@@ -214,7 +214,9 @@ pub fn wait_for(lines: &Mutex<Vec<String>>, n: usize) -> Vec<String> {
 /// script first). `ps` lists a guest's processes (init, zygote, system_server, the native daemons,
 /// apps); `kill` succeeds (logged only: no host process is signalled) except on pids 520
 /// (surfaceflinger) and 530 (cameraserver), which need `su 0` (present for `-9`, missing for 530's
-/// `-15`); and an `exec` line, and its stop, run on the host's `sh`. Airplane mode is a file
+/// `-15`); an `exec` line, and its stop, run on the host's `sh`; and the audio commands keep a
+/// media stream (index 5 of 0..25, unmuted at first) that `dumpsys audio` reports
+/// ([`FakeAdb::image`] makes it an API 34 or an API 29 image). Airplane mode is a file
 /// beside the script that `cmd connectivity airplane-mode` (or `settings put`) sets; `sdk` beside it sets the API level (36 without it) and `settings get` reads; the
 /// network listings (`sim_android::net`) answer with a root listing of the kernel's socket tables
 /// and an eBPF per-uid stats dump. The settle probe
@@ -268,6 +270,13 @@ impl FakeAdb {
         let text = std::fs::read_to_string(&self.log).unwrap_or_default();
         text.lines().map(|l| l.split_once(' ').and_then(|(_, rest)| rest.split_once(' ')).map_or(l, |(_, r)| r).to_owned()).collect()
     }
+
+    /// Makes the fake answer as another kind of image from now on: `api34` (its `cmd audio` has
+    /// no `adj-mute`), `old-media` (no `cmd media_session volume`: only the `media` tool, as on
+    /// API 29), `fixed-volume` (a volume set is ignored), `mute-ignored` (so is a mute).
+    pub fn image(&self, kind: &str) {
+        std::fs::write(self.log.with_file_name(kind), b"").expect("image flag");
+    }
 }
 
 const FAKE_ADB: &str = r#"echo "$*" >> "$(dirname "$0")/adb.log"
@@ -299,6 +308,77 @@ ps_rows() {
 ' 4321   310  7.9 120332   00:42 com.example.app         com.example.app' \
 ' 4400   310  7.9  60112   00:40 com.example.app:remote  com.example.app:remote' \
 ' 4500   310  0.0  50000   00:30 com.google.android.gms.persistent com.google.android.gms.persistent'
+}
+# The media stream's volume index (0..25, 5 at first) and mute, kept beside the script.
+here="$(dirname "$0")"
+music_volume() { cat "$here/music.volume" 2>/dev/null || echo 5; }
+music_muted() { [ -e "$here/music.muted" ] && echo true || echo false; }
+# What the guest's VolumeCtrl (`cmd media_session volume`, `media volume`) prints for --stream 3.
+volume_ctrl() {
+  printf '[V] will control stream=3\n'
+  case "$1" in
+    "--stream 3 --get") ;;
+    "--stream 3 --set "*" --get")
+      n=${1#--stream 3 --set }; n=${n% --get}
+      if [ "$n" -gt 25 ] 2>/dev/null || [ "$n" -lt 0 ] 2>/dev/null; then
+        printf '[V] will set volume\n[V] will get volume\n[V] Connecting to AudioService\n'
+        echo "Error: invalid volume index $n for stream 3 (should be in [0..25])" >&2; return 0
+      fi
+      [ -e "$here/fixed-volume" ] || echo "$n" > "$here/music.volume"; printf '[V] will set volume\n';;
+    *) echo "fake adb: unhandled volume: $1" >&2; return 2;;
+  esac
+  printf '[V] will get volume\n[V] Connecting to AudioService\n[V] volume is %s in range [0..25]\n' "$(music_volume)"
+}
+# An API 34 guest's `dumpsys audio` (trimmed): focus, the stream volumes, the ringer.
+dumpsys_audio() {
+  cat <<EOF
+MediaFocusControl dump time: 10:42:01 AM
+
+Audio Focus stack entries (last is top of stack):
+  source:android.os.BinderProxy@1f2e3d -- pack: com.example.zeta -- client: android.media.AudioManager@5a6b7c8com.example.zeta.Player@9d8e7f -- gain: GAIN_TRANSIENT -- flags:  -- loss: LOSS -- notified: true -- limbo: false -- uid: 10191 -- attr: AudioAttributes: usage=USAGE_MEDIA content=CONTENT_TYPE_MUSIC flags=0x800 tags= bundle=null -- sdk:34
+  source:android.os.BinderProxy@2a3b4c -- pack: com.example.app -- client: android.media.AudioManager@6b7c8d9com.example.app.Player@1a2b3c -- gain: GAIN -- flags:  -- loss: none -- notified: true -- limbo: false -- uid: 10190 -- attr: AudioAttributes: usage=USAGE_MEDIA content=CONTENT_TYPE_MUSIC flags=0x800 tags= bundle=null -- sdk:34
+
+No external focus policy
+
+Stream volumes (device: index)
+- STREAM_VOICE_CALL:
+   Muted: false
+   Muted Internally: false
+   Min: 1
+   Max: 5
+   streamVolume:4
+   Current: 2 (speaker): 4, 40000000 (default): 4
+   Devices: speaker(2)
+   Volume Group: AUDIO_STREAM_VOICE_CALL
+
+- STREAM_RING:
+   Muted: false
+   Muted Internally: false
+   Min: 0
+   Max: 7
+   streamVolume:5
+   Current: 2 (speaker): 5, 40000000 (default): 5
+   Devices: speaker(2)
+   Volume Group: AUDIO_STREAM_RING
+
+- STREAM_MUSIC:
+   Muted: $(music_muted)
+   Muted Internally: false
+   Min: 0
+   Max: 25
+   streamVolume:$(music_volume)
+   Current: 2 (speaker): $(music_volume), 4000000 (usb_headset): 12, 40000000 (default): 15
+   Devices: speaker(2)
+   Volume Group: AUDIO_STREAM_MUSIC
+
+- mute affected streams = 0x2f
+- user mutable streams = 0x2f
+
+Ringer mode:
+- mode (internal) = NORMAL
+- mode (external) = VIBRATE
+- zen mode:0
+EOF
 }
 # The network listings' tables: an API 36 guest's /proc/net, fds, ps and pm (trimmed).
 net_owners() {
@@ -368,6 +448,11 @@ shell)
       stat 7000 sh 206 $((n * 100)) 0; stat 7001 cat 7000 $((n * 100)) 0;;
     "pm list packages -3 -f") printf 'package:/data/app/~~Ab==/com.example.app-Cd==/base.apk=com.example.app\n';;
     "pm list packages") printf 'package:com.android.settings\npackage:com.example.zeta\npackage:android\npackage:com.example.app\n';;
+    # Device state (#418): settings and SystemUI's demo broadcasts succeed, com.example.app is in
+    # the foreground, and a trim-memory signal reaches it.
+    "am broadcast -a com.android.systemui.demo "*) printf 'Broadcasting: Intent { act=com.android.systemui.demo flg=0x400000 (has extras) }\nBroadcast completed: result=0\n';;
+    "dumpsys activity activities | grep "*) echo '  topResumedActivity=ActivityRecord{6d5b2c1 u0 com.example.app/.MainActivity t12}';;
+    "am send-trim-memory com.example.app RUNNING_CRITICAL") ;;
     "cmd package query-activities --brief --components -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.example.app") echo 'com.example.app/.MainActivity';;
     "cmd package query-activities --brief --components -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.example.crash") echo 'com.example.crash/.Gone';;
     "cmd package query-activities --brief --components -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.example.svc") echo 'com.example.svc/.Main';;
@@ -395,11 +480,27 @@ shell)
     "kill -"*" 520"|"kill -"*" 530") echo "/system/bin/sh: kill: ${2##* }: Operation not permitted" >&2; exit 1;;
     "su 0 kill -9 520"|"su 0 kill -9 530") ;;
     "su 0 kill -15 530") echo "/system/bin/sh: su: inaccessible or not found" >&2; exit 127;;
+    # The audio methods: VolumeCtrl through `cmd media_session` (API 30 on) or the `media` tool.
+    "cmd media_session volume "*)
+      if [ -e "$here/old-media" ]; then echo "No shell command implementation."; exit 255; fi
+      volume_ctrl "${2#cmd media_session volume }";;
+    "media volume "*)
+      if [ ! -e "$here/old-media" ]; then echo "/system/bin/sh: media: inaccessible or not found" >&2; exit 127; fi
+      volume_ctrl "${2#media volume }";;
+    "dumpsys audio") dumpsys_audio;;
+    "getprop ro.build.version.sdk") if [ -e "$here/sdk" ]; then cat "$here/sdk"; elif [ -e "$here/api34" ]; then echo 34; else echo 36; fi;;
+    # `cmd audio adj-mute` arrived in API 35. AOSP 13 and 14's AudioManagerShellCommand has no
+    # default case: an unknown command prints nothing and exits 0.
+    "cmd audio adj-mute 3"|"cmd audio adj-unmute 3")
+      verb=${2#cmd audio }; verb=${verb% 3}
+      if [ -e "$here/api34" ] || [ -e "$here/mute-ignored" ]; then exit 0; fi
+      if [ "$verb" = adj-mute ]; then touch "$here/music.muted"; else rm -f "$here/music.muted"; fi;;
     # Every other signal succeeds, and is only logged: the fake never signals a host process.
     "kill -"*) ;;
     "settings get global airplane_mode_on") cat "$(dirname "$0")/airplane" 2>/dev/null || echo 0;;
-    "getprop ro.build.version.sdk") cat "$(dirname "$0")/sdk" 2>/dev/null || echo 36;;
     "settings put global airplane_mode_on "*) echo "${2##* }" > "$(dirname "$0")/airplane";;
+    # After the airplane-mode arm above: case takes the first match.
+    "settings put "*) ;;
     "am broadcast -a android.intent.action.AIRPLANE_MODE"*) echo "Broadcast completed: result=0";;
     # sim_android::notify: com.example.app has an FCM receiver; the broadcast goes as root unless
     # `noroot` is beside the script (no su); BOOT_COMPLETED is a protected broadcast.

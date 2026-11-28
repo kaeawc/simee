@@ -145,7 +145,14 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          exported device's guest identity (ro.serialno, android_id). iOS: not yet",
     ),
     ("shutdown", "device; iOS: set?", "Shut down"),
-    ("erase", "device, set?", "Erase content and settings (shut down first)"),
+    (
+        "erase",
+        "device; iOS: set?",
+        "Erase content and settings (shut down first). Android: simee's user data (the userdata, cache and metadata disks in \
+         `<avd>/simee/`) is removed and cloned again from the image's golden when one has the AVD's shape, so the next boot is \
+         warm; without one the next boot is a first boot. The AVD keeps its name and config, and the stock emulator's own files \
+         are left alone (its `-wipe-data` clears them)",
+    ),
     (
         "screen",
         "device, display?(main|outer|inner|carplay); iOS: set?",
@@ -248,33 +255,57 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "device, bundle_id, payload; iOS: set?",
         "Deliver a push to an app. iOS: an APNs payload (object). Android: an FCM message, {data, notification}: delivered to the \
          app's Firebase receiver (com.google.android.c2dm.intent.RECEIVE) as Google Play services delivers one, as root (adbd's or \
-         `su 0`, which google_apis images have); data values are sent as strings, and notification's fields (title, body, \
-         channel_id, ...) make it a notification message the Firebase SDK shows as the app's own while the app is in the \
-         background. A force-stopped app gets nothing, as with real FCM",
+         `su 0`, which google_apis images have); data values are sent as strings, and notification's fields (FCM v1's names: title, \
+         body, channel_id, ..., sent as gcm.n.<field>, channel_id as gcm.n.android_channel_id) make it a notification message the Firebase SDK shows as the app's own while the app is in the \
+         background. It is delivered as a normal-priority message, and a force-stopped app gets nothing, as with real FCM",
     ),
     (
         "status_bar",
-        "device, time?, data_network?, wifi_mode?, wifi_bars?, cellular_mode?, cellular_bars?, operator?, battery_state?, battery_level?, set?",
-        "Override status bar",
+        "device, time?, data_network?, wifi_mode?, wifi_bars?, cellular_mode?, cellular_bars?, operator?, battery_state?, battery_level?; iOS: set?",
+        "Override status bar. Android: SystemUI's demo mode, which replaces the whole status bar: time as a time of day (HH:MM); \
+         data_network lte-a shows LTE+, 5g-uwb and 5g-uc 5G+, hide no type, wifi the Wi-Fi icon; Wi-Fi's 0-3 bars scale to \
+         Android's 0-4; searching and failed show no bars; charging and charged show the battery plugged in; no operator (the \
+         demo status bar has no carrier name)",
     ),
-    ("clear_status_bar", "device, set?", "Remove status bar overrides"),
+    ("clear_status_bar", "device; iOS: set?", "Remove status bar overrides (Android: leaves demo mode)"),
     ("content_size", "device, size, set?", "Dynamic Type size (name or 0-11)"),
-    ("increase_contrast", "device, on, set?", "Increase Contrast"),
+    (
+        "increase_contrast",
+        "device, on; iOS: set?",
+        "Increase Contrast (Android: high-contrast text, `high_text_contrast_enabled`, and from API 34 the color contrast, \
+         `contrast_level` 1.0 or 0.0)",
+    ),
     ("dynamic_island", "device, suppressed, set?", "Hide the Dynamic Island"),
     ("backlight", "device, on, set?", "Display backlight"),
-    ("keyboard_language", "device, language, set?", "Software keyboard language"),
-    ("hardware_keyboard", "device, on, set?", "Connect the hardware keyboard"),
+    (
+        "keyboard_language",
+        "device, language, set?",
+        "Software keyboard language (not on Android: a keyboard's language is its input method's subtype, which only that \
+         input method's settings choose; no host command sets it)",
+    ),
+    (
+        "hardware_keyboard",
+        "device, on; iOS: set?",
+        "Connect the hardware keyboard (Android: the emulator's keyboard stays attached; off shows the on-screen keyboard \
+         beside it and on hides it, `show_ime_with_hard_keyboard`)",
+    ),
     ("ca_debug", "device, option, on, set?", "Render overlay (see ca_debug_state for names)"),
     ("ca_debug_state", "device, set?", "Every render overlay and whether it is on"),
     ("reset_keychain", "device, set?", "Delete every keychain item"),
-    ("memory_warning", "device, set?", "Simulate a memory warning"),
+    (
+        "memory_warning",
+        "device; iOS: set?; Android: bundle_id?",
+        "Simulate a memory warning (Android: `am send-trim-memory` RUNNING_CRITICAL to bundle_id's process, by default the \
+         foreground app's)",
+    ),
     (
         "notify",
         "device, name; iOS: state?, set?; Android: bundle_id?, extras?",
         "Post a Darwin notification (optionally setting its state). Android: a broadcast, `am broadcast -a <name>` as the shell \
          user, to bundle_id's receivers or every registered one (since Android 8 a manifest receiver hears an implicit broadcast \
-         only with bundle_id), with extras by JSON type (string, null, boolean, integer: int or long, other numbers: float); a \
-         protected system broadcast is refused, and a broadcast has no state",
+         only with bundle_id; only an exported receiver hears the shell user, so one with android:exported=\"false\" or registered \
+         RECEIVER_NOT_EXPORTED gets nothing while the call still succeeds), with extras by JSON type (string, null, boolean, \
+         integer: int or long, other numbers: float); a protected system broadcast is refused, and a broadcast has no state",
     ),
     (
         "biometric",
@@ -445,20 +476,43 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "Remove shaping: clear the device proxy, stop the proxy, remove injection (Android: `network speed full`, `network delay none`, \
          `network loss none` under simee's emu, and airplane mode off)",
     ),
-    ("audio_state", "device, set?", "Device audio settings (routed host UIDs, volume) and every host audio device"),
-    ("audio_volume", "device, level(0-100), set?", "Device output volume (100 = unity); applies to audio clients started afterwards"),
+    (
+        "audio_state",
+        "device; iOS: set?",
+        "Device audio settings. iOS: the routed host UIDs and volume, and every host audio device. Android: from `dumpsys audio`, \
+         the media stream's volume (as audio_volume's level) and mute, every stream's index, range, mute and output devices, the \
+         ringer mode and the audio focus stack with its owner; no host devices (emu plays on the host's default output)",
+    ),
+    (
+        "audio_volume",
+        "device, level(0-100); iOS: set?",
+        "Device output volume. iOS: 100 = unity, for audio clients started afterwards. Android: the media stream's volume index, \
+         the level scaled to its range, live (`cmd media_session volume`, or `media volume` on older images)",
+    ),
     (
         "audio_route",
         "device, scope(input|output), uid | \"default\", set?",
-        "Pin the device's input or output to a host device (any device, including loopback); applies to clients started afterwards",
+        "Pin the device's input or output to a host device (any device, including loopback); applies to clients started afterwards. \
+         Android: not available: emu's sound card uses the host's default output and input, with no \
+         per-device route, and the guest has one output, the card",
     ),
     (
         "audio_capture_start",
         "device, path?(.wav), mute?, set?",
-        "Capture this device's audio output with a process tap (no driver); mute silences it on the host meanwhile; returns capture_id",
+        "Capture this device's audio output with a process tap (no driver); mute silences it on the host meanwhile; returns capture_id. \
+         Android: not available yet: emu's sound card feeds one host sink, the host's output, and has no tap to record from (#265)",
     ),
-    ("audio_capture_stop", "capture_id", "Stop a capture: frames, duration_ms, rms, peak, dbfs, path"),
-    ("audio_mute", "device, on, set?", "Silence (or restore) this device's audio on the host: a per-device null sink"),
+    (
+        "audio_capture_stop",
+        "capture_id",
+        "Stop a capture: frames, duration_ms, rms, peak, dbfs, path. Android: not available, as audio_capture_start",
+    ),
+    (
+        "audio_mute",
+        "device, on; iOS: set?",
+        "Silence (or restore) this device's audio; returns whether it is muted. iOS: on the host, a per-device null sink. Android: \
+         mutes the guest's media stream (`cmd audio adj-mute`, API 35 and later; earlier images have no command for it)",
+    ),
     // Device cameras (#323): host cameras, virtual cameras and synthetic sources (`sim-camera`).
     (
         "camera_sources",
@@ -607,6 +661,13 @@ const ALL_PLATFORMS: &[&str] = &[
     "admission_check",
     "clone",
     "shutdown",
+    // Device state, on Android over adb and the AVD's disks (#418).
+    "erase",
+    "status_bar",
+    "clear_status_bar",
+    "increase_contrast",
+    "hardware_keyboard",
+    "memory_warning",
     "screen",
     "screenshot",
     "stream_start",
@@ -670,6 +731,10 @@ const ALL_PLATFORMS: &[&str] = &[
     "push",
     "notify",
     "biometric",
+    // Android: the guest's media stream, over adb (#417).
+    "audio_state",
+    "audio_volume",
+    "audio_mute",
 ];
 /// Methods only Android devices have.
 const ANDROID_ONLY: &[&str] = &["console", "xr", "vehicle", "touchpad", "export", "import"];
@@ -1688,7 +1753,7 @@ pub(crate) mod tests {
         let help = call(&mut Session::default(), "help", &Value::Null).expect("help");
         let find = |m: &str| help.as_array().and_then(|a| a.iter().find(|x| x["method"] == m)).cloned().expect(m);
         assert_eq!(find("devices")["platforms"], json!(["android", "ios"]));
-        assert_eq!(find("status_bar")["platforms"], json!(["ios"]));
+        assert_eq!(find("appearance")["platforms"], json!(["ios"]));
         assert_eq!(find("tap")["platforms"], json!(["android", "ios"]));
         assert_eq!(find("fold")["platforms"], json!(["android", "ios"]));
         assert_eq!(find("xr")["platforms"], json!(["android"]));
@@ -1767,8 +1832,8 @@ pub(crate) mod tests {
         assert_eq!(call(&mut s, "screen", &json!({"device": "watch"})).expect("screen"), json!({"width": 454, "height": 454}));
         let info = call(&mut s, "info", &json!({"device": "fold"})).expect("info");
         assert_eq!(info["profile"]["fold"]["angle"], 180.0);
-        let err = call(&mut s, "status_bar", &json!({"device": "watch"})).expect_err("iOS-only");
-        assert_eq!(err, "`status_bar` isn't available on Android devices (it works on iOS)");
+        let err = call(&mut s, "appearance", &json!({"device": "watch"})).expect_err("iOS-only");
+        assert_eq!(err, "`appearance` isn't available on Android devices (it works on iOS)");
         let err = call(&mut s, "fold", &json!({"device": "watch", "posture": "closed"})).expect_err("not a foldable");
         assert!(err.starts_with("folding needs a device with Hinge; watch is Wear OS · Watch"), "{err}");
         assert_eq!(
@@ -3100,6 +3165,7 @@ pub(crate) mod tests {
 
     /// Methods the Android dispatcher serves that this test must not run, and why.
     const NOT_RUN_ON_ANDROID: &[(&str, &str)] = &[
+        ("erase", "refuses a running device, and reads no parameters"),
         ("boot", "starts or stops emulators: the fake's advertisement names this process"),
         ("boot_many", "starts emulators"),
         ("shutdown", "signals the advertised process, which is this one"),
