@@ -129,18 +129,21 @@ fn real_main() -> Result<ExitCode> {
     let signals = on_signal::shutdown_signals();
     // Before the NAT sizes its flow caps from it.
     raise_nofile();
-    // Internal: `emu -probe-vulkan <lib64>` and `emu -warm-renderer <lib64>` (see vkprobe.rs).
+    // Internal: `emu -probe-vulkan <lib64>`, `emu -probe-kosmickrisp <lib64>` and
+    // `emu -warm-renderer <lib64>` (see vkprobe.rs).
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         let raw: Vec<String> = std::env::args().collect();
         let child: Option<fn(&std::path::Path) -> bool> = match raw.get(1).map(String::as_str) {
             Some("-probe-vulkan") => Some(vkprobe::probe),
+            Some("-probe-kosmickrisp") => Some(vkprobe::probe_kosmickrisp),
             Some("-warm-renderer") => Some(vkprobe::warm_child),
             _ => None,
         };
         if let Some(run) = child {
             let ok = raw.get(2).is_some_and(|p| run(std::path::Path::new(p)));
-            return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+            // A clean "no" has a status of its own: a crash, a panic or a signal isn't a verdict.
+            return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::from(vkprobe::PROBE_FAILED) });
         }
     }
     let opts = args::parse(std::env::args().skip(1))?;

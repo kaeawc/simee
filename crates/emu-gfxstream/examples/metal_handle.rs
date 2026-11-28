@@ -821,22 +821,18 @@ mod imp {
         let driver = args.get(1).map_or("moltenvk", String::as_str);
         let n: usize = args.get(2).map_or(Ok(200), |s| s.parse())?;
         let launcher = lib64.parent().ok_or("lib64 has no parent")?;
-        if driver == "kosmickrisp" {
-            let manifest = launcher.join("lib64/vulkan/libkosmickrisp_icd.json");
-            if !manifest.is_file() {
-                return Err(format!("{} is not installed", manifest.display()).into());
+        let icd = match driver {
+            "kosmickrisp" if !gfx::Icd::KosmicKrisp.ships_in(&lib64) => {
+                return Err(format!("{} is not installed", lib64.join("vulkan/libkosmickrisp_icd.json").display()).into());
             }
-            for (k, v) in [("VK_DRIVER_FILES", manifest.as_os_str()), ("VK_ICD_FILENAMES", manifest.as_os_str())] {
-                // SAFETY: single-threaded here, before the renderer starts any thread.
-                unsafe { std::env::set_var(k, v) };
-            }
-            // SAFETY: as above.
-            unsafe { std::env::set_var("ANDROID_EMU_VK_ICD", "kosmickrisp") };
-        } else if driver != "moltenvk" {
-            return Err(USAGE.into());
-        }
+            "kosmickrisp" => gfx::Icd::KosmicKrisp,
+            "moltenvk" => gfx::Icd::MoltenVk,
+            _ => return Err(USAGE.into()),
+        };
         gfx::link_beside_exe(&lib64);
-        gfx::configure_environment(launcher, gfx::Icd::MoltenVk);
+        for n in gfx::configure_environment(launcher, icd) {
+            eprintln!("{n}");
+        }
         println!("lib64 {} driver {driver} (ICD files {})", lib64.display(), std::env::var("VK_DRIVER_FILES").unwrap_or_default());
         let r = gfx::Renderer::load(&lib64)?;
         // As emu starts it for an API 36 guest: no GL, Vulkan composition.
