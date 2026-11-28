@@ -21,8 +21,8 @@ Issue [#415](https://github.com/kaeawc/simee/issues/415), part of the Android/iO
 | --- | --- | --- |
 | `mem_vmmap` | `/proc/<pid>/smaps`, grouped by mapping kind | Build. Same shape, minus iOS-only columns. Needs root (`su 0`) on most images |
 | `mem_heap` | An `am dumpheap` hprof for the class histogram; `dumpsys meminfo [-d] <pkg>` for the breakdown, as a separate Android-only `mem_meminfo` | Histogram: build (hprof reader, no new dependency). Breakdown: build first (any app, no root) |
-| `mem_leaks` | `dumpsys meminfo --unreachable <pkg>` (libmemunreachable) | Build, narrower than iOS: debuggable app, leaks as address and size, stacks only with `malloc_debug` |
-| `mem_history` | `malloc_debug` `backtrace` dump | Not a reliable equivalent. Stays iOS-only for now; a design is sketched so the decision can be revisited |
+| `mem_leaks` | `dumpsys meminfo --unreachable <pkg>` (libmemunreachable) | Build, narrower than iOS: any app (a release app's bytes are hidden), at most 100 leaks, a 30 s scan cap, leaks as address and size, stacks only with `malloc_debug` |
+| `mem_history` | `malloc_debug` `backtrace` dump or `record_allocs` | Not a reliable equivalent: no one mode has both an address and a stack. Stays iOS-only for now; a design is sketched so the decision can be revisited |
 
 ## 1. The mechanisms
 
@@ -53,10 +53,15 @@ Issue [#415](https://github.com/kaeawc/simee/issues/415), part of the Android/iO
   `/data/local/tmp/heapdump-<time>.prof`). `-n` dumps the native heap instead of the managed heap,
   `-g` runs a GC first, `-m` adds malloc info, `-b [format]` dumps bitmaps. **[sourced]**
   ([`ActivityManagerShellCommand.java`](https://android.googlesource.com/platform/frameworks/base/+/main/services/core/java/com/android/server/am/ActivityManagerShellCommand.java),
-  `runDumpHeap`.) The shell command itself performs no permission check; the check is in the
-  service that receives the call, which I could not read (the source page truncated before it).
-  **[Unverified: whether a non-debuggable, non-profileable app is refused; Android Studio's own
-  docs say heap dumps need a "debuggable" run for complete data.]**
+  `runDumpHeap`.) The shell command checks nothing; the service does.
+  `ActivityManagerService.dumpHeap` requires `SET_ACTIVITY_WATCHER` (the shell has it) and then
+  calls `enforceDebuggable(proc)`, which throws `SecurityException("Process not debuggable: <pkg>")`
+  unless `Build.IS_DEBUGGABLE` (`ro.debuggable=1`, a userdebug or eng build) or the app has
+  `FLAG_DEBUGGABLE`. **[sourced]**
+  ([`ActivityManagerService.java`](https://android.googlesource.com/platform/frameworks/base/+/main/services/core/java/com/android/server/am/ActivityManagerService.java),
+  `dumpHeap` and `enforceDebuggable`.) A `profileable` app is not enough: on a user build only a
+  debuggable app can be dumped, on a userdebug build any app can. Android Studio's docs likewise
+  say to run "as debuggable (complete data)".
   ([memory profiler](https://developer.android.com/studio/profile/memory-profiler))
 - **hprof format.** ART writes `JAVA PROFILE 1.0.3` with an identifier size of 4, STRING,
   LOAD_CLASS, STACK_*, HEAP_DUMP_SEGMENT and HEAP_DUMP_END records, `CLASS_DUMP`,
@@ -92,8 +97,11 @@ Issue [#415](https://github.com/kaeawc/simee/issues/415), part of the Android/iO
 - **Needs.** Reading another process's files needs `PTRACE_MODE_READ` access (`CAP_SYS_PTRACE`) or
   `CAP_PERFMON`. **[sourced]** (same page) So the shell user can't read an app's `smaps`; root can
   (`su 0` exists on `google_apis` images, which simee already relies on for `kill`:
-  `crates/sim-android/src/procs.rs`). `google_apis_playstore` images have no `su`: **[inferred from
-  the same code and `docs/android.md`; confirm on a device]**. For a debuggable app, `run-as <pkg>`
+  `crates/sim-android/src/procs.rs`). What decides it is the build's `ro.debuggable`, not `su`
+  itself: `su` is present on debuggable (userdebug/eng) builds, and the same `ro.debuggable` is
+  what makes AMS accept `am dumpheap` for any app (`Build.IS_DEBUGGABLE`, above). Whether a
+  `google_apis_playstore` image is a user build with `ro.debuggable=0`: **[inferred from the same
+  code and `docs/android.md`; confirm with `getprop ro.debuggable` on a device]**. For a debuggable app, `run-as <pkg>`
   runs as the app's uid **[inferred]**; whether SELinux lets that domain read its own `/proc/<pid>`
   files is a device question.
 - **`showmap`.** AOSP builds `showmap` in `system/memory/libmeminfo/tools`, with no eng/userdebug
@@ -120,7 +128,7 @@ Issue [#415](https://github.com/kaeawc/simee/issues/415), part of the Android/iO
   **[sourced]** (same page) `<profileable android:shell="true"/>` appeared in API 29; `android:enabled`
   in API 30. **[sourced]**
   ([`<profileable>`](https://developer.android.com/guide/topics/manifest/profileable-element))
-  Config fields: `sampling_interval_bytes` (default 4096; 0 is invalid), `process_cmdline`, `pid`,
+  Config fields: `sampling_interval_bytes` (default 4096 bytes per the [native heap profiler page](https://perfetto.dev/docs/data-sources/native-heap-profiler); the proto says it must be set non-zero, and 0 crashes the target before Android 12), `process_cmdline`, `pid`,
   `heaps`, `shmem_size_bytes` (default 8 MiB, cap 500 MiB), `block_client`, `dump_at_max` (Android
   11+), `continuous_dump_config`. **[sourced]**
   ([trace config](https://perfetto.dev/docs/reference/trace-config-proto))
@@ -147,18 +155,25 @@ Issue [#415](https://github.com/kaeawc/simee/issues/415), part of the Android/iO
   `contents:`.)
 - **Invocation.** `dumpsys -t 600 meminfo --unreachable [process]`; zygote loads the library.
   **[sourced]** (README)
-- **Needs.** The README names no root requirement for the default mode; backtraces need
-  `adb root` and `setprop` on a userdebug device, then an app restart. **[sourced]** A secondary
-  source says the option works only for `FLAG_DEBUGGABLE` apps **[unverified: a machine-translated
-  blog; find the check in `ActivityManagerService`/`MemBinder` or test on a device]**. The target is
-  briefly paused while its threads stop. **[sourced]**
-- **Time and size.** The default `dumpsys` timeout is shorter than a scan needs; the README says
-  `-t 600`. **[sourced]** A real scan's duration and the report size scale with the heap and the
-  leak count: needs a device. The library's `limit` argument truncates the sorted leak list.
-  **[sourced]** (`MemUnreachable.cpp`)
-- **Parse without a new dependency.** Yes. The format is line-oriented; the blog's regex
-  `[0-9]+ bytes unreachable at [A-Za-z0-9]+` is a fair anchor but simee should parse from a
-  recorded fixture, not from a description.
+- **Needs.** No debuggable flag and no root for the scan. AOSP gates only the leak *contents*:
+  `ActivityThread.dumpMemInfo` passes `showContents = appInfo.flags & FLAG_DEBUGGABLE ||
+  Build.IS_DEBUGGABLE` to `Debug.getUnreachableMemory(100, showContents)`, so a release app on a
+  user build still gets the summary and each `N bytes unreachable at <addr>` line, without the
+  hex dump of its bytes. **[sourced]**
+  ([`ActivityThread.java`](https://android.googlesource.com/platform/frameworks/base/+/main/core/java/android/app/ActivityThread.java),
+  `dumpMemInfo`.) Backtraces need `adb root` and `setprop` on a userdebug device, then an app
+  restart. **[sourced]** (README) The target is briefly paused while its threads stop. **[sourced]**
+- **Time and size: two caps.** AMS waits for the app's reply on a `TransferPipe` for **30 000 ms**
+  when `--unreachable` is set (5 000 ms otherwise): `tp.go(fd, opts.dumpUnreachable ? 30000 : 5000)`.
+  **[sourced]** (`ActivityManagerService.java`, `dumpApplicationMemoryUsage`.) That is a fixed
+  server-side wait, so `dumpsys -t 600` (the README's advice) raises only the client's timeout and
+  can't extend it; a scan that takes longer prints `Got IoException!` instead of a report. And the
+  app is asked for at most **100** leaks: `Debug.getUnreachableMemory(100, …)` is hard-coded, and
+  libmemunreachable truncates the sorted list to that `limit` (`leaks.resize(limit)` in
+  `MemUnreachable.cpp`), while its summary counts all of them. **[sourced]** Real scan durations and
+  report sizes: needs a device.
+- **Parse without a new dependency.** Yes. The format is line-oriented; the strings above anchor
+  it, but simee should parse from a recorded fixture, not from a description.
 - **Matches iOS tool:** `leaks`. Differences: no type names (native memory has none), no
   zone, and stacks only if malloc_debug backtraces were enabled before the app started.
 
@@ -168,14 +183,20 @@ Issue [#415](https://github.com/kaeawc/simee/issues/415), part of the Android/iO
   allocation. Signal `SIGRTMAX-17` (47) writes "Android Native Heap Dump" to
   `/data/local/tmp/backtrace_heap.<pid>.txt` (Android P+): one line per record with a zygote-child
   flag `z`, `sz`, `num` and the frame addresses `bt`, then a `MAPS` section (`/proc/<pid>/maps`) to
-  decode them. `record_allocs` logs every allocation and free (dumped on `SIGRTMAX-18`);
+  decode them. `record_allocs` logs every allocation and free as plain text, one line per call (for example
+  `186: malloc 0xb6038060 20`: thread id, call, pointer, size), dumped on `SIGRTMAX-18` and not
+  carrying stacks;
   `leak_track` dumps live allocations at exit; `check_unreachable_on_signal` (API 34, signal 48)
   runs libmemunreachable on a signal. **[sourced]**
   ([README](https://android.googlesource.com/platform/bionic/+/main/libc/malloc_debug/README.md))
 - **Needs.** On a rooted device, `setprop wrap.<pkg> '"LIBC_DEBUG_MALLOC_OPTIONS=backtrace logwrapper"'`
   then `am force-stop <pkg>` (API 26+); verify with `malloc debug enabled` in logcat. Android 12
-  has a bug that can break `wrap.<pkg>`; the documented fix is
-  `dalvik.vm.force-java-zygote-fork-loop` set to `true`, then a restart. Off a rooted device the page
+  has a bug that can break `wrap.<pkg>`; the documented fix is `setprop
+  dalvik.vm.force-java-zygote-fork-loop true` followed by `stop` and `start` (a framework restart:
+  every app on the device restarts, but malloc_debug stays off for the others). Do not reach for
+  `libc.debug.malloc.options` as a fallback: set without `libc.debug.malloc.program` it turns
+  malloc_debug on for every process after the restart (the README's "all processes" recipe), which
+  slows allocation in every process, not one app. Off a rooted device the page
   points to the NDK's `wrap.sh`, which needs an app built for it. **[sourced]** (same README) The
   app must be restarted, so this is a launch option, like iOS's `malloc_stack_logging`.
 - **Cost.** "Slows allocation significantly"; libmemunreachable's README says backtracing every
@@ -203,23 +224,24 @@ the platform's leak-pattern knowledge) is far past "small PR". Recommendation: o
 
 ## 2. What works on which image
 
-| Mechanism | `google_apis_playstore` (user build, no `su`) | `google_apis` (root: `su 0`) | `default` AOSP (userdebug-like) |
+| Mechanism | `ro.debuggable=0` (a user build; `google_apis_playstore` is assumed to be one) | `ro.debuggable=1` (`google_apis`: `su 0`) | `default` AOSP (userdebug-like) |
 | --- | --- | --- | --- |
 | `dumpsys meminfo <pkg>` and `-d` | Yes **[inferred]** | Yes | Yes |
 | `/proc/<pid>/smaps` | Not for another uid; `run-as` for a debuggable app (device check) | Yes | Yes |
-| `am dumpheap` managed | Debuggable app (profileable: device check) | Yes | Yes |
-| `dumpsys meminfo --unreachable` | Debuggable app **[unverified]** | Yes | Yes |
+| `am dumpheap` managed | Debuggable app only (profileable is refused) | Yes, any app | Yes |
+| `dumpsys meminfo --unreachable` | Yes, any app; contents hidden for a release app | Yes | Yes |
 | heapprofd | Debuggable or profileable app, API 29+ | Nearly any process | Nearly any process |
 | `malloc_debug` `wrap.<pkg>` | No (needs `setprop wrap.*`, root, or `wrap.sh` in the APK) | Yes | Yes |
 
-The `su 0` column rests on `procs.rs`'s comment that google_apis images have it; the other two
-columns are inferred from the image tags and the sources' build-type language, and the table's
-cells marked "device check" are open questions below. A tool that isn't allowed on an image should
+The `ro.debuggable` split is from AMS and `ActivityThread` (`Build.IS_DEBUGGABLE`); which image
+tag has which `ro.debuggable` rests on `procs.rs`'s comment that google_apis images have `su`, and
+is a device check below. A tool that isn't allowed on an image should
 say which image or app flag it needs, as `kill` does for root today.
 
 ## 3. Proposed API
 
-All four keep their iOS parameters: `device, bundle_id | pid, raw?, timeout_s?(120)`. On Android
+The iOS parameters are `device, bundle_id | pid, raw?, timeout_s?(120)`; `mem_vmmap`, `mem_heap`
+and `mem_history` keep them, and `mem_leaks` drops `timeout_s` (below). On Android
 `bundle_id` is the package name; `pid` must be one of the device's processes (as `processes`
 reports); `raw: true` adds the source report as printed; every answer has `pid` and `warnings`,
 and the platform column in `help` moves from `iOS` to `Android, iOS` for the methods built.
@@ -228,7 +250,8 @@ dependencies.
 
 ### `mem_vmmap` (build)
 
-Source: `su 0 cat /proc/<pid>/smaps` (fallback `run-as` for a debuggable app, to be confirmed).
+Source: `su 0 cat /proc/<pid>/smaps` (fallback `run-as` for a debuggable app, to be confirmed);
+when neither works, fail with `ro.debuggable`'s value and what to boot instead.
 Answer, matching `outputs.rs`'s `{...@mem, regions: [object], total: object|null, ...}`:
 
 - `regions`: one row per mapping kind, `{region, virtual_bytes, resident_bytes, dirty_bytes,
@@ -277,20 +300,36 @@ iOS tools already answer.
 
 ### `mem_leaks` (build, narrower)
 
-Source: `dumpsys -t <timeout_s> meminfo --unreachable <pkg>`. Answer matching `{...@mem, leak_count,
-stacks, leaks: [object], leaked_bytes?, note?}`:
+Source: `dumpsys -t 40 meminfo --unreachable <pkg>` (the client timeout just above AMS's fixed 30 s
+wait, so simee reports AMS's `IoException` rather than its own timeout). **No `timeout_s`
+parameter on Android**: it can't extend the scan, and a value above 30 would promise what AMS
+refuses. The method says in `help` that the scan stops after 30 s, and fails with that cause when
+the report has `Got IoException!` or no summary line. Needs no debuggable app and no root (sourced
+above), so it also works on a user build; `raw` is available. Answer matching `{...@mem, leak_count,
+stacks, leaks: [object], leaked_bytes?, note?}` plus an Android-only `truncated`:
 
-- `leak_count`, `leaked_bytes` from the summary line.
+- `leak_count`, `leaked_bytes` from the summary line (all leaks, not just the listed ones).
+- `truncated`: true when `leak_count` exceeds the number of leaks listed. The report lists at most
+  100 (`Debug.getUnreachableMemory(100, …)`), largest first, so `leaks` may hold fewer than
+  `leak_count` and `sum(leaks[].count)` is under it. Include the listed total beside it
+  (`listed_count`) so a caller sees how many are missing; add a `note` saying the cap is AOSP's,
+  not simee's. iOS has no cap, so `truncated` is absent there.
 - `leaks`: grouped like iOS (`count`, `bytes`, `instances`, `stack`); each instance
   `{address, size}` (no `zone`); the group key is the allocation stack when present and the "similar"
   grouping libmemunreachable prints otherwise; no `type`, since native blocks have none.
-- `stacks`: true only when backtraces are in the report. Frames `{address, image, symbol?, source?}`
-  as `@frame`, innermost first; `symbol` unset without a symbolizer. Same `note` as iOS when
-  `count > 0 && !stacks`, naming the launch option.
+- `stacks`: true only when backtraces are in the report. Frames are `@frame`, which requires
+  `symbol` (`{address: string, symbol: string, image?: string, source?: string}` in `outputs.rs`):
+  `{address, symbol, image?, source?}`, innermost first. Without a symbolizer the frame has no
+  name, so `symbol` is the empty string `""` (not omitted, not a made-up name) and `image` is the
+  mapping from the dump's `MAPS` section; the address plus `image` is enough to symbolize later.
+  Same `note` as iOS when `count > 0 && !stacks`, naming the launch option.
 - Launch parameter: `launch {malloc_stack_logging: true}` on Android sets
-  `wrap.<pkg>` with `backtrace` (and `libc.debug.malloc.options` where `wrap` is broken) before
-  `am start -S`, and `launch`'s docs row says so. This needs root; without it the launch fails
-  with the reason, not silently without stacks.
+  `wrap.<pkg>` with `backtrace` before `am start -S` (the per-app route; never
+  `libc.debug.malloc.options`, whose scope is every process), and `launch`'s docs row says so.
+  Where `wrap.<pkg>` is broken (Android 12+), the launch fails saying to set
+  `dalvik.vm.force-java-zygote-fork-loop` and restart the framework, rather than doing it. It needs
+  a debuggable build (`su`); without one the launch fails with the reason, not silently without
+  stacks.
 - `nodes` and `malloced_bytes` (iOS totals): omitted. The log line libmemunreachable writes
   (`N bytes in M allocations unreachable out of X bytes in Y allocations`) goes to logcat, so a
   later pass could read it for these.
@@ -299,13 +338,15 @@ stacks, leaks: [object], leaked_bytes?, note?}`:
 
 `mem_history {address}` asks "who allocated this address, as events". `malloc_debug`'s backtrace
 dump has no per-address query: it's an aggregate by stack (`sz`, `num`, `bt`), with no address and
-no frees. `record_allocs` has addresses, but it is a binary-ish allocation trace meant for the
-benchmark replayer, at up to 50 million records, and slows the app.
-**[sourced]** (malloc_debug README) A reliable `mem_history` needs a different method, "allocations
-by stack", not an address lookup. Say so in the API error:
+no frees. `record_allocs` has addresses and frees but no stacks: it writes plain text lines
+(`<tid>: malloc <ptr> <size>`, `free <ptr>`, …) for the benchmark replayer, at up to 50 million
+records. **[sourced]** (malloc_debug README) So no single mode answers "the allocation stack of
+this address": backtraces have stacks and no addresses, `record_allocs` has addresses and no
+stacks, and turning on both and joining them is not something the README offers. A reliable
+`mem_history` needs a different method, "allocations by stack", not an address lookup. Say so in the API error:
 `mem_history is not available on android devices: malloc_debug records allocation sites, not
-addresses; use mem_leaks with stacks`, and keep it iOS-only. Revisit if a device shows `record_allocs`
-is usable on an emulator app within the default timeout. This is the only call of the four where
+addresses; use mem_leaks with stacks`, and keep it iOS-only. Revisit only if a device shows an address-to-stack join is possible (for example `backtrace` plus
+`record_allocs` in one process, with a pointer in each). This is the only call of the four where
 the research answer is "no equivalent that is reliable", which is what #415 asked us to say plainly.
 
 ### Not in `mem_*`
@@ -316,8 +357,8 @@ the research answer is "no equivalent that is reliable", which is what #415 aske
 
 ## 4. Order of work
 
-Each item is one PR, with parsers tested against **recorded** device output as fixtures (AGENTS.md:
-fixtures are captured, never written from a description) and the method tested against a fake adb
+Each item is one PR, with parsers tested against **recorded** device output as fixtures (fixtures are captured, never
+written from a description, as `crates/sim-api/tests/fixtures/memtools/` was for iOS) and the method tested against a fake adb
 (`sim-android`'s `testing.rs`), as the issue's "done when" asks.
 
 1. **Capture fixtures** (needs a device): `smaps`, `smaps_rollup`, `dumpsys meminfo -d`,
@@ -344,20 +385,21 @@ and are confirmed on main):
 
 - Whether `dumpsys meminfo <pkg>` works for a non-debuggable app from the shell user, on
   `google_apis_playstore`; whether `--checkin` is usable for `meminfo`.
-- Whether `su 0` is present on each image type simee provisions, and the error `su` gives without it.
+- `getprop ro.debuggable` and whether `su 0` is present on each image type simee provisions, and the
+  error `su` gives without it.
 - Whether `run-as <pkg> cat /proc/<pid>/smaps` is allowed for a debuggable app under SELinux.
 - Whether `showmap` is installed on any image (not needed, but cheap to know).
-- Whether `dumpsys meminfo --unreachable` is refused for a non-debuggable app, its time on a small
-  and a large heap, its effect on the emulator app (the target pauses), and its output with and
+- `dumpsys meminfo --unreachable` on a release app (the source says it works with contents hidden),
+  its time on a small and a large heap against AMS's 30 s cap, its effect on the emulator app (the target pauses), and its output with and
   without `wrap.<pkg>` backtraces.
 - Whether `wrap.<pkg>` works on API 34–36 images (the README flags an Android 12 bug), and the
   slowdown of `backtrace` on the emulator's app.
-- Whether `am dumpheap` is refused for a non-debuggable, non-profileable app; the time and size of the
-  dump for a test app, and how long the app is frozen.
+- `am dumpheap` on a `profileable` and on a release app on a user build (the source says both are
+  refused; confirm the message), and the time and size of the dump for a test app, and how long the app is frozen.
 - Time and output size for each call, so `docs/api.md`'s Memory tools section can carry Android
   costs the way it carries iOS's, and `docs/benchmarks.md` a row (AGENTS.md: no published number
   without a measured row).
-- Whether `mem_history` has a usable shape on `record_allocs`.
+- Whether an address-to-stack join is possible for `mem_history`.
 
 ## Sources
 
