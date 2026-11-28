@@ -8,25 +8,26 @@ hosts is, what simee measured there, how noisy it was, and what it is good for.
 
 Two scripts produce everything below; nothing here was typed from memory.
 
-- `scripts/bench/host-profile.sh` writes the host fingerprint as one JSON object. It records the
-  fields of the host record in `scripts/bench/summarize.py` (`model`, `cpu`, `os`, `os_version`,
-  `cpus`, `cores_physical`, `mem_gb`, `kvm`, `load1`, `thermal`, `power`, `simee_commit`, and the
-  run record's `chip` and `cores`), so a profile reads like any benchmark's host, and adds the
-  kernel, CPU flags, disk (size, free, filesystem, device, the kernel's rotational flag), whether
-  a VM can actually be made on `/dev/kvm`, render nodes and Vulkan ICDs (`vulkaninfo --summary` when
-  installed), the cgroup CPU and memory limits (the tightest of the process's cgroup and its
-  parents, v2 and v1), steal from `/proc/stat` (since boot and over a window), the container
-  backend's prerequisites (#210) and the CI the host is. What a host can't report is `null`. It
-  reads only, and takes `thermal` and `power` from `scripts/bench/quiet.sh` when that exists
-  ([#468](https://github.com/kaeawc/simee/pull/468)).
-- `scripts/bench/soft-host.sh` builds, boots and measures: see its header. It waits for the
-  quiet-host gate before the build and before every round of boots, and exits 4 when the host stays
-  busy (`BENCH_QUIET_WAIT`, 300 s). Without #468's `lib.sh` it falls back to one check, a 1-minute
-  load below 0.5 per CPU; `--no-quiet-gate` runs anyway with a warning, for numbers that are not
-  published. #468 has merged; the runs below used the fallback (they ran before the rebase onto it),
-  and a smoke run on the rebased tree passed the shared gate (`Quiet gate: passed`, and a host
-  record with `thermal: unavailable`, no sensors in a VM). The fallback was tested here by loading all 4 CPUs (1-minute load 7.7): it refuses with exit 4 and the
-  message. The host profile is written at the start and the end of every run beside the results.
+- `scripts/bench/host-profile.sh` writes the host fingerprint as one JSON object. Its first fields
+  are the host record itself, taken from `scripts/bench/summarize.py host` (the record every
+  benchmark writes, with `thermal` and `power` from `quiet.sh`: [#468](https://github.com/kaeawc/simee/pull/468)),
+  not a copy of it. It adds the kernel, CPU flags, disk (size, free, filesystem, device, the
+  kernel's rotational flag), whether a VM can actually be made on `/dev/kvm`, render nodes and
+  Vulkan ICDs (`vulkaninfo --summary` when installed), the cgroup CPU and memory limits (the
+  tightest of the process's cgroup and its parents, v2 and v1), steal from `/proc/stat` (since boot
+  and over a window), the container backend's prerequisites (#210) and the CI the host is. What a
+  host can't report is `null`. It reads only. `scripts/bench/test-soft-host.sh` checks that its JSON
+  holds every field of the record with the same values.
+- `scripts/bench/soft-host.sh` builds, boots and measures: see its header. It passes the shared
+  quiet-host gate once at the start, again before each later build round, before QEMU's build and
+  before every round of boots, and exits 4 when the host stays busy (`BENCH_QUIET_WAIT`, 300 s).
+  `--no-quiet-gate` runs anyway with a warning, for numbers that are not published. It refuses a
+  protected or odd console port (`--port`) before measuring. The full runs below were taken before
+  #468 merged, with a load check of its own (1-minute load below 0.5 per CPU) that is gone now; a
+  smoke run on the rebased tree passed the shared gate (a host record with `thermal: unavailable`,
+  no sensors in a VM), and the old check's refusal was tried by loading all 4 CPUs (load 7.7). The
+  shared gate's refusal on this script was not re-run. The host profile is written at the start
+  and the end of every run beside the results.
 
 ## The host measured: a Hive worker VM
 
@@ -112,9 +113,10 @@ The guest was a 720x1280 phone, API 36 `default` x86_64, 4 vCPUs and 1536 MB, bo
 
 ## What simee on such a host is good for
 
-- **Build, unit and integration CI: yes.** A cold release build of `emu` is 46 s, and the rebuild after a
-  source change 1 s, on 4 vCPUs. The unit tests need no device (AGENTS.md). Everything that doesn't boot a
-  guest, including the API, CLI and MCP servers, runs here.
+- **Builds: yes.** A cold release build of `emu` is 46 s, and the rebuild after a source change
+  1 s, on 4 vCPUs. The workspace's unit and integration tests, the API, CLI and MCP servers were
+  not run on this VM, so their time and whether they pass here are untested; none of them needs a
+  device or a guest (AGENTS.md), which is why a no-KVM host should suit them.
 - **Provisioning: yes.** Images and platform-tools download without credentials in about a minute
   and a half; QEMU 11.1 has to be built from source on Ubuntu 22.04 (10 minutes here, 4 GB of disk
   while building), because the distribution's 6.2 is too old.

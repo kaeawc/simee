@@ -11,10 +11,10 @@
 # boot, and over --window seconds, default 2; 0 skips the window), the container backend's
 # prerequisites (binder, cgroup v2, user namespaces, overlayfs: #210), and the CI the host is.
 #
-# The first fields are the host record scripts/bench/summarize.py writes (model, cpu, os,
-# os_version, cpus, cores_physical, mem_gb, kvm, load1, load_source, thermal, thermal_detail,
-# power, laptop, simee_commit, and the run record's chip and cores), so a profile reads like any
-# benchmark's host. thermal and power come from scripts/bench/quiet.sh when it is there (#468).
+# The first fields are the host record itself, taken from `scripts/bench/summarize.py host` (the
+# one every benchmark records: model, cpu, os, os_version, cpus, cores_physical, mem_gb, kvm, load1
+# and load_source, thermal and power from quiet.sh, simee_commit), never a copy of it; the rest is
+# what a cloud host needs besides.
 # Everything a host can't report is null, never a guess. Runs on Linux (a cloud VM, a GitHub
 # Actions Ubuntu runner, a container) and degrades on macOS. Needs python3. Reads only.
 # docs/research/cloud-hosts.md.
@@ -55,9 +55,11 @@ case $window in
   *) ;;
 esac
 
-# Thermal and power: the gate's facts (key=value lines), when quiet.sh exists.
-facts=""
-[ -r "$dir/quiet.sh" ] && facts=$(bash "$dir/quiet.sh" facts 2>/dev/null)
+# The host record every benchmark writes: one source, so the two can't drift.
+record=$(python3 -I "$dir/summarize.py" host) || {
+  echo "host-profile.sh: summarize.py host failed" >&2
+  exit 1
+}
 
 # The Vulkan loader's own summary, when there is one. Bounded: a broken ICD can hang it.
 vulkan=""
@@ -65,10 +67,7 @@ if [ "$gpu_probe" = 1 ] && command -v vulkaninfo >/dev/null 2>&1; then
   vulkan=$(timeout 30 vulkaninfo --summary 2>&1 | head -80)
 fi
 
-commit=$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || true)
-[ -n "$commit" ] && [ -n "$(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null)" ] && commit="$commit-dirty"
-
-HP_FACTS=$facts HP_VULKAN=$vulkan HP_COMMIT=$commit HP_WINDOW=$window HP_REPO=$repo \
+HP_RECORD=$record HP_VULKAN=$vulkan HP_WINDOW=$window HP_REPO=$repo \
   exec python3 -I - <<'PY'
 import datetime, fcntl, glob, json, os, platform, re, shutil, subprocess, sys, time
 
@@ -99,7 +98,7 @@ def num(text):
 
 
 linux = sys.platform.startswith('linux')
-facts = dict(l.split('=', 1) for l in env.get('HP_FACTS', '').splitlines() if '=' in l)
+h = json.loads(env['HP_RECORD'])
 cpuinfo = read('/proc/cpuinfo', '') if linux else ''
 meminfo = read('/proc/meminfo', '') if linux else ''
 
@@ -108,63 +107,6 @@ def meminfo_kb(key):
     m = re.search(rf'^{key}:\s+(\d+) kB', meminfo, re.M)
     return int(m.group(1)) if m else None
 
-
-def physical_cores():
-    if not linux:
-        return num(run('sysctl', '-n', 'hw.physicalcpu')) or os.cpu_count()
-    cores = set()
-    for d in glob.glob('/sys/devices/system/cpu/cpu[0-9]*'):
-        pkg = read(d + '/topology/physical_package_id')
-        core = read(d + '/topology/core_id')
-        if pkg is not None and core is not None:
-            cores.add((pkg, core))
-    return len(cores) or os.cpu_count()
-
-
-# --- the host record (summarize.py's names) ---------------------------------------------------
-pretty = ''
-for line in (read('/etc/os-release', '') or '').splitlines():
-    if line.startswith('PRETTY_NAME='):
-        pretty = line.split('=', 1)[1].strip().strip('"')
-if linux:
-    cpu = next((l.split(':', 1)[1].strip() for l in cpuinfo.splitlines() if l.startswith('model name')), None)
-    model = read('/sys/devices/virtual/dmi/id/product_name') or platform.machine()
-    os_name = f'{pretty or "Linux"} (kernel {platform.release()})'
-    os_version = f'{pretty or "Linux"}, kernel {platform.release()}'
-    mem_kb = meminfo_kb('MemTotal')
-    load1 = float(read('/proc/loadavg', '0').split()[0]) if read('/proc/loadavg') else None
-    load_source = 'loadavg'
-else:
-    cpu = run('sysctl', '-n', 'machdep.cpu.brand_string') or platform.processor() or None
-    model = run('sysctl', '-n', 'hw.model') or platform.machine()
-    ver = run('sw_vers', '-productVersion') or platform.mac_ver()[0]
-    os_name = f'macOS {ver} ({run("sw_vers", "-buildVersion")})'
-    os_version = ver
-    mem_kb = (num(run('sysctl', '-n', 'hw.memsize')) or 0) // 1024 or None
-    load1 = round(os.getloadavg()[0], 2)
-    load_source = 'loadavg'
-
-cpus = os.cpu_count()
-h = {
-    'date': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-    'model': model,
-    'cpu': cpu,
-    'chip': cpu,
-    'os': os_name,
-    'os_version': os_version,
-    'cpus': cpus,
-    'cores': cpus,
-    'cores_physical': physical_cores(),
-    'mem_gb': round(mem_kb / 2**20, 1) if mem_kb else None,
-    'kvm': os.path.exists('/dev/kvm') if linux else False,
-    'load1': load1,
-    'load_source': load_source,
-    'thermal': facts.get('thermal', 'unknown'),
-    'thermal_detail': facts.get('thermal_detail', 'quiet.sh not present'),
-    'power': facts.get('power', 'unknown'),
-    'laptop': facts.get('laptop') == '1',
-    'simee_commit': env.get('HP_COMMIT') or 'unknown',
-}
 
 # --- more on the CPU and memory ---------------------------------------------------------------
 flags = next((l.split(':', 1)[1].split() for l in cpuinfo.splitlines() if l.startswith(('flags', 'Features'))), [])

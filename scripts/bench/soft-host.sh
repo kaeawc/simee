@@ -28,10 +28,10 @@
 #            screenshot, tap and screenshot: scripts/ios-step-bench.py, --calls each) and
 #            `adb exec-out screencap` (5 calls: it takes seconds under TCG).
 #
-# The host must be quiet: this script waits for the quiet-host gate (scripts/bench/quiet.sh, #468)
-# before the build phase and again before each round of the boot phase, and exits 4 when the host
-# stays busy. Without quiet.sh it falls back to the one check that matters here, a 1-minute load
-# below 0.5 per CPU, polled for BENCH_QUIET_WAIT s (300). --no-quiet-gate runs anyway and says so
+# The host must be quiet: this script waits for the quiet-host gate (scripts/bench/quiet.sh, #468:
+# a 1-minute load below 0.5 per CPU, no foreign emulators or compilers) before it starts and again
+# before each build round after the first, before QEMU's build and before each round of boots, and
+# exits 4 when the host stays busy (BENCH_QUIET_WAIT s, 300). --no-quiet-gate runs anyway and says so
 # loudly: those numbers are not for publishing. On a host that is somebody's workstation, an agent
 # is the load: don't work in the same VM while it measures.
 #
@@ -63,7 +63,6 @@ calls=20
 skip_build=0
 skip_boot=0
 cold=1
-BENCH_QUIET_GATE=${BENCH_QUIET_GATE:-1}
 BENCH_EMU=${BENCH_EMU:-}
 BENCH_SIMEE=${BENCH_SIMEE:-}
 while [ $# -gt 0 ]; do
@@ -120,10 +119,6 @@ while [ $# -gt 0 ]; do
       cold=0
       shift
       ;;
-    --no-quiet-gate)
-      BENCH_QUIET_GATE=0
-      shift
-      ;;
     *)
       bench_opt "$@"
       shift "$BENCH_SHIFT"
@@ -150,33 +145,11 @@ need_disk() {
   return 1
 }
 
-# The gate, before a phase. With #468's lib.sh it is the shared quiet gate (load, foreign emulators
-# and compilers, thermal, power); without it, a 1-minute load below 0.5 per CPU. --no-quiet-gate
-# skips it, loudly.
+# The shared quiet gate (lib.sh's bench_gate: load, foreign emulators and compilers, thermal, power)
+# before a phase after the first; bench_start runs the first. --no-quiet-gate skips it, loudly.
 soft_gate() {
-  local n limit load t0=$SECONDS
-  if [ "$BENCH_QUIET_GATE" = 0 ]; then
-    bench_log "WARNING: --no-quiet-gate: the host may be busy; these numbers are not for publishing"
-    return 0
-  fi
-  if declare -F bench_gate >/dev/null; then
-    bench_gate
-    return
-  fi
-  n=$(ncpu)
-  limit=$(awk -v n="$n" 'BEGIN { printf "%.2f", 0.5 * n }')
-  while :; do
-    load=$(load1)
-    if awk -v l="$load" -v m="$limit" 'BEGIN { exit !(l < m) }'; then
-      export BENCH_GATE_STATUS="passed (load $load < $limit)"
-      return 0
-    fi
-    [ $((SECONDS - t0)) -ge "${BENCH_QUIET_WAIT:-300}" ] && break
-    sleep 5
-  done
-  echo "$(basename "$0"): refused: the 1-minute load is $load, not below $limit (0.5 x $n CPUs) after $((SECONDS - t0)) s." >&2
-  echo "Run it on an idle host, or --no-quiet-gate for a smoke run whose numbers are not published." >&2
-  exit 4
+  [ "$BENCH_QUIET_GATE" = 0 ] && bench_log "WARNING: --no-quiet-gate: the host may be busy; these numbers are not for publishing"
+  bench_gate
 }
 
 # CPU time counters of the whole host, for steal: "steal total" jiffies since boot.
@@ -197,9 +170,9 @@ cpu_window() {
 # --- host --------------------------------------------------------------------------------------
 stamp=$(date +%Y%m%d-%H%M%S)
 mkdir -p "$BENCH_OUT" "$cache"
-"$BENCH_DIR/host-profile.sh" >"$BENCH_OUT/soft-host-$stamp.profile.json" || bench_log "host-profile.sh failed"
-soft_gate
+bench_refuse_protected_port "$port"
 bench_start soft-host
+"$BENCH_DIR/host-profile.sh" >"$BENCH_OUT/soft-host-$stamp.profile.json" || bench_log "host-profile.sh failed"
 mkdir -p "$BENCH_WORK/bin"
 bench_log "host profile: $BENCH_OUT/soft-host-$stamp.profile.json"
 if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
