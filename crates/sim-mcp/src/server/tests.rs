@@ -119,7 +119,9 @@ impl Rig {
 
     /// The next notification with this method (earlier ones are kept in `notes`).
     fn notification(&self, method: &str) -> Value {
+        let deadline = Instant::now() + WAIT;
         loop {
+            assert!(Instant::now() < deadline, "no {method} notification within {WAIT:?}");
             let found = self.notes.borrow().iter().position(|n| n["method"] == method);
             if let Some(i) = found {
                 return self.notes.borrow_mut().remove(i);
@@ -132,7 +134,9 @@ impl Rig {
     /// Waits until the backend has answered `method` once (a watcher's first read is its baseline),
     /// so an answer set next is a change the watcher sees, never its baseline.
     fn until_read(&self, method: &str) {
+        let deadline = Instant::now() + WAIT;
         while self.fake.answered(method) == 0 {
+            assert!(Instant::now() < deadline, "no {method} call was answered within {WAIT:?}");
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -314,7 +318,9 @@ fn a_long_method_is_a_task_for_a_client_that_declares_the_extension() {
     let task = rig.modern("tasks/get", json!({"taskId": id}));
     assert_eq!((task["result"]["status"].clone(), task["result"]["resultType"].clone()), (json!("working"), json!("complete")));
     gate.release();
+    let deadline = Instant::now() + WAIT;
     let done = loop {
+        assert!(Instant::now() < deadline, "the task did not complete within {WAIT:?}");
         let task = rig.modern("tasks/get", json!({"taskId": id}));
         if task["result"]["status"] == "completed" {
             break task;
@@ -658,7 +664,9 @@ fn a_cancelled_request_is_not_answered() {
     let gate = rig.fake.gate("boot");
     let id = rig.send_modern("tools/call", json!({"name": "boot", "arguments": {"device": "phone"}}), false);
     // Wait until the call is running, then cancel it.
+    let deadline = Instant::now() + WAIT;
     while rig.fake.called("boot").is_empty() {
+        assert!(Instant::now() < deadline, "boot was not called within {WAIT:?}");
         std::thread::sleep(Duration::from_millis(5));
     }
     rig.send(&json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": id}}));
@@ -781,14 +789,18 @@ fn ending_the_connection_ends_its_subscriptions() {
     server.handle_line(
         &json!({"jsonrpc": "2.0", "id": 3, "method": "resources/subscribe", "params": {"uri": "simee://devices/phone/apps"}}).to_string(),
     );
+    let deadline = Instant::now() + WAIT;
     while fake.answered("screenshot") == 0 || fake.answered("devices") == 0 || fake.answered("apps") == 0 {
+        assert!(Instant::now() < deadline, "the first reads were not all answered within {WAIT:?}");
         std::thread::sleep(Duration::from_millis(5));
     }
     drop(server);
     // Reads under way finish; then nothing more is read, and nothing more said.
     let total = || ["screenshot", "devices", "apps"].iter().map(|m| fake.called(m).len()).sum::<usize>();
     let mut seen = total();
+    let deadline = Instant::now() + WAIT;
     loop {
+        assert!(Instant::now() < deadline, "reads kept coming {WAIT:?} after the drop: {seen}");
         std::thread::sleep(SHORT);
         let now = total();
         if now == seen {
