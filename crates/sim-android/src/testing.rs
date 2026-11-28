@@ -175,7 +175,10 @@ pub fn wait_for(lines: &Mutex<Vec<String>>, n: usize) -> Vec<String> {
 /// `pidof` exits 1, as toybox's does), `com.example.late`'s process shows up on the third
 /// `pidof`, `com.example.leaky` has two launcher activities (LeakCanary's alias second), and
 /// `am force-stop com.example.hang` never returns (it writes its PID to `hang.pid` beside the
-/// script first).
+/// script first). `ps` lists a guest's processes (init, zygote, system_server, the native daemons,
+/// apps); `kill` succeeds (logged only: no host process is signalled) except on pids 520
+/// (surfaceflinger) and 530 (cameraserver), which need `su 0` (present for `-9`, missing for 530's
+/// `-15`); and an `exec` line, and its stop, run on the host's `sh`.
 pub fn fake_adb(android: &Android) -> FakeAdb {
     let dir = android.env.sdk_root.as_ref().expect("sdk root").join("platform-tools");
     std::fs::create_dir_all(&dir).expect("platform-tools");
@@ -223,6 +226,34 @@ impl FakeAdb {
 
 const FAKE_ADB: &str = r#"echo "$*" >> "$(dirname "$0")/adb.log"
 [ "$1" = "-s" ] && shift 2
+# What an API 36 guest's toybox `ps -A -o PID,PPID,%CPU,RSS,ETIME,NAME,CMDLINE` prints (trimmed).
+ps_rows() {
+  printf '%s\n' \
+'  PID  PPID %CPU    RSS ELAPSED NAME                    CMDLINE' \
+'    1     0  0.0  11304   15:02 init                    /system/bin/init second_stage' \
+'    2     0  0.0      0   15:02 [kthreadd]              [kthreadd]' \
+'  310     1  0.1   2620   14:58 zygote64                zygote64' \
+'  311     1  0.0   2100   14:58 zygote                  zygote' \
+'  612   310  3.2 301520   14:50 system_server           system_server' \
+'  520     1  0.4  20480   14:58 surfaceflinger          /system/bin/surfaceflinger --flag' \
+'  200     1  0.0   4012   15:00 servicemanager          /system/bin/servicemanager' \
+'  201     1  0.0   4400   15:00 hwservicemanager        /system/system_ext/bin/hwservicemanager' \
+'  202     1  0.0   3300   15:00 vndservicemanager       /vendor/bin/vndservicemanager /dev/vndbinder' \
+'  203     1  0.0   9120   15:00 vold                    /system/bin/vold --blkid_context=u:r:blkid:s0' \
+'  204     1  0.0   3010   15:00 lmkd                    /system/bin/lmkd' \
+'  205     1  0.1   8200   15:00 logd                    /system/bin/logd' \
+'  206     1  0.2   7300   15:00 adbd                    /apex/com.android.adbd/bin/adbd --root_seclabel=u:r:su:s0' \
+'  207     1  0.0   9300   15:00 netd                    /system/bin/netd' \
+'  208     1  0.0   9400   15:00 installd                /system/bin/installd' \
+'  209     1  0.0   2200   15:01 ueventd                 /system/bin/ueventd' \
+'  210     1  0.0   9500   15:00 keystore2               /system/bin/keystore2 /data/misc/keystore' \
+'  211     1  0.0   9600   15:00 statsd                  /apex/com.android.os.statsd/bin/statsd' \
+'  530     1  0.0  12000   14:58 cameraserver            /system/bin/cameraserver' \
+'  900   310  1.5 180224   14:40 com.android.systemui    com.android.systemui' \
+' 4321   310  7.9 120332   00:42 com.example.app         com.example.app' \
+' 4400   310  7.9  60112   00:40 com.example.app:remote  com.example.app:remote' \
+' 4500   310  0.0  50000   00:30 com.google.android.gms.persistent com.google.android.gms.persistent'
+}
 case "$1" in
 install)
   case "$*" in
@@ -263,6 +294,22 @@ shell)
     "pidof -s "*) exit 1;;
     "am force-stop com.example.hang") echo $$ > "$(dirname "$0")/hang.pid"; exec sleep 10;;
     "am force-stop "*) ;;
+    "ps -A -o PID,PPID,%CPU,RSS,ETIME,NAME,CMDLINE") ps_rows;;
+    "ps -A -o PID,PPID,%CPU,RSS,ETIME,NAME,CMDLINE; echo @packages; pm list packages")
+      ps_rows; echo @packages; printf 'package:android\npackage:com.android.systemui\npackage:com.example.app\n';;
+    "kill -"*" 520"|"kill -"*" 530") echo "/system/bin/sh: kill: ${2##* }: Operation not permitted" >&2; exit 1;;
+    "su 0 kill -9 520"|"su 0 kill -9 530") ;;
+    "su 0 kill -15 530") echo "/system/bin/sh: su: inaccessible or not found" >&2; exit 127;;
+    # Every other signal succeeds, and is only logged: the fake never signals a host process.
+    "kill -"*) ;;
+    # exec's argv line runs on the host's sh, as the guest's would run it, in a child that outlives
+    # this adb (as adbd's shell outlives an adb client that is stopped). With `exec.slow` beside the
+    # script, adb takes a second to reach the device first.
+    "r='simee_start() "*)
+      [ -e "$(dirname "$0")/exec.slow" ] && sleep 1
+      /bin/sh -c "$2" & wait $!; exit $?;;
+    # exec's stop runs on the host's sh too: it signals only the group of the process exec started.
+    "simee_start() "*) exec /bin/sh -c "$2";;
     *) echo "fake adb: unhandled: $2" >&2; exit 2;;
   esac;;
 *) echo "fake adb: unhandled: $*" >&2; exit 2;;

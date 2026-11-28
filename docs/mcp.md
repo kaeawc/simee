@@ -193,14 +193,14 @@ reverse):
 
 | Tools | Platforms |
 | --- | --- |
-| `help`, `identity`, `host`, `devices_usage`, `form_factors`, `devices`, `runtimes`, `create`, `delete`, `boot`, `boot_many`, `admission_check`, `clone`, `shutdown`, `screen`, `screenshot`, `contrast_check`, `tap`, `swipe`, `touch`, `button`, `type`, `key`, `open_url`, `install`, `uninstall`, `launch`, `terminate`, `apps`, `location`, `info`, `rotate`, `rotary`, `stylus`, `device_view` | Android, iOS |
+| `help`, `identity`, `host`, `devices_usage`, `form_factors`, `devices`, `runtimes`, `create`, `delete`, `boot`, `boot_many`, `admission_check`, `clone`, `shutdown`, `screen`, `screenshot`, `contrast_check`, `tap`, `swipe`, `touch`, `button`, `type`, `key`, `open_url`, `install`, `uninstall`, `launch`, `terminate`, `apps`, `location`, `info`, `rotate`, `rotary`, `stylus`, `processes`, `kill`, `exec`, `device_view` | Android, iOS |
 | `console`, `fold`, `xr`, `vehicle`, `touchpad`, `export`, `import` | Android (iOS bundles: the next step of #170) |
 | `stream_start`, `stream_status`, `stream_stop`, `streams` | Android, iOS (macOS: VideoToolbox, both platforms; Linux: Android only, in a build with `--features openh264`) |
 | `camera_sources` | Android, iOS (the host's cameras and the synthetic sources; needs no device) |
 | `camera_link`, `camera_unlink`, `camera_links` | Android, iOS (iOS: device-wide shim injection, needs `simee serve`; see [camera.md](camera.md)) |
 | `prefs_stores`, `prefs_read`, `prefs_write`, `prefs_delete`, `prefs_batch`, `prefs_watch` | Android, iOS (iOS is implemented; Android answers "not yet available") |
 | `erase`, `status_bar`, `clear_status_bar`, `increase_contrast`, `hardware_keyboard`, `memory_warning` | Android, iOS (Android: SystemUI's demo mode, settings and `am send-trim-memory` over adb; `erase` on the AVD's disks) |
-| `device_types`, `settle`, `profile`, `appearance`, `privacy`, `push`, `content_size`, `dynamic_island`, `backlight`, `keyboard_language`, `ca_debug`, `ca_debug_state`, `reset_keychain`, `notify`, `biometric`, `exec`, `logs`, `processes`, `kill`, `connections`, `traffic`, `containers`, `ls`, `read`, `write`, `rm`, `du`, `clear_container`, `defaults_read`, `defaults_write`, `crash_reports`, `network_shape`, `network_state`, `network_flows`, `network_clear`, `network_env`, `audio_state`, `audio_volume`, `audio_route`, `audio_capture_start`, `audio_capture_stop`, `audio_mute`, `watch_gesture`, `remote_swipe`, `pointer`, `carplay` | iOS |
+| `device_types`, `settle`, `profile`, `appearance`, `privacy`, `push`, `content_size`, `dynamic_island`, `backlight`, `keyboard_language`, `ca_debug`, `ca_debug_state`, `reset_keychain`, `notify`, `biometric`, `logs`, `connections`, `traffic`, `containers`, `ls`, `read`, `write`, `rm`, `du`, `clear_container`, `defaults_read`, `defaults_write`, `crash_reports`, `network_shape`, `network_state`, `network_flows`, `network_clear`, `network_env`, `audio_state`, `audio_volume`, `audio_route`, `audio_capture_start`, `audio_capture_stop`, `audio_mute`, `watch_gesture`, `remote_swipe`, `pointer`, `carplay` | iOS |
 | `mem_leaks`, `mem_heap`, `mem_vmmap`, `mem_history` | iOS (the host's memory tools on one app; Android answers that they aren't available there) |
 
 A test keeps this page honest: it fails if a tool isn't named here.
@@ -282,12 +282,15 @@ not offered it and the device list isn't read for it; `subscriptions/listen` is 
 `resourcesListChanged` is. The server never changes its tool list, so it doesn't offer
 `toolsListChanged`.
 
-Over HTTP a session's `GET` stream queues at most 256 messages for a client that reads slowly,
-and keeps only the latest update for each resource (and for the list), so a screen announced 30
-times a second never pushes out a logs or prefs update queued behind it. Past 256 different
-resources the oldest message is dropped (each is only "something changed"; the client reads the
-state when it next looks), so a stalled client never holds up the watcher. The `POST` stream of a
-`subscriptions/listen` is not bounded yet.
+Over HTTP every stream of notifications queues at most 256 of them for a client that reads
+slowly: a session's `GET` stream, and the response stream of a `POST` (a `subscriptions/listen`'s
+notifications, a long call's progress). A queue keeps only the latest update for each resource
+(and for the list, for the request's progress, and for each task's state), so a screen announced
+30 times a second never pushes out a logs or prefs update queued behind it. Past 256 different
+things the oldest notification is dropped (each is only "something changed"; the client reads the
+state when it next looks), so a stalled client never holds up the watcher. Two messages are never
+dropped or merged: a `subscriptions/listen`'s acknowledgement, which comes first, and a request's
+response, which comes after the notifications queued before it.
 
 ## Prompts
 
@@ -411,6 +414,8 @@ need a push channel the API doesn't have.
 ```bash
 simee mcp --http                       # http://127.0.0.1:8377/mcp, loopback; token from the state directory
 simee mcp --http 127.0.0.1:9000 --token-file ~/.config/simee/mcp-token   # loopback, a token file of your choice
+simee mcp --http 0.0.0.0:8377 --tls-cert cert.pem --tls-key key.pem   # every interface, HTTPS (see TLS)
+simee mcp --http 0.0.0.0:8377 --tls-self-signed --tls-name box.lan      # HTTPS, a development certificate
 simee mcp --http 0.0.0.0:8377 --insecure-remote   # every interface, plain HTTP (see Security)
 simee mcp --http --no-auth             # loopback, no token: any local user or process can connect
 ```
@@ -442,13 +447,85 @@ This is the Streamable HTTP transport: one endpoint, `/mcp`.
 - Streams carry no event ids, so a dropped stream can't be resumed with `Last-Event-ID`; a long call
   is better made a task (Tasks extension) and polled.
 
+### TLS
+
+`simee mcp --http` serves HTTPS itself when asked, so a client on another machine can connect with
+a token and nothing else in between. TLS is a cargo feature that is off by default (it builds
+[rustls](https://github.com/rustls/rustls) and its crypto, ring, with the host's C compiler, and
+nothing else on the system): build with `cargo build -p simee --features tls`. A build without it refuses the
+flags below and says how to build it.
+
+```bash
+# A certificate you have: PEM files, the chain leaf first (Let's Encrypt's fullchain.pem works).
+simee mcp --http 0.0.0.0:8377 --tls-cert fullchain.pem --tls-key privkey.pem
+
+# A development certificate: made on first use, kept in the state directory, named for the
+# addresses clients will use.
+simee mcp --http 0.0.0.0:8377 --tls-self-signed --tls-name box.lan
+```
+
+- **What it speaks.** TLS 1.3 only (a TLS 1.2 client is refused), ALPN `http/1.1`, no client
+  certificates, no 0-RTT. The key can be RSA, ECDSA (P-256 or P-384) or Ed25519; others are refused at start. The certificate and key are read
+  once, at start: restart the server after renewing them.
+- **Plaintext on a TLS port** is refused: the client gets a `400` in the clear that says this port
+  serves HTTPS, and the connection closes. A bind that isn't loopback with neither TLS nor
+  `--insecure-remote` (also spelled `--insecure`) is refused at start; with TLS it needs no
+  acknowledgement. `--insecure-remote` is for plain HTTP, and TLS doesn't relax any other rule:
+  the bearer token (below) is still required on every request, and `--no-auth` still only works on
+  loopback.
+- **The self-signed certificate** is ECDSA P-256, valid for two years, and names `localhost`,
+  `127.0.0.1`, `::1`, the address the server binds when that is one address (not `0.0.0.0`) and
+  each `--tls-name`. It lives in `mcp-tls.pem` in the state directory (with the token file's
+  rules: a directory only you can write, a regular file you own, mode 0600, no symbolic link), and
+  later runs reuse it, so the fingerprint stays the same. It is made again, and says so, when it
+  was made for other names, has under 30 days left, or is damaged. A copy without the key,
+  `mcp-tls-cert.pem`, is written beside it: that file is what to give a client. Never copy
+  `mcp-tls.pem` off the machine: it holds the key.
+- **Trusting it.** The server prints the certificate's SHA-256 fingerprint in the form
+  `openssl x509 -fingerprint -sha256` prints, so a client can pin it or be checked against it:
+
+  ```bash
+  curl --cacert mcp-tls-cert.pem -H "Authorization: Bearer $(cat mcp-token)" https://box.lan:8377/mcp ...
+  openssl s_client -connect box.lan:8377 </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256
+  ```
+
+  A client that connects to an address or name the certificate doesn't carry fails its name check
+  (that is what `--tls-name` is for).
+- **Limits.** The handshake runs on the connection's own thread, holds one of its slots and has
+  the same deadline as a request head (`request_timeout` from the accept), so a client that stalls
+  or trickles a handshake is cut off as one that trickles a request is, and TLS doesn't raise the
+  connection caps. After it, a head or a body has one deadline however slowly its bytes arrive,
+  even when they trickle inside one TLS record; bodies and heads are bounded and framing is as
+  strict as over plain HTTP. A connection turned away for the limits can't be told so in TLS: it
+  gets the `503` in the clear. A failed handshake is logged (at most once a second), with the
+  client's alert when it sent one (`UnknownCA`: the client doesn't trust the certificate).
+- **Cost.** On a kept-alive connection TLS adds nothing a test can see. A call on a new connection
+  pays the handshake ([benchmarks](#tls-cost) below).
+
+#### TLS cost
+
+`https_call_overhead` (`cargo test --release -p simee-mcp --features tls https_call_overhead --
+--ignored --nocapture`) times `identity` `tools/call`s against the server in the same process,
+next to `http_call_overhead`'s plain rows. Medians of 5 rounds, two runs, a 4-vCPU Xeon @ 2.2 GHz
+Linux VM (not an Apple silicon host), 2026-11-28:
+
+| Call | Plain HTTP | HTTPS (TLS 1.3) |
+| --- | --- | --- |
+| Kept-alive connection, bearer token | 100 µs | 93-102 µs |
+| New connection, one call (plain: no token) | 227 µs | 1.5-1.6 ms resuming the last session; 2.1 ms with a full handshake |
+
+A client that keeps its connection pays the handshake once. Not measured: macOS, TLS under
+concurrent load, a network between the two ends. These rows are not in
+[benchmarks.md](benchmarks.md) yet.
+
 ### Security
 
-- TLS and OAuth are not built in (a follow-up issue tracks them). For access from another machine,
-  put the server behind a TLS-terminating reverse proxy (nginx, Caddy) on the same host, keep it
-  bound to loopback, and keep the token on. A non-loopback bind serves plain HTTP, where the token
-  crosses the network in the clear, so it is refused unless `--insecure-remote` acknowledges that
-  (a trusted network only).
+- OAuth is not built in (a follow-up issue tracks it), and without `--features tls` neither is
+  TLS. Over HTTPS the token is protected from the network. Without TLS, for access from another
+  machine put the server behind a TLS-terminating reverse proxy (nginx, Caddy) on the same host,
+  keep it bound to loopback, and keep the token on. A non-loopback bind without TLS serves plain
+  HTTP, where the token crosses the network in the clear, so it is refused unless
+  `--insecure-remote` acknowledges that (a trusted network only).
 - Authentication is on by default, on every bind, loopback included: a request without a valid
   `Authorization: Bearer <token>` gets 401. Tokens come from `--token-file` (default: `mcp-token`
   in simee's state directory, `$SIMEE_STATE_DIR`, else `~/Library/Application Support/simee` on
@@ -516,9 +593,10 @@ takes milliseconds). Reproduce: `cargo test --release -p simee-mcp http_call_ove
   costs a screenshot a read even when it doesn't change (no cheaper change probe exists in the
   API), and an input made through simee's own tools doesn't bring the next read forward.
   A change between a client's last read and its subscription's baseline read isn't announced.
-- Over HTTP: no TLS, no OAuth (a bearer token from a file is the only authentication; both are
-  tracked in a follow-up issue), no resumable streams, and an `Origin` allowlist beyond loopback
-  and the connection limits aren't configurable.
+- Over HTTP: no OAuth (a bearer token from a file is the only authentication; tracked in a
+  follow-up issue), TLS only in a build with `--features tls` and with certificates read at start,
+  no resumable streams, and an `Origin` allowlist beyond loopback and the connection limits aren't
+  configurable.
 - Tool calls run in the server's process, on its own threads, with a session per thread; they don't
   go through a running `simee serve`, so a long-lived MCP server holds its own simulator connection.
 - A tool is as powerful as the method: `exec` runs programs inside an iOS device, `write` and `rm`

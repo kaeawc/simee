@@ -14,6 +14,7 @@ pub mod console;
 pub mod display;
 pub mod host;
 pub mod listing;
+pub mod procs;
 pub mod state;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
