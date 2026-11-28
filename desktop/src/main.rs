@@ -1537,18 +1537,21 @@ mod tests {
     }
 
     #[test]
-    fn a_device_with_no_body_stays_flat_and_says_so() {
-        // The Vision Pro has no body yet; when headsets get one, pick a device with none.
-        assert!(!sim_core::body::has_body(sim_core::form_factor::FormFactor::Vision));
+    fn the_no_body_status_names_every_form_factor_now_that_each_has_a_body() {
+        // No form factor lacks a body, so no scene can show the flat fallback; the status that a
+        // future one would get lists them all.
+        assert!(sim_core::form_factor::FormFactor::ALL.into_iter().all(sim_core::body::has_body));
+        for name in ["phones", "tablets", "foldables", "watches", "TVs", "car head units", "XR headsets and glasses"] {
+            assert!(scene::NO_BODY.contains(name), "{name}: {}", scene::NO_BODY.as_str());
+        }
         let mut rt = polled_runtime(vision_pro_scene);
         rt.on_key = Some(on_key);
         rt.state.view3d.supported = true;
         rt.key(cmd('3'));
         rt.frame(1.0 / 60.0);
         assert!(rt.state.view3d.on);
-        assert_eq!(rt.state.status.as_deref(), Some(scene::NO_BODY.as_str()));
-        assert!(rt.find("scene-3d").is_none());
-        assert!(rt.find("device-screen").is_some());
+        assert_ne!(rt.state.status.as_deref(), Some(scene::NO_BODY.as_str()), "a Vision Pro has a body");
+        assert!(rt.find("scene-3d").is_some());
     }
 
     #[test]
@@ -1577,8 +1580,10 @@ mod tests {
             if let Some(b) = body {
                 let placed = scene::place(&b, size, sim_core::rotation::Rotation::Deg0).expect("placed");
                 let screen = b.screen(placed.display).expect("the placed screen");
-                // The frame lands on the body screen with its pixels (either orientation), not a fallback.
-                assert!(screen.px == size || screen.px == (size.1, size.0), "{}: {:?} vs {size:?}", d.name, screen.px);
+                // The frame lands on the body screen at its shape (either orientation), not a
+                // fallback: a half-size scene (a headset's) is the same frame at half the pixels.
+                let (px, size) = ((u64::from(screen.px.0), u64::from(screen.px.1)), (u64::from(size.0), u64::from(size.1)));
+                assert!(px.0 * size.1 == px.1 * size.0 || px.0 * size.0 == px.1 * size.1, "{}: {px:?} vs {size:?}", d.name);
             }
         }
         // The glasses' body is built from the glasses' own screen, not the headset's.
