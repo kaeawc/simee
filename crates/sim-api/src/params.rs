@@ -493,6 +493,8 @@ mod tests {
         assert!(shape_profile(&json!({"rules": "x"}), base).expect_err("bad rules").starts_with("bad rules: "));
     }
 
+    // Unix paths; device sets are iOS (macOS) only.
+    #[cfg(unix)]
     #[test]
     fn the_device_set_is_the_set_param_then_the_environment_then_the_default() {
         let env = Some("/farm/set");

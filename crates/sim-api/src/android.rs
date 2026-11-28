@@ -416,6 +416,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             null(d.key(usage, Direction::Up))
         }
         "install" | "uninstall" | "launch" | "terminate" | "apps" | "open_url" => app(&android, &d, method, p),
+        m if crate::android_files::METHODS.contains(&m) => crate::android_files::call(&android, &d, m, p),
         "processes" | "kill" | "exec" => debug(&android, &d, method, p),
         "network_shape" | "network_state" | "network_clear" | "connections" | "traffic" => {
             crate::android_net::call(&android, &d, method, p)

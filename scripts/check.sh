@@ -8,7 +8,8 @@
 # On Windows, where there is no bash, `cargo xtask check` (xtask/) runs the same steps.
 #
 # Steps: the script and docs linters (scripts/lint.sh: each one installed here, else a skip
-# line); rustfmt; clippy for this host; clippy for the other platform's target when its std is
+# line, a loud warning at the end, and under --all a failure: CI's docs-scripts job requires every
+# one); rustfmt; clippy for this host; clippy for the other platform's target when its std is
 # installed (macOS code from Linux: `rustup target add aarch64-apple-darwin`, and the reverse),
 # which type-checks code this host never compiles; the workspace tests (nextest if installed);
 # the desktop workspace when desktop/ changed (or with --all). A change that touches only docs
@@ -52,8 +53,19 @@ step() {
   fi
 }
 
+# How to install each linter CI runs (its docs-scripts job).
+install_hint() {
+  case $1 in
+    typos) echo "cargo install typos-cli --locked" ;;
+    shellcheck | shfmt | lychee | actionlint) echo "brew install $1  (or your package manager)" ;;
+    yamllint) echo "pipx install yamllint" ;;
+    *) echo "see the docs-scripts job in .github/workflows/ci.yml" ;;
+  esac
+}
+
 # Seconds each, and docs need them too: before the docs-only exit. shellcheck needs shfmt to
-# list the scripts.
+# list the scripts. A missing linter is a check CI will run and this push didn't.
+skipped=()
 for tool in shellcheck shfmt lychee typos actionlint yamllint; do
   bin=$tool
   [[ $tool == shellcheck ]] && ! command -v shfmt >/dev/null 2>&1 && bin=shfmt
@@ -61,11 +73,23 @@ for tool in shellcheck shfmt lychee typos actionlint yamllint; do
     step "$tool" scripts/lint.sh "$tool"
   else
     printf 'check: %-34sskipped: %s not installed\n' "$tool" "$bin"
+    skipped+=("$bin")
   fi
 done
+missing_linters() {
+  [[ ${#skipped[@]} -gt 0 ]] || return 0
+  printf 'check: WARNING: %d linter(s) CI runs were skipped here: %s\n' "${#skipped[@]}" "${skipped[*]}" >&2
+  for t in "${skipped[@]}"; do printf 'check:   install %s: %s\n' "$t" "$(install_hint "$t")" >&2; done
+}
+if [[ $mode == all && ${#skipped[@]} -gt 0 ]]; then
+  missing_linters
+  echo "check: FAILED: --all needs every linter CI's docs-scripts job runs" >&2
+  exit 1
+fi
 
 if [[ $mode == changed && -n $changed ]] && ! command grep -qvE '\.md$|^docs/|\.png$' <<<"$changed"; then
   echo "check: only docs changed; nothing to build"
+  missing_linters
   exit 0
 fi
 
@@ -111,3 +135,4 @@ if [[ $mode != quick ]] && touches '^desktop/'; then
   step "desktop tests" bash -c 'cd desktop && cargo test --quiet'
 fi
 echo "check: all passed in $(($(date +%s) - total))s"
+missing_linters

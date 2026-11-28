@@ -35,7 +35,7 @@ const DEFS: &[(&str, &str)] = &[
         "admission",
         r#"{verdict: "admit"|"hold"|"backoff", reasons: [string], predicted: {subject: string, devices: number, admissible: number,
             costs: [object], boot_cpu_pct: number, idle_cpu_pct: number, boot_memory_bytes: number, idle_memory_bytes: number,
-            memory_used_pct: object|null, memory_available_bytes: object|null, load: object|null}}"#,
+            memory_used_pct: object|null, memory_available_bytes: object|null, load: object|null}, host_basis?: string}"#,
     ),
     ("pacing", "{waited_s: number, timed_out: boolean, cancelled: boolean, steps: [object]}"),
     ("rate", r#"{"1s": number|null, "1m": number|null}"#),
@@ -98,7 +98,7 @@ pub const OUTPUTS: &[(&str, &str)] = &[
     (
         "host",
         r#"{snapshot: object, averages: [object], load_trend: string, thermal_state: string|null, thresholds: object,
-            verdict: {verdict: "admit"|"hold"|"backoff", reason: string, reasons: [string], load_limit: number|null}, reasons: [string]}"#,
+            verdict: {verdict: "admit"|"hold"|"backoff", reason: string, reasons: [string], load_limit: number|null}, reasons: [string], history_note?: string}"#,
     ),
     (
         "devices_usage",

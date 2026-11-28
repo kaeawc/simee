@@ -148,7 +148,7 @@ impl Adb {
         // stderr's cap leaves room for the pid line, which isn't the program's; what is past
         // `max_bytes` once it is taken off is cut below.
         let caps = [limits.max_bytes, limits.max_bytes.saturating_add(PID_LINE_MAX)];
-        let ran = crate::apps::capture(&mut command, limits.timeout, caps, &what)?;
+        let ran = crate::apps::capture(&mut command, None, limits.timeout, caps, &what)?;
         let stdout = String::from_utf8_lossy(&ran.stdout).into_owned();
         let (started, mut stderr) = take_pid(&ran.stderr);
         let truncated = ran.truncated || stderr.len() > limits.max_bytes;
