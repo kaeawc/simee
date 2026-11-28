@@ -421,6 +421,20 @@ fn spec(key: String, w: Window, size: (f32, f32), position: Option<(i32, i32)>) 
         ..AppSpec::new("simee", size, Window::default, view)
     };
     let app = rune::App::new(spec).on_close(on_close).on_quit(on_quit).on_visibility(on_visibility);
+    // A menu of its own, so the menu bar is this window's while it has focus: the main window's
+    // View items (⌘⌥S, ⌘⌥I, ⌘⌥R) leave with it and can't change the main window's panes from here
+    // (#560). An App without items would leave the bar to the main window's.
+    #[cfg(target_os = "macos")]
+    let app = app.menu_item(
+        rune::MenuItem::new("Pop Back In", |w: &mut Window, tx: &mut Tx| {
+            w.actions.push(Action::PopIn(w.udid().unwrap_or_default().to_owned()));
+            tx.request_poll();
+        })
+        .id("popout-pop-in")
+        .menu("View")
+        .key_equivalent("cmd+shift+o".parse().expect("a valid shortcut"))
+        .keys_first(),
+    );
     rune::WindowSpec::from_app(key, app).state(w).options(rune::WindowOptions { position, ..rune::WindowOptions::default() })
 }
 
@@ -600,7 +614,7 @@ pub fn stage_button(udid: &str, t: Theme) -> El {
 
 /// The device list's mark on a device that's out in its own window.
 pub fn row_mark(udid: &str, t: Theme) -> El {
-    icon(&icons::REVEAL, 13.0).key(format!("device-{udid}-popped")).label("In its own window").color(t.text_secondary)
+    icon(&icons::REVEAL, 13.0).key(crate::view::row_key("device-popped", udid)).label("In its own window").color(t.text_secondary)
 }
 
 /// What the stage shows for a selected device that's out in its own window.
@@ -660,8 +674,13 @@ fn on_visibility(w: &mut Window, visible: bool, _: &mut Tx) {
     }
 }
 
-/// ⌘⇧O pops the device back in; ⌘S saves a screenshot wherever the focus is.
+/// ⌘⇧O pops the device back in; ⌘S saves a screenshot wherever the focus is. The panes'
+/// shortcuts are the main window's: here they only say so, and change nothing there (#560).
 fn window_key(w: &mut Window, k: &KeyEvent, tx: &mut Tx) -> bool {
+    if crate::panes::ViewItem::for_key(k).is_some() {
+        w.status = Some("The device list and the panel are in the main window".into());
+        return true;
+    }
     let action = if is_toggle(k) {
         Action::PopIn(w.udid().unwrap_or_default().to_owned())
     } else if crate::keys::map(k) == KeyAction::Screenshot {
@@ -1054,7 +1073,7 @@ mod tests {
         assert!(main.state.popouts.is_open("A1"));
         assert_eq!(main.state.selected.as_deref(), Some("pixel_9"), "the main window shows the next running device");
         main.frame(1.0 / 60.0);
-        assert!(main.find("device-A1-popped").is_some(), "the list marks the device that's out");
+        assert!(main.find("device-popped:A1").is_some(), "the list marks the device that's out");
         let mut win = take_window(&mut main, "A1");
         assert!(win.find("popout-screen").is_some() && win.find("home-button").is_some() && win.find("popin-button").is_some());
         assert!(win.find("scene-3d").is_none(), "pop-outs are flat");
@@ -1070,8 +1089,52 @@ mod tests {
         main.frame(1.0 / 60.0);
         assert!(!main.state.popouts.is_open("A1"));
         assert_eq!(main.state.selected.as_deref(), Some("A1"), "back as the main window's device");
-        assert!(main.find("device-A1-popped").is_none());
+        assert!(main.find("device-popped:A1").is_none());
         assert!(main.find("device-screen").is_some());
+    }
+
+    /// #560: popping a device out and back in leaves the main window's panes as they were (the
+    /// list hidden, the resource panel open), the panel stays on screen while the main window
+    /// shows no device, and the panes' shortcuts in the pop-out change nothing in the main window.
+    #[test]
+    fn popping_out_and_back_leaves_each_windows_panes_alone() {
+        let mut main = main_window(crate::demo);
+        main.update(|s, _| {
+            crate::panes::toggle(s, crate::panes::Side::Sidebar, crate::panes::Cause::Key);
+            crate::resources::toggle(s, crate::panes::Cause::Key);
+        });
+        settle(&mut main);
+        let shown = |rt: &Runtime<State>| (rt.find("device-list").is_some(), rt.find("resources-panel").is_some());
+        assert_eq!(shown(&main), (false, true));
+        let logged = main.state.panes.changes.clone();
+        act(&mut main, Action::PopOut("A1".into()));
+        assert!(main.state.popouts.is_open("A1"));
+        assert_eq!(shown(&main), (false, true), "popping out changes no pane");
+        let mut win = take_window(&mut main, "A1");
+        for c in ['s', 'i', 'r'] {
+            win.key(KeyEvent { key: Key::Command(c), mods: Mods { cmd: true, alt: true, ..Mods::default() } });
+        }
+        win.frame(1.0 / 60.0);
+        settle(&mut main);
+        assert_eq!(shown(&main), (false, true), "the pop-out's ⌘⌥ keys aren't the main window's");
+        assert!(win.find("popout-status").is_some(), "the pop-out says where the panes are");
+        // The platform panel too: with the resource panel off, the panel stays while A1 is out,
+        // empty when the main window shows no screen.
+        main.update(|s, _| {
+            crate::resources::toggle(s, crate::panes::Cause::Key);
+            s.offline_screen = false;
+        });
+        settle(&mut main);
+        assert!(main.find("inspector-empty").is_some(), "the panel stays, empty, while no screen shows");
+        main.update(|s, _| s.offline_screen = true);
+        let (x, y) = win.find("popin-button").unwrap();
+        win.pointer_down(x, y);
+        win.pointer_up(x, y);
+        win.frame(1.0 / 60.0);
+        settle(&mut main);
+        assert!(!main.state.popouts.is_open("A1"));
+        assert!(main.find("device-list").is_none() && main.find("debug-panel").is_some(), "docked: the panes as they were");
+        assert_eq!(main.state.panes.changes.len(), logged.len() + 1, "only the resource panel's key: {:?}", main.state.panes.changes);
     }
 
     /// Closing a pop-out returns its device; it doesn't shut it down.
@@ -1134,7 +1197,7 @@ mod tests {
         assert!(!main.state.popouts.is_open("B2"));
         assert_eq!(main.state.status.as_deref(), Some("Boot iPhone 17 Pro Max to pop it out"));
         // The menu itself.
-        let (x, y) = main.find("device-A1").unwrap();
+        let (x, y) = main.find("device-row:A1").unwrap();
         main.secondary_down(x, y);
         main.secondary_up(x, y);
         main.frame(1.0 / 60.0);

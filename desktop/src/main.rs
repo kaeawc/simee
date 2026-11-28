@@ -20,7 +20,8 @@
 //! `cargo run -- --snap shot.png --scene demo` renders headless (scenes: demo, android, foldable,
 //! folded, tablet, ipad, watch, tv, apple-watch, apple-tv, auto, carplay, vision-pro, android-xr,
 //! glasses, turned, turned-tablet, empty,
-//! sidebar-hidden, inspector-hidden, panes-hidden, panes-wide, resources, resources-memory, admission,
+//! sidebar-hidden, inspector-hidden, panes-hidden, panes-wide, toggled-list, toggled-panel, panel-empty,
+//! resources, resources-memory, admission,
 //! admission-many, popped, list-booted, list-search); a release build needs `--features tooling` for it.
 
 mod admission;
@@ -870,6 +871,8 @@ fn coalesce_moves(inputs: Vec<Input>) -> Vec<Input> {
 fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
     // A landed admission check queues its boot (or shows its sheet) before the actions run.
     let mut changed = admission::poll(s);
+    // Before this poll's scan lands: what Return boots is what the list showed.
+    list::keep_highlight(s);
     if let Some((button, due)) = s.held
         && t >= due
     {
@@ -1079,8 +1082,15 @@ fn boot_device(s: &mut State, udid: &str) {
         s.status = Some(format!("Wait for {running} to finish"));
         return;
     }
-    if matches!(info.state, DeviceState::Booted | DeviceState::Booting) {
-        return;
+    match info.state {
+        DeviceState::Booted => return,
+        // Started elsewhere (AutoMobile, simctl, a farm): the Boot button still shows, so say why
+        // it does nothing.
+        DeviceState::Booting => {
+            s.status = Some(format!("{} is already booting", info.name));
+            return;
+        }
+        _ => {}
     }
     // Its own window holds it, stopped: closing that brings it back here to boot.
     if s.popouts.is_open(udid) {
@@ -1355,6 +1365,9 @@ fn main() {
             ("inspector-hidden", panes::inspector_hidden_scene),
             ("panes-hidden", panes::panes_hidden_scene),
             ("panes-wide", panes::panes_wide_scene),
+            ("toggled-list", panes::toggled_list_scene),
+            ("toggled-panel", panes::toggled_panel_scene),
+            ("panel-empty", panes::panel_empty_scene),
             ("resources", resources::scene),
             ("resources-memory", resources::memory_scene),
             ("popped", popout::scene),
@@ -1380,6 +1393,9 @@ fn main() {
         scene::set_supported(true);
         // Headless runs and scenes never read or write the user's settings.
         let store = if headless() { settings::Store::default() } else { settings::Store::open_default() };
+        if let Some(path) = store.path() {
+            eprintln!("simee-desktop: settings: {}", path.display());
+        }
         let opened_at = panes::open_at(&mut spec, &store);
         // With the view off the compositor draws Rune's default frame.
         let app = rune::App::new(spec)
@@ -1393,6 +1409,9 @@ fn main() {
             Some(options) => app.window_options(options),
             None => app,
         };
+        // The View menu: titled on the first poll, retitled as the panes change.
+        #[cfg(target_os = "macos")]
+        panes::remember_app(app.handle());
         // SIGINT and SIGTERM quit like ⌘Q (#553): `on_quit` saves and stops what the window owns.
         if !headless() {
             let handle = app.handle();
@@ -1459,7 +1478,16 @@ mod tests {
     #[test]
     fn demo_scene_shows_devices_screen_and_controls() {
         let rt = runtime(demo);
-        for key in ["device-list", "device-A1", "device-B2", "device-D4", "device-screen", "home-button", "lock-button", "device-title"] {
+        for key in [
+            "device-list",
+            "device-row:A1",
+            "device-row:B2",
+            "device-row:D4",
+            "device-screen",
+            "home-button",
+            "lock-button",
+            "device-title",
+        ] {
             assert!(rt.find(key).is_some(), "{key} rendered");
         }
         assert!(rt.find("placeholder").is_none());
@@ -1494,7 +1522,7 @@ mod tests {
         rt.pointer_up(x + w / 2.0, y + h / 2.0);
         rt.frame(1.0 / 60.0);
         assert!(rt.state.inputs.is_empty(), "no touch through the 3D view: {:?}", rt.state.inputs);
-        press(&mut rt, "device-B2");
+        press(&mut rt, "device-row:B2");
         // B2 is shut down: one click selects and boots it.
         assert_eq!(rt.state.actions, vec![Action::Select("B2".into()), Action::Boot("B2".into())]);
     }
@@ -1675,11 +1703,11 @@ mod tests {
     #[test]
     fn devices_and_title_carry_platform_labels() {
         let rt = runtime(demo);
-        assert_eq!(text_of(&rt, "device-A1-platform"), "iOS");
-        assert_eq!(text_of(&rt, "device-D4-platform"), "iPadOS");
-        assert_eq!(text_of(&rt, "device-E5-platform"), "watchOS");
+        assert_eq!(text_of(&rt, "device-platform:A1"), "iOS");
+        assert_eq!(text_of(&rt, "device-platform:D4"), "iPadOS");
+        assert_eq!(text_of(&rt, "device-platform:E5"), "watchOS");
         assert_eq!(text_of(&rt, "device-title"), "iPhone 17 · iOS · Phone · Booted");
-        let row = rt.elements().into_iter().find(|e| e.key.as_deref() == Some("device-D4")).and_then(|e| e.label);
+        let row = rt.elements().into_iter().find(|e| e.key.as_deref() == Some("device-row:D4")).and_then(|e| e.label);
         assert_eq!(row.as_deref(), Some("iPad Pro 11-inch (M4), iPadOS · Tablet"));
     }
 
@@ -1688,12 +1716,12 @@ mod tests {
         let rt = runtime(demo);
         assert_eq!(text_of(&rt, "platform-ios"), "iOS");
         assert_eq!(text_of(&rt, "platform-android"), "Android");
-        assert_eq!(text_of(&rt, "device-F6-platform"), "tvOS");
-        assert_eq!(text_of(&rt, "device-G7-platform"), "visionOS");
-        assert_eq!(text_of(&rt, "device-pixel_9-platform"), "Android");
-        assert_eq!(text_of(&rt, "device-wear_round-platform"), "Wear OS");
-        assert_eq!(text_of(&rt, "device-google_tv-platform"), "Android TV");
-        assert_eq!(text_of(&rt, "device-automotive-platform"), "Android Automotive");
+        assert_eq!(text_of(&rt, "device-platform:F6"), "tvOS");
+        assert_eq!(text_of(&rt, "device-platform:G7"), "visionOS");
+        assert_eq!(text_of(&rt, "device-platform:pixel_9"), "Android");
+        assert_eq!(text_of(&rt, "device-platform:wear_round"), "Wear OS");
+        assert_eq!(text_of(&rt, "device-platform:google_tv"), "Android TV");
+        assert_eq!(text_of(&rt, "device-platform:automotive"), "Android Automotive");
     }
 
     #[test]
@@ -1950,14 +1978,14 @@ mod tests {
     fn another_devices_boot_is_not_the_selected_devices() {
         let boots = FakeBoots::default();
         let mut rt = booting_runtime(&boots, admit);
-        press(&mut rt, "device-B2"); // iPhone 17 Pro Max, shut down: one click boots it
+        press(&mut rt, "device-row:B2"); // iPhone 17 Pro Max, shut down: one click boots it
         assert_eq!(boots.booted(), ["B2"]);
         assert_eq!(rt.state.selected.as_deref(), Some("B2"));
         assert_eq!(shown(&rt, "busy").as_deref(), Some("Booting…"));
         assert!(rt.find("boot-button").is_none());
         assert!(rt.find("window-busy").is_none(), "the shown device's boot isn't counted beside Refresh");
         // B: another shut-down device, selected only.
-        let (x, y) = rt.find("device-D4").expect("iPad row");
+        let (x, y) = rt.find("device-row:D4").expect("iPad row");
         rt.physical_input(rune::PhysicalInput::Modifiers(rune::Mods { alt: true, ..rune::Mods::default() }));
         rt.frame(1.0 / 60.0);
         rt.pointer_down(x, y);
@@ -1974,7 +2002,7 @@ mod tests {
         assert!(rt.elements().iter().all(|e| e.text.as_deref() != Some("Waiting for the device to finish booting…")), "no booting stage");
         assert_eq!(shown(&rt, "window-busy").as_deref(), Some("1 device booting"));
         // Back on A: its boot shows.
-        let (x, y) = rt.find("device-B2").expect("B2 row");
+        let (x, y) = rt.find("device-row:B2").expect("B2 row");
         rt.physical_input(rune::PhysicalInput::Modifiers(rune::Mods { alt: true, ..rune::Mods::default() }));
         rt.frame(1.0 / 60.0);
         rt.pointer_down(x, y);
@@ -1996,8 +2024,8 @@ mod tests {
     fn two_concurrent_boots_finish_and_report_on_their_own() {
         let boots = FakeBoots::default();
         let mut rt = booting_runtime(&boots, admit);
-        press(&mut rt, "device-B2"); // B2
-        press(&mut rt, "device-pixel_fold"); // pixel_fold
+        press(&mut rt, "device-row:B2"); // B2
+        press(&mut rt, "device-row:pixel_fold"); // pixel_fold
         assert_eq!(boots.booted(), ["B2", "pixel_fold"]);
         assert!(rt.state.jobs.booting("B2") && rt.state.jobs.booting("pixel_fold"));
         assert_eq!(shown(&rt, "window-busy").as_deref(), Some("1 device booting"));
@@ -2022,7 +2050,7 @@ mod tests {
     fn click_to_boot_goes_through_admission() {
         let boots = FakeBoots::default();
         let mut rt = booting_runtime(&boots, hold);
-        press(&mut rt, "device-C3"); // iPhone 18 Pro
+        press(&mut rt, "device-row:C3"); // iPhone 18 Pro
         assert_eq!(rt.state.selected.as_deref(), Some("C3"));
         assert!(boots.booted().is_empty(), "held: nothing boots yet");
         let sheet = rt.state.admission.sheet.clone().expect("the sheet asks");
@@ -2034,7 +2062,7 @@ mod tests {
         until(&mut rt, "C3 booted", |rt| !rt.state.jobs.any());
         // Return on a focused shut-down row boots it too (admitted this time).
         rt.state.admission = admission::Gate::with_call(admit);
-        rt.update(|_, tx| tx.focus("device-E5", false));
+        rt.update(|_, tx| tx.focus("device-row:E5", false));
         rt.frame(1.0 / 60.0);
         rt.key(KeyEvent::from(Key::Enter));
         rt.frame(1.0 / 60.0);
@@ -2062,7 +2090,7 @@ mod tests {
         rt.state.devices.iter_mut().filter(|d| d.udid == "A1").for_each(|d| d.state = DeviceState::Shutdown);
         rt.frame(1.0 / 60.0);
         // The main window selects shut-down B2 without booting it (⌥-click).
-        let (x, y) = rt.find("device-B2").expect("B2 row");
+        let (x, y) = rt.find("device-row:B2").expect("B2 row");
         rt.physical_input(rune::PhysicalInput::Modifiers(rune::Mods { alt: true, ..rune::Mods::default() }));
         rt.frame(1.0 / 60.0);
         rt.pointer_down(x, y);
@@ -2071,7 +2099,7 @@ mod tests {
         rt.physical_input(rune::PhysicalInput::Modifiers(rune::Mods::default()));
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.selected.as_deref(), Some("B2"));
-        press(&mut rt, "device-A1");
+        press(&mut rt, "device-row:A1");
         rt.frame(1.0 / 60.0);
         assert!(boots.booted().is_empty(), "neither A1 nor the selected B2 boots: {:?}", boots.booted());
         assert_eq!(rt.state.selected.as_deref(), Some("B2"), "A1's window came forward instead");
@@ -2128,7 +2156,7 @@ mod tests {
     fn return_on_a_focused_row_boots_its_device_after_a_rescan() {
         let boots = FakeBoots::default();
         let mut rt = booting_runtime(&boots, admit);
-        rt.update(|_, tx| tx.focus("device-E5", false));
+        rt.update(|_, tx| tx.focus("device-row:E5", false));
         rt.frame(1.0 / 60.0);
         rt.state.devices.insert(0, android_info("lane-x-1", FormFactor::Phone, "android-36;google_apis", DeviceState::Shutdown));
         rt.frame(1.0 / 60.0);
@@ -2156,7 +2184,7 @@ mod tests {
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.search.text, "17 26.5");
         assert_eq!(list::order(&rt.state), [0, 1], "the iPhone 17s on iOS 26.5, the booted one first");
-        assert!(rt.find("device-D4").is_none(), "the rest are hidden");
+        assert!(rt.find("device-row:D4").is_none(), "the rest are hidden");
         assert_eq!(list::highlighted(&rt.state), Some(0));
         rt.key(KeyEvent::from(Key::Down));
         rt.key(KeyEvent::from(Key::Down));
@@ -2177,12 +2205,12 @@ mod tests {
         // Typing more starts again at the top.
         rt.key(KeyEvent::from(Key::Text(" ".into())));
         rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.search_highlight, None);
+        assert_eq!(rt.state.search_highlight.as_deref(), Some("A1"), "on the first match, pinned");
         rt.key(KeyEvent::from(Key::Escape));
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.search.text, "", "Escape clears");
         assert!(rt.state.search.focused, "and keeps the field");
-        assert!(rt.find("device-D4").is_some(), "every group is back");
+        assert!(rt.find("device-row:D4").is_some(), "every group is back");
         rt.key(KeyEvent::from(Key::Escape));
         rt.frame(1.0 / 60.0);
         assert!(!rt.state.search.focused, "Escape on an empty field leaves it");
@@ -2198,7 +2226,7 @@ mod tests {
         rt.key(cmd('f'));
         rt.frame(1.0 / 60.0);
         assert!(!rt.state.search.focused, "nothing focused: not the list's");
-        press(&mut rt, "device-A1"); // booted: selected, and the row has focus
+        press(&mut rt, "device-row:A1"); // booted: selected, and the row has focus
         rt.key(cmd('f'));
         rt.frame(1.0 / 60.0);
         assert!(rt.state.search.focused);
@@ -2416,7 +2444,7 @@ mod tests {
         let mut rt = runtime(demo);
         press(&mut rt, "home-button");
         press(&mut rt, "lock-button");
-        press(&mut rt, "device-B2");
+        press(&mut rt, "device-row:B2");
         // B2 is shut down: one click selects and boots it.
         assert_eq!(
             rt.state.actions,
@@ -2566,16 +2594,16 @@ mod tests {
     fn the_selected_device_is_highlighted() {
         let mut rt = polled_runtime(demo);
         let sel = view::selection(rune::tok::theme(true), true);
-        let (row0, row1) = (element(&rt, "device-A1"), element(&rt, "device-B2"));
+        let (row0, row1) = (element(&rt, "device-row:A1"), element(&rt, "device-row:B2"));
         assert!(row0.item_selected && !row1.item_selected, "only iPhone 17 is selected");
         assert_eq!(row0.fill, sel.fill, "the selected row is tinted");
         assert_ne!(row1.fill, sel.fill);
-        assert_eq!(element(&rt, "device-A1-bar").fill, sel.bar, "and marked with the accent bar");
-        assert_eq!(element(&rt, "device-B2-bar").fill.a, 0.0, "the bar's slot is empty on the others");
+        assert_eq!(element(&rt, "device-bar:A1").fill, sel.bar, "and marked with the accent bar");
+        assert_eq!(element(&rt, "device-bar:B2").fill.a, 0.0, "the bar's slot is empty on the others");
         // The press's frame asks for the next, whose poll selects.
-        press(&mut rt, "device-B2");
+        press(&mut rt, "device-row:B2");
         rt.frame(1.0 / 60.0);
-        assert!(element(&rt, "device-B2").item_selected && !element(&rt, "device-A1").item_selected);
+        assert!(element(&rt, "device-row:B2").item_selected && !element(&rt, "device-row:A1").item_selected);
     }
 
     /// WCAG contrast of two opaque colours (linear light in, as Rune's colours are).
@@ -2606,7 +2634,7 @@ mod tests {
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.wake_deadline(), None, "a still window sleeps");
         let before = rt.state.selected.clone();
-        for key in ["device-B2", "home-button", "overlay-blended-layers", "tab-network", "debug-reload"] {
+        for key in ["device-row:B2", "home-button", "overlay-blended-layers", "tab-network", "debug-reload"] {
             press(&mut rt, key);
             assert!(rt.state.actions.is_empty(), "{key}: performed in its frame");
             assert_eq!(rt.wake_deadline(), None, "{key}: no wake, the window sleeps");
@@ -2874,5 +2902,126 @@ mod tests {
         assert_eq!(gpu_backend(Some("")), Ok(None));
         let err = gpu_backend(Some("vulkan")).expect_err("unknown backend");
         assert!(err.contains("SIMEE_GPU_BACKEND") && err.contains("vulkan"), "{err}");
+    }
+
+    /// What the panes show: the list, the panel, and the resource panel in it.
+    fn panes_shown(rt: &Runtime<State>) -> (bool, bool, bool) {
+        let on = |k: &str| rt.find(k).is_some();
+        (on("device-list"), on("resources-toggle"), on("resources-panel"))
+    }
+
+    /// #559, #560, #561: with the list hidden and the resource panel open, a selection change, a
+    /// boot from here finishing (and the rescan after it), a periodic scan and an admission
+    /// check that asks change neither, and log nothing.
+    #[test]
+    fn scans_boots_selections_and_admission_leave_the_panes_alone() {
+        let boots = FakeBoots::default();
+        let mut rt = booting_runtime(&boots, hold);
+        rt.on_key = Some(on_key);
+        rt.key(KeyEvent { key: Key::Command('s'), mods: rune::Mods { cmd: true, alt: true, ..rune::Mods::default() } });
+        rt.key(KeyEvent { key: Key::Command('r'), mods: rune::Mods { cmd: true, alt: true, ..rune::Mods::default() } });
+        rt.frame(1.0 / 60.0);
+        assert_eq!(panes_shown(&rt), (false, true, true), "list hidden, resource panel open");
+        let logged = rt.state.panes.changes.clone();
+        assert_eq!(logged.len(), 2, "{logged:?}");
+        assert!(logged.iter().all(|c| c.cause == panes::Cause::Key));
+        // A selection change, to a device with no screen.
+        rt.state.actions.push(Action::Select("B2".into()));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(panes_shown(&rt), (false, true, true), "a selection");
+        // A periodic scan that changes the list.
+        let mut devices = rt.state.devices.clone();
+        devices.push(android_info("lane-x-1", FormFactor::Phone, "android-36;google_apis", DeviceState::Shutdown));
+        rt.update(move |s, _| {
+            s.apply_scan(scan::Scan { devices, ..scan::Scan::default() });
+        });
+        rt.frame(1.0 / 60.0);
+        assert_eq!(panes_shown(&rt), (false, true, true), "a rescan");
+        // An admission check that holds: its sheet asks, and is cancelled.
+        rt.state.admission = admission::Gate::with_call(hold);
+        rt.state.actions.push(Action::Boot("B2".into()));
+        until(&mut rt, "the sheet", |rt| rt.state.admission.sheet.is_some());
+        assert_eq!(panes_shown(&rt), (false, true, true), "the admission sheet");
+        admission::choose(&mut rt.state, admission::Choice::BootAnyway);
+        rt.frame(1.0 / 60.0);
+        // A boot from here finishing, and the rescan after it.
+        until(&mut rt, "booting", |rt| rt.state.jobs.booting("B2"));
+        rt.update(|s, _| s.devices.iter_mut().filter(|d| d.udid == "B2").for_each(|d| d.state = DeviceState::Booted));
+        boots.release("B2", Ok(()));
+        until(&mut rt, "booted", |rt| !rt.state.jobs.any());
+        assert_eq!(panes_shown(&rt), (false, true, true), "a boot finishing");
+        assert_eq!(rt.state.panes.changes, logged, "nothing but the two keys changed the panes");
+        assert!(!rt.state.prefs.current.sidebar.visible && rt.state.prefs.current.resources.visible);
+    }
+
+    /// The panel shows whether or not a screen does: selecting a shut-down device keeps it, with
+    /// a note, and the gauge button to the resource panel stays in reach.
+    #[test]
+    fn the_panel_stays_with_no_device_on_screen() {
+        let mut rt = polled_runtime(demo);
+        assert!(rt.find("debug-panel").is_some());
+        rt.state.offline_screen = false;
+        rt.state.actions.push(Action::Select("B2".into()));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.find("debug-panel").is_none() && rt.find("inspector-empty").is_some(), "the panel says why it's empty");
+        assert!(rt.find("resources-toggle").is_some());
+        assert!(rt.find("inspector-toggle").is_some() && rt.find("sidebar-toggle").is_some());
+        assert!(rt.state.panes.changes.is_empty());
+    }
+
+    /// #571: Return boots the match the list showed first, even when a scan lists a better one
+    /// before it's pressed (a farm lane's new AVD), with no arrow key pressed in between.
+    #[test]
+    fn return_boots_the_first_match_shown_after_a_rescan_lists_a_better_one() {
+        let boots = FakeBoots::default();
+        let mut rt = booting_runtime(&boots, admit);
+        rt.on_key = Some(on_key);
+        rt.key(cmd('k'));
+        for c in "pixel_f".chars() {
+            rt.key(KeyEvent::from(Key::Text(c.to_string())));
+        }
+        rt.frame(1.0 / 60.0);
+        let first = rt.state.devices[list::order(&rt.state)[0]].udid.clone();
+        assert_eq!(first, "pixel_fold");
+        rt.update(|s, _| s.devices.insert(0, android_info("pixel_f", FormFactor::Phone, "android-36;google_apis", DeviceState::Shutdown)));
+        let order = list::order(&rt.state);
+        assert_eq!(rt.state.devices[order[0]].udid, "pixel_f", "the new AVD ranks first");
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.devices[list::highlighted(&rt.state).expect("a match")].udid, "pixel_fold", "the highlight stays");
+        rt.key(KeyEvent::from(Key::Enter));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(boots.booted(), ["pixel_fold"]);
+        boots.release("pixel_fold", Ok(()));
+        until(&mut rt, "booted", |rt| !rt.state.jobs.any());
+    }
+
+    /// #571: a row's keys can't be a fixed key's or another row's, whatever the AVD is named.
+    #[test]
+    fn row_keys_never_collide_with_fixed_keys_or_each_other() {
+        let mut rt = polled_runtime(demo);
+        for name in ["screen", "title", "list", "x", "x-mark", "x-platform"] {
+            rt.state.devices.push(android_info(name, FormFactor::Phone, "android-36;google_apis", DeviceState::Shutdown));
+        }
+        rt.frame(1.0 / 60.0);
+        let keys: Vec<String> = rt.elements().into_iter().filter_map(|e| e.key).collect();
+        let mut unique = keys.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), keys.len(), "every key is one element's");
+        assert!(rt.find("device-row:screen").is_some() && rt.find("device-screen").is_some());
+        assert!(rt.find("device-row:x-mark").is_some() && rt.find("device-mark:x").is_some());
+    }
+
+    /// #571: Boot on a device that's booting already (started elsewhere) says so.
+    #[test]
+    fn boot_on_a_booting_device_says_it_is_already_booting() {
+        let boots = FakeBoots::default();
+        let mut rt = booting_runtime(&boots, admit);
+        rt.state.devices.iter_mut().filter(|d| d.udid == "B2").for_each(|d| d.state = DeviceState::Booting);
+        rt.state.actions.push(Action::Select("B2".into()));
+        rt.frame(1.0 / 60.0);
+        press(&mut rt, "boot-button");
+        assert!(boots.booted().is_empty());
+        assert_eq!(rt.state.status.as_deref(), Some("iPhone 17 Pro Max is already booting"));
     }
 }
