@@ -799,6 +799,8 @@ mod tests {
         assert!(merge(Client::Codex, Some("[mcp_servers"), "simee", &entry(), true).is_err());
     }
 
+    // Unix paths: on Windows `/bin/simee` resolves to a drive path (Windows coverage is a follow-up).
+    #[cfg(unix)]
     #[test]
     fn install_writes_and_dry_run_does_not() {
         let dir = Dir::new();

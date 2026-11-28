@@ -25,8 +25,8 @@
 //!   The observer waits with no timer and is stopped when the feed ends or its output can't be
 //!   followed (and exits by itself with this process).
 
+use sim_core::hostfs::MetadataExt;
 use std::collections::HashMap;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 

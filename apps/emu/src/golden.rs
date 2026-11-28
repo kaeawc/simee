@@ -8,7 +8,7 @@
 //! boot completed. Nothing here needs a window, audio or a GPU beyond what `-avd` would use.
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -263,9 +263,13 @@ fn wait_exit(child: &mut Child, limit: Duration) -> emu_avd::Result<Option<std::
 }
 
 fn stop_child(child: &mut Child) {
+    #[cfg(unix)]
     if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
         let _ = rustix::process::kill_process(pid, rustix::process::Signal::INT);
     }
+    // No SIGINT on Windows; a clean stop (a console control event) comes with its signals (#245).
+    #[cfg(windows)]
+    let _ = child.kill();
     let until = Instant::now() + Duration::from_secs(20);
     while Instant::now() < until {
         if child.try_wait().ok().flatten().is_some() {
@@ -374,7 +378,7 @@ fn launcher_resumed(text: &str) -> bool {
 /// `kill` on emu's console at `port`, the stock text protocol: the greeting, `auth <token>` from
 /// `~/.emulator_console_auth_token`, then the command. emu stops the guest and exits.
 pub fn console_kill(port: u16) -> std::io::Result<()> {
-    let token = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".emulator_console_auth_token"));
+    let token = std::env::home_dir().map(|h| h.join(".emulator_console_auth_token"));
     console_kill_with(port, token.and_then(|p| std::fs::read_to_string(p).ok()).as_deref().map(str::trim))
 }
 

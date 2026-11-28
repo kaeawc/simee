@@ -126,7 +126,7 @@ pub(crate) struct Connected {
     pub input_note: Option<String>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Connected {
     pub fn new(publication: Box<dyn Publication>) -> Connected {
         Connected { publication, input_note: None }
@@ -1512,71 +1512,80 @@ pub(crate) mod tests {
 
     const URL: &str = "http://127.0.0.1:8889/sim/whip";
 
-    /// A WHIP session that appends its DELETE to a file another process reads (`shutdown`'s
-    /// tests), or, `wedged`, never finishes it.
-    struct FilePublication {
-        resource: String,
-        log: PathBuf,
-        wedged: bool,
-    }
+    /// The fakes `shutdown`'s tests start in a child process (unix: they need its signals).
+    #[cfg(unix)]
+    mod global {
+        use super::*;
 
-    impl Publication for FilePublication {
-        fn send(&mut self, access_unit: &[u8], _: Duration) -> sim_rtc::Result<Sent> {
-            Ok(Sent::Queued { packets: 1, keyframe: access_unit.get(4) == Some(&0x67) })
+        /// A WHIP session that appends its DELETE to a file another process reads (`shutdown`'s
+        /// tests), or, `wedged`, never finishes it.
+        struct FilePublication {
+            resource: String,
+            log: PathBuf,
+            wedged: bool,
         }
 
-        fn resource(&self) -> String {
-            self.resource.clone()
-        }
-
-        fn close(self: Box<Self>) -> sim_rtc::Result<()> {
-            if self.wedged {
-                loop {
-                    std::thread::park();
-                }
+        impl Publication for FilePublication {
+            fn send(&mut self, access_unit: &[u8], _: Duration) -> sim_rtc::Result<Sent> {
+                Ok(Sent::Queued { packets: 1, keyframe: access_unit.get(4) == Some(&0x67) })
             }
-            use std::io::Write as _;
-            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.log).expect("log");
-            writeln!(f, "DELETE {}", self.resource).expect("write");
-            Ok(())
+
+            fn resource(&self) -> String {
+                self.resource.clone()
+            }
+
+            fn close(self: Box<Self>) -> sim_rtc::Result<()> {
+                if self.wedged {
+                    loop {
+                        std::thread::park();
+                    }
+                }
+                use std::io::Write as _;
+                let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.log).expect("log");
+                writeln!(f, "DELETE {}", self.resource).expect("write");
+                Ok(())
+            }
+        }
+
+        struct FileWhip {
+            log: PathBuf,
+            wedged: bool,
+        }
+
+        impl Whip for FileWhip {
+            fn connect(
+                &self,
+                config: PublisherConfig,
+                _: Option<InputSession>,
+                _: Box<dyn FnMut(PublisherEvent) + Send>,
+            ) -> sim_rtc::Result<Connected> {
+                let resource = format!("{}/session-0", config.endpoint);
+                Ok(Connected::new(Box::new(FilePublication { resource, log: self.log.clone(), wedged: self.wedged })))
+            }
+        }
+
+        struct NoInput;
+
+        impl DeviceInput for NoInput {
+            fn call(&mut self, _: &str, _: &Value) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+        }
+
+        /// Makes this process's streams (the ones the server stops as it exits) run on fakes whose
+        /// DELETE goes to `log` (or never finishes, `wedged`), and starts one; its id.
+        pub(crate) fn start_global_fake_stream(log: &std::path::Path, wedged: bool) -> String {
+            let make: MakeInput = Arc::new(|| Box::new(NoInput));
+            let whip = Arc::new(FileWhip { log: log.to_owned(), wedged });
+            let streams = Arc::new(Streams::new(Arc::new(SystemClock), Arc::new(FakeMedia::default()), whip, make));
+            assert!(GLOBAL.set(streams.clone()).is_ok(), "this process's streams were already made");
+            let started = streams.call("stream_start", &json!({"whip_url": URL}), &mut devices).expect("start");
+            started["stream_id"].as_str().expect("id").to_owned()
         }
     }
 
-    struct FileWhip {
-        log: PathBuf,
-        wedged: bool,
-    }
-
-    impl Whip for FileWhip {
-        fn connect(
-            &self,
-            config: PublisherConfig,
-            _: Option<InputSession>,
-            _: Box<dyn FnMut(PublisherEvent) + Send>,
-        ) -> sim_rtc::Result<Connected> {
-            let resource = format!("{}/session-0", config.endpoint);
-            Ok(Connected::new(Box::new(FilePublication { resource, log: self.log.clone(), wedged: self.wedged })))
-        }
-    }
-
-    struct NoInput;
-
-    impl DeviceInput for NoInput {
-        fn call(&mut self, _: &str, _: &Value) -> Result<Value, String> {
-            Ok(Value::Null)
-        }
-    }
-
-    /// Makes this process's streams (the ones the server stops as it exits) run on fakes whose
-    /// DELETE goes to `log` (or never finishes, `wedged`), and starts one; its id.
-    pub(crate) fn start_global_fake_stream(log: &std::path::Path, wedged: bool) -> String {
-        let make: MakeInput = Arc::new(|| Box::new(NoInput));
-        let whip = Arc::new(FileWhip { log: log.to_owned(), wedged });
-        let streams = Arc::new(Streams::new(Arc::new(SystemClock), Arc::new(FakeMedia::default()), whip, make));
-        assert!(GLOBAL.set(streams.clone()).is_ok(), "this process's streams were already made");
-        let started = streams.call("stream_start", &json!({"whip_url": URL}), &mut devices).expect("start");
-        started["stream_id"].as_str().expect("id").to_owned()
-    }
+    #[cfg(unix)]
+    pub(crate) use global::start_global_fake_stream;
 
     impl Fixture {
         fn call(&self, method: &str, p: Value) -> Result<Value, String> {

@@ -205,9 +205,11 @@ fn installs_from_a_local_archive() {
     // Manifests are fetched once, then served from the cache.
     let mf = work.join("repository2-3.xml");
     std::fs::write(&mf, REPO).expect("write manifest");
-    let url = format!("file://{}", mf.display());
+    // `file:///C:/dir/x.xml` on Windows: a URL has slashes, and an absolute path starts with one.
+    let slashed = |p: &Path| p.display().to_string().replace('\\', "/");
+    let url = format!("file://{}{}", if cfg!(windows) { "/" } else { "" }, slashed(&mf));
     let m = sdk.manifest(&url).expect("manifest");
-    assert_eq!(m.base_url, format!("file://{}/", work.display()));
+    assert_eq!(m.base_url, format!("file://{}{}/", if cfg!(windows) { "/" } else { "" }, slashed(&work)));
     std::fs::remove_file(&mf).expect("rm");
     assert_eq!(sdk.manifest(&url).expect("cached").packages.len(), m.packages.len());
     let _ = std::fs::remove_dir_all(work);
@@ -234,7 +236,7 @@ fn resolves_emulator_for_host() {
 fn the_renderer_comes_from_the_package_this_host_can_load() {
     if cfg!(target_os = "macos") {
         assert_eq!((renderer::host(), renderer::BACKEND), (Host::MACOS_ARM64, "libgfxstream_backend.dylib"));
-    } else {
+    } else if cfg!(target_os = "linux") {
         // Before: every host fetched Apple silicon's archive, whose .dylib Linux can't load.
         assert_eq!((renderer::host(), renderer::BACKEND), (Host::current(), "libgfxstream_backend.so"));
         assert_eq!(renderer::host().os, "linux");
@@ -304,7 +306,7 @@ fn renderer_lookup_preference() {
     fake_renderer(&sdk, "37.5.0", Some("37.3.9"), true);
     fake_renderer(&sdk, "38.0.0", Some("38.0.0"), false);
     fake_renderer(&sdk, "junk", Some("39"), true);
-    std::os::unix::fs::symlink("37.3.9", renderer::root(&sdk).join(renderer::CURRENT)).expect("symlink");
+    symlink_dir(Path::new("37.3.9"), &renderer::root(&sdk).join(renderer::CURRENT)).expect("symlink");
     let revs: Vec<String> = renderer::installed(&sdk).iter().map(|i| i.marker.revision.to_string()).collect();
     assert_eq!(revs, ["37.3.10", "37.3.9"]);
     assert_eq!(renderer::find_lib64(&sdk), Some(newest.join("lib64")));
@@ -323,6 +325,7 @@ fn renderer_lookup_preference() {
 /// Whether every host tool a test shells out to is present (an absolute path, or a name looked up
 /// on `PATH`). A missing tool in CI panics, since CI images have them and a broken image must not
 /// read as a pass; elsewhere it prints a `SKIP` line to stderr and returns false.
+#[cfg(unix)]
 fn have_tools(test: &str, tools: &[&str]) -> bool {
     let found = |tool: &str| {
         let path = Path::new(tool);
@@ -341,6 +344,7 @@ fn have_tools(test: &str, tools: &[&str]) -> bool {
 
 /// Zips `<work>/<src>/emulator` with `/usr/bin/zip -y` (symlinks stored as links) and returns its
 /// `Download` for revision `rev`.
+#[cfg(unix)]
 fn zip_emulator(work: &Path, src: &str, rev: &str) -> Download {
     let zip = work.join(format!("emulator-darwin_aarch64-{src}.zip"));
     let _ = std::fs::remove_file(&zip);
@@ -359,6 +363,7 @@ fn zip_emulator(work: &Path, src: &str, rev: &str) -> Download {
 }
 
 /// A tree shaped like the emulator package under `<work>/<src>/emulator`.
+#[cfg(unix)]
 fn fake_emulator_tree(work: &Path, src: &str, backend: bool) {
     let e = work.join(src).join("emulator");
     for d in ["lib64/qt/lib", "lib64/vulkan/layers", "lib64/gles_angle", "lib", "bin64"] {
@@ -384,10 +389,14 @@ fn fake_emulator_tree(work: &Path, src: &str, backend: bool) {
     if backend {
         std::fs::write(e.join("lib64").join(renderer::BACKEND), src).expect("write");
     }
+    #[cfg(unix)]
     std::os::unix::fs::symlink("libprotobuf.28.4.0.dylib", e.join("lib64/libprotobuf.dylib")).expect("symlink");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file("libprotobuf.28.4.0.dylib", e.join("lib64/libprotobuf.dylib")).expect("symlink");
 }
 
 /// Files under `dir`, relative, sorted; symlinks as `name -> target`.
+#[cfg(unix)]
 fn tree(dir: &Path) -> Vec<String> {
     fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
         for e in std::fs::read_dir(dir).expect("ls").flatten() {
@@ -411,7 +420,9 @@ fn tree(dir: &Path) -> Vec<String> {
 
 /// The renderer install path, offline: only lib64 (minus Qt) and the license files are
 /// unpacked, symlinks survive, a marker and `current` are written, the archive is deleted, and a
-/// newer revision replaces the older one.
+/// newer revision replaces the older one. Unix only: it zips with `/usr/bin/zip` and unpacks with
+/// `unzip`, neither on a Windows host.
+#[cfg(unix)]
 #[test]
 fn installs_renderer_from_a_local_archive() {
     if !have_tools("installs_renderer_from_a_local_archive", &["/usr/bin/zip", "curl", "unzip"]) {
@@ -497,6 +508,8 @@ fn the_current_host_matches_the_build_target() {
     assert_eq!(host.os, "linux");
     #[cfg(target_os = "macos")]
     assert_eq!(host.os, "macosx");
+    #[cfg(target_os = "windows")]
+    assert_eq!(host.os, "windows");
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     assert_eq!(host, Host::MACOS_ARM64);
     assert!(repo().resolve("platform-tools", Host { os: "linux", arch: "x64" }).is_ok());
@@ -513,9 +526,19 @@ fn a_missing_host_tool_says_what_to_install() {
     assert!(err.contains("`/nonexistent/curl` not found: install curl"), "{err}");
 }
 
+/// Bytes the filesystem allocated to a file (`st_blocks`); `None` where std can't tell.
+fn allocated(meta: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    return Some(std::os::unix::fs::MetadataExt::blocks(meta) * 512);
+    #[cfg(not(unix))]
+    return {
+        let _ = meta;
+        None
+    };
+}
+
 #[test]
 fn write_sparse_skips_zero_blocks_and_keeps_contents() {
-    use std::os::unix::fs::MetadataExt;
     let path = std::env::temp_dir().join(format!("emu-sdk-sparse-{}.img", std::process::id()));
     // 3 MiB: crosses the copy buffer, with data at a buffer edge and a short non-zero tail.
     let mut data = vec![0u8; 3 * (1 << 20) + 100];
@@ -527,11 +550,13 @@ fn write_sparse_skips_zero_blocks_and_keeps_contents() {
     let (len, written) = write_sparse(&data[..], &file).expect("write");
     drop(file);
     let back = std::fs::read(&path).expect("read");
-    let blocks = std::fs::metadata(&path).expect("meta").blocks();
+    let allocated = allocated(&std::fs::metadata(&path).expect("meta"));
     let _ = std::fs::remove_file(&path);
     assert_eq!(back, data, "contents unchanged");
     assert_eq!((len, written), (data.len() as u64, 3 * 4096 + 100), "only the four non-zero blocks");
-    assert!(blocks * 512 < 64 * 1024, "{blocks} sectors allocated for 3 MiB");
+    if let Some(bytes) = allocated {
+        assert!(bytes < 64 * 1024, "{bytes} bytes allocated for 3 MiB");
+    }
 
     let empty = std::env::temp_dir().join(format!("emu-sdk-sparse-empty-{}.img", std::process::id()));
     let (len, written) = write_sparse(&[][..], &std::fs::File::create(&empty).expect("create")).expect("empty");
@@ -540,6 +565,8 @@ fn write_sparse_skips_zero_blocks_and_keeps_contents() {
 }
 
 /// A system image installs with its disk images sparse and everything else as unzip leaves it.
+/// Unix only: it unpacks with `unzip`, which a Windows host doesn't have.
+#[cfg(unix)]
 #[test]
 fn installs_system_images_with_sparse_disks() {
     if !have_tools("installs_system_images_with_sparse_disks", &["unzip"]) {
@@ -572,11 +599,12 @@ fn installs_system_images_with_sparse_disks() {
     assert_eq!(std::fs::read(dest.join("system.img")).expect("system"), system);
     assert_eq!(std::fs::read(dest.join("vendor.img")).expect("vendor"), b"tiny");
     assert_eq!(std::fs::read(dest.join("data/misc/x.xml")).expect("data"), b"<x/>");
-    use std::os::unix::fs::MetadataExt;
-    let blocks = std::fs::metadata(dest.join("system.img")).expect("meta").blocks();
+    let allocated = allocated(&std::fs::metadata(dest.join("system.img")).expect("meta"));
     let leftovers: Vec<_> = std::fs::read_dir(sdk.downloads()).expect("ls").flatten().collect();
     let _ = std::fs::remove_dir_all(&work);
-    assert!(blocks * 512 < 1 << 20, "a 2 MiB image with one data block takes {blocks} sectors");
+    if let Some(bytes) = allocated {
+        assert!(bytes < 1 << 20, "a 2 MiB image with one data block takes {bytes} bytes");
+    }
     assert!(leftovers.is_empty(), "no archive or temp dirs left: {leftovers:?}");
 }
 

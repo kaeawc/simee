@@ -8,10 +8,9 @@
 //! - [`host`]: host file syscalls std doesn't wrap (hole punching),
 //! - [`SharedMap`]: a file mapped shared, which the display server's frame ring lives in.
 //!
-//! Guest RAM, [`host`] and [`SharedMap`] build on any unix host, so the device models above them build and test
-//! on Linux; the hypervisor itself is Apple silicon only.
-#![cfg(unix)]
-
+//! Guest RAM, [`host`] and [`SharedMap`] build on every host (mmap on unix, `VirtualAlloc` and
+//! file mappings on Windows), so the device models above them build and test on Linux and
+//! Windows; the hypervisor itself is Apple silicon only.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod ffi;
 pub mod host;
@@ -19,6 +18,8 @@ pub mod host;
 mod hv;
 mod ram;
 mod shared;
+#[cfg(windows)]
+mod win;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use hv::*;

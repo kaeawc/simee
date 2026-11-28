@@ -1518,7 +1518,7 @@ fn boot_many_hooked(s: &mut Session, p: &Value, hook: &dyn crate::progress::Boot
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) mod tests {
     use super::*;
     use crate::progress::{CallHooks, with_call_hooks};

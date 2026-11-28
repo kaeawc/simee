@@ -12,8 +12,8 @@
 //! which [`finish`] turns into an error that says so. A SIP-enabled host is not measured: a notice
 //! the tool prints while still answering comes back in `warnings`.
 
+use sim_core::hostfs::CommandExt;
 use std::io::Read;
-use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -824,6 +824,8 @@ mod tests {
         assert!(finish(Tool::Heap, 1, &output(0, HEAP, ""), false).expect("heap")["classes"].is_array());
     }
 
+    // Unix only: it runs `/bin/sh` and `/bin/sleep`.
+    #[cfg(unix)]
     #[test]
     fn the_runner_returns_output_and_kills_its_child_at_the_deadline() {
         let out = run("/bin/sh", &["-c".into(), "echo out; echo err >&2; exit 3".into()], Duration::from_secs(10)).expect("run");

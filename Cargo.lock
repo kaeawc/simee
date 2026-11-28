@@ -2116,6 +2116,7 @@ dependencies = [
 name = "simee-core"
 version = "0.2.0"
 dependencies = [
+ "getrandom 0.4.3",
  "png",
  "serde",
  "serde_json",
@@ -2166,6 +2167,7 @@ dependencies = [
  "rustix",
  "simee-bundle",
  "simee-core",
+ "simee-emu-hvf",
  "thiserror 2.0.21",
 ]
 
@@ -3004,6 +3006,10 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
 ]
+
+[[package]]
+name = "xtask"
+version = "0.2.0"
 
 [[package]]
 name = "yasna"
