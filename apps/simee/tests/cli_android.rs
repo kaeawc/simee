@@ -1,6 +1,8 @@
 //! The CLI end to end against Android devices, on any host: `simee` runs as a subprocess with
 //! its own SDK, AVD home and `$HOME`, and a fake simee (`sim_android::testing`) stands in for
-//! the running emulator: its console records commands, its display socket records input.
+//! the running emulator: its console records commands, its display socket records input. Unix only
+//! until the API has a Windows transport: the fake's display is a Unix socket.
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

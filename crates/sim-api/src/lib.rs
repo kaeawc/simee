@@ -19,6 +19,7 @@
 
 mod android;
 mod camera;
+#[cfg_attr(not(unix), allow(dead_code))]
 mod camera_device;
 pub mod catalog;
 mod contrast;
@@ -44,8 +45,8 @@ pub mod shutdown;
 mod stream;
 mod usage;
 
+use sim_core::net::{UnixListener, UnixStream};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
@@ -485,7 +486,7 @@ impl Client {
 
 /// A socket path for tests: under the temp dir when it fits a `sockaddr_un` (104 bytes on macOS),
 /// else under `/tmp`, since build wrappers point `TMPDIR` at long private directories.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn test_socket(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(name);
     let path = if path.as_os_str().len() < 100 { path } else { PathBuf::from("/tmp").join(name) };
@@ -493,7 +494,7 @@ pub(crate) fn test_socket(name: &str) -> PathBuf {
     path
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use serde_json::json;
 

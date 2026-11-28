@@ -5,6 +5,8 @@
 #   scripts/check.sh --quick    # linters, fmt, host clippy and tests only
 #   scripts/check.sh --all      # every step, whatever changed
 #
+# On Windows, where there is no bash, `cargo xtask check` (xtask/) runs the same steps.
+#
 # Steps: the script and docs linters (scripts/lint.sh: each one installed here, else a skip
 # line); rustfmt; clippy for this host; clippy for the other platform's target when its std is
 # installed (macOS code from Linux: `rustup target add aarch64-apple-darwin`, and the reverse),

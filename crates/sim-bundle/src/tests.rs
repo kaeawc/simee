@@ -123,8 +123,12 @@ fn both_forms_unpack_to_the_same_bytes_with_holes_kept() {
         assert_eq!(fs::read(dest.join("simee/userdata.img")).expect("disk"), data);
         assert_eq!(fs::read(dest.join("config.ini")).expect("config"), b"AvdId=pixel\n");
         assert_eq!(fs::read(dest.join("boot.prop")).expect("boot.prop"), b"");
-        let blocks = fs::metadata(dest.join("simee/userdata.img")).expect("meta").blocks() * 512;
-        assert!(blocks < data.len() as u64 - 16 * CHUNK_SIZE, "the zero chunks stay holes: {blocks} allocated");
+        // Windows has no allocated size to read, and a copy there isn't sparse.
+        #[cfg(unix)]
+        {
+            let blocks = sim_core::hostfs::allocated_bytes(&fs::metadata(dest.join("simee/userdata.img")).expect("meta"));
+            assert!(blocks < data.len() as u64 - 16 * CHUNK_SIZE, "the zero chunks stay holes: {blocks} allocated");
+        }
     }
     // Refuses to overwrite.
     assert!(matches!(export(header(), &contents(&disk), &tmp.join("b"), &Options::default()), Err(Error::Exists(_))));
@@ -219,17 +223,20 @@ fn damaged_bundles_are_refused() {
     assert!(matches!(extract("grown.tar"), Err(Error::ChunkHash(h)) if h == hash(&big)));
 
     // A directory bundle whose manifest or chunk is a link is refused before it is read.
-    let linked = tmp.join("linked");
-    fs::create_dir_all(linked.join("chunks")).expect("dir");
-    std::os::unix::fs::symlink(tmp.join("b/manifest.json"), linked.join(MANIFEST)).expect("symlink");
-    assert!(matches!(Reader::open(&linked), Err(Error::Unsupported(_))));
-    fs::remove_file(linked.join(MANIFEST)).expect("rm");
-    fs::copy(tmp.join("b/manifest.json"), linked.join(MANIFEST)).expect("copy");
-    for h in m.chunk_hashes() {
-        fs::create_dir_all(linked.join(chunk_name(h)).parent().expect("parent")).expect("dir");
-        std::os::unix::fs::symlink("/dev/zero", linked.join(chunk_name(h))).expect("symlink");
+    #[cfg(unix)]
+    {
+        let linked = tmp.join("linked");
+        fs::create_dir_all(linked.join("chunks")).expect("dir");
+        std::os::unix::fs::symlink(tmp.join("b/manifest.json"), linked.join(MANIFEST)).expect("symlink");
+        assert!(matches!(Reader::open(&linked), Err(Error::Unsupported(_))));
+        fs::remove_file(linked.join(MANIFEST)).expect("rm");
+        fs::copy(tmp.join("b/manifest.json"), linked.join(MANIFEST)).expect("copy");
+        for h in m.chunk_hashes() {
+            fs::create_dir_all(linked.join(chunk_name(h)).parent().expect("parent")).expect("dir");
+            std::os::unix::fs::symlink("/dev/zero", linked.join(chunk_name(h))).expect("symlink");
+        }
+        assert!(matches!(extract("linked"), Err(Error::Unsupported(_))));
     }
-    assert!(matches!(extract("linked"), Err(Error::Unsupported(_))));
 
     // A base delta (#171) is reserved: a format 1 reader refuses it before writing.
     let mut delta = m.clone();

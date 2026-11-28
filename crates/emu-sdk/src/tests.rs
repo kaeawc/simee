@@ -304,7 +304,7 @@ fn renderer_lookup_preference() {
     fake_renderer(&sdk, "37.5.0", Some("37.3.9"), true);
     fake_renderer(&sdk, "38.0.0", Some("38.0.0"), false);
     fake_renderer(&sdk, "junk", Some("39"), true);
-    std::os::unix::fs::symlink("37.3.9", renderer::root(&sdk).join(renderer::CURRENT)).expect("symlink");
+    symlink_dir(Path::new("37.3.9"), &renderer::root(&sdk).join(renderer::CURRENT)).expect("symlink");
     let revs: Vec<String> = renderer::installed(&sdk).iter().map(|i| i.marker.revision.to_string()).collect();
     assert_eq!(revs, ["37.3.10", "37.3.9"]);
     assert_eq!(renderer::find_lib64(&sdk), Some(newest.join("lib64")));
@@ -384,7 +384,10 @@ fn fake_emulator_tree(work: &Path, src: &str, backend: bool) {
     if backend {
         std::fs::write(e.join("lib64").join(renderer::BACKEND), src).expect("write");
     }
+    #[cfg(unix)]
     std::os::unix::fs::symlink("libprotobuf.28.4.0.dylib", e.join("lib64/libprotobuf.dylib")).expect("symlink");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file("libprotobuf.28.4.0.dylib", e.join("lib64/libprotobuf.dylib")).expect("symlink");
 }
 
 /// Files under `dir`, relative, sorted; symlinks as `name -> target`.
@@ -497,6 +500,8 @@ fn the_current_host_matches_the_build_target() {
     assert_eq!(host.os, "linux");
     #[cfg(target_os = "macos")]
     assert_eq!(host.os, "macosx");
+    #[cfg(target_os = "windows")]
+    assert_eq!(host.os, "windows");
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     assert_eq!(host, Host::MACOS_ARM64);
     assert!(repo().resolve("platform-tools", Host { os: "linux", arch: "x64" }).is_ok());
@@ -513,9 +518,19 @@ fn a_missing_host_tool_says_what_to_install() {
     assert!(err.contains("`/nonexistent/curl` not found: install curl"), "{err}");
 }
 
+/// Bytes the filesystem allocated to a file (`st_blocks`); `None` where std can't tell.
+fn allocated(meta: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    return Some(std::os::unix::fs::MetadataExt::blocks(meta) * 512);
+    #[cfg(not(unix))]
+    return {
+        let _ = meta;
+        None
+    };
+}
+
 #[test]
 fn write_sparse_skips_zero_blocks_and_keeps_contents() {
-    use std::os::unix::fs::MetadataExt;
     let path = std::env::temp_dir().join(format!("emu-sdk-sparse-{}.img", std::process::id()));
     // 3 MiB: crosses the copy buffer, with data at a buffer edge and a short non-zero tail.
     let mut data = vec![0u8; 3 * (1 << 20) + 100];
@@ -527,11 +542,13 @@ fn write_sparse_skips_zero_blocks_and_keeps_contents() {
     let (len, written) = write_sparse(&data[..], &file).expect("write");
     drop(file);
     let back = std::fs::read(&path).expect("read");
-    let blocks = std::fs::metadata(&path).expect("meta").blocks();
+    let allocated = allocated(&std::fs::metadata(&path).expect("meta"));
     let _ = std::fs::remove_file(&path);
     assert_eq!(back, data, "contents unchanged");
     assert_eq!((len, written), (data.len() as u64, 3 * 4096 + 100), "only the four non-zero blocks");
-    assert!(blocks * 512 < 64 * 1024, "{blocks} sectors allocated for 3 MiB");
+    if let Some(bytes) = allocated {
+        assert!(bytes < 64 * 1024, "{bytes} bytes allocated for 3 MiB");
+    }
 
     let empty = std::env::temp_dir().join(format!("emu-sdk-sparse-empty-{}.img", std::process::id()));
     let (len, written) = write_sparse(&[][..], &std::fs::File::create(&empty).expect("create")).expect("empty");
@@ -572,11 +589,12 @@ fn installs_system_images_with_sparse_disks() {
     assert_eq!(std::fs::read(dest.join("system.img")).expect("system"), system);
     assert_eq!(std::fs::read(dest.join("vendor.img")).expect("vendor"), b"tiny");
     assert_eq!(std::fs::read(dest.join("data/misc/x.xml")).expect("data"), b"<x/>");
-    use std::os::unix::fs::MetadataExt;
-    let blocks = std::fs::metadata(dest.join("system.img")).expect("meta").blocks();
+    let allocated = allocated(&std::fs::metadata(dest.join("system.img")).expect("meta"));
     let leftovers: Vec<_> = std::fs::read_dir(sdk.downloads()).expect("ls").flatten().collect();
     let _ = std::fs::remove_dir_all(&work);
-    assert!(blocks * 512 < 1 << 20, "a 2 MiB image with one data block takes {blocks} sectors");
+    if let Some(bytes) = allocated {
+        assert!(bytes < 1 << 20, "a 2 MiB image with one data block takes {bytes} bytes");
+    }
     assert!(leftovers.is_empty(), "no archive or temp dirs left: {leftovers:?}");
 }
 

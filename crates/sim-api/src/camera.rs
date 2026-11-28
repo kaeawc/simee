@@ -108,7 +108,7 @@ pub struct Session {
 }
 
 impl Session {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn with(host: impl Host + 'static) -> Session {
         Session { host: Some(Box::new(host)), ..Session::default() }
     }
@@ -841,6 +841,7 @@ const DYLD_INSERT: &str = "DYLD_INSERT_LIBRARIES";
 
 /// What a feed serves when a reader doesn't ask for a size: a portrait phone camera at 30 fps, as
 /// #322 measured.
+#[cfg_attr(not(unix), allow(dead_code))]
 const FEED_SPEC: (u32, u32, u32) = (720, 960, 30);
 
 const SHARED: &str = "an iOS device's back and front cameras read one feed (the shim reads one socket), so both are linked";
@@ -1066,7 +1067,7 @@ impl Env {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn fake(
         feeds: Arc<Feeds>,
         shim: impl Fn() -> Result<PathBuf, String> + 'static,
@@ -1521,7 +1522,7 @@ fn ios_rows(host: &dyn Host, ios: &mut dyn IosHost, env: &Env, t: &IosTarget) ->
     rows
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::sync::{Arc, Mutex};
 

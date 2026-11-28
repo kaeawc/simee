@@ -263,9 +263,13 @@ fn wait_exit(child: &mut Child, limit: Duration) -> emu_avd::Result<Option<std::
 }
 
 fn stop_child(child: &mut Child) {
+    #[cfg(unix)]
     if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
         let _ = rustix::process::kill_process(pid, rustix::process::Signal::INT);
     }
+    // No SIGINT on Windows; a clean stop (a console control event) comes with its signals (#245).
+    #[cfg(windows)]
+    let _ = child.kill();
     let until = Instant::now() + Duration::from_secs(20);
     while Instant::now() < until {
         if child.try_wait().ok().flatten().is_some() {

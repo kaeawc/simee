@@ -2,7 +2,7 @@
 resolver = "3"
 # sim-* crates: the shared core (sim-core, sim-api) and the iOS backend; emu-* crates: the Android
 # backend (an emulator on Hypervisor.framework); apps: the simee CLI and the emu emulator binary.
-members = ["crates/*", "apps/simee", "apps/emu"]
+members = ["crates/*", "apps/simee", "apps/emu", "xtask"]
 # The Rune desktop app is its own workspace: a large git dependency and a GPU stack stay out of
 # `cargo check`/`test` here.
 exclude = ["desktop"]

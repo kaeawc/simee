@@ -3,6 +3,9 @@
 c = "check --all-targets"
 # Lint like CI does.
 lint = "clippy --all-targets -- -D warnings"
+# The repository's own automation, the same checks as scripts/check.sh on any host (Windows has no
+# bash): `cargo xtask check [--quick|--all]`.
+xtask = "run --package xtask --"
 # Tests through nextest (one process per test, parallel across binaries).
 t = "nextest run"
 # Tests in a single crate without touching the rest.
@@ -13,6 +16,12 @@ tc = "nextest run -p simee-core"
 # binaries that don't use it the signature changes nothing.
 [target.aarch64-apple-darwin]
 runner = "scripts/sign-run.sh"
+
+# Windows: the C runtime is linked in, so `simee.exe` and `emu.exe` run without the Visual C++
+# redistributable installed. Hosts build with the same flags (no `--target`), so build scripts and
+# proc macros do too.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
 
 [env]
 RUST_BACKTRACE = { value = "short", force = false }

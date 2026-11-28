@@ -6,6 +6,10 @@
 mod bootconfig;
 pub mod bundle;
 mod cache;
+#[cfg(unix)]
+pub mod clone;
+#[cfg(not(unix))]
+#[path = "clone_copy.rs"]
 pub mod clone;
 pub mod golden;
 pub mod gpu;
@@ -205,7 +209,7 @@ fn held_lock(dir: &Path) -> Option<PathBuf> {
             let digits: String = b.iter().take_while(|c| c.is_ascii_digit()).map(|&c| c as char).collect();
             digits.parse::<i32>().ok()
         });
-        if pid.and_then(rustix::process::Pid::from_raw).is_some_and(|p| rustix::process::test_kill_process(p).is_ok()) {
+        if pid.is_some_and(pid_alive) {
             return Some(path);
         }
     }
@@ -759,8 +763,20 @@ impl Running {
 
     /// Whether its process still exists.
     pub fn alive(&self) -> bool {
-        rustix::process::Pid::from_raw(self.pid).is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
+        pid_alive(self.pid)
     }
+}
+
+/// Whether process `pid` exists (`kill(pid, 0)`; a process of another user counts).
+#[cfg(unix)]
+fn pid_alive(pid: i32) -> bool {
+    rustix::process::Pid::from_raw(pid).is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
+}
+
+/// Whether process `pid` exists and hasn't exited.
+#[cfg(windows)]
+fn pid_alive(pid: i32) -> bool {
+    u32::try_from(pid).is_ok_and(emu_hvf::host::process_alive)
 }
 
 /// What the host says about a process, for [`Env::stock_instances_among_with`].
@@ -1064,6 +1080,8 @@ mod tests {
         assert!(me.alive());
     }
 
+    // Unix mode bits decide what can be listed or searched.
+    #[cfg(unix)]
     #[test]
     fn has_avd_stats_one_pointer_instead_of_listing_the_home() {
         use std::os::unix::fs::PermissionsExt;

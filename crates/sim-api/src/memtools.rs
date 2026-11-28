@@ -12,8 +12,8 @@
 //! which [`finish`] turns into an error that says so. A SIP-enabled host is not measured: a notice
 //! the tool prints while still answering comes back in `warnings`.
 
+use sim_core::hostfs::CommandExt;
 use std::io::Read;
-use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};

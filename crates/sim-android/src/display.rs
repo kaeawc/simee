@@ -7,10 +7,10 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::FileExt;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
+use sim_core::hostfs::FileExt;
+use sim_core::net::UnixStream;
 use sim_core::rotation::Rotation;
 use sim_core::stream::{FrameHeader, HEADER_LEN, Input, Record, ring};
 
@@ -305,10 +305,14 @@ impl Ring {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use sim_core::gesture::Phase;
+    #[cfg(unix)]
+    use sim_core::net::UnixListener;
     use std::io::{BufRead, BufReader};
-    use std::os::unix::net::UnixListener;
 
+    // Sockets under /tmp: Windows has no Unix sockets here yet.
+    #[cfg(unix)]
     #[test]
     fn sends_input_lines_and_reads_frames() {
         // Under /tmp: the socket path must fit a unix socket address (104 bytes on macOS).

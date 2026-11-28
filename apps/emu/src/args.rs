@@ -300,6 +300,10 @@ impl Opts {
     /// What each camera links to at start: its flag, else `hw.camera.back` / `hw.camera.front`
     /// from config.ini (`config`), else none. A config value that isn't a source is reported and
     /// skipped; flags were checked when parsed.
+    #[cfg_attr(
+        not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))),
+        allow(dead_code)
+    )]
     pub fn camera_links(&self, config: impl Fn(&str) -> Option<String>) -> Vec<(Facing, Option<SourceSpec>)> {
         [(Facing::Back, &self.camera_back), (Facing::Front, &self.camera_front)]
             .into_iter()
@@ -329,6 +333,7 @@ impl Opts {
 /// `virtualscene`, `videoplayback`, `webcam0`, `webcamN` and any other bare word are the test
 /// card, and only an explicit choice (a `-camera-*` flag, the console's `camera link`, or a simee
 /// source id such as `webcam:obs` in the file) links a host camera.
+#[cfg_attr(not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))), allow(dead_code))]
 fn config_link(key: &str, value: &str) -> Result<Option<SourceSpec>, String> {
     let v = value.trim();
     if matches!(v, "" | "none" | "emulated" | "virtualscene") || v.contains(':') {

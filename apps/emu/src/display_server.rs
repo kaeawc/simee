@@ -20,9 +20,9 @@
 //! record saying how to turn them, so it turns them as it draws and nothing here turns them; any
 //! other client gets them turned upright ([`FrameStore::latest_upright`]). Touches are in pixels
 //! of the upright screen either way ([`FrameStore::to_scanout`]).
+use sim_core::hostfs::OpenOptionsExt;
+use sim_core::net::{UnixListener, UnixStream};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -586,7 +586,7 @@ impl Ring {
     }
 
     fn fill_zero(file: &std::fs::File, len: u64) -> std::io::Result<()> {
-        use std::os::unix::fs::FileExt;
+        use sim_core::hostfs::FileExt;
         let zeros = vec![0u8; 1 << 20];
         let mut at = 0;
         while at < len {
@@ -636,6 +636,17 @@ impl Drop for Ring {
     }
 }
 
+/// Whether no process `pid` exists (another user's live process answers EPERM, so isn't gone).
+#[cfg(unix)]
+fn process_gone(pid: i32) -> bool {
+    rustix::process::Pid::from_raw(pid).is_none_or(|p| rustix::process::test_kill_process(p).is_err_and(|e| e == rustix::io::Errno::SRCH))
+}
+
+#[cfg(windows)]
+fn process_gone(pid: i32) -> bool {
+    u32::try_from(pid).is_ok_and(|p| !emu_hvf::host::process_alive(p))
+}
+
 /// Removes rings left by emulators that are gone (a crash skips their cleanup).
 fn remove_stale_rings(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
@@ -643,10 +654,7 @@ fn remove_stale_rings(dir: &Path) {
         let name = e.file_name();
         let Some(name) = name.to_str().filter(|n| n.ends_with(".ring")) else { continue };
         let Some(pid) = name.strip_prefix("frames-").and_then(|n| n.split('-').next()?.parse::<i32>().ok()) else { continue };
-        // Gone only if no such process (another user's live process answers EPERM).
-        let gone = rustix::process::Pid::from_raw(pid)
-            .is_none_or(|p| rustix::process::test_kill_process(p).is_err_and(|e| e == rustix::io::Errno::SRCH));
-        if gone {
+        if process_gone(pid) {
             let _ = std::fs::remove_file(e.path());
         }
     }

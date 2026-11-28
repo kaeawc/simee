@@ -136,6 +136,24 @@ fn shape_of(avd: &Avd) -> String {
     s
 }
 
+/// What a remembered image hash is keyed by besides the path: size, inode and the modification
+/// and change times.
+#[cfg(unix)]
+fn file_stamp(meta: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!("{}|{}|{}.{}|{}.{}", meta.len(), meta.ino(), meta.mtime(), meta.mtime_nsec(), meta.ctime(), meta.ctime_nsec())
+}
+
+/// Windows has no inode or change time in std: size, modification and creation times. An edit in
+/// place that keeps the length and puts the modification time back isn't seen there.
+#[cfg(not(unix))]
+fn file_stamp(meta: &std::fs::Metadata) -> String {
+    let nanos = |t: std::io::Result<std::time::SystemTime>| {
+        t.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos())
+    };
+    format!("{}|{}|{}", meta.len(), nanos(meta.modified()), nanos(meta.created()))
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -168,20 +186,10 @@ impl Env {
     /// golden). Any write to the file changes its change time, which a program can't set back, so
     /// an edited file is hashed again; a remembered hash that doesn't look like one is ignored.
     fn image_file_hash(&self, path: &Path) -> Result<String> {
-        use std::os::unix::fs::MetadataExt;
         let io = |p: &Path, e| Error::Io(p.to_path_buf(), e);
         let meta = std::fs::metadata(path).map_err(|e| io(path, e))?;
         let real = std::fs::canonicalize(path).map_err(|e| io(path, e))?;
-        let stamp = format!(
-            "{}|{}|{}|{}.{}|{}.{}",
-            real.display(),
-            meta.len(),
-            meta.ino(),
-            meta.mtime(),
-            meta.mtime_nsec(),
-            meta.ctime(),
-            meta.ctime_nsec()
-        );
+        let stamp = format!("{}|{}", real.display(), file_stamp(&meta));
         let dir = self.golden_root().join(HASH_CACHE);
         let entry = dir.join(&sim_bundle::hash(stamp.as_bytes())[..32]);
         if let Ok(h) = std::fs::read_to_string(&entry)
@@ -435,7 +443,9 @@ fn read_golden(dir: &Path) -> Option<Golden> {
     })
 }
 
-#[cfg(test)]
+/// The tests write at offsets and count allocated blocks (`FileExt`, `st_blocks`) and rely on the
+/// change time, so they run where those exist.
+#[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::sync::atomic::{AtomicUsize, Ordering};

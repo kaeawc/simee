@@ -2164,6 +2164,7 @@ dependencies = [
  "rustix",
  "simee-bundle",
  "simee-core",
+ "simee-emu-hvf",
  "thiserror 2.0.21",
 ]
 
@@ -2995,6 +2996,10 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
 ]
+
+[[package]]
+name = "xtask"
+version = "0.2.0"
 
 [[package]]
 name = "yasna"
