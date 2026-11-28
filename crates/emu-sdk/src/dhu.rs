@@ -80,9 +80,17 @@ impl Sdk {
     }
 }
 
+/// Sets the executable bits (the docs say to; zip may not keep them). Windows has none: the file
+/// only has to exist.
 fn make_executable(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     let io = |e| Error::Io(path.to_path_buf(), e);
-    let mode = std::fs::metadata(path).map_err(io)?.permissions().mode();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o755)).map_err(io)
+    let meta = std::fs::metadata(path).map_err(io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o755)).map_err(io)?;
+    }
+    let _ = meta;
+    Ok(())
 }

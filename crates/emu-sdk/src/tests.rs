@@ -734,7 +734,6 @@ mod dhu_tests {
 
     #[test]
     fn installs_atomically_with_an_executable_program_and_is_idempotent() {
-        use std::os::unix::fs::PermissionsExt;
         let work = scratch("dhu-install");
         let bytes = dhu_zip();
         let p = plan(served(&work, &bytes));
@@ -744,7 +743,12 @@ mod dhu_tests {
         let dest = sdk.install_dhu(&p, &["android-sdk-license"]).expect("install");
         assert_eq!(dest, dhu::dir(sdk.root()));
         let exe = dhu::executable(sdk.root()).expect("installed program");
-        assert_eq!(std::fs::metadata(&exe).expect("meta").permissions().mode() & 0o111, 0o111);
+        assert!(exe.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&exe).expect("meta").permissions().mode() & 0o111, 0o111);
+        }
         assert!(sdk.is_installed(Path::new("extras/google/auto")));
         assert!(dest.join("config/default.ini").is_file());
         for e in std::fs::read_dir(sdk.downloads()).expect("ls").flatten() {
