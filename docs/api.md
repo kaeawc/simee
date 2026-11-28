@@ -116,7 +116,7 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 
 `device` is a UDID (an Android device's UDID is its AVD name), an exact name, or `booted` (the default: the only running device). It is resolved across both platforms; pass `platform` (`ios` or `android`) to look at one. Parameters ending in `?` are optional.
 
-**Platforms** says whose devices a method works on. Calling a method on a device of another platform fails with the platforms it does work on, e.g. `` `status_bar` isn't available on Android devices (it works on iOS) ``. Every device in a result carries `platform`, `form_factor` and `sub_platform`.
+**Platforms** says whose devices a method works on. Calling a method on a device of another platform fails with the platforms it does work on, e.g. `` `appearance` isn't available on Android devices (it works on iOS) ``. Every device in a result carries `platform`, `form_factor` and `sub_platform`.
 
 | Method | Platforms | Parameters | Description |
 | --- | --- | --- | --- |
@@ -139,7 +139,7 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `export` | Android | device, to | Pack a shut-down device into a portable bundle at `to` (a .tar file, else a new directory) with no host path in it: manifest.json and content-addressed chunks (1 MiB, BLAKE3, each LZ4-compressed; zero ranges stored as extents). Android: an AVD that has booted under simee (its simee disks, config.ini without host paths, boot.prop) and its system image's identity; captures disks, not RAM (resume is a cold boot). Returns sizes, the identity and the secrets inventory. iOS simulators: not yet (the next step of #170) |
 | `import` | Android | from, name, allow_mismatch?(false) | Create device `name` from a bundle `export` wrote. Android: finds the system image by content (API, tag, ABI, revision, BLAKE3 of its images, fingerprint) and refuses, naming what to install, when none matches (allow_mismatch: use another installed revision of the same API, tag and ABI, named in `mismatch`); checks every chunk and disk hash; drops config.ini keys holding host paths (listed in `dropped`); writes nothing unless it all succeeds. The import keeps the exported device's guest identity (ro.serialno, android_id). iOS: not yet |
 | `shutdown` | Android, iOS | device | Shut down |
-| `erase` | iOS | device | Erase content and settings (shut down first) |
+| `erase` | Android, iOS | device | Erase content and settings (shut down first). Android: simee's user data (the userdata, cache and metadata disks in `<avd>/simee/`) is removed and cloned again from the image's golden when one has the AVD's shape, so the next boot is warm; without one the next boot is a first boot. The AVD keeps its name and config, and the stock emulator's own files are left alone (its `-wipe-data` clears them) |
 | `screen` | Android, iOS | device, display?(main\|outer\|inner\|carplay) | Screen size in pixels, the space tap, swipe and touch take (a folded Android foldable: the size its guest lays out for, a Pixel Fold's 1080x2092, as uiautomator's bounds). display (iOS): main is the screen in use (an unfolded iPhone Duo's inner one), outer and inner an iPhone Duo's two, carplay an iPhone's CarPlay screen |
 | `screenshot` | Android, iOS | device, path?, display?(main\|outer\|inner\|carplay) | PNG to path, else base64 in `png` (a folded Android foldable: its outer screen as the scanout shows it, a Pixel Fold's 949x1840; an iPhone Duo's inner screen as its framebuffer holds it, 2007x2853) |
 | `stream_start` | Android, iOS | device, whip_url, token?, fps?(30), max_size?(1280), bitrate?(2500000), audio?(false), input?(false) | Stream the screen as H.264 over WebRTC to a WHIP endpoint (plaintext http to a loopback host only, e.g. MediaMTX's `http://127.0.0.1:8889/<path>/whip`), with token as its bearer token; max_size caps the longest side (0: full size), bitrate is in bit/s; input offers the `simee-input` data channel, whose touches, keys, text, buttons, rotations, folds and scrolls reach the device (a server that refuses the data channel, as MediaMTX does, gets the stream without it: the result's input is false and input_note says why). One stream per device and URL, living in this process (`simee serve`) on a 30 s lease that stream_status renews: a stream nobody renews is stopped. Returns stream_id, whip_resource and lease_ttl_s (and, with input, whether it is on). Encoded on macOS by VideoToolbox (iOS and Android devices) and on Linux by OpenH264 in a build with `--features openh264` (Android devices only); audio isn't streamed yet |
@@ -163,18 +163,18 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `location` | Android, iOS | device, latitude, longitude | Simulated location |
 | `privacy` | iOS | device, action(grant\|revoke), service, bundle_id | Privacy permission |
 | `push` | iOS | device, bundle_id, payload | Deliver an APNs payload (object) |
-| `status_bar` | iOS | device, time?, data_network?, wifi_mode?, wifi_bars?, cellular_mode?, cellular_bars?, operator?, battery_state?, battery_level? | Override status bar |
-| `clear_status_bar` | iOS | device | Remove status bar overrides |
+| `status_bar` | Android, iOS | device, time?, data_network?, wifi_mode?, wifi_bars?, cellular_mode?, cellular_bars?, operator?, battery_state?, battery_level? | Override status bar. Android: SystemUI's demo mode, which replaces the whole status bar: time as a time of day (HH:MM); data_network lte-a shows LTE+, 5g-uwb and 5g-uc 5G+, hide no type, wifi the Wi-Fi icon; Wi-Fi's 0-3 bars scale to Android's 0-4; searching and failed show no bars; charging and charged show the battery plugged in; no operator (the demo status bar has no carrier name) |
+| `clear_status_bar` | Android, iOS | device | Remove status bar overrides (Android: leaves demo mode) |
 | `content_size` | iOS | device, size | Dynamic Type size (name or 0-11) |
-| `increase_contrast` | iOS | device, on | Increase Contrast |
+| `increase_contrast` | Android, iOS | device, on | Increase Contrast (Android: high-contrast text, `high_text_contrast_enabled`, and from API 34 the color contrast, `contrast_level` 1.0 or 0.0) |
 | `dynamic_island` | iOS | device, suppressed | Hide the Dynamic Island |
 | `backlight` | iOS | device, on | Display backlight |
-| `keyboard_language` | iOS | device, language | Software keyboard language |
-| `hardware_keyboard` | iOS | device, on | Connect the hardware keyboard |
+| `keyboard_language` | iOS | device, language | Software keyboard language (not on Android: a keyboard's language is its input method's subtype, which only that input method's settings choose; no host command sets it) |
+| `hardware_keyboard` | Android, iOS | device, on | Connect the hardware keyboard (Android: the emulator's keyboard stays attached; off shows the on-screen keyboard beside it and on hides it, `show_ime_with_hard_keyboard`) |
 | `ca_debug` | iOS | device, option, on | Render overlay (see ca_debug_state for names) |
 | `ca_debug_state` | iOS | device | Every render overlay and whether it is on |
 | `reset_keychain` | iOS | device | Delete every keychain item |
-| `memory_warning` | iOS | device | Simulate a memory warning |
+| `memory_warning` | Android, iOS | device; Android: bundle_id? | Simulate a memory warning (Android: `am send-trim-memory` RUNNING_CRITICAL to bundle_id's process, by default the foreground app's) |
 | `notify` | iOS | device, name, state? | Post a Darwin notification (optionally setting its state) |
 | `biometric` | iOS | device, action(match\|nomatch\|enroll\|unenroll), face? | Touch ID / Face ID |
 | `exec` | iOS | device, program, args?, env? | Run a program inside the device; returns stdout/stderr |

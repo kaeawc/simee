@@ -135,7 +135,7 @@ fn descriptions_say_what_a_method_does_where_and_in_what_units() {
     assert!(find("xr").contains("Platforms: Android."));
     assert!(!find("xr").contains("iOS."));
     assert!(find("fold").contains("Platforms: Android, iOS."), "the iPhone Duo folds too");
-    assert!(find("status_bar").contains("Platforms: iOS."));
+    assert!(find("appearance").contains("Platforms: iOS."));
     assert!(find("boot").contains("task") && find("boot").contains("Can take a while"));
     assert!(!find("tap").contains("task"));
     // Coordinates in device pixels where the method takes them; not for the touchpad's own units.

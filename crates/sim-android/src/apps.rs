@@ -84,7 +84,7 @@ impl Adb {
     }
 
     /// `adb shell <command>`, for at most `limit`: what it printed, or why it failed.
-    fn shell(&self, command: &str, limit: Duration) -> Result<String, String> {
+    pub(crate) fn shell(&self, command: &str, limit: Duration) -> Result<String, String> {
         match self.run(&["shell", command], limit)? {
             (true, text) => Ok(text),
             (false, text) => Err(failure(command, &text)),

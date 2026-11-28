@@ -18,6 +18,7 @@
 //! macOS hosts; elsewhere they fail with a clear reason.
 
 mod android;
+mod android_state;
 mod camera;
 mod camera_device;
 pub mod catalog;

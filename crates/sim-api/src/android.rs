@@ -319,6 +319,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             }))
         }
         "shutdown" => null(d.shutdown()),
+        m if crate::android_state::is_method(m) => crate::android_state::call(&android, &d, m, p),
         // The guest's layout, which tap, swipe and touch take (a folded foldable's outer screen).
         "screen" => d.layout_size().map(|(w, h)| json!({"width": w, "height": h})),
         // The emulator's own PNG, passed through: with `path` it writes the file itself.

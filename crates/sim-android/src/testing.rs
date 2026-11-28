@@ -236,6 +236,12 @@ shell)
     "pm uninstall "*) echo "Success";;
     "pm list packages -3") printf 'package:com.example.app\npackage:com.example.zeta\n';;
     "pm list packages") printf 'package:com.android.settings\npackage:com.example.zeta\npackage:android\npackage:com.example.app\n';;
+    # Device state (#418): settings and SystemUI's demo broadcasts succeed, com.example.app is in
+    # the foreground, and a trim-memory signal reaches it.
+    "settings put "*) ;;
+    "am broadcast -a com.android.systemui.demo "*) printf 'Broadcasting: Intent { act=com.android.systemui.demo flg=0x400000 (has extras) }\nBroadcast completed: result=0\n';;
+    "dumpsys activity activities | grep "*) echo '  topResumedActivity=ActivityRecord{6d5b2c1 u0 com.example.app/.MainActivity t12}';;
+    "am send-trim-memory com.example.app RUNNING_CRITICAL") ;;
     "cmd package query-activities --brief --components -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.example.app") echo 'com.example.app/.MainActivity';;
     "cmd package query-activities --brief --components -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.example.crash") echo 'com.example.crash/.Gone';;
     "cmd package query-activities --brief --components -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.example.svc") echo 'com.example.svc/.Main';;
