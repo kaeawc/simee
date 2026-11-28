@@ -186,6 +186,9 @@
         "properties": {
           "admission": {
             "properties": {
+              "host_basis": {
+                "type": "string"
+              },
               "predicted": {
                 "properties": {
                   "admissible": {

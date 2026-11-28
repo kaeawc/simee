@@ -166,6 +166,9 @@ pub struct HostState {
     pub memory_free_pct: Option<f64>,
     /// The host's own verdict now (thermal, power, memory pressure, load).
     pub now: Decision,
+    /// What the verdict rests on when the sampler had little history (it runs only while read):
+    /// the newest sample and the kernel's own load average. `None` with a full history.
+    pub basis: Option<String>,
 }
 
 impl HostState {
@@ -178,6 +181,7 @@ impl HostState {
             memory_available_bytes: m.and_then(|m| m.available_bytes),
             memory_free_pct: m.and_then(|m| m.free_percent),
             now: r.verdict.clone(),
+            basis: r.history_note.clone(),
         }
     }
 }
@@ -241,6 +245,10 @@ pub struct Admission {
     pub verdict: Verdict,
     pub reasons: Vec<String>,
     pub predicted: Predicted,
+    /// Set when the host's history was short (a sampler that had been idle): says which readings
+    /// the verdict used instead of the 5 and 15 minute averages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_basis: Option<String>,
 }
 
 /// The verdict's name: `admit`, `hold` or `backoff`.
@@ -413,6 +421,7 @@ pub fn admit(
         (1..=items.len()).take_while(|k| judge(host, &subject, &refs[..*k], concurrency, limits).verdict == Verdict::Admit).count()
     };
     Admission {
+        host_basis: host.basis.clone(),
         verdict,
         reasons,
         predicted: Predicted {
@@ -614,6 +623,7 @@ mod tests {
             memory_available_bytes: avail,
             memory_free_pct: Some(free_pct),
             now: decide(&reading, &Thresholds::default()),
+            basis: None,
         }
     }
 
