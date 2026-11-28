@@ -1,8 +1,9 @@
 //! The body table: one row per device type, with published outer dimensions and display sizes
 //! where the maker publishes them, and generic bodies derived from simee's own screens otherwise.
 //!
-//! Corner radii, camera bumps and button positions are not published by anyone; they are
-//! estimates, and each row's source note says so. No row carries a logo or a vendor asset.
+//! Corner radii, camera housings, lens sizes and button positions are not published by anyone;
+//! they are estimates, and each row's source note says so. A row's finish ([`Finish`]) is a
+//! material and a colour close to one the maker sells. No row carries a logo or a vendor asset.
 //!
 //! Phones, tablets and foldables live here. Each other form factor has a module of its own
 //! ([`watch`], [`tv`], [`car`], [`headset`]) with the same four items, which this table and
@@ -19,8 +20,9 @@ use crate::duo;
 use crate::fold;
 use crate::form_factor::Kind;
 
-const APPLE: &str =
-    "Apple tech specs: outer size, display diagonal and pixel density; corner radii, camera bump and button positions estimated";
+const APPLE: &str = "Apple tech specs (apple.com/iphone/compare, apple.com/ipad/compare): outer size, display diagonal and pixel density; corner radii, frame edge, camera housing, lenses and button positions estimated";
+const PIXEL: &str = "Google Pixel tech specs (store.google.com, each phone's Tech Specs): outer size, display diagonal, resolution and pixel density; corner radii, frame edge, camera bar, lenses, punch hole and button positions estimated";
+const PIXEL_TABLET: &str = "Google Pixel Tablet tech specs (store.google.com): outer size, display diagonal, resolution and pixel density; corner radii, camera and button positions estimated";
 const PIXEL_FOLD: &str = "Google Pixel Fold tech specs: unfolded size, both displays' diagonals and pixel densities; corner radii, camera bar and buttons estimated";
 const SURFACE_DUO: &str =
     "Microsoft Surface Duo tech specs: open size, display diagonal and pixel density; corner radii and buttons estimated";
@@ -35,7 +37,9 @@ pub(super) fn reference_shape(platform: Platform, form_factor: FormFactor) -> Sh
 
 pub(super) fn rows() -> Vec<Body> {
     let mut out: Vec<Body> = IPHONES.iter().map(iphone).collect();
+    out.extend(PIXELS.iter().map(pixel));
     out.extend(IPADS.iter().map(ipad));
+    out.push(pixel_tablet());
     if watch::ENABLED {
         out.extend(watch::rows());
     }
@@ -63,7 +67,49 @@ pub(super) fn rows() -> Vec<Body> {
     out
 }
 
+// --- Finishes ---
+
+const fn finish(frame: Surface, frame_colour: [f32; 3], back: Surface, back_colour: [f32; 3]) -> Finish {
+    Finish::new(frame, frame_colour, back, back_colour)
+}
+
+/// Silver anodized aluminium, back and band.
+const SILVER: Finish = finish(Surface::Aluminium, [0.74, 0.74, 0.75], Surface::Aluminium, [0.74, 0.74, 0.75]);
+/// Dark anodized aluminium, back and band.
+const SPACE_BLACK: Finish = finish(Surface::Aluminium, [0.055, 0.055, 0.06], Surface::Aluminium, [0.055, 0.055, 0.06]);
+/// A warm white glass back in a pale satin band.
+const PORCELAIN: Finish = finish(Surface::Aluminium, [0.62, 0.58, 0.52], Surface::Glass, [0.72, 0.69, 0.63]);
+/// A black glass back in a dark band.
+const OBSIDIAN: Finish = finish(Surface::Aluminium, [0.06, 0.06, 0.065], Surface::Glass, [0.016, 0.017, 0.02]);
+
+// --- Camera parts ---
+
+/// A camera lens on the back: a ring of the housing's metal standing `rim` proud of `z` (the face
+/// it sits on), and the lens glass inside it.
+fn lens(at: [f32; 2], z: f32, diameter: f32, rim: f32) -> [Block; 2] {
+    [Block::on_back(Role::Bump, at, z, diameter, rim, 0.3), Block::on_back(Role::Camera, at, z - rim, diameter - 2.4, 0.1, 0.3)]
+}
+
+/// A flash or sensor window lying flush on the back at `z`.
+fn flash(at: [f32; 2], z: f32, diameter: f32) -> Block {
+    Block::on_back(Role::Flash, at, z, diameter, 0.08, 0.3)
+}
+
 // --- iPhone ---
+
+/// How an iPhone's cameras are housed.
+#[derive(Clone, Copy)]
+enum Housing {
+    /// A plateau across the back's top, `0` mm tall, with `1` lenses at its end (iPhone 17 Pro,
+    /// iPhone Air).
+    Plateau(f32, u8),
+    /// A square island with three lenses (iPhone 16 Pro), its side mm.
+    Square(f32),
+    /// An upright pill with two lenses (iPhone 16, 17): width and height, mm.
+    Pill([f32; 2]),
+    /// One lens in a round bump of this diameter, mm.
+    Single(f32),
+}
 
 struct Phone {
     id: &'static str,
@@ -73,14 +119,18 @@ struct Phone {
     px: (u32, u32),
     ppi: f32,
     inches: f32,
+    /// The display's corner radius as a circular corner reads, mm (drawn continuous).
     screen_radius: f32,
     cutout: Option<CutoutKind>,
-    /// Size, corner radius and height of the camera bump; `bar` runs it across the top.
-    bump: ([f32; 2], f32, f32),
-    bar: bool,
+    housing: Housing,
+    /// How far the housing stands proud of the back, mm.
+    housing_height: f32,
+    /// The radius the band's edges are rounded over, mm.
+    edge: f32,
     /// The Action button (else the ring/silent switch).
     action: bool,
     camera_control: bool,
+    finish: Finish,
 }
 
 const fn phone(id: &'static str, name: &'static str, size: [f32; 3], px: (u32, u32), ppi: f32, inches: f32) -> Phone {
@@ -93,49 +143,147 @@ const fn phone(id: &'static str, name: &'static str, size: [f32; 3], px: (u32, u
         inches,
         screen_radius: 10.3,
         cutout: Some(CutoutKind::Island),
-        bump: ([19.5, 35.0], 9.75, 1.8),
-        bar: false,
+        housing: Housing::Pill([16.5, 35.0]),
+        housing_height: 1.9,
+        edge: 1.3,
         action: true,
         camera_control: true,
+        finish: SILVER,
     }
 }
 
 const IPHONES: [Phone; 10] = [
+    // Cosmic orange: an aluminium unibody, the plateau cut from it.
     Phone {
-        bump: ([0.0, 40.0], 8.0, 1.6),
-        bar: true,
+        housing: Housing::Plateau(38.0, 3),
+        housing_height: 2.0,
+        edge: 1.4,
+        finish: finish(Surface::Aluminium, [0.80, 0.22, 0.045], Surface::Aluminium, [0.80, 0.22, 0.045]),
         ..phone("iPhone-17-Pro", "iPhone 17 Pro", [71.9, 150.0, 8.75], (1206, 2622), 460.0, 6.3)
     },
     Phone {
-        bump: ([0.0, 43.0], 8.0, 1.6),
-        bar: true,
+        housing: Housing::Plateau(40.0, 3),
+        housing_height: 2.0,
+        edge: 1.4,
         ..phone("iPhone-17-Pro-Max", "iPhone 17 Pro Max", [78.0, 163.4, 8.75], (1320, 2868), 460.0, 6.9)
     },
-    phone("iPhone-17", "iPhone 17", [71.5, 149.6, 7.95], (1206, 2622), 460.0, 6.3),
-    Phone { bump: ([0.0, 22.0], 8.0, 2.6), bar: true, ..phone("iPhone-Air", "iPhone Air", [74.7, 156.2, 5.64], (1260, 2736), 460.0, 6.5) },
+    // Mist blue: colour-infused matte glass in an aluminium band.
+    Phone {
+        finish: finish(Surface::Aluminium, [0.36, 0.45, 0.60], Surface::MatteGlass, [0.30, 0.40, 0.58]),
+        ..phone("iPhone-17", "iPhone 17", [71.5, 149.6, 7.95], (1206, 2622), 460.0, 6.3)
+    },
+    // Cloud white: a glass back in a polished titanium band.
+    Phone {
+        housing: Housing::Plateau(21.0, 1),
+        housing_height: 2.6,
+        edge: 1.5,
+        finish: finish(Surface::Polished, [0.78, 0.78, 0.77], Surface::Glass, [0.80, 0.80, 0.79]),
+        ..phone("iPhone-Air", "iPhone Air", [74.7, 156.2, 5.64], (1260, 2736), 460.0, 6.5)
+    },
     Phone {
         screen_radius: 7.8,
         cutout: Some(CutoutKind::Notch),
-        bump: ([14.0, 14.0], 4.5, 1.4),
+        housing: Housing::Single(14.0),
+        housing_height: 1.4,
         camera_control: false,
+        finish: finish(Surface::Aluminium, [0.76, 0.76, 0.76], Surface::MatteGlass, [0.80, 0.80, 0.79]),
         ..phone("iPhone-16e", "iPhone 16e", [71.5, 146.7, 7.8], (1170, 2532), 460.0, 6.1)
     },
-    Phone { screen_radius: 9.1, ..phone("iPhone-16", "iPhone 16", [71.6, 147.6, 7.8], (1179, 2556), 460.0, 6.1) },
-    Phone { screen_radius: 9.1, ..phone("iPhone-16-Plus", "iPhone 16 Plus", [77.8, 160.9, 7.8], (1290, 2796), 460.0, 6.7) },
-    Phone { bump: ([37.0, 37.0], 9.5, 2.4), ..phone("iPhone-16-Pro", "iPhone 16 Pro", [71.5, 149.6, 8.25], (1206, 2622), 460.0, 6.3) },
+    // Ultramarine and teal: colour-infused glass.
     Phone {
-        bump: ([39.5, 39.5], 9.5, 2.4),
+        screen_radius: 9.1,
+        finish: finish(Surface::Aluminium, [0.22, 0.27, 0.62], Surface::MatteGlass, [0.16, 0.20, 0.60]),
+        ..phone("iPhone-16", "iPhone 16", [71.6, 147.6, 7.8], (1179, 2556), 460.0, 6.1)
+    },
+    Phone {
+        screen_radius: 9.1,
+        finish: finish(Surface::Aluminium, [0.30, 0.50, 0.48], Surface::MatteGlass, [0.26, 0.48, 0.46]),
+        ..phone("iPhone-16-Plus", "iPhone 16 Plus", [77.8, 160.9, 7.8], (1290, 2796), 460.0, 6.7)
+    },
+    // Natural and desert titanium over matte glass.
+    Phone {
+        housing: Housing::Square(37.0),
+        housing_height: 2.4,
+        edge: 1.1,
+        finish: finish(Surface::Titanium, [0.47, 0.44, 0.40], Surface::MatteGlass, [0.50, 0.47, 0.43]),
+        ..phone("iPhone-16-Pro", "iPhone 16 Pro", [71.5, 149.6, 8.25], (1206, 2622), 460.0, 6.3)
+    },
+    Phone {
+        housing: Housing::Square(39.5),
+        housing_height: 2.4,
+        edge: 1.1,
+        finish: finish(Surface::Titanium, [0.56, 0.45, 0.36], Surface::MatteGlass, [0.60, 0.50, 0.42]),
         ..phone("iPhone-16-Pro-Max", "iPhone 16 Pro Max", [77.6, 163.0, 8.25], (1320, 2868), 460.0, 6.9)
     },
+    // Midnight: a glass back in a rounded aluminium band.
     Phone {
         screen_radius: 0.0,
         cutout: None,
-        bump: ([9.5, 9.5], 4.75, 0.9),
+        housing: Housing::Single(9.5),
+        housing_height: 0.9,
+        edge: 2.0,
         action: false,
         camera_control: false,
+        finish: finish(Surface::Aluminium, [0.05, 0.055, 0.07], Surface::Glass, [0.014, 0.016, 0.024]),
         ..phone("iPhone-SE-3rd-generation", "iPhone SE (3rd generation)", [67.3, 138.4, 7.3], (750, 1334), 326.0, 4.7)
     },
 ];
+
+/// The camera housing of an iPhone `w` by `h` by `t`: its bump and the lenses, flash and sensor on
+/// it. Everything is placed as seen from the front, so the back's top left (where the lenses are)
+/// is at +x.
+fn iphone_cameras(p: &Phone) -> (Bump, Vec<Block>) {
+    let [w, h, t] = p.size;
+    let top = -t / 2.0 - p.housing_height;
+    let back = -t / 2.0;
+    let mut parts = Vec::new();
+    let bump = match p.housing {
+        Housing::Plateau(tall, lenses) => {
+            let (bw, margin) = (w - 6.4, 3.2);
+            let cy = h / 2.0 - margin - tall / 2.0;
+            let radius = (p.screen_radius + 2.6 - margin).max(4.0).min(tall / 2.0);
+            if lenses >= 3 {
+                let d = 0.41 * tall;
+                let (x, dy) = (bw / 2.0 - 0.29 * tall, 0.24 * tall);
+                parts.extend(lens([x, cy + dy], top, d, 1.0));
+                parts.extend(lens([x, cy - dy], top, d, 1.0));
+                parts.extend(lens([x - 0.445 * tall, cy], top, d, 1.0));
+                parts.push(flash([-bw / 2.0 + 0.26 * tall, cy + dy], top, 6.2));
+                parts.push(Block::on_back(Role::Camera, [-bw / 2.0 + 0.26 * tall, cy - dy], top, 5.6, 0.08, 0.3));
+            } else {
+                parts.extend(lens([bw / 2.0 - tall / 2.0, cy], top, 0.66 * tall, 0.8));
+                parts.push(flash([-bw / 2.0 + tall / 2.0, cy], top, 5.6));
+            }
+            Bump { center: [0.0, cy], size: [bw, tall], corner: Corner::continuous(radius), height: p.housing_height }
+        }
+        Housing::Square(side) => {
+            let c = [w / 2.0 - 3.6 - side / 2.0, h / 2.0 - 3.6 - side / 2.0];
+            let (d, q) = (0.41 * side, 0.225 * side);
+            parts.extend(lens([c[0] + q, c[1] + q], top, d, 1.0));
+            parts.extend(lens([c[0] + q, c[1] - q], top, d, 1.0));
+            parts.extend(lens([c[0] - q, c[1]], top, d, 1.0));
+            parts.push(flash([c[0] - q, c[1] + 0.3 * side], top, 5.6));
+            parts.push(Block::on_back(Role::Camera, [c[0] - q, c[1] - 0.3 * side], top, 5.0, 0.08, 0.3));
+            Bump { center: c, size: [side, side], corner: Corner::continuous(0.27 * side), height: p.housing_height }
+        }
+        Housing::Pill([bw, bh]) => {
+            let c = [w / 2.0 - 5.2 - bw / 2.0, h / 2.0 - 5.2 - bh / 2.0];
+            let d = bw - 2.6;
+            let dy = (bh - bw) / 2.0;
+            parts.extend(lens([c[0], c[1] + dy], top, d, 0.8));
+            parts.extend(lens([c[0], c[1] - dy], top, d, 0.8));
+            parts.push(flash([c[0] - bw / 2.0 - 7.0, c[1]], back, 5.6));
+            Bump { center: c, size: [bw, bh], corner: Corner::round(bw / 2.0), height: p.housing_height }
+        }
+        Housing::Single(d) => {
+            let c = [w / 2.0 - 5.5 - d / 2.0, h / 2.0 - 5.5 - d / 2.0];
+            parts.push(Block::on_back(Role::Camera, c, top, d - 2.6, 0.1, 0.3));
+            parts.push(flash([c[0] - d / 2.0 - 5.5, c[1]], back, 4.6));
+            Bump { center: c, size: [d, d], corner: Corner::round(d / 2.0), height: p.housing_height }
+        }
+    };
+    (bump, parts)
+}
 
 fn iphone(p: &Phone) -> Body {
     let [w, h, t] = p.size;
@@ -159,29 +307,17 @@ fn iphone(p: &Phone) -> Body {
         CutoutKind::Notch | CutoutKind::PunchHole => Cutout { kind, center: [0.0, top - 2.7], size: [26.0, 5.4] },
     });
     let bezel = ((w - sw) / 2.0).min((h - sh) / 2.0);
-    let ([bw, bh], br, height) = p.bump;
-    let bump = if p.bar {
-        let bw = w - 5.0;
-        Bump { center: [0.0, h / 2.0 - 2.5 - bh / 2.0], size: [bw, bh], corner: Corner { radius: br, exponent: 3.0 }, height }
-    } else {
-        // Top left as you look at the back: top right from the front.
-        let round = (br - bw.min(bh) / 2.0).abs() < 0.01;
-        Bump {
-            center: [w / 2.0 - 3.0 - bw / 2.0, h / 2.0 - 3.0 - bh / 2.0],
-            size: [bw, bh],
-            corner: Corner { radius: br, exponent: if round { 2.0 } else { 3.0 } },
-            height,
-        }
-    };
-    let side = |name, side, from_top: f32, length| Button { name, side, at: h / 2.0 - from_top, length, depth: 0.6, width: 2.4 };
+    let (bump, extras) = iphone_cameras(p);
+    // Keys stand 0.35 mm proud; the Camera Control is a sapphire strip flush with the band.
+    let side = |name, side, from_top: f32, length| Button { name, side, at: h / 2.0 - from_top, length, depth: 0.35, width: 2.6 };
     let mut buttons = vec![
-        side(if p.action { "action" } else { "ring-silent" }, Side::Left, 30.0, 7.0),
-        side("volume-up", Side::Left, 44.0, 10.0),
-        side("volume-down", Side::Left, 57.0, 10.0),
-        side("side", Side::Right, 48.0, 16.0),
+        side(if p.action { "action" } else { "ring-silent" }, Side::Left, 30.5, 6.4),
+        side("volume-up", Side::Left, 44.0, 10.5),
+        side("volume-down", Side::Left, 57.5, 10.5),
+        side("side", Side::Right, 48.0, 17.5),
     ];
     if p.camera_control {
-        buttons.push(Button { depth: 0.2, ..side("camera-control", Side::Right, h - 52.0, 13.0) });
+        buttons.push(Button { depth: 0.06, ..side("camera-control", Side::Right, h - 51.0, 14.5) });
     }
     Body {
         id: p.id.to_owned(),
@@ -191,14 +327,158 @@ fn iphone(p: &Phone) -> Body {
         form_factor: FormFactor::Phone,
         source: Source::Published(APPLE),
         size: [w, h, t],
-        corner: Corner { radius: p.screen_radius.max(7.0) + bezel, exponent: 3.0 },
-        bevel: 0.8,
+        // A square-cornered screen (the SE's) sits in a body with plain round corners.
+        corner: if p.screen_radius > 0.0 { Corner::continuous(p.screen_radius + bezel) } else { Corner::round(9.0) },
+        bevel: p.edge.min(t / 2.0 - 1.4),
         screens: vec![screen],
         bump: Some(bump),
         buttons,
         crown: None,
         fold: None,
-        extras: Vec::new(),
+        extras,
+        finish: p.finish,
+    }
+}
+
+// --- Pixel ---
+
+/// A Pixel phone: Google's published size and display, and its camera bar.
+struct Pixel {
+    id: &'static str,
+    name: &'static str,
+    /// Width, height, depth, mm.
+    size: [f32; 3],
+    px: (u32, u32),
+    ppi: f32,
+    inches: f32,
+    /// The camera bar: `true` a pill that floats clear of the sides (Pixel 9), else a visor that
+    /// runs into the band on both sides (Pixel 8).
+    island: bool,
+    lenses: u8,
+    finish: Finish,
+}
+
+/// The ids are the SDK's hardware profile names (`hw.device.name` in an AVD made for the device).
+const PIXELS: [Pixel; 5] = [
+    Pixel {
+        id: "pixel_9",
+        name: "Pixel 9",
+        size: [72.0, 152.8, 8.5],
+        px: (1080, 2424),
+        ppi: 422.0,
+        inches: 6.3,
+        island: true,
+        lenses: 2,
+        finish: PORCELAIN,
+    },
+    // Hazel: matte glass in a polished band.
+    Pixel {
+        id: "pixel_9_pro",
+        name: "Pixel 9 Pro",
+        size: [72.0, 152.8, 8.5],
+        px: (1280, 2856),
+        ppi: 495.0,
+        inches: 6.3,
+        island: true,
+        lenses: 3,
+        finish: finish(Surface::Polished, [0.42, 0.44, 0.41], Surface::MatteGlass, [0.20, 0.23, 0.21]),
+    },
+    Pixel {
+        id: "pixel_9_pro_xl",
+        name: "Pixel 9 Pro XL",
+        size: [76.6, 162.8, 8.5],
+        px: (1344, 2992),
+        ppi: 486.0,
+        inches: 6.8,
+        island: true,
+        lenses: 3,
+        finish: finish(Surface::Polished, [0.10, 0.10, 0.105], Surface::MatteGlass, [0.022, 0.023, 0.026]),
+    },
+    Pixel {
+        id: "pixel_8",
+        name: "Pixel 8",
+        size: [70.8, 150.5, 8.9],
+        px: (1080, 2400),
+        ppi: 428.0,
+        inches: 6.2,
+        island: false,
+        lenses: 2,
+        finish: OBSIDIAN,
+    },
+    Pixel {
+        id: "pixel_8_pro",
+        name: "Pixel 8 Pro",
+        size: [76.5, 162.6, 8.8],
+        px: (1344, 2992),
+        ppi: 489.0,
+        inches: 6.7,
+        island: false,
+        lenses: 3,
+        finish: finish(Surface::Polished, [0.66, 0.64, 0.60], Surface::MatteGlass, [0.70, 0.67, 0.61]),
+    },
+];
+
+/// A Pixel-style camera bar across the back of a phone `w` wide whose back is at `back` (z): the
+/// bar, its black cover glass, `lenses` lenses under it and a flash beside it. `cy` is the bar's
+/// centre line. As seen from the front, so the lenses (the back's left) are at +x.
+fn camera_bar(w: f32, cy: f32, back: f32, island: bool, lenses: u8) -> (Bump, Vec<Block>) {
+    let (bw, bh, height) = if island { (w - 19.0, 20.5, 3.0) } else { (w - 1.2, 19.0, 2.8) };
+    let top = back - height;
+    let n = f32::from(lenses.max(1));
+    let (d, pitch) = (11.2, 13.4);
+    // The cover glass: one pill over the bar's whole face, the lenses toward the back's left
+    // under it and the flash at its other end.
+    let gh = bh - 4.6;
+    let gw = if island { bw - 4.6 } else { bw - 13.0 };
+    let glass = top - 0.15;
+    let mut parts = vec![Block::new(Role::Lens, [0.0, cy, top + 0.15], [gw, gh, 0.6], Corner::round(gh / 2.0), 0.1)];
+    let first = gw / 2.0 - gh / 2.0 - 0.6;
+    for i in 0..lenses.max(1) {
+        parts.push(Block::on_back(Role::Camera, [first - f32::from(i) * pitch, cy], glass, d, 0.08, 0.2));
+    }
+    let free = gw - gh / 2.0 - 0.6 - (n - 1.0) * pitch - d / 2.0;
+    parts.push(flash([-gw / 2.0 + (free / 2.0).clamp(4.0, 9.0), cy], glass, 4.6));
+    let corner = if island { Corner::round(bh / 2.0) } else { Corner::round(2.5) };
+    (Bump { center: [0.0, cy], size: [bw, bh], corner, height }, parts)
+}
+
+fn pixel(p: &Pixel) -> Body {
+    let [w, h, t] = p.size;
+    let mut screen = Screen {
+        display: Display::Main,
+        face: Face::Front,
+        px: p.px,
+        ppi: p.ppi,
+        center: [0.0, 0.0],
+        shape: reference_shape(Platform::Android, FormFactor::Phone),
+        corner_radius: 8.6,
+        cutout: None,
+        published: Some(Published::Diagonal(p.inches)),
+    };
+    let [sw, sh] = screen.size();
+    // The front camera's punch hole, centred near the top.
+    screen.cutout = Some(Cutout { kind: CutoutKind::PunchHole, center: [0.0, sh / 2.0 - 4.4], size: [3.7, 3.7] });
+    let bezel = ((w - sw) / 2.0).min((h - sh) / 2.0);
+    let (bump, extras) = camera_bar(w, h / 2.0 - 23.5, -t / 2.0, p.island, p.lenses);
+    // Power above volume on the right side.
+    let key = |name, from_top: f32, length| Button { name, side: Side::Right, at: h / 2.0 - from_top, length, depth: 0.4, width: 2.5 };
+    Body {
+        id: p.id.to_owned(),
+        aliases: Vec::new(),
+        name: p.name.to_owned(),
+        platform: Platform::Android,
+        form_factor: FormFactor::Phone,
+        source: Source::Published(PIXEL),
+        size: [w, h, t],
+        corner: Corner::continuous(screen.corner_radius + bezel),
+        bevel: 1.5,
+        screens: vec![screen],
+        bump: Some(bump),
+        buttons: vec![key("power", 45.0, 10.5), key("volume", 68.0, 21.0)],
+        crown: None,
+        fold: None,
+        extras,
+        finish: p.finish,
     }
 }
 
@@ -216,6 +496,7 @@ struct Tablet {
     bump: ([f32; 2], f32),
     /// The volume keys sit on the top edge beside the top button (else on the right side).
     volume_on_top: bool,
+    finish: Finish,
 }
 
 const IPADS: [Tablet; 6] = [
@@ -229,6 +510,7 @@ const IPADS: [Tablet; 6] = [
         inches: 11.0,
         bump: ([18.5, 30.0], 1.1),
         volume_on_top: false,
+        finish: SPACE_BLACK,
     },
     Tablet {
         id: "iPad-Pro-13-inch-M4",
@@ -240,6 +522,7 @@ const IPADS: [Tablet; 6] = [
         inches: 13.0,
         bump: ([18.5, 30.0], 1.1),
         volume_on_top: false,
+        finish: SILVER,
     },
     Tablet {
         id: "iPad-Air-11-inch-M3",
@@ -251,6 +534,7 @@ const IPADS: [Tablet; 6] = [
         inches: 11.0,
         bump: ([9.0, 9.0], 0.8),
         volume_on_top: true,
+        finish: finish(Surface::Aluminium, [0.42, 0.50, 0.60], Surface::Aluminium, [0.42, 0.50, 0.60]),
     },
     Tablet {
         id: "iPad-Air-13-inch-M3",
@@ -262,6 +546,7 @@ const IPADS: [Tablet; 6] = [
         inches: 13.0,
         bump: ([9.0, 9.0], 0.8),
         volume_on_top: true,
+        finish: finish(Surface::Aluminium, [0.70, 0.66, 0.60], Surface::Aluminium, [0.70, 0.66, 0.60]),
     },
     Tablet {
         id: "iPad-mini-A17-Pro",
@@ -273,6 +558,7 @@ const IPADS: [Tablet; 6] = [
         inches: 8.3,
         bump: ([9.5, 9.5], 0.8),
         volume_on_top: true,
+        finish: finish(Surface::Aluminium, [0.38, 0.36, 0.48], Surface::Aluminium, [0.38, 0.36, 0.48]),
     },
     Tablet {
         id: "iPad-A16",
@@ -284,6 +570,7 @@ const IPADS: [Tablet; 6] = [
         inches: 11.0,
         bump: ([9.0, 9.0], 0.8),
         volume_on_top: true,
+        finish: SILVER,
     },
 ];
 
@@ -307,10 +594,21 @@ fn ipad(p: &Tablet) -> Body {
     let bump = Bump {
         center: [w / 2.0 - 6.0 - bw / 2.0, h / 2.0 - 6.0 - bh / 2.0],
         size: [bw, bh],
-        corner: if round { Corner { radius: bw / 2.0, exponent: 2.0 } } else { Corner { radius: 7.0, exponent: 3.0 } },
+        corner: if round { Corner::round(bw / 2.0) } else { Corner::continuous(5.6) },
         height,
     };
-    let key = |name, side, at, length| Button { name, side, at, length, depth: 0.5, width: 2.2 };
+    // One lens in a round bump; a wide lens, a LiDAR window and a flash on the Pro's island.
+    let top = -t / 2.0 - height;
+    let [cx, cy] = bump.center;
+    let extras = if round {
+        vec![Block::on_back(Role::Camera, [cx, cy], top, bw - 2.4, 0.1, 0.3)]
+    } else {
+        let mut parts = lens([cx, cy + bh / 2.0 - bw / 2.0], top, bw - 5.0, 0.7).to_vec();
+        parts.push(Block::on_back(Role::Camera, [cx, cy - 4.5], top, 5.0, 0.08, 0.3));
+        parts.push(flash([cx, cy - bh / 2.0 + 5.5], top, 4.6));
+        parts
+    };
+    let key = |name, side, at, length| Button { name, side, at, length, depth: 0.35, width: 2.2 };
     let mut buttons = vec![key("top", Side::Top, w / 2.0 - 22.0, 15.0)];
     if p.volume_on_top {
         buttons.push(key("volume-up", Side::Top, -w / 2.0 + 48.0, 12.0));
@@ -327,14 +625,55 @@ fn ipad(p: &Tablet) -> Body {
         form_factor: FormFactor::Tablet,
         source: Source::Published(APPLE),
         size: [w, h, t],
-        corner: Corner { radius: screen.corner_radius + bezel, exponent: 3.0 },
-        bevel: 0.8,
+        corner: Corner::continuous(screen.corner_radius + bezel),
+        bevel: 1.0,
         screens: vec![screen],
         bump: Some(bump),
         buttons,
         crown: None,
         fold: None,
-        extras: Vec::new(),
+        extras,
+        finish: p.finish,
+    }
+}
+
+/// The Pixel Tablet, landscape as it docks: 258 x 169 x 8.1 mm around a 10.95 inch 2560x1600
+/// display at 276 ppi, with one camera in the back's top corner.
+fn pixel_tablet() -> Body {
+    let (w, h, t) = (258.0, 169.0, 8.1);
+    let screen = Screen {
+        display: Display::Main,
+        face: Face::Front,
+        px: (2560, 1600),
+        ppi: 276.0,
+        center: [0.0, 0.0],
+        shape: reference_shape(Platform::Android, FormFactor::Tablet),
+        corner_radius: 6.0,
+        cutout: None,
+        published: Some(Published::Diagonal(10.95)),
+    };
+    let [sw, sh] = screen.size();
+    let bezel = ((w - sw) / 2.0).min((h - sh) / 2.0);
+    let c = [w / 2.0 - 13.0, h / 2.0 - 13.0];
+    let key = |name, side, at, length| Button { name, side, at, length, depth: 0.4, width: 2.6 };
+    Body {
+        id: "pixel_tablet".to_owned(),
+        aliases: Vec::new(),
+        name: "Pixel Tablet".to_owned(),
+        platform: Platform::Android,
+        form_factor: FormFactor::Tablet,
+        source: Source::Published(PIXEL_TABLET),
+        size: [w, h, t],
+        corner: Corner::continuous(screen.corner_radius + bezel),
+        bevel: 2.4,
+        screens: vec![screen],
+        bump: Some(Bump { center: c, size: [10.0, 10.0], corner: Corner::round(5.0), height: 0.5 }),
+        buttons: vec![key("power", Side::Top, -w / 2.0 + 24.0, 16.0), key("volume", Side::Left, h / 2.0 - 32.0, 26.0)],
+        crown: None,
+        fold: None,
+        extras: vec![Block::on_back(Role::Camera, c, -t / 2.0 - 0.5, 7.4, 0.1, 0.3)],
+        // Porcelain: a matte coated aluminium shell.
+        finish: finish(Surface::MatteGlass, [0.66, 0.63, 0.57], Surface::MatteGlass, [0.70, 0.67, 0.61]),
     }
 }
 
@@ -439,6 +778,7 @@ fn book(
         crown: None,
         fold: Some(FoldBody { panels, hinge: axis, screen_gap }),
         extras: Vec::new(),
+        finish: Finish::GRAPHITE,
     }
 }
 
@@ -472,15 +812,22 @@ fn pixel_fold() -> Body {
         Some(outer),
         HingeSpec::from_hinge(&d.hinge),
     );
-    // The camera bar across the top of the other panel's back.
-    b.bump = Some(Bump {
-        center: [w / 4.0, h / 2.0 - 12.0],
-        size: [w / 2.0 - 8.0, 16.0],
-        corner: Corner { radius: 8.0, exponent: 2.0 },
-        height: 2.6,
-    });
-    let key = |name, at, length| Button { name, side: Side::Right, at, length, depth: 0.5, width: 2.4 };
-    b.buttons = vec![key("power", h / 2.0 - 28.0, 14.0), key("volume", h / 2.0 - 50.0, 22.0)];
+    // The camera bar across the top of the other panel's back: a visor that floats clear of the
+    // panel's edges, three lenses under one cover glass.
+    let half = w / 2.0;
+    let (mut bump, mut extras) = camera_bar(half + 11.0, h / 2.0 - 15.0, -t / 2.0, true, 3);
+    bump.center[0] = w / 4.0;
+    bump.height = 2.6;
+    for x in &mut extras {
+        x.center[0] += w / 4.0;
+        x.center[2] += 0.4;
+    }
+    b.bump = Some(bump);
+    b.extras = extras;
+    let key = |name, at, length| Button { name, side: Side::Right, at, length, depth: 0.4, width: 2.4 };
+    b.buttons = vec![key("power", h / 2.0 - 28.0, 12.0), key("volume", h / 2.0 - 52.0, 21.0)];
+    // Porcelain: matte glass in a polished band.
+    b.finish = finish(Surface::Polished, [0.66, 0.64, 0.60], Surface::MatteGlass, [0.70, 0.67, 0.61]);
     b
 }
 
@@ -506,8 +853,10 @@ fn surface_duo() -> Body {
         None,
         HingeSpec::from_hinge(&d.hinge),
     );
-    let key = |name, at, length| Button { name, side: Side::Right, at, length, depth: 0.4, width: 2.0 };
+    let key = |name, at, length| Button { name, side: Side::Right, at, length, depth: 0.35, width: 2.0 };
     b.buttons = vec![key("power", h / 2.0 - 30.0, 12.0), key("volume", h / 2.0 - 52.0, 20.0)];
+    // Glacier: white glass on both outer faces.
+    b.finish = finish(Surface::Plastic, [0.74, 0.74, 0.74], Surface::Glass, [0.80, 0.80, 0.80]);
     b
 }
 
@@ -525,7 +874,7 @@ fn generic_book(
     hinge: HingeSpec,
     exponent: f32,
 ) -> Body {
-    let (side, top, t, bevel) = (2.5, 4.0, 6.0, 0.6);
+    let (side, top, t, bevel) = (2.5, 3.0, 5.6, 1.0);
     let radius = |shape| if shape == Shape::Rounded { 4.0 } else { 0.0 };
     let inner = foldable_screen(Display::Inner, Face::Front, inner, ppi, [0.0, 0.0], shape, radius(shape));
     let [iw, ih] = inner.size();
@@ -533,7 +882,7 @@ fn generic_book(
     let outer_size = outer_screen([0.0, 0.0]).map(|s| s.size());
     let corner = Corner { radius: 7.0, exponent };
     let note = Source::Generic(note);
-    let key = |name, side, at, length| Button { name, side, at, length, depth: 0.5, width: 2.4 };
+    let key = |name, side, at, length| Button { name, side, at, length, depth: 0.4, width: 2.4 };
     if !hinge.vertical {
         // A flip: the screen's top half is the lid, with the cover screen and the camera on its
         // back, side by side along its top.
@@ -708,42 +1057,46 @@ pub(super) fn generic(
     }
 }
 
-/// A generic phone or tablet: the screen in even bezels, a camera bump and two keys.
+/// A generic phone or tablet: the screen under cover glass in thin, even bezels, a camera bar (a
+/// tablet: one lens) and two keys.
 fn generic_slab(g: &Spec) -> Body {
-    // Side bezel, top bezel, thickness, screen corner radius, edge bevel.
-    let (side, top, t, radius, bevel) = match g.form_factor {
-        FormFactor::Tablet => (8.0, 8.0, 6.5, 5.0, 0.8),
-        _ => (3.0, 4.5, 8.5, 4.0, 0.8),
+    // Bezel (the band's edge included), thickness, screen corner radius, edge radius.
+    let (bezel, t, radius, bevel) = match g.form_factor {
+        FormFactor::Tablet => (8.5, 6.5, 5.0, 1.2),
+        _ => (3.0, 8.4, 7.5, 1.4),
     };
     let screen = g.screen(radius);
     let [sw, sh] = screen.size();
     let (size, corner) = if g.shape == Shape::Round {
-        let d = sw.max(sh) + 2.0 * side;
-        ([d, d, t], Corner { radius: d / 2.0, exponent: 2.0 })
+        let d = sw.max(sh) + 2.0 * bezel;
+        ([d, d, t], Corner::round(d / 2.0))
     } else {
-        let (w, h) = (sw + 2.0 * side, sh + 2.0 * top);
-        ([w, h, t], Corner { radius: screen.corner_radius.max(2.0) + side, exponent: 2.0 })
+        // Continuous corners round a rounded screen; a square-cornered one keeps plain ones, which
+        // stay clear of its corners.
+        let corner = if g.shape == Shape::Rounded { Corner::continuous(radius + bezel) } else { Corner::round(2.0 + bezel) };
+        ([sw + 2.0 * bezel, sh + 2.0 * bezel, t], corner)
     };
     let [w, h, _] = size;
-    let key = |name, side, at, length| Button { name, side, at, length, depth: 0.6, width: 2.6 };
-    let (bump, buttons) = match g.form_factor {
+    let key = |name, side, at, length| Button { name, side, at, length, depth: 0.4, width: 2.5 };
+    let (bump, extras, buttons) = match g.form_factor {
         FormFactor::Tablet => {
-            let bump = Bump {
-                center: [w / 2.0 - 12.0, h / 2.0 - 12.0],
-                size: [12.0, 12.0],
-                corner: Corner { radius: 6.0, exponent: 2.0 },
-                height: 0.8,
-            };
-            (bump, vec![key("power", Side::Top, -w / 2.0 + 30.0, 14.0), key("volume", Side::Top, w / 2.0 - 40.0, 25.0)])
+            let c = [w / 2.0 - 12.0, h / 2.0 - 12.0];
+            let bump = Bump { center: c, size: [11.0, 11.0], corner: Corner::round(5.5), height: 0.6 };
+            let keys = vec![key("power", Side::Top, -w / 2.0 + 30.0, 14.0), key("volume", Side::Top, w / 2.0 - 40.0, 25.0)];
+            (bump, vec![Block::on_back(Role::Camera, c, -t / 2.0 - 0.6, 8.2, 0.1, 0.3)], keys)
         }
         _ => {
-            let bump = Bump {
-                center: [w / 2.0 - 15.0, h / 2.0 - 10.0],
-                size: [22.0, 12.0],
-                corner: Corner { radius: 4.0, exponent: 2.0 },
-                height: 1.2,
-            };
-            (bump, vec![key("power", Side::Right, 0.25 * h, 12.0), key("volume", Side::Right, 0.05 * h, 24.0)])
+            // A camera bar where the phone is wide enough for one, else one lens in a round bump.
+            let keys = vec![key("power", Side::Right, 0.21 * h, 10.5), key("volume", Side::Right, 0.05 * h, 21.0)];
+            if w >= 56.0 && h >= 90.0 {
+                let (bump, extras) = camera_bar(w, h / 2.0 - 23.5, -t / 2.0, true, 2);
+                (bump, extras, keys)
+            } else {
+                let d = (0.3 * w.min(h)).clamp(4.0, 12.0);
+                let c = [w / 2.0 - bezel - d, h / 2.0 - bezel - d];
+                let bump = Bump { center: c, size: [d, d], corner: Corner::round(d / 2.0), height: 1.0 };
+                (bump, vec![Block::on_back(Role::Camera, c, -t / 2.0 - 1.0, d - 2.2, 0.1, 0.3)], keys)
+            }
         }
     };
     Body {
@@ -761,6 +1114,7 @@ fn generic_slab(g: &Spec) -> Body {
         buttons,
         crown: None,
         fold: None,
-        extras: Vec::new(),
+        extras,
+        finish: Finish::GRAPHITE,
     }
 }

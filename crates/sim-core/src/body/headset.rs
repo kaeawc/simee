@@ -40,7 +40,7 @@ const fn corner(radius: f32, exponent: f32) -> Corner {
 }
 
 fn block(role: Role, center: [f32; 3], size: [f32; 3], corner: Corner, bevel: f32) -> Block {
-    Block { role, center, size, corner, bevel }
+    Block::new(role, center, size, corner, bevel)
 }
 
 /// A headset row: the visor's size, and the width the frame spans on its eye-side face.
@@ -125,6 +125,8 @@ fn headset(id: &str, name: String, platform: Platform, source: Source, size: [f3
         crown: None,
         fold: None,
         extras: headset_extras(size),
+        // A silver aluminium frame; the outside is the front glass block over it.
+        finish: Finish::new(Surface::Aluminium, [0.62, 0.62, 0.63], Surface::Aluminium, [0.62, 0.62, 0.63]),
     }
 }
 
@@ -203,6 +205,8 @@ fn ai_glasses(id: &str, name: String, platform: Platform, source: Source, px: (u
         crown: None,
         fold: None,
         extras,
+        // Black acetate frames.
+        finish: Finish::new(Surface::Plastic, [0.014, 0.014, 0.016], Surface::Plastic, [0.014, 0.014, 0.016]),
     }
 }
 

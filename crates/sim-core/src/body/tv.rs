@@ -70,7 +70,7 @@ pub(super) fn generic(g: &Spec) -> Option<Body> {
 }
 
 fn block(role: Role, center: [f32; 3], size: [f32; 3], radius: f32, bevel: f32) -> Block {
-    Block { role, center, size, corner: Corner { radius, exponent: 2.0 }, bevel }
+    Block::new(role, center, size, Corner::round(radius), bevel)
 }
 
 /// A television at `px` with a 55 inch diagonal, on a pedestal and a base; `apple` adds the Apple
@@ -130,6 +130,8 @@ fn television(id: &str, name: &str, platform: Platform, source: Source, px: (u32
         crown: None,
         fold: None,
         extras,
+        // A black moulded set: a gloss bezel under the panel's glass, a plastic back.
+        finish: Finish::new(Surface::Plastic, [0.012, 0.012, 0.014], Surface::Plastic, [0.016, 0.016, 0.018]),
     }
 }
 

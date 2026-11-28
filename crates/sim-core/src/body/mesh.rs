@@ -3,6 +3,13 @@
 //! into its faces with their own UVs, and the bump, buttons, crown and extra blocks
 //! (`Body::extras`) as rounded boxes.
 //!
+//! A panel's skin is three parts, so the scene can shade each as what it is: the cover glass
+//! round the front screen ([`Role::Glass`], and the front edge too where
+//! [`super::Finish::glass_wraps`]), the band round the sides ([`Role::Shell`]) and the back
+//! ([`Role::Back`]; cover glass again where a screen is set into it). A side key is a pill of the
+//! band's metal in a dark recess ([`Role::Recess`]) cut where the band's outline really is at
+//! that point, so it sits in a round case as it does in a flat side.
+//!
 //! One vertex and index buffer per body, split into [`Part`]s by role and panel so the scene picks
 //! a material per part and draws a foldable's panel 1 with [`super::HingeAxis::transform`]. The
 //! mesh is authored flat (unfolded), in the body's frame (millimetres, right-handed, origin at
@@ -17,15 +24,18 @@ use super::{Body, Display, Face, Side};
 use crate::form_factor::Shape;
 
 /// Points per rounded corner, ends included.
-const CORNER_STEPS: usize = 8;
+const CORNER_STEPS: usize = 16;
 /// Steps across each rounded-over edge.
-const BEVEL_STEPS: usize = 4;
+const BEVEL_STEPS: usize = 6;
 /// Points around an outline.
 const RING: usize = 4 * (CORNER_STEPS + 1);
 /// The smallest corner radius drawn, mm: a square corner is rounded this much.
 pub const MIN_RADIUS: f32 = 0.3;
 /// How far a bump, button or crown sinks into the body, mm, so no seam shows where it sits.
 const EMBED: f32 = 0.3;
+/// How much wider than its key a recess is on every side, mm, and how far it stands off the side.
+const RECESS: f32 = 0.22;
+const RECESS_LIFT: f32 = 0.03;
 /// How far a cutout floats off the screen it sits on, mm (draw it after the screen).
 pub const CUTOUT_LIFT: f32 = 0.05;
 
@@ -44,6 +54,12 @@ impl Mesh {
     pub fn part_indices(&self, part: &Part) -> &[u32] {
         &self.indices[part.first as usize..(part.first + part.count) as usize]
     }
+
+    /// The positions a part's triangles are drawn from, each once: what to walk for its bounds
+    /// (a sixth of the points its indices name). The parts of one panel's skin share theirs.
+    pub fn part_positions(&self, part: &Part) -> &[[f32; 3]] {
+        &self.positions[part.vertex_first as usize..(part.vertex_first + part.vertex_count) as usize]
+    }
 }
 
 /// A run of the index buffer: what it draws and which panel it moves with.
@@ -54,13 +70,26 @@ pub struct Part {
     pub panel: usize,
     pub first: u32,
     pub count: u32,
+    /// The run of vertices its indices fall in ([`Mesh::part_positions`]).
+    pub vertex_first: u32,
+    pub vertex_count: u32,
 }
 
 /// What a part is, for its material.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Role {
-    /// The body: UVs project its outline onto 0..1.
+    /// The band round the body's sides: UVs project its outline onto 0..1.
     Shell,
+    /// The cover glass round a screen: black under glass.
+    Glass,
+    /// The back, where no screen is set into it.
+    Back,
+    /// The dark gap a key or crown sits in.
+    Recess,
+    /// A camera lens: coated glass over a dark barrel.
+    Camera,
+    /// A flash or sensor window: a pale diffuser.
+    Flash,
     /// A screen's glass: UV (0, 0) is the screen's top-left as it shows, v grows down its rows.
     Screen(Display),
     Cutout,
@@ -130,7 +159,13 @@ pub fn mesh(body: &Body) -> Mesh {
         // A flexible display's panel has no rounded-over edge at the hinge on its front.
         let (front_hole, back_hole) = (front.map(|(_, r)| r), back.map(|(_, r)| r));
         let faces = Faces { front: front_hole.as_ref(), back: back_hole.as_ref(), flat: square.filter(|_| front.is_some()) };
-        b.part(Role::Shell, pi, |b| slab(b, &frame, &shell, t, body.bevel, &faces));
+        let (first, vertices) = (b.mark(), b.mesh.positions.len() as u32);
+        let [band, back_cap] = slab(&mut b, &frame, &shell, t, body.bevel, &faces, body.finish.glass_wraps);
+        let end = b.mark();
+        b.cut(Role::Glass, pi, first, band, vertices);
+        b.cut(Role::Shell, pi, band, back_cap, vertices);
+        // A back with a screen set into it is cover glass too.
+        b.cut(if back_hole.is_some() { Role::Glass } else { Role::Back }, pi, back_cap, end, vertices);
         for (face, piece) in [(Face::Front, front), (Face::Back, back)] {
             let Some((s, local)) = piece else { continue };
             let [l, r, bottom, top] = s.rect();
@@ -163,7 +198,10 @@ pub fn mesh(body: &Body) -> Mesh {
             radii: [bump.corner.radius; 4],
             exponent: bump.corner.exponent,
         };
-        b.part(Role::Bump, pi, |b| slab(b, &frame, &shape, bump.height + EMBED, 0.6, &Faces::default()));
+        let bevel = (0.3 * bump.height).clamp(0.2, 0.7);
+        b.part(Role::Bump, pi, |b| {
+            slab(b, &frame, &shape, bump.height + EMBED, bevel, &Faces::default(), false);
+        });
     }
     let mut keys: Vec<SideKey> = body
         .buttons
@@ -173,9 +211,9 @@ pub fn mesh(body: &Body) -> Mesh {
             side: k.side,
             at: k.at,
             size: [k.width, k.length],
-            radius: k.width.min(k.length) / 2.0 * 0.9,
+            radius: k.width.min(k.length) / 2.0,
             depth: k.depth,
-            bevel: 0.25,
+            bevel: (0.5 * k.depth).clamp(0.05, 0.2),
         })
         .collect();
     if let Some(c) = &body.crown {
@@ -191,16 +229,30 @@ pub fn mesh(body: &Body) -> Mesh {
         };
         let pi = body.panel_at(on_side);
         let p = panels[pi];
-        let depth = depth + EMBED;
-        let out = depth / 2.0 - EMBED;
-        let origin = match side {
-            Side::Left => [p.center[0] - p.size[0] / 2.0 - out, at, 0.0],
-            Side::Right => [p.center[0] + p.size[0] / 2.0 + out, at, 0.0],
-            Side::Top => [at, p.center[1] + p.size[1] / 2.0 + out, 0.0],
-            Side::Bottom => [at, p.center[1] - p.size[1] / 2.0 - out, 0.0],
+        let outline =
+            RoundRect { center: p.center, half: [p.size[0] / 2.0, p.size[1] / 2.0], radii: p.radii, exponent: body.corner.exponent };
+        // Where the band's outline is at the key's middle, and how far it falls away by the key's
+        // ends (a round case): the key is sunk that much deeper so its back stays inside.
+        let edge = outline.edge(side, at);
+        let sag = (edge - outline.edge(side, at - along / 2.0).min(outline.edge(side, at + along / 2.0))).max(0.0);
+        let place = |b: &mut Builder, role: Role, grow: f32, proud: f32, bevel: f32| {
+            let depth = proud + EMBED + sag;
+            let mid = edge + (proud - EMBED - sag) / 2.0;
+            let origin = match side {
+                Side::Left => [p.center[0] - mid, at, 0.0],
+                Side::Right => [p.center[0] + mid, at, 0.0],
+                Side::Top => [at, p.center[1] + mid, 0.0],
+                Side::Bottom => [at, p.center[1] - mid, 0.0],
+            };
+            let half = [across / 2.0 + grow, along / 2.0 + grow];
+            let shape = RoundRect { center: [0.0, 0.0], half, radii: [radius + grow; 4], exponent: 2.0 };
+            b.part(role, pi, |b| {
+                slab(b, &Frame::side(side, origin), &shape, depth, bevel, &Faces::default(), false);
+            });
         };
-        let shape = RoundRect { center: [0.0, 0.0], half: [across / 2.0, along / 2.0], radii: [radius; 4], exponent: 2.0 };
-        b.part(role, pi, |b| slab(b, &Frame::side(side, origin), &shape, depth, bevel, &Faces::default()));
+        // The recess the key is machined into, a hair proud of the side so it shows round the key.
+        place(&mut b, Role::Recess, RECESS, RECESS_LIFT, 0.0);
+        place(&mut b, role, 0.0, depth, bevel);
     }
     // Each extra block is a part of its own, on the panel its centre is on.
     for x in &body.extras {
@@ -211,7 +263,9 @@ pub fn mesh(body: &Body) -> Mesh {
             radii: [x.corner.radius; 4],
             exponent: x.corner.exponent,
         };
-        b.part(x.role, pi, |b| slab(b, &Frame::at(x.center), &shape, x.size[2], x.bevel, &Faces::default()));
+        b.part(x.role, pi, |b| {
+            slab(b, &Frame::tilted(x.center, x.tilt), &shape, x.size[2], x.bevel, &Faces::default(), false);
+        });
     }
     b.mesh
 }
@@ -248,7 +302,8 @@ fn screen_piece(body: &Body, s: &super::Screen, [bl, br, bb, bt]: [f32; 4], shar
     let [w, h] = s.size();
     let (radius, exponent) = match s.shape {
         Shape::Round => (w.min(h) / 2.0, 2.0),
-        Shape::Rounded => (s.corner_radius, body.corner.exponent),
+        // A continuous corner reaches further along its edges than the circular one it reads as.
+        Shape::Rounded => (s.corner_radius * reach(body.corner.exponent), body.corner.exponent),
         Shape::Rectangle => (MIN_RADIUS, body.corner.exponent),
     };
     let (keep_l, keep_r, keep_b, keep_t) = (cl == l, cr == r, cb == b, ct == t);
@@ -267,6 +322,12 @@ fn screen_piece(body: &Body, s: &super::Screen, [bl, br, bb, bt]: [f32; 4], shar
         }
     }
     Some(RoundRect { center: [(cl + cr) / 2.0, (cb + ct) / 2.0], half: [(cr - cl) / 2.0, (ct - cb) / 2.0], radii, exponent })
+}
+
+/// How much further than a circular corner a superellipse one of `exponent` reaches along its
+/// edges to stand as far in from the corner at its middle ([`super::CONTINUOUS_REACH`] at 3).
+fn reach(exponent: f32) -> f32 {
+    if exponent <= 2.0 { 1.0 } else { (1.0 - 0.5f32.sqrt()) / (1.0 - 0.5f32.powf(1.0 / exponent)) }
 }
 
 /// The two corners (indices into [`RoundRect::radii`]) on a side.
@@ -304,6 +365,15 @@ struct Frame {
 impl Frame {
     fn at(origin: V3) -> Self {
         Frame { origin, ex: [1.0, 0.0, 0.0], ey: [0.0, 1.0, 0.0], ez: [0.0, 0.0, 1.0] }
+    }
+
+    /// As [`Frame::at`], leaning back about its x axis by `tilt` radians (local +y tips to -z).
+    fn tilted(origin: V3, tilt: f32) -> Self {
+        if tilt == 0.0 {
+            return Self::at(origin);
+        }
+        let (s, c) = tilt.sin_cos();
+        Frame { origin, ex: [1.0, 0.0, 0.0], ey: [0.0, c, -s], ez: [0.0, s, c] }
     }
 
     /// Local z out of the back face.
@@ -378,6 +448,31 @@ impl RoundRect {
     }
 }
 
+impl RoundRect {
+    /// How far the outline reaches from its centre toward `side`, at `at` along that side (`at`
+    /// in the frame the outline's centre is given in).
+    fn edge(&self, side: Side, at: f32) -> f32 {
+        // The axis the edge is measured on, and the one along the side.
+        let (a, o) = if matches!(side, Side::Left | Side::Right) { (0, 1) } else { (1, 0) };
+        let rel = at - self.center[o];
+        let limit = self.half[0].min(self.half[1]);
+        let k = match (side, rel >= 0.0) {
+            (Side::Right, true) | (Side::Top, true) => 0,
+            (Side::Left, true) | (Side::Top, false) => 1,
+            (Side::Left, false) | (Side::Bottom, false) => 2,
+            (Side::Right, false) | (Side::Bottom, true) => 3,
+        };
+        let r = self.radii[k].clamp(0.0, limit);
+        let past = rel.abs() - (self.half[o] - r);
+        if past <= 0.0 || r <= 0.0 {
+            return self.half[a];
+        }
+        let n = self.exponent.max(1.0);
+        let d = (past / r).min(1.0);
+        self.half[a] - r + r * (1.0 - d.powf(n)).max(0.0).powf(1.0 / n)
+    }
+}
+
 /// UVs projecting `rect`'s bounds onto 0..1, v down.
 fn planar(rect: &RoundRect) -> impl Fn(V3) -> [f32; 2] + use<> {
     let (l, top, w, h) = (rect.center[0] - rect.half[0], rect.center[1] + rect.half[1], 2.0 * rect.half[0], 2.0 * rect.half[1]);
@@ -419,13 +514,25 @@ impl Builder {
         }
     }
 
-    fn part(&mut self, role: Role, panel: usize, build: impl FnOnce(&mut Self)) {
-        let first = self.mesh.indices.len() as u32;
-        build(self);
-        let count = self.mesh.indices.len() as u32 - first;
-        if count > 0 {
-            self.mesh.parts.push(Part { role, panel, first, count });
+    /// Where the index buffer is now.
+    fn mark(&self) -> u32 {
+        self.mesh.indices.len() as u32
+    }
+
+    /// The indices from `first` to `end` as a part, if there are any; its vertices are those from
+    /// `vertices` on.
+    fn cut(&mut self, role: Role, panel: usize, first: u32, end: u32, vertices: u32) {
+        if end > first {
+            let vertex_count = self.mesh.positions.len() as u32 - vertices;
+            self.mesh.parts.push(Part { role, panel, first, count: end - first, vertex_first: vertices, vertex_count });
         }
+    }
+
+    fn part(&mut self, role: Role, panel: usize, build: impl FnOnce(&mut Self)) {
+        let (first, vertices) = (self.mark(), self.mesh.positions.len() as u32);
+        build(self);
+        let end = self.mark();
+        self.cut(role, panel, first, end, vertices);
     }
 }
 
@@ -466,7 +573,11 @@ fn flat_weights(side: Option<Side>) -> [f32; RING] {
 /// A closed rounded box in `frame`: `outline` in the local x/y plane, `depth` along local z
 /// (centred), the edges of both caps rounded over by `bevel` (but for [`Faces::flat`], where the
 /// front goes straight down to the side). The holes in `faces` are for [`fill`] to close.
-fn slab(b: &mut Builder, frame: &Frame, outline: &RoundRect, depth: f32, bevel: f32, faces: &Faces) {
+///
+/// Its triangles come in three runs, and it returns where the second and third start: the front
+/// cap (with the front's rounded-over edge when `wraps`: cover glass that curves down to the
+/// band), the band (the rounded-over edges and the wall between), and the back cap.
+fn slab(b: &mut Builder, frame: &Frame, outline: &RoundRect, depth: f32, bevel: f32, faces: &Faces, wraps: bool) -> [u32; 2] {
     let limit = outline.half[0].min(outline.half[1]);
     let bevel = bevel.min(depth / 2.0).min(limit - MIN_RADIUS).max(0.0);
     let outline = RoundRect { radii: outline.radii.map(|r| r.max(bevel + MIN_RADIUS)), ..*outline };
@@ -496,15 +607,23 @@ fn slab(b: &mut Builder, frame: &Frame, outline: &RoundRect, depth: f32, bevel: 
         }
     }
     let at = |ring: usize, i: usize| base + (ring * RING + i % RING) as u32;
-    for ring in 0..rings.len() - 1 {
-        for i in 0..RING {
-            let (a0, a1, b0, b1) = (at(ring, i), at(ring, i + 1), at(ring + 1, i), at(ring + 1, i + 1));
-            b.tri(a0, b0, b1);
-            b.tri(a0, b1, a1);
+    let walls = |b: &mut Builder, from: usize, to: usize| {
+        for ring in from..to {
+            for i in 0..RING {
+                let (a0, a1, b0, b1) = (at(ring, i), at(ring, i + 1), at(ring + 1, i), at(ring + 1, i + 1));
+                b.tri(a0, b0, b1);
+                b.tri(a0, b1, a1);
+            }
         }
-    }
+    };
     cap(b, frame, &outline, &uv, at(0, 0), depth / 2.0, true, faces.front, faces.flat.is_some());
+    let glass = if wraps { BEVEL_STEPS } else { 0 };
+    walls(b, 0, glass);
+    let band = b.mark();
+    walls(b, glass, rings.len() - 1);
+    let back = b.mark();
     cap(b, frame, &outline, &uv, at(rings.len() - 1, 0), -depth / 2.0, false, faces.back, false);
+    [band, back]
 }
 
 /// A position back in `frame`'s x/y plane.
