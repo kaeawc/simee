@@ -781,6 +781,8 @@ fn on_debug_ptr() -> u64 {
 pub enum Icd {
     /// Metal, on the host GPU.
     MoltenVk,
+    /// Metal, on the host GPU, through Mesa's KosmicKrisp (the SDK ships it beside MoltenVK).
+    KosmicKrisp,
     /// Software (llvmpipe); always works, uses CPU.
     Lavapipe,
     SwiftShader,
@@ -790,17 +792,50 @@ impl Icd {
     pub fn manifest(self) -> &'static str {
         match self {
             Icd::MoltenVk => "MoltenVK_icd.json",
+            Icd::KosmicKrisp => "libkosmickrisp_icd.json",
             Icd::Lavapipe => "lvp_icd.json",
             Icd::SwiftShader => "vk_swiftshader_icd.json",
         }
     }
 
+    /// The name gfxstream takes in `ANDROID_EMU_VK_ICD`.
     pub fn name(self) -> &'static str {
         match self {
             Icd::MoltenVk => "moltenvk",
+            Icd::KosmicKrisp => "kosmickrisp",
             Icd::Lavapipe => "lavapipe",
             Icd::SwiftShader => "swiftshader",
         }
+    }
+
+    /// The ICD `name` ([`Icd::name`]) stands for.
+    pub fn from_name(name: &str) -> Option<Icd> {
+        [Icd::MoltenVk, Icd::KosmicKrisp, Icd::Lavapipe, Icd::SwiftShader].into_iter().find(|icd| icd.name() == name)
+    }
+
+    /// Whether the renderer's `lib64` ships this ICD's manifest.
+    pub fn ships_in(self, lib64: &Path) -> bool {
+        lib64.join("vulkan").join(self.manifest()).is_file()
+    }
+}
+
+/// The host-GPU Vulkan driver for a boot whose `-gpu` mode is the host GPU: KosmicKrisp when
+/// the guest's UI draws with Skia GL on the guest's own ANGLE (`ui_gl_on_angle`) and the
+/// renderer ships KosmicKrisp, else MoltenVK. `asked` (`ANDROID_EMU_VK_ICD`) naming either GPU
+/// driver wins, KosmicKrisp only where it ships; any other name leaves the choice here.
+///
+/// That ANGLE (API 34 and 35 images) builds pipelines whose vertex input format has another
+/// numeric type than the shader's input (a float format for a `uvec2`): Vulkan leaves the values
+/// undefined and compiles them, Metal refuses ("Vertex attribute ... of type uint2 cannot be
+/// read using MTLAttributeFormatFloat4"), so MoltenVK fails each one and the draw is lost.
+/// No MoltenVK setting changes that; KosmicKrisp compiles them (issue #412).
+pub fn gpu_icd(ui_gl_on_angle: bool, kosmickrisp_ships: bool, asked: Option<&str>) -> Icd {
+    match asked.and_then(Icd::from_name) {
+        Some(Icd::MoltenVk) => Icd::MoltenVk,
+        Some(Icd::KosmicKrisp) if kosmickrisp_ships => Icd::KosmicKrisp,
+        Some(Icd::KosmicKrisp) => Icd::MoltenVk,
+        _ if ui_gl_on_angle && kosmickrisp_ships => Icd::KosmicKrisp,
+        _ => Icd::MoltenVk,
     }
 }
 
@@ -818,6 +853,17 @@ static VULKAN_FAILED: AtomicBool = AtomicBool::new(false);
 ///
 /// Call before spawning threads that might read the environment.
 pub fn configure_environment(emulator_dir: &Path, icd: Icd) {
+    for (k, v) in environment(emulator_dir, icd) {
+        if std::env::var_os(k).is_none() {
+            // SAFETY: documented precondition: called while the process is single-threaded
+            // with respect to environment access.
+            unsafe { std::env::set_var(k, v) };
+        }
+    }
+}
+
+/// What [`configure_environment`] sets (each variable only where it isn't set already).
+fn environment(emulator_dir: &Path, icd: Icd) -> Vec<(&'static str, std::ffi::OsString)> {
     let vk = emulator_dir.join("lib64/vulkan");
     let loader = vk.join(if cfg!(target_os = "macos") { "libvulkan.dylib" } else { "libvulkan.so.1" });
     let mut vars = vec![("ANDROID_EMULATOR_LAUNCHER_DIR", emulator_dir.as_os_str().to_owned())];
@@ -846,13 +892,7 @@ pub fn configure_environment(emulator_dir: &Path, icd: Icd) {
         vars.push(("MVK_CONFIG_VK_SEMAPHORE_SUPPORT_STYLE", "0".into()));
         vars.push(("MVK_CONFIG_USE_MTLHEAP", "1".into()));
     }
-    for (k, v) in vars {
-        if std::env::var_os(k).is_none() {
-            // SAFETY: documented precondition: called while the process is single-threaded
-            // with respect to environment access.
-            unsafe { std::env::set_var(k, v) };
-        }
-    }
+    vars
 }
 
 /// Runs the renderer's host GLES (ANGLE) on `platform` (`metal`, `swiftshader`, ...) instead of
@@ -1566,6 +1606,70 @@ pub fn page_range(host: HostRange, len: usize) -> HostRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_ui_on_skia_gl_on_angle_runs_on_kosmickrisp_where_it_ships() {
+        // API 34/35 phones: the guest's ANGLE asks for vertex inputs whose numeric type differs
+        // from the shader's (a float format for a uvec2 input), which Metal refuses to compile
+        // under MoltenVK and KosmicKrisp compiles (issue #412).
+        assert_eq!(gpu_icd(true, true, None), Icd::KosmicKrisp);
+        // A renderer revision without KosmicKrisp keeps MoltenVK.
+        assert_eq!(gpu_icd(true, false, None), Icd::MoltenVk);
+        // A UI on Skia Vulkan (API 36) or the GLES encoder (API 30 to 33) stays on MoltenVK.
+        assert_eq!(gpu_icd(false, true, None), Icd::MoltenVk);
+        assert_eq!(gpu_icd(false, false, None), Icd::MoltenVk);
+    }
+
+    #[test]
+    fn android_emu_vk_icd_picks_the_gpu_driver_when_it_names_one() {
+        assert_eq!(gpu_icd(true, true, Some("moltenvk")), Icd::MoltenVk);
+        assert_eq!(gpu_icd(false, true, Some("kosmickrisp")), Icd::KosmicKrisp);
+        // KosmicKrisp only where it ships; a software or unknown name leaves the choice to emu
+        // (the `-gpu` mode picks software drivers).
+        assert_eq!(gpu_icd(false, false, Some("kosmickrisp")), Icd::MoltenVk);
+        assert_eq!(gpu_icd(true, true, Some("lavapipe")), Icd::KosmicKrisp);
+        assert_eq!(gpu_icd(false, true, Some("bogus")), Icd::MoltenVk);
+    }
+
+    #[test]
+    fn icd_names_round_trip() {
+        for icd in [Icd::MoltenVk, Icd::KosmicKrisp, Icd::Lavapipe, Icd::SwiftShader] {
+            assert_eq!(Icd::from_name(icd.name()), Some(icd));
+        }
+        assert_eq!(Icd::from_name("metal"), None);
+    }
+
+    #[test]
+    fn the_environment_points_the_loader_at_the_chosen_icd() {
+        let dir = std::env::temp_dir().join(format!("emu-gfx-env-{}", std::process::id()));
+        let vk = dir.join("lib64/vulkan");
+        std::fs::create_dir_all(&vk).expect("dir");
+        for icd in [Icd::MoltenVk, Icd::KosmicKrisp] {
+            std::fs::write(vk.join(icd.manifest()), "{}").expect("manifest");
+        }
+        let get = |icd: Icd, k: &str| environment(&dir, icd).into_iter().find(|(key, _)| *key == k).map(|(_, v)| v);
+        let kk = vk.join("libkosmickrisp_icd.json").into_os_string();
+        assert_eq!(get(Icd::KosmicKrisp, "VK_DRIVER_FILES"), Some(kk.clone()));
+        assert_eq!(get(Icd::KosmicKrisp, "VK_ICD_FILENAMES"), Some(kk));
+        assert_eq!(get(Icd::KosmicKrisp, "ANDROID_EMU_VK_ICD"), Some("kosmickrisp".into()));
+        assert!(Icd::KosmicKrisp.ships_in(&dir.join("lib64")));
+        assert!(!Icd::Lavapipe.ships_in(&dir.join("lib64")));
+        // MoltenVK's settings are MoltenVK's alone; MoltenVK keeps them.
+        let mvk = ["MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "MVK_CONFIG_VK_SEMAPHORE_SUPPORT_STYLE", "MVK_CONFIG_USE_MTLHEAP"];
+        for k in mvk {
+            assert_eq!(get(Icd::KosmicKrisp, k), None, "{k}");
+        }
+        let want = [
+            ("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0"),
+            ("MVK_CONFIG_VK_SEMAPHORE_SUPPORT_STYLE", "0"),
+            ("MVK_CONFIG_USE_MTLHEAP", "1"),
+        ];
+        for (k, v) in want {
+            assert_eq!(get(Icd::MoltenVk, k), Some(v.into()), "{k}");
+        }
+        assert_eq!(get(Icd::MoltenVk, "VK_DRIVER_FILES"), Some(vk.join("MoltenVK_icd.json").into_os_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn ranges(mem: &emu_hvf::GuestRam, n: usize) -> impl Iterator<Item = HostRange> + '_ {
         (0..n).map(move |i| mem.host_range(mem.base() + (i as u64 % 64) * 4096, 4096).expect("range"))

@@ -224,8 +224,25 @@ impl Instance {
             let icd = match choice.backend {
                 emu_avd::gpu::Backend::SwiftShader => emu_gfxstream::Icd::SwiftShader,
                 emu_avd::gpu::Backend::Lavapipe => emu_gfxstream::Icd::Lavapipe,
-                // MoltenVK (host GPU) unless it fails on this machine; then software.
-                _ if crate::vkprobe::moltenvk_works(lib64) => emu_gfxstream::Icd::MoltenVk,
+                // The host GPU (MoltenVK, or KosmicKrisp for a UI on Skia GL on the guest's
+                // ANGLE) unless MoltenVK fails on this machine; then software.
+                _ if crate::vkprobe::moltenvk_works(lib64) => {
+                    let asked = std::env::var("ANDROID_EMU_VK_ICD").ok();
+                    let kosmickrisp = emu_gfxstream::Icd::KosmicKrisp.ships_in(lib64);
+                    match host_gpu_icd(avd, &guest_egl(avd), kosmickrisp, asked.as_deref()) {
+                        emu_gfxstream::Icd::KosmicKrisp if !crate::vkprobe::kosmickrisp_works(lib64) => {
+                            eprintln!("emu: KosmicKrisp didn't come up here; using MoltenVK");
+                            emu_gfxstream::Icd::MoltenVk
+                        }
+                        emu_gfxstream::Icd::KosmicKrisp => {
+                            if opts.verbose && asked.is_none() {
+                                eprintln!("{KOSMICKRISP_NOTICE}");
+                            }
+                            emu_gfxstream::Icd::KosmicKrisp
+                        }
+                        icd => icd,
+                    }
+                }
                 _ => {
                     eprintln!("emu: MoltenVK unavailable here; using lavapipe (software Vulkan)");
                     emu_gfxstream::Icd::Lavapipe
@@ -975,6 +992,26 @@ fn host_angle(api: Option<u32>, first_boot: bool, without_gl: bool) -> Option<&'
     (without_gl || (first_boot && api == Some(29))).then_some("swiftshader")
 }
 
+/// What `-verbose` says when a boot runs on KosmicKrisp ([`host_gpu_icd`]).
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+const KOSMICKRISP_NOTICE: &str = "emu: the UI draws with Skia GL on the guest's ANGLE: host Vulkan is KosmicKrisp, which \
+     compiles the pipelines MoltenVK refuses (#412; ANDROID_EMU_VK_ICD=moltenvk overrides)";
+
+/// The host-GPU Vulkan driver for `avd` with guest GLES `egl`: KosmicKrisp when the guest's UI
+/// draws with Skia GL on its own ANGLE (API 34 and 35 phones, Automotive, google-xr 34) and the
+/// renderer ships it (`kosmickrisp`), else MoltenVK; `asked` (`ANDROID_EMU_VK_ICD`) picks either
+/// by name. That ANGLE asks for vertex inputs whose numeric type differs from the shader's (a
+/// float format for a `uvec2` input), which Vulkan allows and Metal refuses: under MoltenVK each
+/// such pipeline fails to compile (15,303 `Render pipeline compile failed` on one API 34 boot)
+/// and the draw is lost. KosmicKrisp compiles them. API 36 and newer draw their UI with Skia on
+/// Vulkan and API 30 to 33 with the GLES encoder; they stay on MoltenVK. See
+/// docs/research/api34-moltenvk.md.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn host_gpu_icd(avd: &Avd, egl: &str, kosmickrisp: bool, asked: Option<&str>) -> emu_gfxstream::Icd {
+    let ui_gl_on_angle = egl == "angle" && takes_bootconfig(avd) && !AngleImage::of(avd).virtual_queue;
+    emu_gfxstream::gpu_icd(ui_gl_on_angle, kosmickrisp, asked)
+}
+
 /// The guest draws with ANGLE on its Vulkan (an image that boots on bootconfig, its GLES ANGLE),
 /// so the renderer can run without GL ([`emu_vmm::GpuSpec::vulkan_only`]). Images without
 /// bootconfig have no ANGLE: their GLES is the encoder, on the host's GL.
@@ -1326,6 +1363,41 @@ mod tests {
             assert_eq!(host_angle(api, true, true), Some("swiftshader"), "{api:?}");
             assert_eq!(host_angle(api, false, true), Some("swiftshader"), "{api:?}");
         }
+    }
+
+    #[test]
+    fn the_host_gpu_driver_per_api_is_kosmickrisp_only_where_the_ui_is_skia_gl_on_angle() {
+        use emu_gfxstream::Icd::{KosmicKrisp, MoltenVk};
+        let s = sdk("gpu-icd");
+        add_image(&s, "r", 30, "");
+        add_image(&s, "t", 33, "AndroidbootProps2 = on\n");
+        add_image(&s, "u", 34, "AndroidbootProps2 = on\n");
+        add_image(&s, "v", 35, "AndroidbootProps2 = on\n");
+        add_image(&s, "w", 36, "AndroidbootProps2 = on\nVulkanVirtualQueue = on\n");
+        let icd = |name: &str, kosmickrisp: bool, asked: Option<&str>| {
+            let avd = s.env.load(name).expect("load");
+            host_gpu_icd(&avd, default_egl(avd.api_level()), kosmickrisp, asked)
+        };
+        // API 30 to 33: the GLES encoder. API 34 and 35: Skia GL on the guest's ANGLE, whose
+        // pipelines MoltenVK can't compile (#412). API 36: Skia on Vulkan (skiavk).
+        let want = [("r", 30, MoltenVk), ("t", 33, MoltenVk), ("u", 34, KosmicKrisp), ("v", 35, KosmicKrisp), ("w", 36, MoltenVk)];
+        let wrong: Vec<String> = want
+            .iter()
+            .filter(|(name, _, want)| icd(name, true, None) != *want)
+            .map(|(name, api, want)| format!("API {api}: {:?}, want {want:?}", icd(name, true, None)))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
+        // Automotive 34 and google-xr 34 draw the same way as the API 34 phone.
+        assert_eq!(icd("car", true, None), KosmicKrisp);
+        assert_eq!(icd("headset", true, None), KosmicKrisp);
+        // A renderer without KosmicKrisp, or ANDROID_EMU_VK_ICD=moltenvk, keeps MoltenVK.
+        for (name, ..) in want {
+            assert_eq!(icd(name, false, None), MoltenVk, "{name}");
+            assert_eq!(icd(name, true, Some("moltenvk")), MoltenVk, "{name}");
+        }
+        // The GLES encoder on an API 34 image (EMU_GUEST_EGL=emulation) has no guest ANGLE.
+        let u = s.env.load("u").expect("load");
+        assert_eq!(host_gpu_icd(&u, "emulation", true, None), MoltenVk);
     }
 
     #[test]

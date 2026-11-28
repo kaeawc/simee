@@ -1,19 +1,24 @@
-//! One-time check that gfxstream can bring up Vulkan on MoltenVK. The renderer initializes once
-//! per process and silently disables Vulkan on failure, so the check runs in a child process
-//! (`emu -probe-vulkan <lib64>`) and its verdict is cached per renderer build.
+//! One-time check that gfxstream can bring up Vulkan on MoltenVK (and on KosmicKrisp, for the
+//! guests that run on it). The renderer initializes once per process and silently disables
+//! Vulkan on failure, so the check runs in a child process (`emu -probe-vulkan <lib64>`,
+//! `emu -probe-kosmickrisp <lib64>`) and its verdict is cached per renderer build.
 use std::path::{Path, PathBuf};
 
 fn cache_file(lib64: &Path) -> Option<PathBuf> {
+    cache_file_for(lib64, emu_gfxstream::Icd::MoltenVk)
+}
+
+fn cache_file_for(lib64: &Path, icd: emu_gfxstream::Icd) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     let meta = std::fs::metadata(lib64.join("libgfxstream_backend.dylib")).ok()?;
-    Some(PathBuf::from(home).join("Library/Caches/simee").join(stamp_name(&meta)))
+    Some(PathBuf::from(home).join("Library/Caches/simee").join(stamp_name(icd, &meta)))
 }
 
 /// One renderer build: its backend's size, mtime (ns) and inode. Builds installed within the same
 /// second (or copied with preserved mtimes) still differ by size or inode.
-fn stamp_name(meta: &std::fs::Metadata) -> String {
+fn stamp_name(icd: emu_gfxstream::Icd, meta: &std::fs::Metadata) -> String {
     use std::os::unix::fs::MetadataExt;
-    format!("moltenvk-{}.{:09}-{}-{}", meta.mtime(), meta.mtime_nsec(), meta.len(), meta.ino())
+    format!("{}-{}.{:09}-{}-{}", icd.name(), meta.mtime(), meta.mtime_nsec(), meta.len(), meta.ino())
 }
 
 /// Cached verdict, probing (≈1 s, once) when unknown.
@@ -27,6 +32,27 @@ pub fn moltenvk_works(lib64: &Path) -> bool {
     probe_and_record(lib64, cache)
 }
 
+/// Whether gfxstream brings up Vulkan on KosmicKrisp: cached like [`moltenvk_works`], probing
+/// (`emu -probe-kosmickrisp`) once per renderer build.
+pub fn kosmickrisp_works(lib64: &Path) -> bool {
+    let cache = cache_file_for(lib64, emu_gfxstream::Icd::KosmicKrisp);
+    if let Some(c) = &cache
+        && let Ok(v) = std::fs::read_to_string(c)
+    {
+        return v.trim() == "ok";
+    }
+    let ok = child("-probe-kosmickrisp", lib64);
+    record(cache, ok);
+    ok
+}
+
+fn record(cache: Option<PathBuf>, ok: bool) {
+    if let Some(c) = cache {
+        let _ = c.parent().map(std::fs::create_dir_all);
+        let _ = std::fs::write(c, if ok { "ok" } else { "fail" });
+    }
+}
+
 /// Runs `emu <flag> <lib64>` and reports whether it succeeded.
 fn child(flag: &str, lib64: &Path) -> bool {
     std::env::current_exe()
@@ -38,10 +64,7 @@ fn child(flag: &str, lib64: &Path) -> bool {
 /// Runs the probe child and records its verdict.
 fn probe_and_record(lib64: &Path, cache: Option<PathBuf>) -> bool {
     let ok = child("-probe-vulkan", lib64);
-    if let Some(c) = cache {
-        let _ = c.parent().map(std::fs::create_dir_all);
-        let _ = std::fs::write(c, if ok { "ok" } else { "fail" });
-    }
+    record(cache, ok);
     ok
 }
 
@@ -73,8 +96,17 @@ pub fn warm_child(lib64: &Path) -> bool {
 
 /// Child side: init the renderer on MoltenVK and report whether Vulkan came up.
 pub fn probe(lib64: &Path) -> bool {
+    probe_on(lib64, emu_gfxstream::Icd::MoltenVk)
+}
+
+/// Child side of [`kosmickrisp_works`]: [`probe`] on KosmicKrisp.
+pub fn probe_kosmickrisp(lib64: &Path) -> bool {
+    probe_on(lib64, emu_gfxstream::Icd::KosmicKrisp)
+}
+
+fn probe_on(lib64: &Path, icd: emu_gfxstream::Icd) -> bool {
     let Some(emulator_dir) = lib64.parent() else { return false };
-    emu_gfxstream::configure_environment(emulator_dir, emu_gfxstream::Icd::MoltenVk);
+    emu_gfxstream::configure_environment(emulator_dir, icd);
     let Ok(r) = emu_gfxstream::Renderer::load(lib64) else { return false };
     let flags = emu_gfxstream::flags::USE_GLES | emu_gfxstream::flags::USE_VK;
     r.init(320, 240, flags, false, std::sync::Arc::new(|_| {})).is_ok() && emu_gfxstream::vulkan_ok()
@@ -91,11 +123,14 @@ mod tests {
         let (a, b) = (dir.join("a"), dir.join("b"));
         std::fs::write(&a, b"build one").expect("a");
         std::fs::write(&b, b"build two!").expect("b");
-        let name = |p: &Path| stamp_name(&std::fs::metadata(p).expect("meta"));
+        let name = |p: &Path| stamp_name(emu_gfxstream::Icd::MoltenVk, &std::fs::metadata(p).expect("meta"));
         assert_eq!(name(&a), name(&a));
         // Written in the same second: size and inode still tell them apart.
         assert_ne!(name(&a), name(&b));
         assert!(name(&a).starts_with("moltenvk-"));
+        // Each driver's verdict has a file of its own.
+        let kk = stamp_name(emu_gfxstream::Icd::KosmicKrisp, &std::fs::metadata(&a).expect("meta"));
+        assert_eq!(kk, name(&a).replacen("moltenvk-", "kosmickrisp-", 1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
