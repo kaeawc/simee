@@ -170,6 +170,7 @@ pub fn call(s: &mut Calls, method: &str, p: &Value) -> Result<Value, String> {
         "camera_link" => {
             let facings = facings(Some(need_str(p, "facing")?))?;
             let source = need_str(p, "source")?;
+            device_source_in_environment_set(s, source)?;
             match target(s, p)? {
                 Target::Android(d) => with_env(s, |host, env| link(host, env, &d, &facings, source)),
                 Target::Ios(q) => with_ios(s, |host, ios, env| ios_link(host, ios, env, &q, &facings, source, p)),
@@ -186,6 +187,30 @@ pub fn call(s: &mut Calls, method: &str, p: &Value) -> Result<Value, String> {
     }
 }
 
+/// Refuses a `device:` `source` from a call on another iOS device set than the environment's
+/// (#409): the link outlives the call, and its device is found in the environment's set each time
+/// its feed opens, so from a farm's set `device:booted` would be the default set's booted
+/// simulator, and `device:farm-2` never found.
+fn device_source_in_environment_set(s: &Calls, source: &str) -> Result<(), String> {
+    if !matches!(SourceSpec::parse(source.trim()), Ok(SourceSpec::Device(_))) {
+        return Ok(());
+    }
+    let (call, env) = (s.ios.set()?, crate::methods::environment_set(s)?);
+    if call == env {
+        return Ok(());
+    }
+    let name = |set: &Option<String>| set.as_deref().map_or_else(|| "the default set".to_owned(), |dir| format!("the device set {dir}"));
+    Err(format!(
+        "a camera's `{}` source is found in the environment's device set ({}), not this call's ({}): link it from a call on \
+         the environment's set, or run the server with {}={}",
+        source.trim(),
+        name(&env),
+        name(&call),
+        sim_core::device::DEVICE_SET_ENV,
+        call.as_deref().unwrap_or("")
+    ))
+}
+
 /// `boot`'s `camera_back` / `camera_front`: linked (and saved) before the boot, so the boot
 /// passes them to emu (Android) or reapplies them ([`ios_booted`]). Then, on Android, the feeds of
 /// the saved `device:` links are served before emu needs them ([`serve_saved_feeds`]).
@@ -193,6 +218,9 @@ pub fn before_boot(s: &mut Calls, p: &Value) -> Result<(), String> {
     resume_feeds(s);
     let asked: Vec<(&str, &str)> =
         [("back", "camera_back"), ("front", "camera_front")].into_iter().filter_map(|(f, k)| Some((f, str_param(p, k)?))).collect();
+    for (_, source) in &asked {
+        device_source_in_environment_set(s, source)?;
+    }
     if asked.is_empty() {
         // Nothing to link: the boot reports a device it can't find itself.
         if let Ok(Target::Android(d)) = target(s, p) {
@@ -2545,6 +2573,33 @@ mod tests {
             run(&mut s, "camera_link", json!({"device": "phone", "facing": "back", "source": "device:tablet"})).expect_err("no server");
         assert!(err.contains("start `simee serve`") && err.contains("nothing was linked"), "{err}");
         assert!(Ios::console_links(&emulator).is_empty() && ios.f.saved().is_empty());
+    }
+
+    /// #409: a `device:` source is found in the environment's device set whenever its feed opens
+    /// (the link outlives the call), so a call on another set can't link one: `device:booted` from
+    /// a farm's set would be the default set's booted simulator. A call on the environment's set
+    /// links it as before.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_device_source_is_refused_from_a_call_on_another_device_set() {
+        let ios = Ios::new("dev-set", false);
+        let mut s = ios.session(ios.env(false, false, true));
+        s.fake_env_set = Some(None);
+        for source in ["device:booted", "device:tablet:0,0,540,960", " device:tablet"] {
+            let p = json!({"device": "phone", "facing": "back", "source": source, "set": "/farm/sims"});
+            let err = run(&mut s, "camera_link", p).expect_err(source);
+            assert!(err.contains("/farm/sims") && err.contains("the default set") && err.contains("SIMEE_IOS_DEVICE_SET"), "{err}");
+        }
+        let err = run(&mut s, "boot", json!({"device": "phone", "camera_back": "device:booted", "set": "/farm/sims"})).expect_err("boot");
+        assert!(err.contains("/farm/sims"), "{err}");
+        assert!(ios.f.saved().is_empty() && ios.take_log().is_empty(), "nothing linked or served");
+        // Other sources don't name a device: linked from any set.
+        run(&mut s, "camera_link", json!({"device": "phone", "facing": "back", "source": "qr:x", "set": "/farm/sims"})).expect("qr");
+        // The call's set is the environment's: linked as before.
+        s.fake_env_set = Some(Some("/farm/sims".into()));
+        let r = run(&mut s, "camera_link", json!({"device": "phone", "facing": "back", "source": "device:tablet"})).expect("same set");
+        assert_eq!(r["applied"], "at_boot");
+        assert_eq!(ios.f.saved(), "back=device:tablet\n");
     }
 
     #[test]
