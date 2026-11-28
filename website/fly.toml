@@ -1,0 +1,27 @@
+# The public website: static files from website/dist behind Caddy. Deployed by
+# .github/workflows/website.yml on pushes to main; see website/README.md.
+app = "simee"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  # One machine stays up so the first visitor after a quiet hour doesn't wait for a cold start.
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    path = "/healthz"
+    interval = "30s"
+    timeout = "2s"
+    grace_period = "5s"
+    method = "GET"
+    protocol = "http"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

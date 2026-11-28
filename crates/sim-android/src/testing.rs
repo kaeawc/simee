@@ -20,69 +20,155 @@ pub struct FakeEmulator {
     pub fold_status: Arc<Mutex<Option<String>>>,
     /// What simee's `rotation` answers: degrees the guest rotated its display (0 at first).
     pub rotation: Arc<Mutex<u32>>,
+    /// What each camera is linked to (`camera list`): `camera link` sets it, and a test can seed
+    /// it. Empty: `camera list` answers a bare `OK`.
+    pub cameras: Arc<Mutex<Vec<(String, String)>>>,
+    /// A facing (`back`, `front`) whose `camera link` fails with `KO`; None: none does.
+    pub camera_link_fails: Arc<Mutex<Option<String>>>,
+    /// The NAT's conditions, as `network status` reports them: a test can seed them (a loss the
+    /// API's integer percent can't ask for).
+    pub network: Arc<Mutex<sim_core::network::Conditions>>,
+    /// While true, `network loss` fails with `KO` (an emu that has the command but errs).
+    pub loss_fails: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Starts a fake emulator for AVD `avd` and advertises it in `android`'s running dir, so the AVD
 /// lists as booted. `screenshot <path>` writes a 2x1 PNG; `car get`/`car list` answer with
 /// vehicle HAL readings.
 pub fn fake_emulator(android: &Android, avd: &str) -> FakeEmulator {
-    fake(android, avd, false)
+    fake(android, avd, false, false)
 }
 
 /// [`fake_emulator`] as the stock emulator: advertised without `emulator=simee`, and simee's own
-/// console commands (`fold status`) get stock's refusal.
+/// console commands (`fold status`, `network loss`) get stock's refusal.
 pub fn fake_stock_emulator(android: &Android, avd: &str) -> FakeEmulator {
-    fake(android, avd, true)
+    fake(android, avd, true, false)
 }
 
-fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
+/// [`fake_emulator`] as a simee emu built before `network loss`: advertised `emulator=simee`, but
+/// its console answers `network loss` with stock's `KO:  bad sub-command`.
+pub fn fake_old_emulator(android: &Android, avd: &str) -> FakeEmulator {
+    fake(android, avd, false, true)
+}
+
+fn fake(android: &Android, avd: &str, stock: bool, no_loss: bool) -> FakeEmulator {
     let console = Arc::new(Mutex::new(Vec::new()));
     let fold_status: Arc<Mutex<Option<String>>> = Arc::default();
     let status = fold_status.clone();
     let rotation = Arc::new(Mutex::new(0));
     let turned = rotation.clone();
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("console");
+    let cameras: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let camera_link_fails: Arc<Mutex<Option<String>>> = Arc::default();
+    let (links, fails) = (cameras.clone(), camera_link_fails.clone());
+    // `network speed|delay|status`, shared by every console session as the emulator's NAT is.
+    let network: Arc<Mutex<sim_core::network::Conditions>> = Arc::default();
+    let shared_network = network.clone();
+    let loss_fails: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+    let loss_broken = loss_fails.clone();
+    // The advertised adb port is the console's plus one, so the console must not be on 65535 (an
+    // ephemeral port the OS hands out now and then): bind again, keeping the unusable one held so
+    // the next bind gets another.
+    let mut skipped = Vec::new();
+    let listener = loop {
+        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("console");
+        if l.local_addr().expect("addr").port() < u16::MAX {
+            break l;
+        }
+        skipped.push(l);
+    };
+    drop(skipped);
     let port = listener.local_addr().expect("addr").port();
     let log = console.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let mut out = stream.try_clone().expect("clone");
-            let _ = out.write_all(b"Android Console: type 'help' for a list of commands\r\nOK\r\n");
-            for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                let line = line.trim().to_owned();
-                if line == "quit" {
-                    break;
-                }
-                let reply = match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-                    // Authentication is the session's, not a command: answered, never recorded
-                    // (clients send it whenever `~/.emulator_console_auth_token` exists).
-                    ["auth", ..] => {
-                        let _ = out.write_all(b"Android Console: type 'help' for a list of commands\r\nOK\r\n");
-                        continue;
+            // A thread per connection, so concurrent clients are served concurrently.
+            let (log, status, turned) = (log.clone(), status.clone(), turned.clone());
+            let (links, fails, network) = (links.clone(), fails.clone(), network.clone());
+            let loss_broken = loss_broken.clone();
+            std::thread::spawn(move || {
+                let mut out = stream.try_clone().expect("clone");
+                let _ = out.write_all(b"Android Console: type 'help' for a list of commands\r\nOK\r\n");
+                for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                    let line = line.trim().to_owned();
+                    if line == "quit" {
+                        break;
                     }
-                    ["ping"] => "I am alive!\r\nOK".to_owned(),
-                    ["frames"] => "3\r\nOK".to_owned(),
-                    ["rotation"] if stock => "KO: unknown command, try 'help'".to_owned(),
-                    ["rotation"] => format!("rotation: {}\r\nOK", turned.lock().expect("rotation")),
-                    ["fold", "status"] if stock => "KO: Usage: \"fold\"".to_owned(),
-                    ["fold", "status"] => match status.lock().expect("status").as_deref() {
-                        Some(lines) => format!("{lines}\r\nOK"),
-                        None => "OK".to_owned(),
-                    },
-                    ["car", "get", ..] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\nOK".to_owned(),
-                    ["car", "list"] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\n\
+                    let reply = match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+                        // Authentication is the session's, not a command: answered, never recorded
+                        // (clients send it whenever `~/.emulator_console_auth_token` exists).
+                        ["auth", ..] => {
+                            let _ = out.write_all(b"Android Console: type 'help' for a list of commands\r\nOK\r\n");
+                            continue;
+                        }
+                        ["ping"] => "I am alive!\r\nOK".to_owned(),
+                        ["frames"] => "3\r\nOK".to_owned(),
+                        ["rotation"] if stock => "KO: unknown command, try 'help'".to_owned(),
+                        ["rotation"] => format!("rotation: {}\r\nOK", turned.lock().expect("rotation")),
+                        ["fold", "status"] if stock => "KO: Usage: \"fold\"".to_owned(),
+                        ["fold", "status"] => match status.lock().expect("status").as_deref() {
+                            Some(lines) => format!("{lines}\r\nOK"),
+                            None => "OK".to_owned(),
+                        },
+                        ["car", "get", ..] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\nOK".to_owned(),
+                        ["car", "list"] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\n\
                                         property=INFO_MAKE id=0x11100101 area=0 status=available value=Toy Car\r\nOK"
-                        .to_owned(),
-                    ["screenshot", path] => {
-                        let frame = Frame { width: 2, height: 1, rgba: vec![9, 9, 9, 255, 8, 8, 8, 255] };
-                        std::fs::write(path, sim_core::frame::encode_png(&frame).expect("png")).expect("write png");
-                        format!("{path} (2x1, frame 3)\r\nOK")
-                    }
-                    _ => "OK".to_owned(),
-                };
-                log.lock().expect("log").push(line);
-                let _ = out.write_all(format!("{reply}\r\n").as_bytes());
-            }
+                            .to_owned(),
+                        ["camera", "list"] => {
+                            let mut text = String::new();
+                            for (facing, source) in links.lock().expect("cameras").iter() {
+                                text.push_str(&format!("{facing}: {source}\r\n"));
+                            }
+                            format!("{text}OK")
+                        }
+                        // Like emu's console: the source is the rest of the line, its whitespace
+                        // collapsed to single spaces.
+                        ["camera", "link", facing, source @ ..] if !source.is_empty() => {
+                            if fails.lock().expect("fails").as_deref() == Some(*facing) {
+                                "KO: camera link failed".to_owned()
+                            } else {
+                                let mut links = links.lock().expect("cameras");
+                                links.retain(|(f, _)| f != facing);
+                                // The stock values are the test card, as emu reports them.
+                                let source = match source.join(" ").as_str() {
+                                    "emulated" | "virtualscene" => "pattern:testcard".to_owned(),
+                                    other => other.to_owned(),
+                                };
+                                links.push(((*facing).to_owned(), source));
+                                "OK".to_owned()
+                            }
+                        }
+                        // As emu's console (and stock's) answer them.
+                        ["network", "status"] => format!("{}\r\nOK", network.lock().expect("network").status()),
+                        ["network", "speed", speed] => match network.lock().expect("network").set_speed(speed) {
+                            true => "OK".to_owned(),
+                            false => "KO: invalid <speed> argument, see 'help network speed' for valid values".to_owned(),
+                        },
+                        ["network", "delay", delay] => match network.lock().expect("network").set_latency(delay) {
+                            true => "OK".to_owned(),
+                            false => "KO: invalid <delay> argument, see 'help network delay' for valid values".to_owned(),
+                        },
+                        // simee's own: stock's console has no such sub-command.
+                        ["network", "loss", ..] if stock || no_loss => "KO:  bad sub-command".to_owned(),
+                        ["network", "loss", ..] if loss_broken.load(std::sync::atomic::Ordering::SeqCst) => {
+                            "KO: network loss failed".to_owned()
+                        }
+                        ["network", "loss", loss @ ..] => match network.lock().expect("network").set_loss(&loss.join(" ")) {
+                            Ok(()) => "OK".to_owned(),
+                            Err(why) => format!("KO: invalid <loss> argument: {why}; use <percent> or <up>:<down>"),
+                        },
+                        ["screenshot", path] => {
+                            let frame = Frame { width: 2, height: 1, rgba: vec![9, 9, 9, 255, 8, 8, 8, 255] };
+                            std::fs::write(path, sim_core::frame::encode_png(&frame).expect("png")).expect("write png");
+                            // The emulator takes a moment to encode, so overlapping screenshots overlap here.
+                            sleep(Duration::from_millis(150));
+                            format!("{path} (2x1, frame 3)\r\nOK")
+                        }
+                        _ => "OK".to_owned(),
+                    };
+                    log.lock().expect("log").push(line);
+                    let _ = out.write_all(format!("{reply}\r\n").as_bytes());
+                }
+            });
         }
     });
     let display = Arc::new(Mutex::new(Vec::new()));
@@ -105,7 +191,7 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
     let emulator = if stock { "" } else { "emulator=simee\n" };
     let ad = format!("port.serial={port}\nport.adb={}\navd.name={avd}\n{emulator}", port + 1);
     std::fs::write(running.join(format!("pid_{}.ini", std::process::id())), ad).expect("advertise");
-    FakeEmulator { console, display, fold_status, rotation }
+    FakeEmulator { console, display, fold_status, rotation, cameras, camera_link_fails, network: shared_network, loss_fails }
 }
 
 /// `lines` once it holds `n` entries (or after 5 s, whatever it holds).
@@ -125,7 +211,24 @@ pub fn wait_for(lines: &Mutex<Vec<String>>, n: usize) -> Vec<String> {
 /// `pidof` exits 1, as toybox's does), `com.example.late`'s process shows up on the third
 /// `pidof`, `com.example.leaky` has two launcher activities (LeakCanary's alias second), and
 /// `am force-stop com.example.hang` never returns (it writes its PID to `hang.pid` beside the
-/// script first).
+/// script first). `ps` lists a guest's processes (init, zygote, system_server, the native daemons,
+/// apps); `kill` succeeds (logged only: no host process is signalled) except on pids 520
+/// (surfaceflinger) and 530 (cameraserver), which need `su 0` (present for `-9`, missing for 530's
+/// `-15`); an `exec` line, and its stop, run on the host's `sh`; and the audio commands keep a
+/// media stream (index 5 of 0..25, unmuted at first) that `dumpsys audio` reports
+/// ([`FakeAdb::image`] makes it an API 34 or an API 29 image). Airplane mode is a file
+/// beside the script that `cmd connectivity airplane-mode` (or `settings put`) sets; `sdk` beside it sets the API level (36 without it) and `settings get` reads; the
+/// network listings (`sim_android::net`) answer with a root listing of the kernel's socket tables
+/// and an eBPF per-uid stats dump. The settle probe
+/// (`sim_android::settle::PROBE`) answers a booted guest whose uptime moves 1 s per probe and whose
+/// system_server uses 60% of a core between the first two probes and 2% after (the probe's own
+/// shell and `cat` busy throughout, as they are left out). The package manager has the `slim`
+/// profile's `apps.turbo`, `apps.wellbeing` and `partnersetup` (which it refuses to disable) and
+/// not `apps.restore`; what is disabled is kept in `disabled` beside the script. `com.example.app` has
+/// an FCM receiver that a root `am broadcast` reaches (`noroot` beside the script: no `su`), and
+/// `am broadcast -a` succeeds except for the protected `BOOT_COMPLETED`. `forward` keeps the adb
+/// server's forwards (every device's) in `forwards` beside the script, host ports from 41001, and
+/// the TCP tables say 8080 listens.
 pub fn fake_adb(android: &Android) -> FakeAdb {
     let dir = android.env.sdk_root.as_ref().expect("sdk root").join("platform-tools");
     std::fs::create_dir_all(&dir).expect("platform-tools");
@@ -164,16 +267,220 @@ pub struct FakeAdb {
 }
 
 impl FakeAdb {
+    /// Android Auto on the phone at `version` (`None`: not installed), as `dumpsys package` says.
+    pub fn android_auto(&self, version: Option<&str>) {
+        let flag = self.log.with_file_name("gearhead");
+        match version {
+            Some(v) => std::fs::write(flag, v).expect("gearhead flag"),
+            None => drop(std::fs::remove_file(flag)),
+        }
+    }
+
+    /// Whether the head unit server listens on the phone's port 5277.
+    pub fn head_unit_server(&self, listening: bool) {
+        let flag = self.log.with_file_name("gearhead.server");
+        if listening {
+            std::fs::write(flag, b"").expect("server flag");
+        } else {
+            let _ = std::fs::remove_file(flag);
+        }
+    }
+
+    /// Makes the next `n` forwards fail as adb does for a host port another program took.
+    pub fn ports_taken(&self, n: u32) {
+        std::fs::write(self.log.with_file_name("forward.busy"), n.to_string()).expect("busy flag");
+    }
+
+    /// The forwards adb holds now, as `adb forward --list` prints them (`<serial> tcp:<host>
+    /// tcp:<device>`).
+    pub fn forwards(&self) -> Vec<String> {
+        std::fs::read_to_string(self.log.with_file_name("forwards")).unwrap_or_default().lines().map(str::to_owned).collect()
+    }
+
+    /// Makes the guest's `package-restrictions.xml` never change after a profile's disables, so
+    /// the flush wait ends at its deadline.
+    pub fn flush_stuck(&self) {
+        std::fs::write(self.log.with_file_name("flush.stuck"), b"").expect("stuck flag");
+    }
+
     /// Each invocation's arguments, in order, without the leading `-s <serial>`.
     pub fn calls(&self) -> Vec<String> {
         let text = std::fs::read_to_string(&self.log).unwrap_or_default();
         text.lines().map(|l| l.split_once(' ').and_then(|(_, rest)| rest.split_once(' ')).map_or(l, |(_, r)| r).to_owned()).collect()
     }
+
+    /// Makes the fake answer as another kind of image from now on: `api34` (its `cmd audio` has
+    /// no `adj-mute`), `old-media` (no `cmd media_session volume`: only the `media` tool, as on
+    /// API 29), `fixed-volume` (a volume set is ignored), `mute-ignored` (so is a mute).
+    pub fn image(&self, kind: &str) {
+        std::fs::write(self.log.with_file_name(kind), b"").expect("image flag");
+    }
 }
 
 const FAKE_ADB: &str = r#"echo "$*" >> "$(dirname "$0")/adb.log"
-[ "$1" = "-s" ] && shift 2
+serial=""
+[ "$1" = "-s" ] && serial="$2" && shift 2
+# What an API 36 guest's toybox `ps -A -o PID,PPID,%CPU,RSS,ETIME,NAME,CMDLINE` prints (trimmed).
+ps_rows() {
+  printf '%s\n' \
+'  PID  PPID %CPU    RSS ELAPSED NAME                    CMDLINE' \
+'    1     0  0.0  11304   15:02 init                    /system/bin/init second_stage' \
+'    2     0  0.0      0   15:02 [kthreadd]              [kthreadd]' \
+'  310     1  0.1   2620   14:58 zygote64                zygote64' \
+'  311     1  0.0   2100   14:58 zygote                  zygote' \
+'  612   310  3.2 301520   14:50 system_server           system_server' \
+'  520     1  0.4  20480   14:58 surfaceflinger          /system/bin/surfaceflinger --flag' \
+'  200     1  0.0   4012   15:00 servicemanager          /system/bin/servicemanager' \
+'  201     1  0.0   4400   15:00 hwservicemanager        /system/system_ext/bin/hwservicemanager' \
+'  202     1  0.0   3300   15:00 vndservicemanager       /vendor/bin/vndservicemanager /dev/vndbinder' \
+'  203     1  0.0   9120   15:00 vold                    /system/bin/vold --blkid_context=u:r:blkid:s0' \
+'  204     1  0.0   3010   15:00 lmkd                    /system/bin/lmkd' \
+'  205     1  0.1   8200   15:00 logd                    /system/bin/logd' \
+'  206     1  0.2   7300   15:00 adbd                    /apex/com.android.adbd/bin/adbd --root_seclabel=u:r:su:s0' \
+'  207     1  0.0   9300   15:00 netd                    /system/bin/netd' \
+'  208     1  0.0   9400   15:00 installd                /system/bin/installd' \
+'  209     1  0.0   2200   15:01 ueventd                 /system/bin/ueventd' \
+'  210     1  0.0   9500   15:00 keystore2               /system/bin/keystore2 /data/misc/keystore' \
+'  211     1  0.0   9600   15:00 statsd                  /apex/com.android.os.statsd/bin/statsd' \
+'  530     1  0.0  12000   14:58 cameraserver            /system/bin/cameraserver' \
+'  900   310  1.5 180224   14:40 com.android.systemui    com.android.systemui' \
+' 4321   310  7.9 120332   00:42 com.example.app         com.example.app' \
+' 4400   310  7.9  60112   00:40 com.example.app:remote  com.example.app:remote' \
+' 4500   310  0.0  50000   00:30 com.google.android.gms.persistent com.google.android.gms.persistent'
+}
+# The media stream's volume index (0..25, 5 at first) and mute, kept beside the script.
+here="$(dirname "$0")"
+music_volume() { cat "$here/music.volume" 2>/dev/null || echo 5; }
+music_muted() { [ -e "$here/music.muted" ] && echo true || echo false; }
+# What the guest's VolumeCtrl (`cmd media_session volume`, `media volume`) prints for --stream 3.
+volume_ctrl() {
+  printf '[V] will control stream=3\n'
+  case "$1" in
+    "--stream 3 --get") ;;
+    "--stream 3 --set "*" --get")
+      n=${1#--stream 3 --set }; n=${n% --get}
+      if [ "$n" -gt 25 ] 2>/dev/null || [ "$n" -lt 0 ] 2>/dev/null; then
+        printf '[V] will set volume\n[V] will get volume\n[V] Connecting to AudioService\n'
+        echo "Error: invalid volume index $n for stream 3 (should be in [0..25])" >&2; return 0
+      fi
+      [ -e "$here/fixed-volume" ] || echo "$n" > "$here/music.volume"; printf '[V] will set volume\n';;
+    *) echo "fake adb: unhandled volume: $1" >&2; return 2;;
+  esac
+  printf '[V] will get volume\n[V] Connecting to AudioService\n[V] volume is %s in range [0..25]\n' "$(music_volume)"
+}
+# An API 34 guest's `dumpsys audio` (trimmed): focus, the stream volumes, the ringer.
+dumpsys_audio() {
+  cat <<EOF
+MediaFocusControl dump time: 10:42:01 AM
+
+Audio Focus stack entries (last is top of stack):
+  source:android.os.BinderProxy@1f2e3d -- pack: com.example.zeta -- client: android.media.AudioManager@5a6b7c8com.example.zeta.Player@9d8e7f -- gain: GAIN_TRANSIENT -- flags:  -- loss: LOSS -- notified: true -- limbo: false -- uid: 10191 -- attr: AudioAttributes: usage=USAGE_MEDIA content=CONTENT_TYPE_MUSIC flags=0x800 tags= bundle=null -- sdk:34
+  source:android.os.BinderProxy@2a3b4c -- pack: com.example.app -- client: android.media.AudioManager@6b7c8d9com.example.app.Player@1a2b3c -- gain: GAIN -- flags:  -- loss: none -- notified: true -- limbo: false -- uid: 10190 -- attr: AudioAttributes: usage=USAGE_MEDIA content=CONTENT_TYPE_MUSIC flags=0x800 tags= bundle=null -- sdk:34
+
+No external focus policy
+
+Stream volumes (device: index)
+- STREAM_VOICE_CALL:
+   Muted: false
+   Muted Internally: false
+   Min: 1
+   Max: 5
+   streamVolume:4
+   Current: 2 (speaker): 4, 40000000 (default): 4
+   Devices: speaker(2)
+   Volume Group: AUDIO_STREAM_VOICE_CALL
+
+- STREAM_RING:
+   Muted: false
+   Muted Internally: false
+   Min: 0
+   Max: 7
+   streamVolume:5
+   Current: 2 (speaker): 5, 40000000 (default): 5
+   Devices: speaker(2)
+   Volume Group: AUDIO_STREAM_RING
+
+- STREAM_MUSIC:
+   Muted: $(music_muted)
+   Muted Internally: false
+   Min: 0
+   Max: 25
+   streamVolume:$(music_volume)
+   Current: 2 (speaker): $(music_volume), 4000000 (usb_headset): 12, 40000000 (default): 15
+   Devices: speaker(2)
+   Volume Group: AUDIO_STREAM_MUSIC
+
+- mute affected streams = 0x2f
+- user mutable streams = 0x2f
+
+Ringer mode:
+- mode (internal) = NORMAL
+- mode (external) = VIBRATE
+- zen mode:0
+EOF
+}
+# The network listings' tables: an API 36 guest's /proc/net, fds, ps and pm (trimmed).
+net_owners() {
+  printf '%s\n' '@net:ps' '  PID   UID USER           NAME' '    1     0 root           init' \
+'  612  1000 system         system_server' ' 4321 10086 u0_a86         com.example.app' \
+'@net:packages' 'package:com.example.app uid:10086' 'package:android uid:1000' 'package:com.android.settings uid:1000'
+}
+net_sockets() {
+  printf '%s\n' '@net:root' '@net:tcp' \
+'  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode' \
+'   0: 0F02000A:A1B2 2E2E3AD8:01BB 01 00000000:00000000 02:000A7B2C 00000000 10086        0 18002 2 0000000000000000 20 4 30 10 -1' \
+'@net:tcp6' \
+'  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode' \
+'   0: 00000000000000000000000000000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 18003 1 0000000000000000 100 0 0 10 0' \
+'   1: 0000000000000000FFFF00000F02000A:B000 0000000000000000FFFF00002E2E3AD8:01BB 01 00000000:00000000 02:000A7B2C 00000000 10086        0 18004 2 0000000000000000 20 4 30 10 -1' \
+'@net:udp' \
+'  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops' \
+'  100: 00000000:14E9 00000000:0000 07 00000000:00000000 00:00000000 00000000  1021        0 18005 2 0000000000000000 0' \
+'@net:udp6' '@net:fd' '/proc/612/fd:' 'lrwx------ 1 system system 64 2026-11-28 10:00 300 -> socket:[18003]' '' \
+'/proc/4321/fd:' 'lrwx------ 1 u0_a86 u0_a86 64 2026-11-28 10:00 57 -> socket:[18002]' \
+'lrwx------ 1 u0_a86 u0_a86 64 2026-11-28 10:00 58 -> socket:[18004]'
+  net_owners
+}
+net_traffic() {
+  printf '%s\n' '@net:bpf' 'BPF map status:' '  mAppUidStatsMap: OK' '  mStatsMapA: OK' 'TrafficController:' '  mAppUidStatsMap:' '    uid rxBytes rxPackets txBytes txPackets' \
+'    1000 4096 10 2048 8' '    10086 123456 100 23456 50' '  mStatsMapA:'
+  net_owners
+}
+# One /proc/<pid>/stat line: pid, comm, ppid, utime and stime ticks.
+stat() { echo "$1 ($2) S $3 1 1 0 -1 4194560 100 0 0 0 $4 $5 0 0 20 0 1 0 100 0 0"; }
+d="$(dirname "$0")"
+installed() { printf 'package:android\npackage:com.android.systemui\npackage:com.google.android.apps.turbo\npackage:com.google.android.apps.wellbeing\npackage:com.google.android.partnersetup\n'; }
 case "$1" in
+# `forward [--no-rebind] tcp:<host> tcp:<device>`, `forward --remove tcp:<host>` and `forward --list`
+# (sim_android::dhu) on one table for every serial, `forwards` beside the script, as adb's server
+# keeps it: `--no-rebind` refuses a host port already forwarded, and while `forward.busy` holds a
+# count above 0 that many more forwards are refused as taken by another program. `forward tcp:0
+# tcp:<device>` (net-forward links) allocates the next host port from 41001 (`forward.next`) and
+# prints it, as adb does.
+forward)
+  shift
+  f="$d/forwards"
+  touch "$f"
+  case "$1" in
+    --list) cat "$f";;
+    --remove)
+      grep -q " $2 " "$f" || { echo "adb: error: listener '$2' not found" >&2; exit 1; }
+      grep -v " $2 " "$f" > "$f.$$"; mv "$f.$$" "$f";;
+    tcp:0)
+      n=$(( $(cat "$d/forward.next" 2>/dev/null || echo 41001) ))
+      echo $(( n + 1 )) > "$d/forward.next"
+      echo "$serial tcp:$n $2" >> "$f"; echo "$n";;
+    *)
+      norebind=""
+      [ "$1" = "--no-rebind" ] && norebind=1 && shift
+      if [ -n "$norebind" ] && grep -q " $1 " "$f"; then echo "adb: error: cannot rebind existing socket" >&2; exit 1; fi
+      busy="$(cat "$d/forward.busy" 2>/dev/null || echo 0)"
+      if [ "$busy" -gt 0 ]; then
+        echo $((busy - 1)) > "$d/forward.busy"
+        echo "adb: error: cannot bind listener: Address already in use" >&2; exit 1
+      fi
+      grep -v " $1 " "$f" > "$f.$$"; echo "$serial $1 $2" >> "$f.$$"; mv "$f.$$" "$f";;
+  esac;;
 install)
   case "$*" in
     *broken.apk*) echo "Performing Streamed Install" >&2; echo "adb: failed to install broken.apk: Failure [INSTALL_PARSE_FAILED_NOT_APK: Failed to parse /data/app/vmdl1.tmp/base.apk]" >&2; exit 1;;
@@ -185,7 +492,46 @@ shell)
     "pm uninstall com.missing.app") echo "Failure [DELETE_FAILED_INTERNAL_ERROR]";;
     "pm uninstall "*) echo "Success";;
     "pm list packages -3") printf 'package:com.example.app\npackage:com.example.zeta\n';;
+    "pm list packages; echo @disabled; pm list packages -d") installed; echo @disabled; cat "$d/disabled" 2>/dev/null || true;;
+    "pm disable-user "*|"pm enable "*)
+      # The guest's flush suffix (profile::FLUSH) has semicolons of its own: it is cut off and
+      # answered at the end, in order: `flush.stuck` beside the script (the file never changes:
+      # @timeout), `noroot` (no su: @blind), else @flushed. The state is kept as the guest has it
+      # when the flush runs, so a stop before it loses nothing here; the sequence is in adb.log.
+      line=${2%%; f=/data/system/users/0/package-restrictions.xml*}
+      echo "$line" | tr ';' '\n' | while read -r c; do
+        p=${c##* }
+        case "$c" in
+          "pm disable-user --user 0 com.google.android.partnersetup")
+            echo "Error: java.lang.IllegalArgumentException: Cannot disable a protected package: $p";;
+          "pm disable-user --user 0 "*)
+            grep -qx "package:$p" "$d/disabled" 2>/dev/null || echo "package:$p" >> "$d/disabled"
+            echo "Package $p new state: disabled-user";;
+          "pm enable --user 0 "*)
+            grep -vx "package:$p" "$d/disabled" > "$d/disabled.tmp"; mv "$d/disabled.tmp" "$d/disabled"
+            echo "Package $p new state: enabled";;
+          "echo @disabled") echo @disabled;;
+          "pm list packages -d") cat "$d/disabled" 2>/dev/null || true;;
+        esac
+      done
+      if [ "$line" != "$2" ]; then
+        if [ -e "$d/flush.stuck" ]; then echo @timeout
+        elif [ -e "$d/noroot" ]; then echo @blind
+        else echo @flushed; fi
+      fi;;
+    "echo @self \$\$; cat /proc/uptime; getprop sys.boot_completed; cat /proc/[0-9]*/stat 2>/dev/null; true")
+      n=$(cat "$d/settle.n" 2>/dev/null || echo 0); echo $((n + 1)) > "$d/settle.n"
+      busy=$(( n == 0 ? 0 : 60 + (n - 1) * 2 ))
+      echo "@self 7000"; echo "$n.00 1.00"; echo 1
+      stat 1 init 0 10 20; stat 612 system_server 310 "$busy" 0; stat 900 ndroid.systemui 310 50 10
+      stat 7000 sh 206 $((n * 100)) 0; stat 7001 cat 7000 $((n * 100)) 0;;
+    "pm list packages -3 -f") printf 'package:/data/app/~~Ab==/com.example.app-Cd==/base.apk=com.example.app\n';;
     "pm list packages") printf 'package:com.android.settings\npackage:com.example.zeta\npackage:android\npackage:com.example.app\n';;
+    # Device state (#418): settings and SystemUI's demo broadcasts succeed, com.example.app is in
+    # the foreground, and a trim-memory signal reaches it.
+    "am broadcast -a com.android.systemui.demo "*) printf 'Broadcasting: Intent { act=com.android.systemui.demo flg=0x400000 (has extras) }\nBroadcast completed: result=0\n';;
+    "dumpsys activity activities | grep "*) echo '  topResumedActivity=ActivityRecord{6d5b2c1 u0 com.example.app/.MainActivity t12}';;
+    "am send-trim-memory com.example.app RUNNING_CRITICAL") ;;
     "cmd package query-activities --brief --components -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.example.app") echo 'com.example.app/.MainActivity';;
     "cmd package query-activities --brief --components -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.example.crash") echo 'com.example.crash/.Gone';;
     "cmd package query-activities --brief --components -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.example.svc") echo 'com.example.svc/.Main';;
@@ -207,6 +553,73 @@ shell)
     "pidof -s "*) exit 1;;
     "am force-stop com.example.hang") echo $$ > "$(dirname "$0")/hang.pid"; exec sleep 10;;
     "am force-stop "*) ;;
+    "ps -A -o PID,PPID,%CPU,RSS,ETIME,NAME,CMDLINE") ps_rows;;
+    "ps -A -o PID,PPID,%CPU,RSS,ETIME,NAME,CMDLINE; echo @packages; pm list packages")
+      ps_rows; echo @packages; printf 'package:android\npackage:com.android.systemui\npackage:com.example.app\n';;
+    "kill -"*" 520"|"kill -"*" 530") echo "/system/bin/sh: kill: ${2##* }: Operation not permitted" >&2; exit 1;;
+    "su 0 kill -9 520"|"su 0 kill -9 530") ;;
+    "su 0 kill -15 530") echo "/system/bin/sh: su: inaccessible or not found" >&2; exit 127;;
+    # The audio methods: VolumeCtrl through `cmd media_session` (API 30 on) or the `media` tool.
+    "cmd media_session volume "*)
+      if [ -e "$here/old-media" ]; then echo "No shell command implementation."; exit 255; fi
+      volume_ctrl "${2#cmd media_session volume }";;
+    "media volume "*)
+      if [ ! -e "$here/old-media" ]; then echo "/system/bin/sh: media: inaccessible or not found" >&2; exit 127; fi
+      volume_ctrl "${2#media volume }";;
+    "dumpsys audio") dumpsys_audio;;
+    "getprop ro.build.version.sdk") if [ -e "$here/sdk" ]; then cat "$here/sdk"; elif [ -e "$here/api34" ]; then echo 34; else echo 36; fi;;
+    # `cmd audio adj-mute` arrived in API 35. AOSP 13 and 14's AudioManagerShellCommand has no
+    # default case: an unknown command prints nothing and exits 0.
+    "cmd audio adj-mute 3"|"cmd audio adj-unmute 3")
+      verb=${2#cmd audio }; verb=${verb% 3}
+      if [ -e "$here/api34" ] || [ -e "$here/mute-ignored" ]; then exit 0; fi
+      if [ "$verb" = adj-mute ]; then touch "$here/music.muted"; else rm -f "$here/music.muted"; fi;;
+    # Every other signal succeeds, and is only logged: the fake never signals a host process.
+    "kill -"*) ;;
+    # sim_android::dhu: Android Auto's version is the text in `gearhead` beside the script (not
+    # installed without it); `gearhead.server` makes the head unit server listen on 5277.
+    "dumpsys package com.google.android.projection.gearhead")
+      if [ -e "$d/gearhead" ]; then
+        printf 'Packages:\n  Package [com.google.android.projection.gearhead] (1a2b3c):\n    versionCode=1 minSdk=26\n    versionName=%s\n' "$(cat "$d/gearhead")"
+      else
+        echo "Unable to find package: com.google.android.projection.gearhead"
+      fi;;
+    "cat /proc/net/tcp /proc/net/tcp6")
+      echo '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode'
+      echo '   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1 1 0'
+      [ -e "$d/gearhead.server" ] && echo '   1: 00000000:149D 00000000:0000 0A 00000000:00000000 00:00000000 00000000 10170        0 2 1 0'
+      true;;
+    "settings get global airplane_mode_on") cat "$(dirname "$0")/airplane" 2>/dev/null || echo 0;;
+    "settings put global airplane_mode_on "*) echo "${2##* }" > "$(dirname "$0")/airplane";;
+    # After the airplane-mode arm above: case takes the first match.
+    "settings put "*) ;;
+    "am broadcast -a android.intent.action.AIRPLANE_MODE"*) echo "Broadcast completed: result=0";;
+    # sim_android::notify: com.example.app has an FCM receiver; the broadcast goes as root unless
+    # `noroot` is beside the script (no su); BOOT_COMPLETED is a protected broadcast.
+    "cmd package query-receivers --brief --components -a com.google.android.c2dm.intent.RECEIVE com.example.app")
+      echo 'com.example.app/com.google.firebase.iid.FirebaseInstanceIdReceiver';;
+    "cmd package query-receivers"*) echo "No receivers found";;
+    "if [ \"\$(id -u)\" = 0 ]; then am broadcast -n "*)
+      if [ -e "$d/noroot" ]; then echo "/system/bin/sh: su: inaccessible or not found" >&2; exit 127; fi
+      printf 'Broadcasting: Intent { act=com.google.android.c2dm.intent.RECEIVE flg=0x400000 cmp=com.example.app/com.google.firebase.iid.FirebaseInstanceIdReceiver (has extras) }\nBroadcast completed: result=-1\n';;
+    "am broadcast -a 'android.intent.action.BOOT_COMPLETED'"*)
+      printf 'Broadcasting: Intent { act=android.intent.action.BOOT_COMPLETED flg=0x400000 }\nSecurity exception: Permission Denial: not allowed to send broadcast android.intent.action.BOOT_COMPLETED from pid=7001, uid=2000\n\njava.lang.SecurityException: Permission Denial: not allowed to send broadcast android.intent.action.BOOT_COMPLETED from pid=7001, uid=2000\n' >&2; exit 255;;
+    "am broadcast -a '"*) printf 'Broadcasting: Intent { flg=0x400000 }\nBroadcast completed: result=0\n';;
+    "cmd connectivity airplane-mode enable") echo 1 > "$(dirname "$0")/airplane";;
+    "cmd connectivity airplane-mode disable") echo 0 > "$(dirname "$0")/airplane";;
+    # sim_android::net's socket listing, as root (google_apis has su), and its traffic counters.
+    *"echo @net:fd;"*) net_sockets;;
+    # sim_android::net's listening ports: the same tables (8080 listens on IPv6).
+    "echo @net:tcp; cat /proc/net/tcp; "*) net_sockets;;
+    *"mAppUidStatsMap"*) net_traffic;;
+    # exec's argv line runs on the host's sh, as the guest's would run it, in a child that outlives
+    # this adb (as adbd's shell outlives an adb client that is stopped). With `exec.slow` beside the
+    # script, adb takes a second to reach the device first.
+    "r='simee_start() "*)
+      [ -e "$(dirname "$0")/exec.slow" ] && sleep 1
+      /bin/sh -c "$2" & wait $!; exit $?;;
+    # exec's stop runs on the host's sh too: it signals only the group of the process exec started.
+    "simee_start() "*) exec /bin/sh -c "$2";;
     *) echo "fake adb: unhandled: $2" >&2; exit 2;;
   esac;;
 *) echo "fake adb: unhandled: $*" >&2; exit 2;;

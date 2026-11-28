@@ -10,20 +10,22 @@
 //! crate packs, unpacks and verifies: every chunk against its hash, every disk and file against
 //! its whole hash, every path (relative, no `..`), and the format's major version.
 
+mod beneath;
+pub mod ios;
 mod manifest;
 mod store;
 mod tar;
 
-use std::collections::BTreeMap;
+use sim_core::hostfs::{FileExt, allocated_bytes};
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{BufReader, BufWriter};
-use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 pub use manifest::{
-    AndroidImage, Base, CHUNK_SIZE, COLD_BOOT, COMPRESSION, Captures, Device, Disk, Extent, FORMAT, File, GuestIdentity, Identity,
-    Manifest, Secret, is_hash, safe_path,
+    AndroidImage, Base, CHUNK_SIZE, COLD_BOOT, COMPRESSION, Captures, Device, Disk, Entry, EntryKind, Extent, FORMAT, File, GuestIdentity,
+    Identity, IosSimulator, MAX_SIZE, MAX_TARGET, Manifest, Secret, ignorable, is_hash, safe_path, safe_target,
 };
 pub use store::{ChunkStore, chunk_name, compress, decompress_verified, hash, hash_file, max_compressed, parse_chunk_name, read_regular};
 pub use tar::{TarReader, TarWriter};
@@ -40,7 +42,7 @@ pub enum Error {
     Format(u64),
     #[error("bad bundle manifest: {0}")]
     Manifest(String),
-    #[error("unsafe path `{0}` in the bundle (absolute, empty, or with `.` or `..`)")]
+    #[error("unsafe path `{0}` in the bundle (absolute, empty, with `.` or `..`, or with an ignorable or format code point)")]
     Path(String),
     #[error("chunk {0} doesn't match its hash")]
     ChunkHash(String),
@@ -62,6 +64,13 @@ pub enum Error {
     Changed(String),
     #[error("{0} already exists")]
     Exists(PathBuf),
+    /// A device or host that can't take part as asked (running, missing a runtime): why.
+    #[error("{0}")]
+    Refused(String),
+    /// A write that would go through a symlink in the destination (`{0}`, at the bundle path
+    /// where the link sits): refused, so an extract never writes outside it.
+    #[error("`{0}` is a symlink, and nothing is written through one")]
+    ThroughLink(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -223,7 +232,7 @@ pub fn export(mut manifest: Manifest, contents: &Contents, to: &Path, opts: &Opt
     let mut summary = Summary { form: if is_archive(to) { "tar" } else { "dir" }.into(), ..Summary::default() };
     for ((_, file), d) in contents.disks.iter().zip(&manifest.disks) {
         summary.disk_bytes += d.size;
-        summary.allocated_bytes += fs::metadata(file).map(|m| m.blocks() * 512).unwrap_or(0);
+        summary.allocated_bytes += fs::metadata(file).map(|m| allocated_bytes(&m)).unwrap_or(0);
         for e in &d.extents {
             if e.zero {
                 summary.zero_bytes += e.len;
@@ -249,8 +258,9 @@ pub fn export(mut manifest: Manifest, contents: &Contents, to: &Path, opts: &Opt
             fs::create_dir(&partial).map_err(|e| Error::Io(partial.clone(), e))?;
             Sink::Dir(ChunkStore::new(&partial))
         };
-        let disks: Vec<fs::File> =
-            contents.disks.iter().map(|(_, f)| fs::File::open(f).map_err(|e| Error::Io(f.clone(), e))).collect::<Result<_>>()?;
+        // One disk open at a time (an iOS data directory is thousands of files, and a process
+        // launchd starts may have 256 descriptors): the origins come disk by disk, in order.
+        let mut open: Option<(usize, fs::File)> = None;
         let threads = match opts.threads {
             0 => std::thread::available_parallelism().map_or(4, |n| n.get()).min(8),
             n => n,
@@ -263,7 +273,14 @@ pub fn export(mut manifest: Manifest, contents: &Contents, to: &Path, opts: &Opt
                     Origin::Disk { disk, offset, len } => {
                         let mut buf = vec![0u8; len as usize];
                         let path = &contents.disks[disk].1;
-                        if read_at(&disks[disk], path, &mut buf, offset)? != buf.len() || hash(&buf) != *h {
+                        let f = match &mut open {
+                            Some((at, f)) if *at == disk => &*f,
+                            slot => {
+                                *slot = None;
+                                &slot.insert((disk, fs::File::open(path).map_err(|e| Error::Io(path.clone(), e))?)).1
+                            }
+                        };
+                        if read_at(f, path, &mut buf, offset)? != buf.len() || hash(&buf) != *h {
                             return Err(Error::Changed(path.display().to_string()));
                         }
                         buf
@@ -313,6 +330,71 @@ pub fn export(mut manifest: Manifest, contents: &Contents, to: &Path, opts: &Opt
         Err(e) => {
             let _ = if partial.is_dir() { fs::remove_dir_all(&partial) } else { fs::remove_file(&partial) };
             Err(e)
+        }
+    }
+}
+
+/// The most of an extract's files open at once. An iOS data directory is thousands of files,
+/// and a process launchd starts may have 256 descriptors.
+pub const OPEN_FILES: usize = 32;
+
+/// The files an extract writes, by index: at most [`OPEN_FILES`] open, the most recently used,
+/// and any other reopened (under `root`, never through a link) when a chunk goes into it.
+struct Targets<'a> {
+    root: &'a beneath::Beneath,
+    paths: Vec<String>,
+    open: VecDeque<(usize, fs::File)>,
+}
+
+impl Targets<'_> {
+    fn host_path(&self, t: usize) -> PathBuf {
+        self.root.path().join(&self.paths[t])
+    }
+
+    fn keep(&mut self, t: usize, f: fs::File) {
+        if self.open.len() >= OPEN_FILES {
+            self.open.pop_front();
+        }
+        self.open.push_back((t, f));
+    }
+
+    /// Creates `path`, `size` bytes long (a hole), and returns its index.
+    fn create(&mut self, path: &str, size: u64) -> Result<usize> {
+        let f = self.root.create(path)?;
+        let t = self.paths.len();
+        self.paths.push(path.to_owned());
+        f.set_len(size).map_err(|e| Error::Io(self.host_path(t), e))?;
+        self.keep(t, f);
+        Ok(t)
+    }
+
+    /// File `t`, open, and its host path (for errors).
+    fn get(&mut self, t: usize) -> Result<(PathBuf, &fs::File)> {
+        match self.open.iter().position(|(at, _)| *at == t) {
+            Some(i) if i + 1 == self.open.len() => {}
+            Some(i) => {
+                if let Some(e) = self.open.remove(i) {
+                    self.open.push_back(e);
+                }
+            }
+            None => {
+                let f = self.root.open(&self.paths[t])?;
+                self.keep(t, f);
+            }
+        }
+        let path = self.host_path(t);
+        match self.open.back() {
+            Some((_, f)) => Ok((path, f)),
+            None => Err(Error::Io(path, std::io::ErrorKind::NotFound.into())),
+        }
+    }
+
+    /// File `t`, taken out of the open set (closed when the caller drops it).
+    fn take(&mut self, t: usize) -> Result<(PathBuf, fs::File)> {
+        let path = self.host_path(t);
+        match self.open.iter().position(|(at, _)| *at == t).and_then(|i| self.open.remove(i)) {
+            Some((_, f)) => Ok((path, f)),
+            None => Ok((path, self.root.open(&self.paths[t])?)),
         }
     }
 }
@@ -369,23 +451,29 @@ impl Reader {
     /// checked against its hash as it arrives, the bundle must hold every chunk the manifest
     /// names and no other, and each disk and file is read back and checked against its whole
     /// hash. On an error, what was written stays for the caller to remove.
+    ///
+    /// Nothing is written through a symlink under `dest` ([`Error::ThroughLink`]), and at most
+    /// [`OPEN_FILES`] of the files being written are open at once.
     pub fn extract(self, dest: &Path) -> Result<Extracted> {
         let start = Instant::now();
         let m = self.manifest;
-        let mut targets: Vec<(PathBuf, fs::File)> = Vec::new();
+        let root = beneath::Beneath::new(dest)?;
+        let need = m.stored_bytes();
+        if let Some(free) = root.free_bytes()
+            && need > free
+        {
+            return Err(Error::Refused(format!(
+                "the bundle holds {need} bytes of data and {} has {free} free; free some space and import again",
+                dest.display()
+            )));
+        }
+        let mut targets = Targets { root: &root, paths: Vec::new(), open: VecDeque::new() };
         let mut places: BTreeMap<String, Vec<(usize, u64, u64)>> = BTreeMap::new();
         let mut create = |path: &str, size: u64| -> Result<usize> {
             if !safe_path(path) {
                 return Err(Error::Path(path.to_owned()));
             }
-            let p = dest.join(path);
-            if let Some(dir) = p.parent() {
-                fs::create_dir_all(dir).map_err(|e| Error::Io(dir.to_path_buf(), e))?;
-            }
-            let f = fs::File::create_new(&p).map_err(|e| Error::Io(p.clone(), e))?;
-            f.set_len(size).map_err(|e| Error::Io(p.clone(), e))?;
-            targets.push((p, f));
-            Ok(targets.len() - 1)
+            targets.create(path, size)
         };
         for d in &m.disks {
             let t = create(&d.path, d.size)?;
@@ -409,8 +497,8 @@ impl Reader {
                 if len != data.len() as u64 {
                     return Err(Error::ChunkHash(h.to_owned()));
                 }
-                let (path, f) = &targets[t];
-                f.write_all_at(data, offset).map_err(|e| Error::Io(path.clone(), e))?;
+                let (path, f) = targets.get(t)?;
+                f.write_all_at(data, offset).map_err(|e| Error::Io(path, e))?;
                 out.written_bytes += len;
             }
             out.chunks += 1;
@@ -438,7 +526,8 @@ impl Reader {
             return Err(Error::Missing { first: first.clone(), count: places.len() });
         }
         let wholes = m.disks.iter().map(|d| (&d.path, &d.blake3)).chain(m.files.iter().map(|f| (&f.path, &f.blake3)));
-        for ((path, f), (name, want)) in targets.iter().zip(wholes) {
+        for (t, (name, want)) in wholes.enumerate() {
+            let (path, f) = targets.take(t)?;
             let mut h = blake3::Hasher::new();
             let mut r = BufReader::with_capacity(1 << 20, f);
             std::io::Seek::rewind(&mut r).map_err(|e| Error::Io(path.clone(), e))?;

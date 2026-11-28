@@ -193,6 +193,13 @@ impl Screen {
         self.send(&Input::Hello { max_width: if visible { self.max_width } else { 0 } });
     }
 
+    /// Moved to another window: console work from now on goes to `console`, whose outbox is that
+    /// window's. Work still queued on the old worker is dropped, as a pause drops it.
+    pub fn set_console(&mut self, console: Worker<Lookup>) {
+        self.console = Some(console);
+        *lock(&self.tail) = None;
+    }
+
     /// Pauses the frame stream while the window is hidden (minimised, or covered where the
     /// system says so) and resumes it with the newest frame when it shows again.
     pub fn set_visible(&self, visible: bool) {

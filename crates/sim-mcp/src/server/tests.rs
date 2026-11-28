@@ -23,9 +23,30 @@ struct Rig {
 }
 
 impl Rig {
+    /// A server of every tool.
     fn new() -> Rig {
+        Rig::serving(Toolsets::all())
+    }
+
+    fn serving(toolsets: Toolsets) -> Rig {
+        Rig::over(toolsets, |fake| fake)
+    }
+
+    /// A server of every tool whose backend is `wrap` of the fake.
+    fn over(toolsets: Toolsets, wrap: impl FnOnce(Arc<Fake>) -> Arc<dyn Backend>) -> Rig {
+        Rig::guarded(toolsets, wrap, Arc::new(Safety::default()))
+    }
+
+    /// [`Rig::over`], with these safety settings.
+    fn guarded(toolsets: Toolsets, wrap: impl FnOnce(Arc<Fake>) -> Arc<dyn Backend>, safety: Arc<Safety>) -> Rig {
+        Rig::draining(toolsets, wrap, safety, Drain::shared())
+    }
+
+    /// [`Rig::guarded`], whose server counts its calls with `drain`.
+    fn draining(toolsets: Toolsets, wrap: impl FnOnce(Arc<Fake>) -> Arc<dyn Backend>, safety: Arc<Safety>, drain: Arc<Drain>) -> Rig {
         let fake = Arc::new(Fake::with_devices());
-        let timing = Timing { watch: Duration::from_millis(20), heartbeat: Duration::from_millis(40) };
+        let backend = wrap(fake.clone());
+        let timing = Timing { watch: Pace::uniform(Duration::from_millis(20)), heartbeat: Duration::from_millis(40) };
         let (tx, rx) = channel::<String>();
         let tx = Mutex::new(tx);
         let sink: Sink = Arc::new(move |line| drop(tx.lock().expect("tx").send(line)));
@@ -39,7 +60,13 @@ impl Rig {
             });
             vrx
         };
-        Rig { server: Server::with_timing(fake.clone(), sink, timing), fake, rx, notes: RefCell::default(), next: Cell::new(1) }
+        Rig {
+            server: Server::with_drain(backend, sink, timing, toolsets, safety, drain),
+            fake,
+            rx,
+            notes: RefCell::default(),
+            next: Cell::new(1),
+        }
     }
 
     fn meta(tasks: bool) -> Value {
@@ -92,7 +119,9 @@ impl Rig {
 
     /// The next notification with this method (earlier ones are kept in `notes`).
     fn notification(&self, method: &str) -> Value {
+        let deadline = Instant::now() + WAIT;
         loop {
+            assert!(Instant::now() < deadline, "no {method} notification within {WAIT:?}");
             let found = self.notes.borrow().iter().position(|n| n["method"] == method);
             if let Some(i) = found {
                 return self.notes.borrow_mut().remove(i);
@@ -102,9 +131,12 @@ impl Rig {
         }
     }
 
-    /// Waits until the backend has been asked for `method` (a watcher's first read is its baseline).
+    /// Waits until the backend has answered `method` once (a watcher's first read is its baseline),
+    /// so an answer set next is a change the watcher sees, never its baseline.
     fn until_read(&self, method: &str) {
-        while self.fake.called(method).is_empty() {
+        let deadline = Instant::now() + WAIT;
+        while self.fake.answered(method) == 0 {
+            assert!(Instant::now() < deadline, "no {method} call was answered within {WAIT:?}");
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -166,9 +198,37 @@ fn tools_list_has_a_tool_for_every_method() {
     assert_eq!(tools.len(), METHODS.len() + 1);
     assert!(tools.iter().all(|t| t["inputSchema"]["type"] == "object" && t["description"].is_string()));
     assert_eq!(response["result"]["resultType"], "complete");
-    assert_eq!(response["result"]["cacheScope"], "public");
+    assert_eq!(response["result"]["cacheScope"], "private");
     let again = rig.modern("tools/list", json!({}));
     assert_eq!(again["result"]["tools"], response["result"]["tools"], "a deterministic order");
+}
+
+#[test]
+fn the_default_server_lists_its_toolsets_and_refuses_the_rest() {
+    let rig = Rig::serving(Toolsets::default());
+    let tools = rig.modern("tools/list", json!({}))["result"]["tools"].clone();
+    let names: Vec<&str> = tools.as_array().expect("tools").iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.len() <= 25 && names.contains(&"tap") && names.contains(&"device_view") && !names.contains(&"exec"), "{names:?}");
+    assert!(tools.as_array().expect("tools").iter().all(|t| t["outputSchema"].is_object() && t["annotations"].is_object()));
+    let hidden = rig.modern("tools/call", json!({"name": "exec", "arguments": {"device": "phone", "program": "/bin/ls"}}));
+    assert_eq!(hidden["error"]["code"], rpc::INVALID_PARAMS);
+    assert!(hidden["error"]["message"].as_str().is_some_and(|m| m.contains("`debug` toolset")), "{hidden}");
+    assert!(rig.fake.called("exec").is_empty(), "never reaches the API");
+    assert_eq!(
+        rig.modern("tools/call", json!({"name": "tap", "arguments": {"device": "phone", "x": 1, "y": 2}}))["result"]["content"][0]["text"],
+        "ok"
+    );
+    // An older client sees the same tools, with object output schemas; 2025-03-26 has none.
+    let id = rig.send_raw("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    rig.response(id);
+    let id = rig.send_raw("tools/list", json!({}));
+    let old = rig.response(id)["result"]["tools"].clone();
+    assert_eq!(old.as_array().map(Vec::len), Some(names.len()));
+    assert!(old.as_array().expect("tools").iter().all(|t| t["outputSchema"]["type"] == "object"));
+    let id = rig.send_raw("initialize", json!({"protocolVersion": "2025-03-26", "capabilities": {}}));
+    rig.response(id);
+    let id = rig.send_raw("tools/list", json!({}));
+    assert!(rig.response(id)["result"]["tools"].as_array().expect("tools").iter().all(|t| t.get("outputSchema").is_none()));
 }
 
 #[test]
@@ -229,12 +289,15 @@ fn resources_are_listed_and_read() {
     assert!(
         resources.iter().any(|r| r["uri"] == "simee://devices") && resources.iter().any(|r| r["uri"] == "simee://devices/phone/screenshot")
     );
+    assert!(resources.iter().any(|r| r["uri"] == "simee://devices/phone/screen"), "the agent-sized screen is listed for a booted device");
     assert_eq!((list["result"]["ttlMs"].clone(), list["result"]["cacheScope"].clone()), (json!(0), json!("private")));
     let read = rig.modern("resources/read", json!({"uri": "simee://devices/phone"}));
     assert_eq!(read["result"]["contents"][0]["uri"], "simee://devices/phone");
     assert!(read["result"]["contents"][0]["text"].as_str().is_some_and(|t| t.contains("udid")));
     let templates = rig.modern("resources/templates/list", json!({}));
-    assert_eq!(templates["result"]["resourceTemplates"].as_array().map(Vec::len), Some(4));
+    let names: Vec<&str> =
+        templates["result"]["resourceTemplates"].as_array().expect("templates").iter().filter_map(|t| t["name"].as_str()).collect();
+    assert_eq!(names, ["device", "screen", "screenshot", "logs", "apps", "processes", "prefs", "prefs-store"]);
     let missing = rig.modern("resources/read", json!({"uri": "simee://devices/"}));
     assert_eq!(missing["error"]["code"], rpc::INVALID_PARAMS);
     assert_eq!(missing["error"]["data"]["uri"], "simee://devices/");
@@ -255,7 +318,9 @@ fn a_long_method_is_a_task_for_a_client_that_declares_the_extension() {
     let task = rig.modern("tasks/get", json!({"taskId": id}));
     assert_eq!((task["result"]["status"].clone(), task["result"]["resultType"].clone()), (json!("working"), json!("complete")));
     gate.release();
+    let deadline = Instant::now() + WAIT;
     let done = loop {
+        assert!(Instant::now() < deadline, "the task did not complete within {WAIT:?}");
         let task = rig.modern("tasks/get", json!({"taskId": id}));
         if task["result"]["status"] == "completed" {
             break task;
@@ -263,7 +328,8 @@ fn a_long_method_is_a_task_for_a_client_that_declares_the_extension() {
         std::thread::sleep(Duration::from_millis(10));
     };
     assert_eq!(done["result"]["result"]["structuredContent"], json!({"boot_s": 12.0}));
-    assert_eq!(rig.fake.called("boot"), [json!({"device": "phone"})]);
+    // The server applies the host's admission to a boot the agent didn't say anything about.
+    assert_eq!(rig.fake.called("boot"), [json!({"device": "phone", "admission": "refuse"})]);
     // A method that isn't long is answered inline even for such a client.
     let tap = rig.with_tasks("tools/call", json!({"name": "tap", "arguments": {"device": "phone", "x": 1, "y": 1}}));
     assert_eq!(tap["result"]["resultType"], "complete");
@@ -294,6 +360,63 @@ fn a_task_can_be_cancelled_and_stays_cancelled() {
     assert_eq!(rig.modern("tasks/get", json!({}))["error"]["code"], rpc::INVALID_PARAMS);
 }
 
+const WAITING: &str = "boot: 3 waiting at 5 s, admission hold: memory: 3 more iOS phone devices would take memory used from 60% to 90%";
+
+impl Rig {
+    /// Waits until the call to `method` that was gated saw whether it was cancelled.
+    fn saw_cancel(&self, method: &str) -> bool {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Some((_, c)) = self.fake.saw_cancel.lock().expect("saw_cancel").iter().find(|(m, _)| m == method) {
+                return *c;
+            }
+            assert!(Instant::now() < deadline, "the call never ended");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+#[test]
+fn cancelling_a_task_reaches_the_call_that_waits_and_its_status_says_what_it_waits_on() {
+    let rig = Rig::new();
+    let gate = rig.fake.gate("boot");
+    rig.fake.says.lock().expect("says").insert("boot".into(), WAITING.into());
+    let created = rig.with_tasks("tools/call", json!({"name": "boot", "arguments": {"device": "phone", "admission": "wait"}}));
+    let id = created["result"]["taskId"].as_str().expect("task id").to_owned();
+    let deadline = Instant::now() + WAIT;
+    let message = loop {
+        let m = rig.modern("tasks/get", json!({"taskId": id}))["result"]["statusMessage"].as_str().unwrap_or("").to_owned();
+        if m.contains("admission hold") || Instant::now() > deadline {
+            break m;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(message.starts_with("boot has been running for ") && message.ends_with("from 60% to 90%"), "{message}");
+    rig.modern("tasks/cancel", json!({"taskId": id}));
+    gate.release();
+    assert!(rig.saw_cancel("boot"), "the waiting call sees the cancel");
+}
+
+#[test]
+fn cancelling_a_request_reaches_the_call_and_progress_says_what_it_waits_on() {
+    let rig = Rig::new();
+    let gate = rig.fake.gate("boot");
+    rig.fake.says.lock().expect("says").insert("boot".into(), WAITING.into());
+    let mut params = json!({"name": "boot", "arguments": {"device": "phone", "admission": "wait"}});
+    params["_meta"] = Rig::meta(false);
+    params["_meta"]["progressToken"] = json!("t1");
+    let id = rig.send_raw("tools/call", params);
+    let progress = rig.notification("notifications/progress");
+    let message = progress["params"]["message"].as_str().expect("message");
+    assert!(
+        message.starts_with("boot is still running (") && message.contains("): boot: 3 waiting at 5 s, admission hold: memory"),
+        "{message}"
+    );
+    rig.send(&json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": id}}));
+    gate.release();
+    assert!(rig.saw_cancel("boot"), "the waiting call sees the cancel");
+}
+
 #[test]
 fn a_client_without_the_extension_waits_and_hears_progress() {
     let rig = Rig::new();
@@ -312,10 +435,227 @@ fn a_client_without_the_extension_waits_and_hears_progress() {
         (response["result"]["resultType"].clone(), response["result"]["structuredContent"]["boot_s"].clone()),
         (json!("complete"), json!(3))
     );
-    // No token, no progress.
+    // However many heartbeats landed while the call ran, they all came before its response.
+    let before = rig.notes.take();
+    assert!(before.iter().all(|n| n["method"] == "notifications/progress" && n["params"]["progressToken"] == "t1"), "{before:?}");
+    // None comes after it; and with no token, no progress.
     rig.fake.gates.lock().expect("gates").clear();
     rig.modern("tools/call", json!({"name": "boot", "arguments": {"device": "phone"}}));
-    assert!(rig.quiet());
+    assert!(rig.quiet(), "{:?}", rig.notes.borrow());
+}
+
+#[test]
+fn no_progress_follows_the_response() {
+    // The heartbeat is stopped at its worst moment: it has decided to send, and the call returns.
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink: Sink = {
+        let lines = lines.clone();
+        Arc::new(move |line| lock(&lines).push(line))
+    };
+    let (paused_tx, paused) = channel();
+    let (go, go_rx) = channel::<()>();
+    let first = AtomicBool::new(true);
+    let beat = heartbeat_with(sink, json!("t1"), "boot".into(), Duration::from_millis(1), move || {
+        if first.swap(false, Ordering::Relaxed) {
+            paused_tx.send(()).ok();
+            go_rx.recv().ok();
+        }
+    });
+    paused.recv_timeout(WAIT).expect("the heartbeat reaches its send");
+    let (done_tx, done) = channel();
+    let answer = {
+        let lines = lines.clone();
+        std::thread::spawn(move || {
+            drop(beat);
+            lock(&lines).push("response".into());
+            done_tx.send(()).ok();
+        })
+    };
+    // Give the response every chance to overtake the progress; stopping waits for the send instead.
+    let _ = done.recv_timeout(Duration::from_millis(500));
+    go.send(()).ok();
+    answer.join().expect("answered");
+    let deadline = Instant::now() + WAIT;
+    while !lock(&lines).iter().any(|l| l.contains("notifications/progress")) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let lines = lock(&lines).clone();
+    assert!(lines.first().is_some_and(|l| l.contains("notifications/progress")), "{lines:?}");
+    assert_eq!(lines.last().map(String::as_str), Some("response"), "no progress after the response: {lines:?}");
+}
+
+/// A backend that reports steps as `sim-api`'s long methods do: `before` as the call starts, then
+/// the fake (and its gate), then `after`.
+struct Stepping {
+    fake: Arc<Fake>,
+    before: Vec<(u64, u64, &'static str)>,
+    after: Vec<(u64, u64, &'static str)>,
+}
+
+impl Backend for Stepping {
+    fn call(&self, method: &str, params: &Value) -> Result<Value, String> {
+        for (done, total, message) in &self.before {
+            sim_api::call_step("booting", *done, *total, *message);
+        }
+        let r = self.fake.call(method, params);
+        if !sim_api::call_cancelled() {
+            for (done, total, message) in &self.after {
+                sim_api::call_step("booted", *done, *total, *message);
+            }
+        }
+        r
+    }
+}
+
+fn stepping_rig() -> Rig {
+    Rig::over(Toolsets::all(), |fake| {
+        Arc::new(Stepping {
+            fake,
+            before: vec![(0, 8, "0 of 8 devices booted")],
+            after: vec![(4, 8, "4 of 8 done"), (8, 8, "8 of 8 done")],
+        })
+    })
+}
+
+/// Every progress before `id`'s response, and the response; none may follow it.
+fn progress_until(rig: &Rig, id: u64) -> (Vec<Value>, Value) {
+    let response = rig.response(id);
+    let progress: Vec<Value> = rig.notes.take().into_iter().filter(|n| n["method"] == "notifications/progress").collect();
+    assert!(rig.quiet(), "no progress after the response: {:?}", rig.notes.borrow());
+    (progress, response)
+}
+
+#[test]
+fn a_long_calls_steps_are_its_progress_with_a_total_and_beats_between_them_only_increase() {
+    let rig = stepping_rig();
+    let gate = rig.fake.gate("boot_many");
+    let mut params = json!({"name": "boot_many", "arguments": {"devices": ["d0", "d1", "d2", "d3"]}});
+    params["_meta"] = Rig::meta(false);
+    params["_meta"]["progressToken"] = json!("t1");
+    let id = rig.send_raw("tools/call", params);
+    // The first step at once, then heartbeats partway to the next device while the first ones boot.
+    let first = rig.notification("notifications/progress");
+    assert_eq!((first["params"]["progress"].as_f64(), first["params"]["total"].as_u64()), (Some(0.0), Some(8)), "{first}");
+    assert_eq!(first["params"]["message"], "boot_many: 0 of 8 devices booted");
+    let beat = rig.notification("notifications/progress");
+    let between = beat["params"]["progress"].as_f64().expect("progress");
+    assert!(between > 0.0 && between < 1.0 && beat["params"]["total"] == 8, "{beat}");
+    assert!(
+        beat["params"]["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("boot_many is still running (") && m.ends_with("0 of 8 devices booted"))
+    );
+    gate.release();
+    let (progress, response) = progress_until(&rig, id);
+    assert_eq!(response["result"]["resultType"], "complete");
+    let values: Vec<f64> = progress.iter().map(|p| p["params"]["progress"].as_f64().expect("progress")).collect();
+    assert!(values.windows(2).all(|w| w[0] < w[1]) && values.first().is_none_or(|v| *v > between), "{values:?}");
+    assert_eq!(values.last(), Some(&8.0), "{values:?}");
+    assert!(progress.iter().all(|p| p["params"]["total"] == 8 && p["params"]["progressToken"] == "t1"), "{progress:?}");
+    // With no token, no progress at all.
+    rig.fake.gates.lock().expect("gates").clear();
+    rig.modern("tools/call", json!({"name": "boot_many", "arguments": {"devices": ["d0"]}}));
+    assert!(rig.quiet(), "{:?}", rig.notes.borrow());
+}
+
+#[test]
+fn an_older_clients_long_call_hears_the_same_progress() {
+    let rig = stepping_rig();
+    let id = rig.send_raw("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    rig.response(id);
+    let id = rig.send_raw("tools/call", json!({"name": "boot_many", "arguments": {"devices": ["d0"]}, "_meta": {"progressToken": 7}}));
+    let (progress, response) = progress_until(&rig, id);
+    assert_eq!(response["result"].get("resultType"), None, "the older shape");
+    // The steps (a heartbeat may fall between them on a slow host, partway to the next).
+    let counts: Vec<(f64, u64)> = progress
+        .iter()
+        .map(|p| (p["params"]["progress"].as_f64().unwrap_or(-1.0), p["params"]["total"].as_u64().unwrap_or(0)))
+        .filter(|(p, _)| p.fract() == 0.0)
+        .collect();
+    assert_eq!(counts, [(0.0, 8), (4.0, 8), (8.0, 8)]);
+}
+
+#[test]
+fn a_tasks_status_says_its_step_and_a_cancelled_boot_many_keeps_the_devices_done() {
+    let rig = stepping_rig();
+    let gate = rig.fake.gate("boot_many");
+    // What boot_many returns once it has stopped: the devices done, the rest cancelled.
+    let partial =
+        json!({"cancelled": true, "failed": 4, "devices": [{"device": "d0", "boot_s": 9.0}, {"device": "d4", "error": "cancelled"}]});
+    rig.fake.answer("boot_many", Ok(partial));
+    let created = rig.with_tasks("tools/call", json!({"name": "boot_many", "arguments": {"devices": ["d0", "d4"]}}));
+    let id = created["result"]["taskId"].as_str().expect("task id").to_owned();
+    let deadline = Instant::now() + WAIT;
+    let message = loop {
+        let m = rig.modern("tasks/get", json!({"taskId": id}))["result"]["statusMessage"].as_str().unwrap_or("").to_owned();
+        if m.ends_with("0 of 8 devices booted") || Instant::now() > deadline {
+            break m;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(message.starts_with("boot_many has been running for ") && message.ends_with(": 0 of 8 devices booted"), "{message}");
+    rig.modern("tasks/cancel", json!({"taskId": id}));
+    gate.release();
+    let task = loop {
+        let task = rig.modern("tasks/get", json!({"taskId": id}))["result"].clone();
+        if task.get("result").is_some() || Instant::now() > deadline {
+            break task;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(task["status"], "cancelled");
+    assert_eq!(task["result"]["structuredContent"]["devices"][0]["device"], "d0", "the device done is returned: {task}");
+    assert!(task["statusMessage"].as_str().is_some_and(|m| m.contains("returned what it had done")), "{task}");
+}
+
+#[test]
+fn progress_values_only_increase_whichever_comes_first() {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink: Sink = {
+        let lines = lines.clone();
+        Arc::new(move |line| lock(&lines).push(line))
+    };
+    let values = |lines: &Mutex<Vec<String>>| -> Vec<(f64, Option<u64>)> {
+        lock(lines)
+            .iter()
+            .map(|l| serde_json::from_str::<Value>(l).expect("json"))
+            .map(|v| (v["params"]["progress"].as_f64().unwrap_or(-1.0), v["params"]["total"].as_u64()))
+            .collect()
+    };
+    let step = |done, total| crate::tasks::Note { done, total: Some(total), message: format!("{done} of {total} done"), counted: true };
+    // Seconds first (a long admission wait): it stays in seconds, so a step can't go backwards.
+    let beat = heartbeat_with(sink.clone(), json!("a"), "boot_many".into(), Duration::from_secs(3600), || {});
+    {
+        let mut r = lock(&beat.report);
+        r.start -= Duration::from_secs(30);
+        r.beat(None);
+        r.step(&step(1, 8));
+        r.beat(Some("1 of 8 done".into()));
+    }
+    drop(beat);
+    assert_eq!(values(&lines), [(30.0, None)], "the step and a beat in the same second aren't sent");
+    lock(&lines).clear();
+    // A step first: counted, beats move partway to the next unit, the next step jumps past them.
+    let beat = heartbeat_with(sink, json!("b"), "boot_many".into(), Duration::from_secs(3600), || {});
+    {
+        let mut r = lock(&beat.report);
+        r.step(&step(0, 2));
+        for _ in 0..3 {
+            r.beat(None);
+        }
+        r.step(&step(1, 2));
+        r.beat(None);
+        r.step(&step(1, 2));
+    }
+    let steps = beat.steps();
+    drop(beat);
+    steps(&step(2, 2));
+    let v = values(&lines);
+    assert_eq!(v.iter().map(|(_, t)| *t).collect::<Vec<_>>(), vec![Some(2); 6], "{v:?}");
+    let p: Vec<f64> = v.iter().map(|(p, _)| *p).collect();
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+    assert!(near(p[0], 0.0) && near(p[1], 0.45) && near(p[4], 1.0) && near(p[5], 1.45), "{p:?}");
+    assert!(p.windows(2).all(|w| w[0] < w[1]) && p[3] < 0.9, "{p:?}");
 }
 
 #[test]
@@ -324,7 +664,9 @@ fn a_cancelled_request_is_not_answered() {
     let gate = rig.fake.gate("boot");
     let id = rig.send_modern("tools/call", json!({"name": "boot", "arguments": {"device": "phone"}}), false);
     // Wait until the call is running, then cancel it.
+    let deadline = Instant::now() + WAIT;
     while rig.fake.called("boot").is_empty() {
+        assert!(Instant::now() < deadline, "boot was not called within {WAIT:?}");
         std::thread::sleep(Duration::from_millis(5));
     }
     rig.send(&json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": id}}));
@@ -371,6 +713,108 @@ fn listening_acknowledges_first_then_sends_what_changed() {
     while rig.rx.try_recv().is_ok() {}
     rig.fake.answer("info", Ok(json!({"state": "Shutdown"})));
     assert!(rig.quiet(), "no more notifications");
+}
+
+#[test]
+fn nothing_is_read_for_resources_nobody_subscribed_to() {
+    let rig = Rig::new();
+    rig.fake.answer("screenshot", Ok(json!({"png": "AAAA"})));
+    rig.fake.answer("processes", Ok(json!([])));
+    // Reading and listing resources, and listing them again, is the calls it asks for and no more.
+    rig.modern("resources/read", json!({"uri": "simee://devices/phone/screenshot"}));
+    rig.modern("resources/list", json!({}));
+    rig.modern("resources/templates/list", json!({}));
+    // A listen that asks for nothing starts no watcher either.
+    let id = rig.send_modern("subscriptions/listen", json!({"notifications": {}}), false);
+    assert_eq!(rig.next_message().expect("ack")["method"], "notifications/subscriptions/acknowledged");
+    std::thread::sleep(SHORT * 3);
+    let after = |m: &str| rig.fake.called(m).len();
+    assert_eq!((after("screenshot"), after("processes"), after("devices")), (1, 0, 1), "one read, one listing, and then quiet");
+    assert!(rig.quiet());
+    rig.send(&json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": id}}));
+}
+
+#[test]
+fn a_listener_hears_when_a_screen_changes_under_the_name_it_gave() {
+    let rig = Rig::new();
+    rig.fake.answer("screenshot", Ok(json!({"png": "AAAA"})));
+    rig.fake.answer("processes", Ok(json!([{"pid": 1, "path": "/a"}])));
+    let screen = "simee://device/phone/screen";
+    let processes = "simee://devices/phone/processes";
+    let id = rig.send_modern(
+        "subscriptions/listen",
+        json!({"notifications": {"resourceSubscriptions": [screen, processes, "simee://device/phone/nope"]}}),
+        false,
+    );
+    let ack = rig.next_message().expect("acknowledgement");
+    assert_eq!(ack["params"]["notifications"], json!({"resourceSubscriptions": [screen, processes]}));
+    rig.until_read("screenshot");
+    rig.until_read("processes");
+    // A new frame is announced; a busier process list is not, but a new process is.
+    rig.fake.answer("screenshot", Ok(json!({"png": "BBBB"})));
+    rig.fake.answer("processes", Ok(json!([{"pid": 1, "path": "/a", "cpu": 80.0}])));
+    let updated = rig.notification("notifications/resources/updated");
+    assert_eq!((updated["params"]["uri"].clone(), updated["params"]["_meta"][META_SUBSCRIPTION].clone()), (json!(screen), json!(id)));
+    assert!(rig.quiet(), "a process list that is only busier says nothing: {:?}", rig.notes.borrow());
+    rig.fake.answer("processes", Ok(json!([{"pid": 1, "path": "/a"}, {"pid": 2, "path": "/b"}])));
+    let started = rig.notification("notifications/resources/updated");
+    assert_eq!(started["params"]["uri"], processes);
+}
+
+#[test]
+fn a_listener_hears_when_a_device_boots_or_is_deleted() {
+    let rig = Rig::new();
+    let id = rig.send_modern("subscriptions/listen", json!({"notifications": {"resourcesListChanged": true}}), false);
+    rig.next_message().expect("acknowledgement");
+    rig.until_read("devices");
+    let iphone = "0000AAAA-BBBB-CCCC-DDDD-EEEEFFFF0000";
+    rig.fake.answer("devices", Ok(json!([{"udid": "phone", "state": "Booted"}, {"udid": iphone, "state": "Booted"}])));
+    assert_eq!(rig.notification("notifications/resources/list_changed")["params"]["_meta"][META_SUBSCRIPTION], id);
+    rig.fake.answer("devices", Ok(json!([{"udid": iphone, "state": "Booted"}])));
+    rig.notification("notifications/resources/list_changed");
+    assert!(rig.quiet(), "{:?}", rig.notes.borrow());
+}
+
+#[test]
+fn ending_the_connection_ends_its_subscriptions() {
+    let Rig { server, fake, rx, .. } = Rig::new();
+    fake.answer("screenshot", Ok(json!({"png": "AAAA"})));
+    let meta = Rig::meta(false);
+    let listen = json!({"jsonrpc": "2.0", "id": 1, "method": "subscriptions/listen",
+        "params": {"_meta": meta, "notifications": {"resourcesListChanged": true, "resourceSubscriptions": ["simee://devices/phone/screen"]}}});
+    server.handle_line(&listen.to_string());
+    // An older client's subscription is the connection's too.
+    server
+        .handle_line(&json!({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}}).to_string());
+    server.handle_line(
+        &json!({"jsonrpc": "2.0", "id": 3, "method": "resources/subscribe", "params": {"uri": "simee://devices/phone/apps"}}).to_string(),
+    );
+    let deadline = Instant::now() + WAIT;
+    while fake.answered("screenshot") == 0 || fake.answered("devices") == 0 || fake.answered("apps") == 0 {
+        assert!(Instant::now() < deadline, "the first reads were not all answered within {WAIT:?}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(server);
+    // Reads under way finish; then nothing more is read, and nothing more said.
+    let total = || ["screenshot", "devices", "apps"].iter().map(|m| fake.called(m).len()).sum::<usize>();
+    let mut seen = total();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        assert!(Instant::now() < deadline, "reads kept coming {WAIT:?} after the drop: {seen}");
+        std::thread::sleep(SHORT);
+        let now = total();
+        if now == seen {
+            break;
+        }
+        seen = now;
+    }
+    while rx.try_recv().is_ok() {}
+    fake.answer("screenshot", Ok(json!({"png": "BBBB"})));
+    fake.answer("devices", Ok(json!([])));
+    fake.answer("apps", Ok(json!(["x"])));
+    std::thread::sleep(SHORT * 3);
+    assert_eq!(total(), seen, "no more reads");
+    assert!(rx.try_recv().is_err(), "no more notifications");
 }
 
 #[test]
@@ -473,8 +917,120 @@ fn an_older_client_subscribes_to_resources_the_old_way() {
     while rig.rx.try_recv().is_ok() {}
     rig.fake.answer("info", Ok(json!({"state": "Shutdown"})));
     assert!(rig.quiet(), "unsubscribed");
+    // Unsubscribing the last one ends the watching.
+    let reads = rig.fake.called("info").len();
+    std::thread::sleep(SHORT);
+    assert_eq!(rig.fake.called("info").len(), reads);
     // Modern requests don't have it.
     assert_eq!(rig.modern("resources/subscribe", json!({"uri": "simee://devices"}))["error"]["code"], -32601);
+}
+
+#[test]
+fn an_older_client_unsubscribes_under_either_spelling_of_a_resource() {
+    let rig = Rig::new();
+    let id = rig.send_raw("initialize", json!({"protocolVersion": "2025-11-25", "capabilities": {}}));
+    rig.response(id);
+    rig.fake.answer("info", Ok(json!({"state": "Shutdown"})));
+    let id = rig.send_raw("resources/subscribe", json!({"uri": "simee://device/phone"}));
+    assert_eq!(rig.response(id)["result"], json!({}));
+    rig.until_read("info");
+    let id = rig.send_raw("resources/unsubscribe", json!({"uri": "simee://devices/phone"}));
+    assert_eq!(rig.response(id)["result"], json!({}));
+    std::thread::sleep(SHORT);
+    while rig.rx.try_recv().is_ok() {}
+    rig.fake.answer("info", Ok(json!({"state": "Booted"})));
+    assert!(rig.quiet(), "unsubscribed under the other spelling");
+    // Its watcher is gone with its last resource: no more reads.
+    let reads = rig.fake.called("info").len();
+    std::thread::sleep(SHORT);
+    assert_eq!(rig.fake.called("info").len(), reads);
+}
+
+#[test]
+fn an_older_client_is_not_offered_list_changed_and_keeps_baselines_across_subscribes() {
+    let rig = Rig::new();
+    let id = rig.send_raw("initialize", json!({"protocolVersion": "2025-11-25", "capabilities": {}}));
+    let init = rig.response(id);
+    assert_eq!(init["result"]["capabilities"]["resources"], json!({"subscribe": true}), "no list_changed to promise");
+    rig.fake.answer("screenshot", Ok(json!({"png": "AAAA"})));
+    let uri = "simee://devices/phone/screen";
+    let id = rig.send_raw("resources/subscribe", json!({"uri": uri}));
+    assert_eq!(rig.response(id)["result"], json!({}));
+    rig.until_read("screenshot");
+    // A second subscription doesn't restart the first one's baseline: its change is still announced.
+    rig.fake.answer("screenshot", Ok(json!({"png": "BBBB"})));
+    let id = rig.send_raw("resources/subscribe", json!({"uri": "simee://devices/phone/apps"}));
+    assert_eq!(rig.response(id)["result"], json!({}));
+    assert_eq!(rig.notification("notifications/resources/updated")["params"], json!({"uri": uri}));
+    // The device list isn't read for it, and a boot says nothing.
+    rig.fake.answer("devices", Ok(json!([])));
+    assert!(rig.quiet(), "{:?}", rig.notes.borrow());
+    assert!(rig.fake.called("devices").is_empty());
+}
+
+#[test]
+fn two_spellings_of_a_resource_are_read_once_and_each_announced_under_its_own() {
+    let rig = Rig::new();
+    rig.fake.answer("screenshot", Ok(json!({"png": "AAAA"})));
+    let (a, b) = ("simee://device/phone/screen", "simee://devices/phone/screen");
+    let id = rig.send_modern("subscriptions/listen", json!({"notifications": {"resourceSubscriptions": [a, b]}}), false);
+    assert_eq!(rig.next_message().expect("ack")["params"]["notifications"], json!({"resourceSubscriptions": [a, b]}));
+    rig.until_read("screenshot");
+    // (That it is one read a period, not two, is the schedule's test in `watch`.)
+    rig.fake.answer("screenshot", Ok(json!({"png": "BBBB"})));
+    let first = rig.notification("notifications/resources/updated");
+    let second = rig.notification("notifications/resources/updated");
+    let mut uris: Vec<String> = [first, second].iter().filter_map(|n| n["params"]["uri"].as_str().map(str::to_owned)).collect();
+    uris.sort();
+    assert_eq!(uris, [a, b], "one change, announced under each spelling");
+    rig.send(&json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": id}}));
+}
+
+#[test]
+fn a_core_only_server_does_not_serve_resources_that_read_through_other_toolsets() {
+    let rig = Rig::serving(Toolsets::default());
+    rig.fake.answer("processes", Ok(json!([{"pid": 1, "path": "/a"}])));
+    rig.fake.answer("prefs_read", Ok(json!({"values": {"token": {"type": "string", "value": "secret"}}})));
+    let iphone = "0000AAAA-BBBB-CCCC-DDDD-EEEEFFFF0000";
+    rig.fake.answer("devices", Ok(json!([{"udid": iphone, "name": "iPhone", "state": "Booted", "platform": "ios"}])));
+    let procs = format!("simee://devices/{iphone}/processes");
+    let prefs = format!("simee://devices/{iphone}/prefs/com.bank.app");
+    for uri in [&procs, &prefs] {
+        let read = rig.modern("resources/read", json!({"uri": uri}));
+        assert_eq!(read["error"]["code"], rpc::INVALID_PARAMS, "{read}");
+        assert!(read["error"]["message"].as_str().is_some_and(|m| m.contains("SIMEE_MCP_TOOLSETS=core,")), "{read}");
+    }
+    let list = rig.modern("resources/list", json!({}));
+    let uris: Vec<&str> = list["result"]["resources"].as_array().expect("resources").iter().filter_map(|r| r["uri"].as_str()).collect();
+    assert!(uris.iter().all(|u| !u.ends_with("/processes") && *u != "simee://runtimes"), "{uris:?}");
+    assert!(uris.contains(&format!("simee://devices/{iphone}/logs").as_str()));
+    let templates = rig.modern("resources/templates/list", json!({}));
+    let names: Vec<&str> =
+        templates["result"]["resourceTemplates"].as_array().expect("templates").iter().filter_map(|t| t["name"].as_str()).collect();
+    assert_eq!(names, ["device", "screen", "screenshot", "logs", "apps"]);
+    // A listen asking for them is acknowledged without them, and nothing is read for them.
+    let id = rig.send_modern(
+        "subscriptions/listen",
+        json!({"notifications": {"resourceSubscriptions": [procs, prefs, format!("simee://devices/{iphone}/apps")]}}),
+        false,
+    );
+    let ack = rig.next_message().expect("ack");
+    assert_eq!(ack["params"]["notifications"], json!({"resourceSubscriptions": [format!("simee://devices/{iphone}/apps")]}));
+    rig.send(&json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": id}}));
+    // So does an older client's subscribe, which is refused.
+    let init = rig.send_raw("initialize", json!({"protocolVersion": "2025-11-25", "capabilities": {}}));
+    rig.response(init);
+    let sub = rig.send_raw("resources/subscribe", json!({"uri": procs}));
+    assert_eq!(rig.response(sub)["error"]["code"], rpc::INVALID_PARAMS);
+    let read = rig.send_raw("resources/read", json!({"uri": prefs}));
+    assert_eq!(rig.response(read)["error"]["code"], rpc::INVALID_PARAMS);
+    assert_eq!(rig.fake.called("processes").len() + rig.fake.called("prefs_read").len(), 0, "never called");
+    // With the toolsets that have them, the same server serves them.
+    let rig = Rig::serving(Toolsets::parse("core,debug,prefs").expect("sets"));
+    rig.fake.answer("processes", Ok(json!([{"pid": 1, "path": "/a"}])));
+    rig.fake.answer("prefs_read", Ok(json!({"values": {}})));
+    assert!(rig.modern("resources/read", json!({"uri": procs}))["result"]["contents"].is_array());
+    assert!(rig.modern("resources/read", json!({"uri": prefs}))["result"]["contents"].is_array());
 }
 
 #[test]
@@ -490,7 +1046,7 @@ fn serving_lines_answers_each_and_drains_before_returning() {
         json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "devices", "_meta": meta}}),
         "not json",
     );
-    crate::serve(fake, std::io::Cursor::new(input), sink).expect("served");
+    crate::serve(fake, std::io::Cursor::new(input), sink, Toolsets::all()).expect("served");
     let lines: Vec<Value> = rx.try_iter().map(|l| serde_json::from_str(&l).expect("json")).collect();
     // Input ended; everything it asked was answered first.
     assert_eq!(lines.len(), 3);
@@ -516,7 +1072,7 @@ fn response_lines_are_pinned_byte_for_byte() {
         "not json".to_owned(),
     ]
     .join("\n");
-    crate::serve(fake, std::io::Cursor::new(input), sink).expect("served");
+    crate::serve(fake, std::io::Cursor::new(input), sink, Toolsets::all()).expect("served");
     let mut lines: Vec<String> = rx.try_iter().collect();
     lines.sort();
     let info = format!(r#""_meta":{{"{META_SERVER_INFO}":{{"name":"simee","version":"{}"}}}}"#, env!("CARGO_PKG_VERSION"));
@@ -529,7 +1085,10 @@ fn response_lines_are_pinned_byte_for_byte() {
         format!(
             r#"{{"id":1,"jsonrpc":"2.0","result":{{{info},"content":[{{"text":"{{\"height\":1,\"width\":2}}","type":"text"}}],"resultType":"complete","structuredContent":{{"height":1,"width":2}}}}}}"#
         ),
-        format!(r#"{{"id":3,"jsonrpc":"2.0","result":{{{info},"content":[{{"text":"ok","type":"text"}}],"resultType":"complete"}}}}"#),
+        // Nothing to report is `ok`, and `{}` as its structure (what the tool's output schema says).
+        format!(
+            r#"{{"id":3,"jsonrpc":"2.0","result":{{{info},"content":[{{"text":"ok","type":"text"}}],"resultType":"complete","structuredContent":{{}}}}}}"#
+        ),
         r#"{"id":4,"jsonrpc":"2.0","result":{}}"#.to_owned(),
     ];
     expected.sort();
@@ -559,15 +1118,74 @@ fn per_call_us(mut f: impl FnMut()) -> f64 {
 /// request through the server (dispatch to a worker, reply through the sink).
 ///     cargo test --release -p simee-mcp tool_call_overhead -- --ignored --nocapture
 #[test]
+fn prompts_are_listed_and_got_in_every_revision() {
+    let get = json!({"name": "find-slowness", "arguments": {"device": "phone"}});
+    let check = |list: &Value, got: &Value, missing: &Value, titles: bool, label: &str| {
+        let prompts = list["result"]["prompts"].as_array().unwrap_or_else(|| panic!("{label}: {list}"));
+        assert_eq!(prompts.len(), crate::prompts::PROMPTS.len(), "{label}");
+        assert_eq!(prompts[0].get("title").is_some(), titles, "{label}");
+        let text = got["result"]["messages"][0]["content"]["text"].as_str().unwrap_or_else(|| panic!("{label}: {got}"));
+        assert!(text.contains("`processes` {device: \"phone\"}") && text.contains("This server serves all of them."), "{label}");
+        assert_eq!(missing["error"]["code"], rpc::INVALID_PARAMS, "{label}");
+        assert_eq!(missing["error"]["data"]["missing"], json!(["device"]), "{label}");
+    };
+    let rig = Rig::new();
+    let discover = rig.modern("server/discover", json!({}));
+    assert_eq!(discover["result"]["capabilities"]["prompts"], json!({"listChanged": false}));
+    let list = rig.modern("prompts/list", json!({}));
+    assert_eq!((list["result"]["resultType"].clone(), list["result"]["cacheScope"].clone()), (json!("complete"), json!("public")));
+    let got = rig.modern("prompts/get", get.clone());
+    assert_eq!(got["result"]["resultType"], "complete");
+    check(&list, &got, &rig.modern("prompts/get", json!({"name": "find-slowness"})), true, MODERN);
+    assert_eq!(rig.modern("prompts/list", json!({"cursor": "junk"}))["error"]["code"], rpc::INVALID_PARAMS);
+    for version in LEGACY {
+        let rig = Rig::new();
+        let id = rig.send_raw("initialize", json!({"protocolVersion": version, "capabilities": {}}));
+        let init = rig.response(id);
+        assert_eq!(init["result"]["capabilities"]["prompts"], json!({"listChanged": false}), "{version}");
+        let id = rig.send_raw("prompts/list", json!({}));
+        let list = rig.response(id);
+        assert_eq!(list["result"].get("ttlMs"), None, "{version}");
+        let id = rig.send_raw("prompts/get", get.clone());
+        let got = rig.response(id);
+        let id = rig.send_raw("prompts/get", json!({"name": "find-slowness", "arguments": {}}));
+        check(&list, &got, &rig.response(id), *version != "2025-03-26", version);
+    }
+}
+
+#[test]
+fn a_prompt_says_which_of_its_tools_this_server_lacks() {
+    let rig = Rig::serving(Toolsets::default());
+    let arguments = json!({"app_path": "/a.app", "form_factors": "phone,tablet"});
+    let got = rig.modern("prompts/get", json!({"name": "across-form-factors", "arguments": arguments}));
+    let text = got["result"]["messages"][0]["content"]["text"].as_str().expect("text");
+    assert!(text.contains("and not `form_factors`, `create`, `boot_many`:"), "{text}");
+    assert!(text.contains("SIMEE_MCP_TOOLSETS=core,lifecycle (or all)"), "{text}");
+}
+
+#[test]
 #[ignore = "benchmark"]
 fn tool_call_overhead() {
     let backend: Arc<dyn Backend> = Arc::new(crate::ApiBackend::new());
     let (tx, rx) = channel::<String>();
     let tx = Mutex::new(tx);
     let sink: Sink = Arc::new(move |line| drop(tx.lock().expect("tx").send(line)));
-    let server = Server::new(backend.clone(), sink);
+    let server = Server::new(backend.clone(), sink, Toolsets::all());
+    // The same server with the audit log on: one more append a call.
+    let scratch = crate::backend::fake::Scratch::new("overhead");
+    let log = crate::audit::AuditLog::open(crate::audit::Config::new(scratch.0.join("audit.log"))).expect("audit log");
+    let (audited_tx, audited_rx) = channel::<String>();
+    let audited_tx = Mutex::new(audited_tx);
+    let audited_sink: Sink = Arc::new(move |line| drop(audited_tx.lock().expect("tx").send(line)));
+    let audited = Server::with_safety(
+        backend.clone(),
+        audited_sink,
+        Timing::default(),
+        Toolsets::all(),
+        Arc::new(Safety::new(crate::policy::Policy::default(), Some(log))),
+    );
     let meta = Rig::meta(false);
-    println!("{:<13} {:>8} {:>8} {:>8} {:>8} {:>8}  µs per call", "tool", "parse", "method", "result", "write", "server");
+    println!("{:<13} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}  µs per call", "tool", "parse", "method", "result", "write", "server", "audited");
     for tool in ["identity", "help", "form_factors"] {
         let line = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": {}, "_meta": meta}})
             .to_string();
@@ -581,6 +1199,13 @@ fn tool_call_overhead() {
             server.handle_line(&line);
             drop(rx.recv_timeout(WAIT).expect("reply"));
         });
-        println!("{tool:<13} {parse:>8.2} {method:>8.2} {result:>8.2} {write:>8.2} {whole:>8.2}");
+        let with_log = per_call_us(|| {
+            audited.handle_line(&line);
+            drop(audited_rx.recv_timeout(WAIT).expect("reply"));
+        });
+        println!("{tool:<13} {parse:>8.2} {method:>8.2} {result:>8.2} {write:>8.2} {whole:>8.2} {with_log:>8.2}");
     }
 }
+
+mod drain;
+mod safety;

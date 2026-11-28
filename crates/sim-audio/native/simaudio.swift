@@ -1,4 +1,5 @@
-// simee host audio helper (built on demand by sim-audio; macOS 14.2+ public Core Audio only).
+// simee host audio helper (built on demand by sim-audio; public Core Audio only). `devices` runs on
+// any macOS; `tap` needs 14.2 and answers an error naming it before then.
 //
 //   simaudio devices
 //       JSON: every host audio device (id, uid, name, input/output channels).
@@ -116,6 +117,8 @@ func wav(_ pcm: Data, rate: Int, channels: Int) -> Data {
     return d
 }
 
+/// The Core Audio process tap (`AudioHardwareCreateProcessTap`) is macOS 14.2+.
+@available(macOS 14.2, *)
 func tap(root: pid_t, out: String?, mute: Bool) {
     // A tap needs at least one process; wait until the device has an audio client.
     var clients = deviceClients(root: root)
@@ -219,7 +222,12 @@ case "tap":
         i += 1
     }
     guard root > 1 else { fail("--launchd <pid> is required") }
-    tap(root: root, out: out, mute: mute)
+    if #available(macOS 14.2, *) {
+        tap(root: root, out: out, mute: mute)
+    } else {
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        fail("audio capture needs macOS 14.2 or later (a Core Audio process tap, AudioHardwareCreateProcessTap); this Mac runs macOS \(v.majorVersion).\(v.minorVersion).\(v.patchVersion)")
+    }
 default:
     fail("usage: simaudio devices | simaudio tap --launchd <pid> [--out file.wav] [--mute]")
 }

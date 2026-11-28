@@ -24,7 +24,7 @@ to use fewer resources.
 | Boot | Full Android boot to `sys.boot_completed`: 9.5 s cold, 3.5 s warm (stock: 22.9 s and 17.1 s; [benchmarks](benchmarks.md)); first boot formats and encrypts `/data`. System images from API 29 on; emu refuses older ones up front with the reason (`EMU_ALLOW_OLD_IMAGES=1` boots them anyway, to work on them). API 29 and 30 draw with the GLES encoder over the goldfish `opengles` pipe: each pipe gets a render channel of its own in the renderer, as stock gives it ([performance notes](#performance-notes)); API 30 `google_apis` first-boots in 18.0 s (stock 17.0 s), and both idle at 2.1–2.9% of a host core (stock 3.7–5.4%; [benchmarks](benchmarks.md#api-29-and-30-first-boots-and-idle-host-cpu)); the board has no virtio-gpu for them (their kernels oops on it, and stock gives them none). They also get adb over `qemud:adb` (a client that connects first waits for adbd's `accept`), the reference RIL's `qemud:gsm` modem, and `logcat -Q`'s `logcat` stream from stock's `qemu.cmdline` and `qemu.logcat` properties. API 29 `default` warm-boots in 4.8 s (stock 6.4 s) and first-boots in 3.7 s (stock 4.8 s); its first boot runs the host GLES on SwiftShader, since ANGLE on Metal faults there ([performance notes](#performance-notes)); API 29 `default` and API 30 `google_apis` pass the AutoMobile harness (40 of 41 on API 30, 35 of 41 on API 29; device snapshots and video recording fail, and rotation and dark theme on API 29 fail on stock too; since the touch screen became stock's `virtio_input_multi_touch_1` (#69), AutoMobile's injected taps, multi-touch and pinch are cancelled on API 30, 2026-11-26). API 31 and 32 draw over the same pipe with no virtio-gpu (bootconfig `gltransport=pipe`, as stock gives every image): the gralloc mapper inside their `media.swcodec` opens the GLES transport to read color buffers, and their SELinux policy denies `mediaswcodec` the render node (`avc: denied { read write } ... name="renderD128" scontext=u:r:mediaswcodec:s0 tcontext=u:object_r:gpu_device:s0`) but not the goldfish pipe, so over virtio-gpu `screenrecord`'s encoder crashed ([#64](https://github.com/kaeawc/simee/issues/64)). API 33 guests set up address-space graphics with the protocol before the renderer's; the GPU translates it (`virtio/legacy_asg.rs`, [#39](https://github.com/kaeawc/simee/issues/39)). API 31 to 33's GLES is the encoder on a renderer with GL, as stock runs them, since their ANGLE finds SurfaceFlinger no EGL config. Images without `AndroidbootProps2` (API 30 and older, kernels without bootconfig) get stock's legacy kernel command line (`qemu.*` names) instead of bootconfig |
 | adb | virtio-vsock with a host bridge on `console port + 1`, announced to the adb server. `adb shell`/`root`/`push` work, and the device shows up about 8 s after launch on a warm boot |
 | Apps | The API's `install`, `uninstall`, `launch`, `terminate`, `apps` and `open_url` run on Android devices through the host's `adb` (the SDK's platform-tools, else the PATH), so they work on a stock emulator's AVD too, with iOS's parameters and result shapes. `install` is `adb install -r` for an `.apk` (an `.aab` through `bundletool` when it is on the PATH, else an error that says so); `uninstall` is `pm uninstall`; `launch` starts the package's own first launcher activity (`cmd package query-activities --brief --components`, so an app with two, as a debug build with LeakCanary's "Leaks" alias has, never gets the system's chooser), runs `am start -W` (`-S` when `restart` is true, the default, as iOS terminates first) and returns the app's `pid` from `pidof`, polled for up to 3 s (null when no process is named for the package), with the `activity` it started; `terminate` is `am force-stop`; `apps` lists third-party packages (`all` adds the system's) as bare package names, without labels, which need `aapt` or a `dumpsys` per package; `open_url` is `am start -a android.intent.action.VIEW -d`. Package names and URLs are validated and quoted before they reach the guest's shell. Every adb call has a deadline (an install or `pm uninstall` 300 s, `am start` 30 s, the rest 10 s); one past it is killed and reported by its command line, and each `.aab` install builds in a scratch directory of its own. `launch`'s `args`, `env` and `shaped` are refused on Android. Tested against a fake adb; not yet timed on a booted device |
-| Console | `adb emu` / telnet console with token auth: `avd name`, `ping`, `kill`, `sensor set\|get\|status`, `event send\|text`, `geo fix`, `finger touch\|remove`, `power`, `rotate`, `sms send`, `gsm call\|accept\|busy\|cancel\|hold\|list\|voice\|data\|status\|signal`, `screenshot` turned upright as the guest rotated its display (as `adb screencap` is), `network speed|delay|status` (stock's presets, numbers and report, seeded by `-netspeed`/`-netdelay`; applied live in the NAT, `crates/emu-vmm/src/net/shape.rs`: a token bucket per direction, 0 = unlimited, each direction holds about a second of its rate and drops past that, as a bottleneck does (except small control frames, ARP replies and payload-free TCP segments, which take a bounded reserve of 16 frames past it), with TCP held back by the download queue's room; unshaped devices take the plain path with no shaper; inbound frames are delayed by a latency between min and max, in order. Verified in unit tests over loopback only: not yet measured in a guest under `network speed edge`, and `network speed` doesn't change the radio's reported data type), `avd snapshot` (answers as stock does without snapshot support: `save`/`load` are a `KO`, `list` is empty, `del` succeeds), plus simee's `touch`, `clipboard`, `frames`, `sms list`, `xr` (Android XR), `car` (Automotive) |
+| Console | `adb emu` / telnet console with token auth: `avd name`, `ping`, `kill`, `sensor set\|get\|status`, `event send\|text`, `geo fix`, `finger touch\|remove`, `power`, `rotate`, `sms send`, `gsm call\|accept\|busy\|cancel\|hold\|list\|voice\|data\|status\|signal`, `screenshot` turned upright as the guest rotated its display (as `adb screencap` is), `network speed|delay|status` (stock's presets, numbers and report, seeded by `-netspeed`/`-netdelay`; applied live in the NAT, `crates/emu-vmm/src/net/shape.rs`: a token bucket per direction, 0 = unlimited, each direction holds about a second of its rate and drops past that, as a bottleneck does (except small control frames, ARP replies and payload-free TCP segments, which take a bounded reserve of 16 frames past it), with TCP held back by the download queue's room; unshaped devices take the plain path with no shaper; inbound frames are delayed by a latency between min and max, in order. Verified in unit tests over loopback only: not yet measured in a guest under `network speed edge`, and `network speed` doesn't change the radio's reported data type), simee's `network loss <percent>|<up>:<down>|none` (stock has no loss command: each direction drops that percent of the guest's TCP, UDP and ICMP packets at the NAT, never ARP and never adb, which doesn't cross the NAT; drawn from a random stream per direction seeded once per boot; `network status` adds a download and an upload loss line while either is set; unit-tested with fixed seeds, not yet measured in a guest), `avd snapshot` (answers as stock does without snapshot support: `save`/`load` are a `KO`, `list` is empty, `del` succeeds), plus simee's `touch`, `clipboard`, `frames`, `sms list`, `xr` (Android XR), `car` (Automotive) |
 | Discovery | `-list-avds`, `pid_<pid>.ini` running-instance file, `emulator-<port>` serial on stdout |
 | Graphics | Home screen and apps render. virtio-gpu with gfxstream contexts on the host GPU: the guest's GLES through ANGLE on its Vulkan and, on images that map it (API 36 and newer, `VulkanVirtualQueue`), its UI and SurfaceFlinger drawn with Skia on that Vulkan, as stock's `GuestAngle` mode does, so the renderer runs without a GL backend (see "Vulkan-only renderer" below); Vulkan on MoltenVK (lavapipe fallback), Vulkan composition. Host-visible memory via blob mapping; goldfish address space (PCIe, shared-slot allocator) and goldfish pipe (refcounted color buffers) for the ranchu gralloc; guest `screencap` and host screenshots both work |
 | Input & sensors | virtio-input touchscreen, keyboard and rotary, plus stock's dual-mode mouse on XR images. The keyboard is stock's `qwerty2` (0627:0001, stock's key set), so goldfish's `qwerty2.kl` applies: HOME, D-pad centre (`KEY_CENTER`), Recents (580), media and stem keys arrive. The console takes every stock `KEY_*` name and numeric codes. `qemud:sensors` lists the AVD's sensors by stock's rules (`hw.sensor*` flags; heart rate and wrist tilt on Wear OS API 28+; the hinge on foldables) with live values; GNSS over `qemud:gps`; goldfish battery; fingerprint; clipboard |
@@ -69,6 +69,7 @@ ignored for now.
 | `crates/emu-sdk` | Java-free SDK provisioning: repository manifests, verified downloads, unpacking, the on-demand renderer (`emu -provision`, `-provision-renderer`) |
 | `crates/emu-ext4` | Native ext4 formatter for first-boot userdata: writes only metadata, so a fresh 10 GiB image takes under 1 MB on disk |
 | `crates/emu-fdt` | Flattened device tree writer |
+| `crates/emu-container` | Host probe, backend selection (KVM, container, TCG) and the Redroid-style container launcher for Linux hosts with binder ([below](#container-backend-linux-with-binder-and-no-kvm)) |
 | `apps/emu` | The `emu` CLI: SDK-emulator-compatible flags, per-AVD instance state, console server, display server |
 | `crates/sim-android` | The client front ends use: AVDs as devices, starting `emu`, the console and display-socket clients |
 | `desktop/` | simee's Rune window (both platforms), its own workspace |
@@ -94,10 +95,18 @@ an avdmanager AVD; emu has no snapshots and ignores those keys. (Earlier builds 
 AVDs the stock emulator runs list as `Booted`. The stock emulator (36.x, macOS) does not write the
 `pid_<pid>.ini` that simee's `emu` writes to `~/Library/Caches/TemporaryItems/avd/running`; it
 holds `<avd>/multiinstance.lock` and writes the qemu PID to `<avd>/hardware-qemu.ini.lock`. simee
-reads that PID, checks it is alive and a qemu started with the exact pair `-avd <name>` (`ps`), and
-takes the ports from `-port N` (adb is N + 1) or `-ports C,A`, else from the emulator-range port it
-listens on (`lsof`). A call on one AVD reads only that AVD's lock; a listing asks the host once
-(one `ps -axo`, and one `lsof` only if an emulator lacks `-port`).
+reads that PID, checks it is alive and a qemu started with the exact pair `-avd <name>`, and takes
+the ports from `-port N` (adb is N + 1) or `-ports C,A`, else from the emulator-range port it
+listens on. The process facts come from the kernel for that one PID, with nothing spawned:
+`/proc/<pid>` on Linux, libproc on macOS (`sim-android`'s `host.rs`), where a host-wide `ps -axo`
+and `lsof` cost ~60 ms each. A call on one AVD reads only that AVD's lock. A server remembers a
+qemu's command line and ports by (PID, start time), so a PID the kernel hands to another program
+is asked about again; an emulator is never listed from memory alone, as every call reads the locks
+and checks the PID is alive. The parsed pointer and `config.ini` of each AVD are remembered by
+(path, mtime, ctime, size, inode) in `emu-avd` (the change time catches a same-size file put back with its old mtime), except files changed in the last 2 s, so resolving a
+device reads no AVD file that hasn't changed. The listing of the AVD home is remembered too, by the
+directory's own stamp, which an entry that comes, goes or is renamed over changes; a listing
+with a link among the pointers or a failed read is not remembered.
 `simee info` shows `running.emulator` (`stock` or `simee`), the serial, ports and PID. What needs
 simee's `emu` (touch, keys, wheel and frames over `display.sock`, the touchpad) says so and names
 the fix instead of failing on a missing socket. `shutdown` interrupts the qemu process
@@ -115,9 +124,16 @@ the valid ones. Every mode renders through gfxstream; what differs is the Vulkan
 |---|---|---|
 | `auto`, `host` (default) | the host GPU through MoltenVK/KosmicKrisp; lavapipe if MoltenVK fails here | a normal desktop session |
 | `lavapipe`, `swangle`, `angle_indirect` | lavapipe, software Vulkan on the CPU | no GPU, CI, headless hosts |
-| `swiftshader`, `swiftshader_indirect` | SwiftShader, software Vulkan on the CPU | comparing against lavapipe |
+| `swiftshader`, `swiftshader_indirect` | SwiftShader, software Vulkan on the CPU (Linux hosts only; see below) | comparing against lavapipe |
 | `software`, `guest` | lavapipe, with stock's notice that guest rendering isn't supported | an AVD configured that way keeps booting |
 | `off`, `none` | no renderer; the guest boots without graphics | boot-only checks (flag only; `hw.gpu.mode=off` in `config.ini` is ignored) |
+| `metal` (flag only, experimental) | `host`, and posted frames also go to simee's encoder as IOSurfaces copied on the GPU instead of read back | measuring the Metal present path (#356, docs/research/metal-present.md) |
+
+SwiftShader doesn't work on macOS hosts: the renderer aborts at init with "Failed to find memory
+type for ColorBuffers" (6 of 6 boots on API 30 and 36, M3 Max, 2026-11-27, #397). So `emu -gpu
+swiftshader` (or `swiftshader_indirect`) is refused up front with "use -gpu lavapipe", and an AVD
+whose `hw.gpu.mode` says `swiftshader` runs lavapipe instead and prints a notice. Linux hosts are
+unchanged.
 
 Rendering inside the guest (virtio-gpu 2D with Mesa in the image) isn't possible with SDK
 images: a scan of the API 34 to 37 system images found none that ships a guest renderer, and
@@ -147,8 +163,11 @@ emu -provision 36 -dry-run                              # resolve only: URL, siz
 emu -provision 36 -no-renderer                          # skip the renderer (boots without graphics)
 emu -provision 34 -tag android-automotive               # no plain 34 image: picks the newest, 34-ext9
 emu -provision-renderer                                 # install or update just the renderer
+emu -provision-dhu -dry-run                             # Android Auto's Desktop Head Unit: URL, size, sha1, license
+emu -provision-dhu -accept-licenses [-dhu-beta]         # install it into <sdk>/extras/google/auto
 emu -create-avd NAME -sysdir system-images/android-36/google_apis/arm64-v8a -lcd 720x1280@320
 emu -create-avd NAME -sysdir ... -no-golden             # a pristine first boot: no golden user data
+emu -create-avd NAME -sysdir ... -profile software-lite # a phone for software mode: 540x960, 30 Hz (below)
 ```
 
 `-create-avd` (and `-provision ... -create-avd`) also keeps one settled "golden" user data per
@@ -156,6 +175,18 @@ system image: the first AVD of an image boots once to the launcher and is stoppe
 AVD of that image starts from a copy-on-write clone of it, skipping the first boot's extra minutes
 (apexd decompressing the image's compressed APEX files, `system_server`'s first-boot work). How it
 is keyed, locked and invalidated, and what it saves, is in [farm-android.md](farm-android.md#golden-user-data-per-system-image).
+
+`-provision-dhu` fetches Google's Android Auto Desktop Head Unit (`extras;google;auto`) only when
+asked. It is under the `android-sdk-license` terms, which don't allow redistribution, so simee
+never bundles it and refuses to install it without `-accept-licenses`; `-dry-run` needs no
+acceptance. The archive is chosen per host (macOS arm64 and x64, Linux x64, Windows x64; any other
+host is told which have one), stable (r2.0) by default and `-dhu-beta` for r2.1, checked against
+the manifest's size and sha1, unpacked beside its final name, `desktop-head-unit` made executable
+and the directory moved in whole (the replaced copy is set aside under `.downloads`). Archive members
+that are absolute or contain `..` are refused, and so is a program that is a symlink. It lands in the
+SDK's own `extras/google/auto`, so an install by Android Studio's SDK Manager is reused when it is
+the requested revision. simee records the revision and channel it installed in `.simee-dhu`; a
+newer revision, or `-dhu-beta` over a stable install (or the reverse), installs over it.
 
 `crates/emu-sdk` reads Google's repository manifests (`repository2-3.xml`, and
 `sys-img/<tag>/sys-img2-3.xml` per tag), picks the newest stable archive for the host
@@ -221,14 +252,37 @@ kill` work as on a Mac. What follows records what was decided and why. The numbe
 ```bash
 emu -provision 36 -tag default -abi x86_64 -create-avd phone
 emu -provision-renderer
-emu -accel-check    # which QEMU would run the guest, or what's missing (Ubuntu 22.04's 6.2 is too old)
+emu -accel-check    # which QEMU would run the guest and on what (KVM or TCG), or what's missing
 EMU_QEMU=/path/to/qemu-system-x86_64 emu -avd phone   # QEMU 11.1 or newer; without it, PATH's
+emu -avd phone -accel off   # TCG even where /dev/kvm is usable (-accel on: KVM or fail)
 ```
 
+- **KVM when the host has it.** emu probes KVM the way QEMU will use it: `/dev/kvm` opens with
+  what QEMU needs (`emu_kvm::open`, whose error says how to fix a missing or denied device), it
+  creates a VM (which fails with EBUSY on kernels before 6.12 while VirtualBox or VMware holds
+  VT-x), and the QEMU's `-accel help` lists `kvm` (a QEMU built with `--disable-kvm` doesn't).
+  Then QEMU runs the guest with `-accel kvm -cpu host` and keeps everything else: the board,
+  emu's devices over vhost-user and vfio-user, the shared memfd RAM. Otherwise the guest runs on
+  TCG, and `-verbose` and `-accel-check` say why. `-accel` and `-no-accel` mean what they mean to
+  stock: `auto` by default, `on` is KVM or fail, `off` is TCG.
+- **Retry on TCG.** In `auto`, a QEMU that still fails on KVM is started once more on TCG, with
+  a one-line notice, on the devices already served (their accept loops take the new
+  connection). It retries only a failure that is KVM's: QEMU's stderr named KVM or the
+  accelerator, or QEMU died silently before the guest wrote to its console; and only within
+  10 s of starting, as a backstop (`soft::retry_on_tcg`). Any other failure is reported as is.
+- **CI on GitHub's KVM.** GitHub's x86_64 hosted runners expose `/dev/kvm` as root:kvm 0660;
+  `.github/actions/enable-kvm` opens it to the runner user. The `Software mode` workflow boots
+  once on KVM and once with `-accel off`. The KVM leg then runs `scripts/bench/android-boot.sh`
+  against the stock emulator, a pinned release checked against its SHA-256 in an SDK of its own,
+  on the same runner: one round on a pull request, three on main or a manual run
+  ([benchmarks](benchmarks.md#android-software-mode-on-kvm-githubs-x86_64-runner)). GitHub's
+  arm64 hosted runners have no `/dev/kvm` (probed in #56), so the arm64 KVM backend can't run
+  natively there.
+
 - **Host:** x86_64 Linux with QEMU 11.1 or newer and the SDK's Linux renderer
-  (`emu -provision-renderer`); no GPU. The smallest host it has run on is 4 cores and 8 GiB.
-  QEMU's peak RSS is about 3 GB for a 2 GB guest, and emu's about 0.25 GB. When the host has `/dev/kvm`, use the KVM backend
-  ([#54](https://github.com/kaeawc/simee/issues/54)) instead: the guest runs natively there.
+  (`emu -provision-renderer`); no GPU. The smallest host it has run on is 4 cores and 3.8 GiB (a
+  3.3 GiB cgroup limit), with a 1.5 GB guest (emu and QEMU at 2.3 GB PSS); the research host had 8 GiB.
+  QEMU's peak RSS is about 3 GB for a 2 GB guest, and emu's about 0.25 GB (measured under TCG).
 - **What runs where:** `emu_vmm::soft` builds QEMU's command line for stock's x86 board, serves
   every device but the disks, and supervises QEMU. QEMU resets the machine itself when the guest
   reboots. `apps/emu/src/software.rs` is the boot. AVDs from arm64 images are refused with the
@@ -260,6 +314,29 @@ EMU_QEMU=/path/to/qemu-system-x86_64 emu -avd phone   # QEMU 11.1 or newer; with
   `hw.lcd.vsync=30` in the AVD's `config.ini` (emu honours it as stock does) settles 0.12 cores
   lower, with no frames lost at software mode's rate
   ([benchmarks](benchmarks.md#software-mode-through-emu--avd)).
+- **The software-lite profile** (`emu -create-avd NAME -sysdir system-images/android-36/default/x86_64
+  -profile software-lite`, also with `-provision … -create-avd`): a 540x960 screen at 240 dpi and
+  `hw.lcd.vsync=30` together, for hosts where the guest and SwiftShader share a few cores. Measured
+  against the default 720x1280 at 60 Hz on one 4-vCPU host (2026-11-28, median of 3 warm boots
+  each, [benchmarks](benchmarks.md#software-mode-a-smaller-screen-and-30-hz)):
+
+  | | default | software-lite |
+  | --- | --- | --- |
+  | Idle host CPU | 0.59 cores | 0.53 (30 Hz alone: 0.49) |
+  | Host CPU while swiping | 2.43 cores | 2.01 (the screen alone: 2.15) |
+  | Launcher frames in 20 swipes, warm / cold | 185 / 121 | 185 / 118 (the same) |
+  | p90 frame time | 300 ms | 200 ms |
+  | Warm boot to `sys.boot_completed` | 169.8 s | 181.9 s (spreads overlap) |
+  | Memory (PSS) | 2868 MB | 2828 MB (no real change) |
+
+  The two halves do not add: 30 Hz is what lowers the idle cost and the smaller screen is what
+  lowers the swiping cost and frame times, and the profile gets about a tenth less idle CPU and
+  about 17% less swiping CPU, with no more frames and no faster boot or less memory. It is
+  opt-in because apps see the smaller, slower display; a default AVD stays 720x1280 at 60 Hz. It
+  applies to phone images only (the other form factors have screens of their own and are refused),
+  RAM and vCPUs stay as `-memory` and `-cores` say, and an explicit `-lcd` wins over its screen. An image's
+  golden user data is keyed by screen size, so the first software-lite AVD of an image boots once
+  to settle its own golden. `scripts/bench/software-profile.sh --arms "default lcd540 vsync30 lite shipped"` reproduces the table (the software-lite column is its `shipped` arm).
 - **KFENCE sampling off** (`kfence.sample_interval=0` on the x86 board's command line). These
   kernels build KFENCE with static keys, so every 500 ms its sampler flips a branch inside every
   slab allocation, live-patching kernel text through an `int3`. Under multi-threaded TCG another
@@ -343,8 +420,109 @@ EMU_QEMU=/path/to/qemu-system-x86_64 emu -avd phone   # QEMU 11.1 or newer; with
   into a boot (a SIGSEGV inside `libvulkan_lvp.so` under `RenderThread::main`, every lavapipe
   boot); SwiftShader ran without one and booted faster.
 
-When the host has KVM, use it ([#54](https://github.com/kaeawc/simee/issues/54)): the guest runs
-natively there, and software mode is the fallback.
+When the host has KVM, software mode runs the guest on it (above); TCG is the fallback.
+
+## Container backend (Linux with binder and no KVM)
+
+In progress ([#210](https://github.com/kaeawc/simee/issues/210)): Android's userspace in a
+container on the host's kernel, as Redroid does, for hosts that have binder and no usable KVM. The
+research, environment matrix and the cited Redroid numbers are in
+[research/container-backend.md](research/container-backend.md). What `crates/emu-container` has
+so far, and what it doesn't:
+
+- **Selection.** Owner decision 2026-11-27: with no `-backend`, KVM first; the container only on
+  a host without usable KVM that has what it needs; then TCG software mode. `-backend
+  kvm|container|tcg` forces one, and a forced backend that can't run is an error naming why, never a
+  fallback. The container is considered only for a guest of the host's own architecture.
+- **Host probe.** Required: Linux, binder (binderfs in `/proc/filesystems` that, test-mounted in a
+  throwaway user namespace, holds `binder`, `hwbinder` and `vndbinder`: a plain `modprobe
+  binder_linux` gives an empty one), memfd, the unified cgroup hierarchy, user namespaces (also for
+  root: the container's process runs unprivileged), and, for an unprivileged user, `newuidmap` and
+  `newgidmap` with a 65,536-id range in `/etc/subuid` and `/etc/subgid`; overlayfs on Linux 5.11
+  or newer (`userxattr`); and a way to give the container a network namespace of its own: `ip`,
+  plus `pasta` or `slirp4netns` with `/dev/net/tun`, or root for a veth pair. Reported but not blocking: cgroup memory/cpu/pids controllers, DMA-BUF
+  heaps. Each missing piece prints its fix.
+- **Image.** One pinned image: `redroid/redroid:15.0.0_64only-250627`, by per-architecture
+  manifest digest and layer digest (`image.rs`). It is downloaded only when asked (`skopeo copy` of
+  the manifest by digest) and every blob is hashed against the pin before it is unpacked.
+- **Launcher.** `unshare` into new user, mount, pid, uts, ipc, cgroup and network namespaces.
+  Container root is never host root and never the launching user: an unprivileged user's container
+  ids are their `/etc/subuid` range (`newuidmap`), so container root is its first subordinate id
+  and the user's own uid is not in the map; run as host root, the container's process drops to a
+  range of its own (root's `/etc/subuid` range, else 2,000,000,000 + 65,536) before it creates the
+  namespace. Either way the state directory is handed to that range. The unprivileged process has
+  an uid the map doesn't contain, so `unshare --keep-caps` keeps its capabilities across `exec`
+  and the helper's `become-root` waits for the maps, clears the supplementary groups and becomes
+  uid and gid 0, in a first `unshare` that makes every namespace but the pid one; a second
+  `unshare --pid --fork` then runs the script. A subordinate range must have 65,536 ids and must
+  not contain the user's own uid or gid (all of the user's `/etc/subuid` and `/etc/subgid` lines
+  are read, and the first range that qualifies is used); when none does, the fix names a range
+  after the highest one in the file. `chown` and `rm` on the container's files run in a short
+  admin namespace where the user is root and container id `n` is id `n + 1` (no guest code runs
+  there; the user's uid appears in that map only). The script mounts an overlay of the
+  unpacked image over a per-device writable layer, a `/dev` tmpfs with the nodes Redroid's init
+  expects, binderfs (checked for the three devices, linked at `/dev/*`), `/proc` with runc's masked
+  and read-only paths (`kcore`, `/proc/sys`, `sysrq-trigger`...), and the host's `/sys` with every
+  mount in it read-only. A helper then `pivot_root`s into the overlay and detaches the old root
+  (no `chroot`: root inside one can walk out), and execs `/init` with Redroid's arguments
+  (`androidboot.redroid_width|height|dpi|gpu_mode`, `androidboot.use_memfd=true`). The helper is
+  `emu` itself under a hidden subcommand (`helper::main`) or the crate's `simee-container-helper`
+  binary, and it also sets `PR_SET_PDEATHSIG` so a crashed `emu` takes the container down with it
+  (start containers from a thread that outlives them: the kernel ties the signal to the thread).
+  The kernel clears that signal on a credential change and on any `exec` that gains capabilities,
+  so it is set again in `become-root` (checking the launcher is still the parent) and in `pivot`
+  just before `/init` (checking that the launcher's control pipe, which stays open, isn't hung up);
+  the launcher-death test runs the whole chain. Dropping a `Container` kills it. Removing a rootfs the container made runs `rm` in the admin
+  namespace.
+- **Network and adb (`net.rs`).** The pinned image's adbd listens on port 5555 on every address and
+  the image ships with adb authentication off (`ro.adb.secure=0`, in
+  `/system_ext/etc/build.prop`: "GSI always disables adb authentication"; `ro.secure=1`,
+  `ro.debuggable=1`; read from the pinned layer, 2026-11-28), and Redroid's own docs say never to
+  expose the port on a public network. So the container's namespace is its own and the host
+  reaches adb through `127.0.0.1:<port>` only, with nothing in the host's namespace listening on a
+  non-loopback address. Uplink, in order: `pasta` (attached to the container's namespaces by pid,
+  `eth0` named as Redroid's init expects, one `-t 127.0.0.1/<port>:5555` rule and every other
+  direction off: `-T none -U none -u none --no-map-gw`, because pasta's defaults forward every port the
+  guest binds on every host address and splice the guest's loopback to the host's), then
+  `slirp4netns` (`--disable-host-loopback`; the forward is added through its API socket), then,
+  for root, a veth pair (a /30 per container from the first of 10.233.0.0/16, 10.234.0.0/16,
+  10.235.0.0/16, 172.29.0.0/16 and 192.168.233.0/24 that the host has no route into, read from
+  `/proc/net/route` and from every policy-routing table (`ip -4 route show table all`, and the
+  ranges `ip -4 rule` selects on), so Tailscale's table 52 counts: not Tailscale's 100.64.0.0/10,
+  behind which a tailnet peer could be hidden. Each /30 is held in a file under `/run/simee/veth`
+  while its plan or container lives, claimed under a host-wide `flock`, so containers planned at
+  once never share a subnet; a claim whose process is gone is taken over. A host whose `ip rule` consults a table with a default route before main (a Tailscale exit node's table 52, a full-tunnel VPN) is refused the pair, with the fix, because the pair's traffic would leave through that table. Refused with the list
+  when every candidate is routed or held; a proxy thread on the loopback port). Root prefers pasta to the veth pair because it gives the guest an uplink without changing
+  the host's routing or firewall. The veth pair has no uplink (the guest reaches the host's end of
+  the pair and nothing further; services the host binds on all addresses are reachable from it
+  there). Authentication: `AdbAuth::Keys` sets `ro.adb.secure=1` as an init argument and writes the
+  host's `adbkey.pub` lines to `/data/misc/adb/adb_keys` before the container starts;
+  `AdbAuth::Disabled` keeps the image's setting, which leaves the loopback port open to every
+  local user. The caller chooses; there is no default.
+- **Verified:** the plan, the script, the probe and the selection against fake hosts; and on a Linux
+  VM without binder, as root and as an unprivileged user, a real user namespace with the id maps,
+  the overlay, `/dev`, devpts, `/proc` and its masks, `/sys` read-only throughout, and the pivot:
+  the container's mount table has the overlay as its only root, no host device, no path to the
+  host's files, and uid 0 maps to a non-zero host id; setup stops at binderfs with its message
+  there. Also that a helper's child dies when its parent is killed, and that a tree owned by
+  subordinate ids is removed from inside the namespace. Unprivileged, container root maps to the
+  first subordinate id (`0 165536 65536`, not the user's uid), the process is uid 0, gid 0 with no
+  groups, and the unpack and removal go through the admin namespace. As root, with the veth pair
+  (this VM has no `/dev/net/tun`): the guest's namespace differs from the host's, it has only `lo`
+  and `eth0`, the host listens on the adb port on `127.0.0.1` and nowhere else, a connection from
+  the host reaches a listener in the guest over the pair, and the listener is gone when the
+  container stops. Killing the launcher takes the whole container tree with it, as root and as an
+  unprivileged user (it failed before `pivot` set the signal again: `/init` outlived `unshare`).
+- **Not verified:** a boot. No binder host has run this launcher, so whether Redroid's `/init`
+  starts unprivileged in this namespace set (as a subordinate id, with `eth0` configured by the
+  uplink), and how long it takes, are open; so is whether `ro.adb.secure=1` as an init argument
+  overrides the image's `ro.adb.secure=0` and whether adbd reads the seeded key under the image's
+  SELinux labels. pasta and slirp4netns were not run end to end (no `/dev/net/tun` on the VM):
+  their command lines are asserted as data and pasta's accepted the flags and printed the one
+  loopback rule. It is not wired into `emu` yet, so nothing boots through it; there is no display,
+  input or console for it, no cgroup limits, and no `docs/benchmarks.md` row (nothing measured). `SIMEE_E2E_CONTAINER=1 cargo
+  nextest run -p simee-emu-container` runs the namespace tests against the host's kernel;
+  `cargo run -p simee-emu-container --example probe` prints what a host offers.
 
 ## Automotive
 
@@ -403,6 +581,26 @@ input only with `-allow-host-audio`; otherwise it is silence. After the host des
 card's thread for longer than a period, only one overdue buffer completes at once and the rest
 follow at the stream's rate: returning every queued period in one burst left the guest's
 driver queueing nothing more, and every HAL write then timed out (EIO).
+
+**Capturing playback.** The console copies what the guest plays, with or without `-no-audio`
+(`crates/emu-vmm/src/audio/tap.rs`; a second reader on the playback path, ahead of the host ring):
+
+```
+audio capture start <path|unix:/socket> [wav|raw]   # a file is a WAV by default, a socket raw
+audio capture status                                # running or stopped, format, frames captured, frames dropped
+audio capture stop                                  # finishes the file, then the same report
+```
+
+The bytes are the guest's own, in the guest's format (rate, channels and sample format are in
+the WAV header, and in `status` once the guest has played something; 24-bit samples are a
+`WAVE_FORMAT_EXTENSIBLE` WAV, left-justified in a 32-bit word as that format says, so the WAV's samples are the guest's shifted up a byte; a raw capture keeps the guest's words as written). With no capture running a buffer costs
+one atomic load. With one running it is copied into a 1 MiB queue that a writer thread drains;
+the guest never waits for it, and frames the queue can't take (a slow socket) are dropped and
+counted. A capture holds what the guest plays, not wall-clock time: silence the guest doesn't
+queue isn't in it. A stream that changes format mid-capture has its new frames dropped and
+counted. A socket reader that pauses (a write that times out after 2 s) costs the frames it didn't take, counted as dropped; the capture ends when the peer closes, or when it stays paused for more than about 6 s in the middle of a frame. `stop` and emu's exit wait at most about 2 s for a stalled reader, then drop and count what is still queued. A file's WAV sizes are filled in on `stop`, when emu exits (power-off, `kill`, SIGINT/SIGTERM) and once a second while capturing, so a file from an emu that was killed hard opens with at most about a second of audio missing, plus whatever was still queued; a socket's say "unknown". Software mode
+(QEMU) has no tap. Not yet: the `audio_capture_start`/`audio_capture_stop` API methods for
+Android (#265).
 
 Checked on API 36 `google_apis` (phone, `android.hardware.audio@7.1-impl.ranchu`): the card
 is `/proc/asound` card 0 (`pcmC0D0p`, `pcmC0D0c`); AudioFlinger's primary output (48 kHz,
@@ -590,6 +788,23 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   dm-default-key metadata encryption, which passes discard through but not write-zeroes, and
   zeroes it writes land as ciphertext. So discard is the only way to free space, and a fresh
   first boot (about 610 MB allocated) has only about 2 MB left to trim.
+- **AVD disks are copy-on-write clones (#203).** Every disk an AVD is made from (a golden's,
+  `-clone-avd`'s, `boot.prop`) goes through one helper, `emu_avd::clone::clone_file`:
+  `clonefile(2)` on APFS, `FICLONE` on Linux file systems with reflinks, else a copy of only the
+  data extents (`SEEK_DATA`/`SEEK_HOLE`), keeping the source's mode and extended attributes. On
+  one APFS volume it was already a clone (`std::fs::copy` tries `fclonefileat` first):
+  `-clone-avd` of an AVD with a 6 GiB userdata takes 11 ms and no disk before and after, and
+  `-create-avd ... -no-golden` 11 ms and 20 KiB (only the ini files; median of 5, M3 Max, macOS
+  26.6.2, 2026-11-27, host load about 7). What changed is the fallback: from an AVD whose disks
+  are on another APFS volume (`EXDEV`; a 6 GiB userdata holding 1 GiB of data), `std::fs::copy`'s
+  `fcopyfile` filled the holes, 2.97 s and 6.1 GiB per clone; the extent copy takes 0.57 s and
+  1.0 GiB (median of 5, same host and day).
+  The key is the one disk written at boot, so `emu_avd::clone::clone_file_atomic` copies
+  `encryptionkey.img` under `.encryptionkey.img.partial` and renames it into place: a kill mid-copy
+  leaves no half-written key at the final name. A symlink at that path, dangling or not, is
+  refused with an error naming it (the old `std::fs::copy` wrote through it). The tests run the
+  real `FICLONE` where the file system has it; `SIMEE_REFLINK_DIR=<dir on Btrfs or XFS>` points
+  them at one (a loop-mounted `mkfs.xfs -m reflink=1` image works).
 - **Screenshots: fast PNG, no re-encode, no needless copies.** Automation takes a screenshot
   after nearly every step. On a 2480×1740 screen (`cargo run --release -p simee-core --example
   frame_bench`), PNG encoding at the `png` crate's default level took 74 ms and BGRA→RGBA
@@ -663,7 +878,11 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   still a log: a rotation reaches emu a few milliseconds after the guest relayouts, so a tap at
   bounds read from the turned layout and sent in that window maps with the old turn; a caller
   that rotates then taps should read `rotation` (the console, or `simee screen`) until it shows
-  the new turn. The two tags add little log: on an API 36 phone (720x1280, 2026-11-26, this Mac at load 19 to 62), 4.3 KB in 17 lines from boot to boot complete, nothing in 2 minutes idle, and 11.4 KB in 50 lines over four rotations and five Settings launches (2 rotation lines each), against 1.9 MB in 10,385 lines that the guest logged under all tags in the same window (`adb logcat -d -s WindowManager:I ActivityTaskManager:I`; one run, not a benchmark). API 29 and 30 aren't followed: their filter
+  the new turn. `simee rotate` (the API's `rotate`, the desktop's Rotate) reads the guest's
+  `dumpsys window displays` over adb before and after the turn, for up to 3 s: it returns the
+  rotation the guest turned to, or says why it stayed ("the guest stayed upright: the app in
+  front (`<package>`) doesn't rotate", auto-rotate off, or a turn upside down;
+  `sim_core::window`), which the desktop shows in its status line. The two tags add little log: on an API 36 phone (720x1280, 2026-11-26, this Mac at load 19 to 62), 4.3 KB in 17 lines from boot to boot complete, nothing in 2 minutes idle, and 11.4 KB in 50 lines over four rotations and five Settings launches (2 rotation lines each), against 1.9 MB in 10,385 lines that the guest logged under all tags in the same window (`adb logcat -d -s WindowManager:I ActivityTaskManager:I`; one run, not a benchmark). API 29 and 30 aren't followed: their filter
   goes through `qemu.cmdline`, at most 91 bytes, which the two tags would overflow, so emu
   leaves it as the user's and `rotation` says `unknown` there (frames and touches stay as the
   panel lies). Phones, tablets and foldables follow it; TVs, cars, watches and XR headsets and

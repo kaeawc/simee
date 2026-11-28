@@ -28,6 +28,7 @@ use emu_hvf::GuestRam;
 use super::queue::{Chain, Queue};
 use super::{Activation, INT_USED_RING, Interrupt, VirtioDevice};
 use crate::audio::host::{Command, Direction, Host};
+use crate::audio::tap::{PcmFormat, Tap};
 use crate::audio::{self, Format, Options, Reader, Ring};
 
 pub const ID_SOUND: u32 = 25;
@@ -353,6 +354,7 @@ enum Msg {
 
 pub struct Snd {
     opts: Options,
+    tap: Arc<Tap>,
     tx: Sender<Msg>,
     rx: Option<Receiver<Msg>>,
     worker: Option<JoinHandle<Receiver<Msg>>>,
@@ -361,8 +363,14 @@ pub struct Snd {
 impl Snd {
     /// A card that plays and records on the host as `opts` allow.
     pub fn new(opts: Options) -> Snd {
+        Snd::with_tap(opts, Arc::default())
+    }
+
+    /// A card whose playback `tap` can copy, with or without a host output.
+    pub fn with_tap(opts: Options, tap: Arc<Tap>) -> Snd {
         let (tx, rx) = channel();
-        Snd { opts, tx, rx: Some(rx), worker: None }
+        tap.set_card(true);
+        Snd { opts, tap, tx, rx: Some(rx), worker: None }
     }
 
     fn stop_worker(&mut self) {
@@ -415,6 +423,7 @@ impl VirtioDevice for Snd {
         // No host thread at all for a silent card (`-no-audio`).
         let host = (self.opts.output || self.opts.input).then(|| Box::new(Host::new(self.opts.verbose)) as Box<dyn Sink>);
         let mut w = Worker::new(act.mem, act.irq, control, [q(QUEUE_TX), q(QUEUE_RX)], self.opts, host);
+        w.tap = self.tap.clone();
         let h = std::thread::Builder::new()
             .name("virtio-snd".into())
             .spawn(move || {
@@ -502,6 +511,8 @@ struct Worker {
     pcm: Pcm<(usize, Chain)>,
     opts: Options,
     host: Option<Box<dyn Sink>>,
+    /// The capture tap on playback; idle (one atomic load per buffer) unless the console starts it.
+    tap: Arc<Tap>,
     links: [Link; 2],
     /// Reused for every buffer: guest bytes and stereo frames.
     bytes: Vec<u8>,
@@ -528,6 +539,7 @@ impl Worker {
             pcm: Pcm::new(Instant::now()),
             opts,
             host,
+            tap: Arc::default(),
             links: Default::default(),
             bytes: Vec::new(),
             frames: Vec::new(),
@@ -603,10 +615,20 @@ impl Worker {
     /// Playback: the guest's audio in `chain` (after its 4-byte header) into the stream's ring.
     /// Reads at most the header and [`Params::max_io_bytes`].
     fn play(&mut self, id: usize, chain: &Chain) {
-        let Some(p) = self.pcm.params(id).filter(|_| self.enabled(D_OUTPUT) && self.pcm.direction(id) == Some(D_OUTPUT)) else { return };
+        let Some(p) = self.pcm.params(id).filter(|_| self.pcm.direction(id) == Some(D_OUTPUT)) else { return };
+        let (tapping, playing) = (self.tap.is_active(), self.enabled(D_OUTPUT));
+        if !tapping && !playing {
+            return;
+        }
         let Some(format) = Format::from_virtio(p.format) else { return };
         let max = 4 + p.max_io_bytes() as usize;
         if chain.read_all_into(&self.mem, max, &mut self.bytes).is_err() || self.bytes.len() <= 4 {
+            return;
+        }
+        if tapping {
+            self.tap.offer(PcmFormat { rate: p.hz(), channels: p.channels, format }, &self.bytes[4..]);
+        }
+        if !playing {
             return;
         }
         let ring = self.links[id].ring.get_or_insert_with(|| Arc::new(Ring::new((p.hz() * RING_SECONDS) as usize, p.hz())));
@@ -997,6 +1019,103 @@ mod tests {
         fn names(&self) -> Vec<String> {
             self.take().into_iter().map(|(n, _)| n).collect()
         }
+    }
+
+    /// A worker with a playback stream prepared (48 kHz stereo S16), and the driver of its tx queue.
+    fn playback_worker(opts: Options, host: Option<Box<dyn Sink>>, tap: Arc<Tap>) -> (Worker, crate::virtio::queue::tests::Driver) {
+        use crate::irq::TestLine;
+        use crate::virtio::queue::tests::{Driver, RAM_BASE};
+        let mem = Arc::new(GuestRam::new(RAM_BASE, 0x10_0000).expect("ram"));
+        let mut ctl = Driver::new(8);
+        let mut txd = Driver::new(8);
+        for a in [&mut txd.cfg.desc, &mut txd.cfg.avail, &mut txd.cfg.used] {
+            *a += 0x4000;
+        }
+        let mut w = Worker::new(
+            mem,
+            Arc::new(Interrupt::new(Arc::new(TestLine::default()))),
+            Queue::new(ctl.cfg, false),
+            [Some(Queue::new(txd.cfg, false)), None],
+            opts,
+            host,
+        );
+        w.tap = tap;
+        for (i, r) in [set_params(0, 3840, 1920, 2, 5, 7), req(&[R_PCM_PREPARE, 0]), req(&[R_PCM_START, 0])].into_iter().enumerate() {
+            let at = RAM_BASE + 0x8_0000 + i as u64 * 0x1000;
+            w.mem.write(at, &r).expect("request");
+            ctl.push(&w.mem, &[(at, r.len() as u32, false), (at + 0x800, 4, true)]);
+            w.run();
+            assert_eq!(w.mem.read_u32(at + 0x800).expect("status"), S_OK);
+        }
+        (w, txd)
+    }
+
+    fn play_bytes(w: &mut Worker, txd: &mut crate::virtio::queue::tests::Driver, at: u64, pcm: &[u8]) {
+        w.mem.write(at, &0u32.to_le_bytes()).expect("xfer header");
+        w.mem.write(at + 0x10, pcm).expect("pcm");
+        txd.push(&w.mem, &[(at, 4, false), (at + 0x10, pcm.len() as u32, false), (at + 0x800, 8, true)]);
+        w.run();
+    }
+
+    #[test]
+    fn the_tap_copies_playback_under_no_audio_and_beside_the_host_output() {
+        use crate::audio::tap::{Container, Sink as TapSink};
+        use crate::virtio::queue::tests::RAM_BASE;
+        let at = |i: u64| RAM_BASE + 0x9_0000 + i * 0x1000;
+        let pcm: Vec<u8> = (0..=255u8).cycle().take(1920).collect();
+        let captured = |tap: &Tap| {
+            #[derive(Clone, Default)]
+            struct Out(Arc<std::sync::Mutex<Vec<u8>>>);
+            impl std::io::Write for Out {
+                fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().expect("out").extend_from_slice(b);
+                    Ok(b.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let out = Out::default();
+            tap.start(TapSink::Stream(Box::new(out.clone())), Container::Raw).expect("start");
+            out
+        };
+
+        // `-no-audio`: no host, no output; the tap still gets the guest's bytes, exactly.
+        let tap = Arc::new(Tap::default());
+        let (mut w, mut txd) = playback_worker(Options::default(), None, tap.clone());
+        play_bytes(&mut w, &mut txd, at(0), &pcm); // before a capture: nothing is kept
+        let out = captured(&tap);
+        play_bytes(&mut w, &mut txd, at(1), &pcm);
+        let status = tap.stop().expect("running");
+        assert_eq!(*out.0.lock().expect("out"), pcm);
+        assert_eq!((status.captured_frames, status.dropped_frames), (480, 0));
+        assert_eq!(status.format.map(|f| (f.rate, f.channels, f.format)), Some((48_000, 2, Format::S16)));
+        assert!(w.links[0].ring.is_none(), "no host ring is filled without a host output");
+
+        // With the host output on: the ring gets the same audio as before, and the tap a copy.
+        let host = FakeHost::default();
+        let opts = Options { output: true, input: false, verbose: false };
+        let tap = Arc::new(Tap::default());
+        let (mut w, mut txd) = playback_worker(opts, Some(Box::new(host.clone())), tap.clone());
+        let ring = host.take().into_iter().find_map(|(_, r)| r).expect("opened on START");
+        let out = captured(&tap);
+        play_bytes(&mut w, &mut txd, at(0), &pcm);
+        tap.stop();
+        assert_eq!(*out.0.lock().expect("out"), pcm);
+        assert_eq!(ring.len(), 480);
+    }
+
+    #[test]
+    fn without_a_tap_the_host_ring_gets_exactly_the_guests_frames() {
+        use crate::virtio::queue::tests::RAM_BASE;
+        let host = FakeHost::default();
+        let opts = Options { output: true, input: false, verbose: false };
+        let (mut w, mut txd) = playback_worker(opts, Some(Box::new(host.clone())), Arc::default());
+        let ring = host.take().into_iter().find_map(|(_, r)| r).expect("opened on START");
+        let pcm: Vec<u8> = (0..480).flat_map(|_| [0x00, 0x40, 0x00, 0xc0]).collect();
+        play_bytes(&mut w, &mut txd, RAM_BASE + 0x9_0000, &pcm);
+        assert_eq!((ring.len(), ring.pop()), (480, Some([0.5, -0.5])));
+        assert!(w.tap.feed_is_idle(), "no capture, no queue");
     }
 
     #[test]

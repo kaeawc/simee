@@ -3,40 +3,62 @@
 //!
 //! Corner radii, camera bumps and button positions are not published by anyone; they are
 //! estimates, and each row's source note says so. No row carries a logo or a vendor asset.
+//!
+//! Phones, tablets and foldables live here. Each other form factor has a module of its own
+//! ([`watch`], [`tv`], [`car`], [`headset`]) with the same four items, which this table and
+//! [`super::has_body`] ask and nothing else needs to know about:
+//! - `ENABLED: bool`: the form factor has bodies;
+//! - `rows() -> Vec<Body>`: its rows of the table (published devices);
+//! - `generic(&Spec) -> Option<Body>`: a body for a screen no row has;
+//! - `SIZES_BY_DPI: bool`: its generic body's screen is drawn at the dpi simee reports (the shared
+//!   reference-body test checks that size only when true; a TV or headset sized another way says false).
 
 use super::*;
+use super::{car, headset, tv, watch};
 use crate::duo;
 use crate::fold;
 use crate::form_factor::Kind;
 
 const APPLE: &str =
     "Apple tech specs: outer size, display diagonal and pixel density; corner radii, camera bump and button positions estimated";
-const APPLE_WATCH: &str = "Apple tech specs: case size and display area; corner radii, crown, sensor dome and button positions estimated";
 const PIXEL_FOLD: &str = "Google Pixel Fold tech specs: unfolded size, both displays' diagonals and pixel densities; corner radii, camera bar and buttons estimated";
 const SURFACE_DUO: &str =
     "Microsoft Surface Duo tech specs: open size, display diagonal and pixel density; corner radii and buttons estimated";
-const GENERIC: &str = "no published dimensions: derived from the screen simee reports (its pixels at its density), with generic bezels";
+pub(super) const GENERIC: &str =
+    "no published dimensions: derived from the screen simee reports (its pixels at its density), with generic bezels";
 const IPHONE_DUO: &str = "no published dimensions: derived from its two screens as the simulator reports them (duo.rs) at an assumed 460 ppi, with generic bezels";
 
 /// The screen outline simee's model gives a kind.
-fn reference_shape(platform: Platform, form_factor: FormFactor) -> Shape {
+pub(super) fn reference_shape(platform: Platform, form_factor: FormFactor) -> Shape {
     Kind::new(platform, form_factor).map(|k| k.profile().shape).unwrap_or(Shape::Rounded)
 }
 
 pub(super) fn rows() -> Vec<Body> {
     let mut out: Vec<Body> = IPHONES.iter().map(iphone).collect();
     out.extend(IPADS.iter().map(ipad));
-    out.extend(WATCHES.iter().map(watch));
+    if watch::ENABLED {
+        out.extend(watch::rows());
+    }
     out.push(pixel_fold());
     out.push(surface_duo());
     out.push(iphone_duo());
-    // The AVD form factors simee creates, from their reference profiles.
-    for f in [FormFactor::Phone, FormFactor::Tablet, FormFactor::Foldable, FormFactor::Watch] {
-        let p = Kind::new(Platform::Android, f).expect("Android offers it").profile();
+    if tv::ENABLED {
+        out.extend(tv::rows());
+    }
+    if car::ENABLED {
+        out.extend(car::rows());
+    }
+    if headset::ENABLED {
+        out.extend(headset::rows());
+    }
+    // The AVD form factors simee creates, from their reference profiles: every one with a body.
+    for f in FormFactor::ALL.into_iter().filter(|f| has_body(*f)) {
+        let Ok(k) = Kind::new(Platform::Android, f) else { continue };
+        let p = k.profile();
         let folded = p.fold.map(|f| (f.folded_width, f.folded_height));
         let hinge = HingeSpec::default();
         let id = generic_id(Platform::Android, f, (p.width, p.height), p.density, p.shape, folded, hinge);
-        out.push(generic(&id, Platform::Android, f, (p.width, p.height), p.density, p.shape, folded, hinge));
+        out.extend(generic(&id, Platform::Android, f, (p.width, p.height), p.density, p.shape, folded, hinge, ""));
     }
     out
 }
@@ -176,6 +198,7 @@ fn iphone(p: &Phone) -> Body {
         buttons,
         crown: None,
         fold: None,
+        extras: Vec::new(),
     }
 }
 
@@ -311,103 +334,7 @@ fn ipad(p: &Tablet) -> Body {
         buttons,
         crown: None,
         fold: None,
-    }
-}
-
-// --- Apple Watch ---
-
-struct Watch {
-    id: &'static str,
-    name: &'static str,
-    /// Case width, height, depth, mm.
-    size: [f32; 3],
-    px: (u32, u32),
-    /// Apple's published display area, mm².
-    area: f32,
-    corner: f32,
-    screen_radius: f32,
-    bevel: f32,
-    crown: f32,
-    /// The Action button on the left (Ultra).
-    action: bool,
-}
-
-const fn apple_watch(id: &'static str, name: &'static str, size: [f32; 3], px: (u32, u32), area: f32, corner: f32) -> Watch {
-    Watch { id, name, size, px, area, corner, screen_radius: corner - 3.4, bevel: 2.4, crown: 5.5, action: false }
-}
-
-const WATCHES: [Watch; 7] = [
-    apple_watch("Apple-Watch-Series-10-46mm", "Apple Watch Series 10 (46mm)", [39.0, 46.0, 9.7], (416, 496), 1220.0, 12.5),
-    apple_watch("Apple-Watch-Series-10-42mm", "Apple Watch Series 10 (42mm)", [36.0, 42.0, 9.7], (374, 446), 989.0, 11.5),
-    apple_watch("Apple-Watch-Series-11-46mm", "Apple Watch Series 11 (46mm)", [39.0, 46.0, 9.7], (416, 496), 1220.0, 12.5),
-    apple_watch("Apple-Watch-Series-11-42mm", "Apple Watch Series 11 (42mm)", [36.0, 42.0, 9.7], (374, 446), 989.0, 11.5),
-    Watch {
-        screen_radius: 6.0,
-        bevel: 2.0,
-        crown: 7.0,
-        action: true,
-        ..apple_watch("Apple-Watch-Ultra-2-49mm", "Apple Watch Ultra 2 (49mm)", [44.0, 49.0, 14.4], (410, 502), 1185.0, 9.5)
-    },
-    Watch {
-        bevel: 2.6,
-        ..apple_watch(
-            "Apple-Watch-SE-44mm-2nd-generation",
-            "Apple Watch SE (44mm) (2nd generation)",
-            [38.0, 44.0, 10.7],
-            (368, 448),
-            977.0,
-            11.5,
-        )
-    },
-    Watch {
-        bevel: 2.6,
-        ..apple_watch(
-            "Apple-Watch-SE-40mm-2nd-generation",
-            "Apple Watch SE (40mm) (2nd generation)",
-            [34.0, 40.0, 10.7],
-            (324, 394),
-            759.0,
-            10.5,
-        )
-    },
-];
-
-fn watch(p: &Watch) -> Body {
-    let [w, h, t] = p.size;
-    // Apple publishes the display's area, not its density: the width that area gives at the
-    // screen's aspect sets the density.
-    let width = (p.area * p.px.0 as f32 / p.px.1 as f32).sqrt();
-    let screen = Screen {
-        display: Display::Main,
-        face: Face::Front,
-        px: p.px,
-        ppi: p.px.0 as f32 * MM_PER_INCH / width,
-        center: [0.0, 0.0],
-        shape: reference_shape(Platform::Ios, FormFactor::Watch),
-        corner_radius: p.screen_radius,
-        cutout: None,
-        published: Some(Published::Area(p.area)),
-    };
-    let mut buttons = vec![Button { name: "side", side: Side::Right, at: -0.12 * h, length: 0.17 * h, depth: 0.6, width: 3.5 }];
-    if p.action {
-        buttons.push(Button { name: "action", side: Side::Left, at: 0.1 * h, length: 0.25 * h, depth: 0.8, width: 4.0 });
-    }
-    let dome = 0.65 * w.min(h);
-    Body {
-        id: p.id.to_owned(),
-        aliases: Vec::new(),
-        name: p.name.to_owned(),
-        platform: Platform::Ios,
-        form_factor: FormFactor::Watch,
-        source: Source::Published(APPLE_WATCH),
-        size: [w, h, t],
-        corner: Corner { radius: p.corner, exponent: 3.0 },
-        bevel: p.bevel,
-        screens: vec![screen],
-        bump: Some(Bump { center: [0.0, 0.0], size: [dome, dome], corner: Corner { radius: dome / 2.0, exponent: 2.0 }, height: 0.8 }),
-        buttons,
-        crown: Some(Crown { side: Side::Right, at: 0.15 * h, diameter: p.crown, length: 2.6 }),
-        fold: None,
+        extras: Vec::new(),
     }
 }
 
@@ -511,6 +438,7 @@ fn book(
         buttons: Vec::new(),
         crown: None,
         fold: Some(FoldBody { panels, hinge: axis, screen_gap }),
+        extras: Vec::new(),
     }
 }
 
@@ -650,8 +578,8 @@ fn iphone_duo() -> Body {
         "iPhone Duo",
         Platform::Ios,
         IPHONE_DUO,
-        (2853, 2007),
-        Some((1398, 2034)),
+        (duo::INNER_PX.1, duo::INNER_PX.0),
+        Some(duo::OUTER_PX),
         460.0,
         Shape::Rounded,
         HingeSpec { range: (duo::CLOSED as f32, duo::OPEN as f32), ..HingeSpec::default() },
@@ -701,8 +629,57 @@ pub(super) fn generic_id(
     format!("{}-{}-{w}x{h}-{density}-{shape}{folded}{hinge}", platform.as_str(), form_factor.as_str())
 }
 
+/// What a generic body is built from: the screen simee reports, at its density. A form factor's
+/// module builds its generic body from this ([`watch::generic`], [`tv::generic`],
+/// [`car::generic`], [`headset::generic`]).
+pub(super) struct Spec<'a> {
+    /// The body's id ([`generic_id`]): the table's key for it.
+    pub id: &'a str,
+    /// `Generic <platform> <form factor> (<w>x<h>)`.
+    pub name: String,
+    pub platform: Platform,
+    pub form_factor: FormFactor,
+    /// The screen, pixels, in the body's natural orientation.
+    pub px: (u32, u32),
+    /// Pixels per inch: the dpi simee reports, or for an Apple scale, the density assumed for it
+    /// ([`assumed_ppi`]).
+    pub ppi: f32,
+    pub shape: Shape,
+    /// The system image's tag (`ai-glasses`, `android-xr`, `google_apis`, `google-tv`, ...), or ""
+    /// when it isn't known (an Apple device, a profile without an image): what tells a headset
+    /// from glasses.
+    #[allow(dead_code, reason = "headset.rs reads it to tell glasses from headsets (#504)")]
+    pub image_tag: &'a str,
+}
+
+impl Spec<'_> {
+    /// The main screen on the front face, centred: a round screen's corners are its radius, a
+    /// rounded one's `radius`, a rectangle's square.
+    pub fn screen(&self, radius: f32) -> Screen {
+        let mut screen = Screen {
+            display: Display::Main,
+            face: Face::Front,
+            px: self.px,
+            ppi: self.ppi,
+            center: [0.0, 0.0],
+            shape: self.shape,
+            corner_radius: 0.0,
+            cutout: None,
+            published: None,
+        };
+        let [sw, sh] = screen.size();
+        screen.corner_radius = match self.shape {
+            Shape::Round => sw.min(sh) / 2.0,
+            Shape::Rounded => radius,
+            Shape::Rectangle => 0.0,
+        };
+        screen
+    }
+}
+
 /// A body for a screen with no published dimensions: the screen at its density inside generic
-/// bezels for its form factor.
+/// bezels for its form factor, from the form factor's module where it has one. None for a form
+/// factor with no body.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn generic(
     id: &str,
@@ -713,58 +690,43 @@ pub(super) fn generic(
     shape: Shape,
     folded: Option<(u32, u32)>,
     hinge: HingeSpec,
-) -> Body {
+    image_tag: &str,
+) -> Option<Body> {
     let ppi = match density {
         Density::Dpi(d) => d.max(1) as f32,
         Density::Scale(s) => assumed_ppi(form_factor, s),
     };
     let name = format!("Generic {} {} ({}x{})", platform.label(), form_factor.as_str(), px.0, px.1);
-    if form_factor == FormFactor::Foldable {
-        return generic_book(id, &name, platform, GENERIC, px, folded, ppi, shape, hinge, 2.0);
+    let spec = Spec { id, name, platform, form_factor, px, ppi, shape, image_tag };
+    match form_factor {
+        FormFactor::Foldable => Some(generic_book(id, &spec.name, platform, GENERIC, px, folded, ppi, shape, hinge, 2.0)),
+        FormFactor::Phone | FormFactor::Tablet => Some(generic_slab(&spec)),
+        FormFactor::Watch => watch::generic(&spec),
+        FormFactor::Tv => tv::generic(&spec),
+        FormFactor::Auto => car::generic(&spec),
+        FormFactor::Vision => headset::generic(&spec),
     }
+}
+
+/// A generic phone or tablet: the screen in even bezels, a camera bump and two keys.
+fn generic_slab(g: &Spec) -> Body {
     // Side bezel, top bezel, thickness, screen corner radius, edge bevel.
-    let (side, top, t, radius, bevel) = match form_factor {
+    let (side, top, t, radius, bevel) = match g.form_factor {
         FormFactor::Tablet => (8.0, 8.0, 6.5, 5.0, 0.8),
-        FormFactor::Watch => (3.5, 3.5, 11.0, 6.0, 2.0),
         _ => (3.0, 4.5, 8.5, 4.0, 0.8),
     };
-    let mut screen = Screen {
-        display: Display::Main,
-        face: Face::Front,
-        px,
-        ppi,
-        center: [0.0, 0.0],
-        shape,
-        corner_radius: 0.0,
-        cutout: None,
-        published: None,
-    };
+    let screen = g.screen(radius);
     let [sw, sh] = screen.size();
-    screen.corner_radius = match shape {
-        Shape::Round => sw.min(sh) / 2.0,
-        Shape::Rounded => radius,
-        Shape::Rectangle => 0.0,
-    };
-    let (size, corner) = if shape == Shape::Round {
+    let (size, corner) = if g.shape == Shape::Round {
         let d = sw.max(sh) + 2.0 * side;
         ([d, d, t], Corner { radius: d / 2.0, exponent: 2.0 })
     } else {
-        let (w, h) = (sw + 2.0 * side, sh + 2.0 * if form_factor == FormFactor::Watch { side } else { top });
+        let (w, h) = (sw + 2.0 * side, sh + 2.0 * top);
         ([w, h, t], Corner { radius: screen.corner_radius.max(2.0) + side, exponent: 2.0 })
     };
     let [w, h, _] = size;
     let key = |name, side, at, length| Button { name, side, at, length, depth: 0.6, width: 2.6 };
-    let (bump, buttons, crown) = match form_factor {
-        FormFactor::Watch => {
-            let dome = 0.6 * w.min(h);
-            let bump = Bump { center: [0.0, 0.0], size: [dome, dome], corner: Corner { radius: dome / 2.0, exponent: 2.0 }, height: 0.8 };
-            let buttons = if shape == Shape::Round { Vec::new() } else { vec![key("button", Side::Right, -0.2 * h, 0.15 * h)] };
-            (
-                bump,
-                buttons,
-                Some(Crown { side: Side::Right, at: if shape == Shape::Round { 0.0 } else { 0.1 * h }, diameter: 5.0, length: 2.5 }),
-            )
-        }
+    let (bump, buttons) = match g.form_factor {
         FormFactor::Tablet => {
             let bump = Bump {
                 center: [w / 2.0 - 12.0, h / 2.0 - 12.0],
@@ -772,7 +734,7 @@ pub(super) fn generic(
                 corner: Corner { radius: 6.0, exponent: 2.0 },
                 height: 0.8,
             };
-            (bump, vec![key("power", Side::Top, -w / 2.0 + 30.0, 14.0), key("volume", Side::Top, w / 2.0 - 40.0, 25.0)], None)
+            (bump, vec![key("power", Side::Top, -w / 2.0 + 30.0, 14.0), key("volume", Side::Top, w / 2.0 - 40.0, 25.0)])
         }
         _ => {
             let bump = Bump {
@@ -781,15 +743,15 @@ pub(super) fn generic(
                 corner: Corner { radius: 4.0, exponent: 2.0 },
                 height: 1.2,
             };
-            (bump, vec![key("power", Side::Right, 0.25 * h, 12.0), key("volume", Side::Right, 0.05 * h, 24.0)], None)
+            (bump, vec![key("power", Side::Right, 0.25 * h, 12.0), key("volume", Side::Right, 0.05 * h, 24.0)])
         }
     };
     Body {
-        id: id.to_owned(),
+        id: g.id.to_owned(),
         aliases: Vec::new(),
-        name,
-        platform,
-        form_factor,
+        name: g.name.clone(),
+        platform: g.platform,
+        form_factor: g.form_factor,
         source: Source::Generic(GENERIC),
         size,
         corner,
@@ -797,7 +759,8 @@ pub(super) fn generic(
         screens: vec![screen],
         bump: Some(bump),
         buttons,
-        crown,
+        crown: None,
         fold: None,
+        extras: Vec::new(),
     }
 }

@@ -43,11 +43,11 @@ const BUTTON_HOLD: Duration = Duration::from_millis(80);
 
 /// `boot` and `boot_many` parameters only iOS devices take, and why.
 const IOS_BOOT_PARAMS: &[(&str, &str)] = &[
-    ("settle", "a settle wait reads a simulator's process tree; an Android boot waits for sys.boot_completed"),
+    ("settle", "an Android boot waits for sys.boot_completed; call `settle` after it"),
     ("settle_cpu_pct", "it tunes the settle wait"),
     ("settle_window_s", "it tunes the settle wait"),
     ("settle_timeout_s", "it tunes the settle wait"),
-    ("profile", "profiles are sets of a simulator's launchd jobs"),
+    ("profile", "on Android, call `profile` on the booted device"),
     ("shaped", "the network shaper is injected into a simulator's processes"),
     ("env", "it is a simulator launchd's environment"),
 ];
@@ -118,6 +118,115 @@ fn app(android: &Android, d: &sim_android::Device, method: &str, p: &Value) -> R
     }
 }
 
+/// The longest `exec` `timeout_s`: a day.
+const MAX_EXEC_TIMEOUT_S: u64 = 86_400;
+
+/// `processes`, `kill` and `exec`, over adb, in iOS's shapes: `processes` rows with each app
+/// process's `package` too, nothing for `kill` (a signal to `pid`, or with `bundle_id` an app stop:
+/// `am force-stop`), and `exec`'s `{pid, stdout, stderr}` with `exit_code` and `truncated`.
+fn debug(android: &Android, d: &sim_android::Device, method: &str, p: &Value) -> Result<Value, String> {
+    match method {
+        "processes" => Ok(d
+            .adb(android)?
+            .processes()?
+            .into_iter()
+            .map(|r| {
+                json!({"pid": r.pid, "ppid": r.ppid, "cpu": r.cpu, "rss_kb": r.rss_kb, "elapsed": r.elapsed, "name": r.name,
+                    "path": r.path, "package": r.package})
+            })
+            .collect()),
+        "kill" => {
+            let pid = match p.get("pid") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(v.as_i64().ok_or("pid must be an integer")?),
+            };
+            let force = opt_bool(p, "force")?.unwrap_or(false);
+            match (pid, str_param(p, "bundle_id")) {
+                (Some(_), Some(_)) => Err("give `pid` or `bundle_id`, not both".into()),
+                (None, Some(package)) => d.adb(android)?.terminate(package).map(|()| Value::Null),
+                (Some(pid), None) => {
+                    let signal = p.get("signal").and_then(Value::as_i64).unwrap_or(15);
+                    d.adb(android)?.kill(pid, signal, force).map(|()| Value::Null)
+                }
+                (None, None) => Err("give `pid` (a signal) or `bundle_id` (an app stop)".into()),
+            }
+        }
+        _ => {
+            let program = need_str(p, "program")?;
+            // Unlike iOS's, a value that isn't a string is refused: dropping it would change the argv.
+            let args = match p.get("args") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(v) => v
+                    .as_array()
+                    .and_then(|a| a.iter().map(|w| w.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>())
+                    .ok_or("`args` must be a list of strings")?,
+            };
+            let env = match p.get("env") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(v) => v
+                    .as_object()
+                    .and_then(|o| o.iter().map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned()))).collect::<Option<Vec<_>>>())
+                    .ok_or("`env` must be an object of strings (names to values)")?,
+            };
+            let defaults = sim_android::procs::ExecLimits::default();
+            let at_least_1 = |key: &str| match opt_u64(p, key) {
+                Some(0) => Err(format!("{key} must be at least 1")),
+                n => Ok(n),
+            };
+            let timeout = match at_least_1("timeout_s")? {
+                Some(s) if s > MAX_EXEC_TIMEOUT_S => return Err(format!("timeout_s must be at most {MAX_EXEC_TIMEOUT_S} (a day)")),
+                s => s,
+            };
+            let limits = sim_android::procs::ExecLimits {
+                timeout: timeout.map_or(defaults.timeout, Duration::from_secs),
+                max_bytes: at_least_1("max_bytes")?.map_or(defaults.max_bytes, |n| usize::try_from(n).unwrap_or(usize::MAX)),
+            };
+            let out = d.adb(android)?.exec(program, &args, &env, limits)?;
+            Ok(json!({"pid": out.pid, "stdout": out.stdout, "stderr": out.stderr, "exit_code": out.exit_code, "truncated": out.truncated}))
+        }
+    }
+}
+
+/// `audio_state`, `audio_volume` and `audio_mute` on the guest's media stream, over adb, in iOS's
+/// shapes: `{settings, muted, host_devices}` (settings: the media stream's `volume` as
+/// `audio_volume`'s level, every stream, the ringer mode and the focus stack; muted: the media
+/// stream's; no host devices, since emu plays on the host's default output and can't be routed),
+/// nothing for `audio_volume`, and `{muted}` read back after a mute. Parameters are read first.
+fn audio(android: &Android, d: &sim_android::Device, method: &str, p: &Value) -> Result<Value, String> {
+    match method {
+        "audio_volume" => {
+            let level = opt_u64(p, "level").ok_or("missing number parameter `level`")?.min(100) as u8;
+            d.adb(android)?.set_media_volume(level).map(|_| Value::Null)
+        }
+        "audio_mute" => {
+            let on = crate::params::need_bool(p, "on")?;
+            d.adb(android)?.set_media_mute(on).map(|muted| json!({"muted": muted}))
+        }
+        _ => {
+            let state = d.adb(android)?.audio_state()?;
+            let music = state.stream("music");
+            let streams: Vec<Value> = state
+                .streams
+                .iter()
+                .map(|s| json!({"stream": s.name, "volume": s.volume, "min": s.min, "max": s.max, "muted": s.muted, "devices": s.devices}))
+                .collect();
+            let focus: Vec<Value> =
+                state.focus.iter().map(|f| json!({"package": f.package, "uid": f.uid, "gain": f.gain, "client": f.client})).collect();
+            Ok(json!({
+                "settings": {
+                    "volume": music.and_then(|m| Some(sim_android::audio::level(m.volume?, m.min, m.max?))),
+                    "streams": streams,
+                    "ringer_mode": state.ringer_mode,
+                    "focus": focus,
+                    "focus_owner": state.focus.last().map(|f| f.package.clone()),
+                },
+                "muted": music.is_some_and(|m| m.muted),
+                "host_devices": Value::Null,
+            }))
+        }
+    }
+}
+
 /// `fold`: `folded` (the console's `fold` or `unfold`), a hinge `angle`, or a `posture` (stock's
 /// names or ids: closed, half-opened, opened, flipped, tent); a `null` one is absent. Answers
 /// with the hinge as simee's emulator then has it (angle, posture, whether folded, the display
@@ -169,6 +278,23 @@ fn first_port(p: &Value) -> Result<u16, String> {
     }
 }
 
+/// How long a boot waits for `sys.boot_completed` (`timeout_s`, default 300 s), and whether the
+/// device plays on the host (`audio`, default false: a farm booting N devices would open N host
+/// streams).
+pub(crate) fn boot_options(p: &Value) -> Result<(Duration, bool), String> {
+    Ok((Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300)), opt_bool(p, "audio")?.unwrap_or(false)))
+}
+
+/// `boot_many`'s boot timeout and first console port.
+pub(crate) fn boot_many_options(p: &Value) -> Result<(Duration, u16), String> {
+    Ok((Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300)), first_port(p)?))
+}
+
+/// `import`'s `allow_mismatch` (default false: only the exported revision of the system image).
+pub(crate) fn import_allows_mismatch(p: &Value) -> Result<bool, String> {
+    Ok(opt_bool(p, "allow_mismatch")?.unwrap_or(false))
+}
+
 /// One device's [`sim_android::BootOutcome`] in `boot_many`'s result: the same shape as an iOS
 /// device's (`device`, `boot_s`, or `error`), with the console port and adb serial.
 fn outcome_json(o: &sim_android::BootOutcome) -> Value {
@@ -181,18 +307,35 @@ fn outcome_json(o: &sim_android::BootOutcome) -> Value {
     }
 }
 
-/// `boot_many` for AVDs (`udids`, already resolved): [`Android::boot_many`], at most
-/// `concurrency` emulators starting at once, each on its own console port.
-pub fn boot_many(s: &mut Session, p: &Value, udids: &[String]) -> Result<Value, String> {
+/// A [`crate::progress::BootHook`] as the Android window's hook: each outcome as its `devices` entry.
+struct Outcomes<'a>(&'a dyn crate::progress::BootHook);
+
+impl sim_android::BootHook for Outcomes<'_> {
+    fn start(&self, i: usize) -> Result<(), String> {
+        self.0.start(i)
+    }
+
+    fn launching(&self, i: usize) -> Result<(), String> {
+        self.0.launching(i)
+    }
+
+    fn finished(&self, i: usize, outcome: &sim_android::BootOutcome) {
+        self.0.finished(i, &outcome_json(outcome));
+    }
+}
+
+/// `boot_many` for AVDs (`udids`, already resolved): [`Android::boot_many_hooked`], at most
+/// `concurrency` emulators starting at once, each on its own console port, with `hook` asked and
+/// told about each.
+pub(crate) fn boot_many(s: &mut Session, p: &Value, udids: &[String], hook: &dyn crate::progress::BootHook) -> Result<Value, String> {
     reject_ios_boot_params("boot_many", p)?;
     if udids.is_empty() {
         return Err("give `devices`: a list of AVD names".into());
     }
     let concurrency = crate::params::concurrency(p)?;
-    let timeout = Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300));
-    let first = first_port(p)?;
+    let (timeout, first) = boot_many_options(p)?;
     let start = std::time::Instant::now();
-    let outcomes = s.backend().boot_many(udids, concurrency, timeout, first)?;
+    let outcomes = s.backend().boot_many_hooked(udids, concurrency, timeout, first, &Outcomes(hook))?;
     let devices: Vec<Value> = outcomes.iter().map(outcome_json).collect();
     let failed = outcomes.iter().filter(|o| o.result.is_err()).count();
     Ok(json!({"concurrency": concurrency, "all_s": (start.elapsed().as_secs_f64() * 10.0).round() / 10.0, "failed": failed,
@@ -204,7 +347,7 @@ pub fn boot_many(s: &mut Session, p: &Value, udids: &[String]) -> Result<Value, 
 /// device's guest identity, which `config.ini` keys it dropped, and any revision mismatch.
 pub fn import(s: &mut Session, p: &Value) -> Result<Value, String> {
     let (from, name) = (need_str(p, "from")?, need_str(p, "name")?);
-    let allow_mismatch = opt_bool(p, "allow_mismatch")?.unwrap_or(false);
+    let allow_mismatch = import_allows_mismatch(p)?;
     let (info, im) = s.backend().import_avd(std::path::Path::new(from), name, allow_mismatch)?;
     Ok(json!({
         "device": info,
@@ -240,15 +383,66 @@ impl crate::contrast::Target for ContrastTarget<'_> {
     }
 }
 
+/// The guest's processes as a settle wait reads them: each one's CPU (all of it counts as
+/// foreground: Android has no QoS split a probe can read, and a guest's background work still
+/// costs the host its vCPU time), with "SpringBoard running" read as the framework up:
+/// `sys.boot_completed` and `system_server` running.
+fn settle_tree(sample: &sim_android::settle::CpuSample) -> crate::settle::Tree {
+    crate::settle::Tree {
+        cpu: sample.procs.iter().map(|p| (p.pid, crate::settle::Cpu { total_s: p.cpu_s, background_s: 0.0 })).collect(),
+        springboard: sample.boot_completed && sample.running("system_server"),
+    }
+}
+
+/// `settle` on a running AVD: iOS's rule, parameters and result, over the guest's own process
+/// table (one adb probe a second, timed on the guest's clock), so it measures the device and not
+/// the emulator around it.
+fn settle(android: &Android, d: &sim_android::Device, p: &Value) -> Result<Value, String> {
+    let (rule, timeout) = crate::settle::options(p)?;
+    if d.running.is_none() {
+        return Err(format!("{} isn't booted", d.info.name));
+    }
+    let adb = d.adb(android)?;
+    let mut clock = crate::settle::Host(std::time::Instant::now());
+    let sample = || adb.cpu_sample().ok().map(|s| (s.uptime_s, settle_tree(&s)));
+    let crate::settle::Settled { at, settler } = crate::settle::wait(rule, timeout, false, sample, &mut clock);
+    let settle_s = at.ok_or_else(|| crate::settle::not_settled(&settler, rule, timeout))?;
+    let mut result = json!({"settle_s": crate::settle::round(settle_s)});
+    crate::settle::put_load(&mut result, &settler);
+    Ok(result)
+}
+
+/// `profile` on a running AVD: the named set of packages off for user 0 (or with `undo`, on), in
+/// iOS's result shape (`not_loaded`: packages this image doesn't have).
+fn profile(android: &Android, d: &sim_android::Device, p: &Value) -> Result<Value, String> {
+    let profile = sim_android::profile::profile(need_str(p, "name")?)?;
+    let undo = opt_bool(p, "undo")?.unwrap_or(false);
+    if d.running.is_none() {
+        return Err(format!("{} isn't booted", d.info.name));
+    }
+    let a = d.adb(android)?.apply_profile(profile, undo)?;
+    let key = if undo { "enabled" } else { "disabled" };
+    let mut r = json!({(key): a.changed, "failed": a.failed, "name": profile.name});
+    if !undo {
+        r["not_loaded"] = json!(a.not_loaded);
+        r["already"] = json!(a.already);
+    }
+    // Only a flush that isn't verified shows: `deadline` (the guest never rewrote its package
+    // state: a stop now may lose it) or `blind` (no root shell to check; waited and synced).
+    if let Some(unverified) = a.flush.unverified() {
+        r["persist"] = json!(unverified);
+    }
+    Ok(r)
+}
+
 /// Dispatches one device method for the AVD named `udid`.
 pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Value, String> {
     let android = s.backend().clone();
     let d = android.device(udid)?;
     match crate::params::display(p)? {
         sim_core::duo::Display::Active => {}
-        sim_core::duo::Display::CarPlay => {
-            return Err("display=carplay is an iPhone's CarPlay screen; Android devices have one display".into());
-        }
+        // `car` and `carplay` are one name: on an Android phone, the Android Auto head unit's screen.
+        sim_core::duo::Display::CarPlay => return crate::android_car::display(&d, method, p),
         sim_core::duo::Display::Builtin(s) => {
             return Err(format!("display={} is an iPhone Duo's screen; an Android foldable shows the screen `fold` sets", s.as_str()));
         }
@@ -258,9 +452,8 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
         "delete" => null(android.delete(&d)),
         "boot" => {
             reject_ios_boot_params(method, p)?;
-            // Silent unless asked: a tool or farm booting N devices would open N host streams.
-            let audio = opt_bool(p, "audio")?.unwrap_or(false);
-            null(d.boot(&android, Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300)), audio))
+            let (timeout, audio) = boot_options(p)?;
+            null(d.boot_asking(&android, timeout, audio, &crate::progress::launching))
         }
         "clone" => {
             if d.running.is_some() {
@@ -285,7 +478,8 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
                 "dropped": m.dropped,
             }))
         }
-        "shutdown" => null(d.shutdown()),
+        "shutdown" => null(android.shutdown(&d)),
+        m if crate::android_state::is_method(m) => crate::android_state::call(&android, &d, m, p),
         // The guest's layout, which tap, swipe and touch take (a folded foldable's outer screen).
         "screen" => d.layout_size().map(|(w, h)| json!({"width": w, "height": h})),
         // The emulator's own PNG, passed through: with `path` it writes the file itself.
@@ -314,6 +508,16 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             null(d.key(usage, Direction::Up))
         }
         "install" | "uninstall" | "launch" | "terminate" | "apps" | "open_url" => app(&android, &d, method, p),
+        m if crate::android_files::METHODS.contains(&m) => crate::android_files::call(&android, &d, m, p),
+        "processes" | "kill" | "exec" => debug(&android, &d, method, p),
+        "audio_state" | "audio_volume" | "audio_mute" => audio(&android, &d, method, p),
+        m if crate::android_car::METHODS.contains(&m) => crate::android_car::call(&android, &d, m, p),
+        m if crate::android_notify::METHODS.contains(&m) => crate::android_notify::call(&android, &d, m, p),
+        "network_shape" | "network_state" | "network_clear" | "connections" | "traffic" => {
+            crate::android_net::call(&android, &d, method, p)
+        }
+        "settle" => settle(&android, &d, p),
+        "profile" => profile(&android, &d, p),
         "location" => {
             let (lat, lon) = (crate::params::need_f64(p, "latitude")?, crate::params::need_f64(p, "longitude")?);
             null(d.set_location(lat, lon))
@@ -341,7 +545,15 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             d.console(&commands).map(|lines| json!(lines))
         }
         "rotate" => match crate::params::opt_orientation(p)? {
-            None => null(d.rotate()),
+            // `rotation`: degrees the guest's display turned to (null without adb); `note`: why
+            // it stayed where it was, when it didn't follow the turn.
+            None => d.rotate(&android).map(|r| {
+                let mut out = json!({"rotation": r.rotation.map(sim_core::rotation::Rotation::degrees)});
+                if let Some(note) = r.note {
+                    out["note"] = json!(note);
+                }
+                out
+            }),
             Some(_) => Err("Android's rotate turns 90° clockwise per call; `orientation` is iOS-only".into()),
         },
         "fold" => fold(&d, p),
@@ -379,6 +591,10 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             d.xr(&command).map(|lines| json!(lines))
         }
         "vehicle" => {
+            // With a head unit running, the DHU's console takes speed, gear, night and parking-brake.
+            if let Some(result) = crate::android_car::vehicle(&d, p) {
+                return result;
+            }
             let area = vehicle_area(p)?;
             match (str_param(p, "property"), vehicle_value(p)?) {
                 (None, None) => d.vehicle_list().map(|all| all.iter().map(reading_json).collect()),
@@ -391,7 +607,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use serde_json::{Value, json};
     use sim_android::testing::{FakeAdb, FakeEmulator, fake_adb, fake_emulator};
@@ -493,6 +709,343 @@ mod tests {
         run(&mut s, "launch", json!({"bundle_id": "com.example.app", "args": [], "env": {}, "shaped": false})).expect("empty");
         assert_eq!(adb.calls().len(), 3, "only the last call ran adb");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn processes_kill_and_exec_work_on_both_platforms() {
+        let help = call(&mut Session::default(), "help", &Value::Null).expect("help");
+        for method in ["processes", "kill", "exec"] {
+            let row = help.as_array().and_then(|a| a.iter().find(|x| x["method"] == method)).expect(method);
+            assert_eq!(row["platforms"], json!(["android", "ios"]), "{method}");
+        }
+    }
+
+    #[test]
+    fn processes_answers_with_ios_rows_and_each_apps_package() {
+        let (mut s, root, _adb, _emulator) = session("procs");
+        let rows = run(&mut s, "processes", json!({})).expect("processes");
+        let rows = rows.as_array().expect("rows");
+        assert_eq!(
+            rows[0],
+            json!({"pid": 4321, "ppid": 310, "cpu": 7.9, "rss_kb": 120_332, "elapsed": "00:42", "name": "com.example.app",
+                "path": "com.example.app", "package": "com.example.app"})
+        );
+        let sf = rows.iter().find(|r| r["pid"] == 520).expect("surfaceflinger");
+        assert_eq!((&sf["path"], &sf["package"]), (&json!("/system/bin/surfaceflinger"), &Value::Null));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn kill_signals_stops_an_app_and_guards_the_essential_processes() {
+        let (mut s, root, adb, _emulator) = session("kill");
+        assert_eq!(run(&mut s, "kill", json!({"pid": 4321})), Ok(Value::Null));
+        assert_eq!(run(&mut s, "kill", json!({"pid": 4400, "signal": 9})), Ok(Value::Null));
+        let err = run(&mut s, "kill", json!({"pid": 612})).expect_err("system_server");
+        assert!(err.contains("system_server") && err.contains("force"), "{err}");
+        assert_eq!(run(&mut s, "kill", json!({"pid": 612, "force": true})), Ok(Value::Null));
+        // An app stop rather than a signal.
+        assert_eq!(run(&mut s, "kill", json!({"bundle_id": "com.example.app"})), Ok(Value::Null));
+        let signals: Vec<String> = adb.calls().into_iter().filter(|c| !c.starts_with("shell ps ")).collect();
+        assert_eq!(signals, ["shell kill -15 4321", "shell kill -9 4400", "shell kill -15 612", "shell am force-stop com.example.app"]);
+        assert_eq!(
+            run(&mut s, "kill", json!({"pid": 4321, "bundle_id": "com.example.app"})),
+            Err("give `pid` or `bundle_id`, not both".into())
+        );
+        assert_eq!(run(&mut s, "kill", json!({})), Err("give `pid` (a signal) or `bundle_id` (an app stop)".into()));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn exec_runs_an_argv_with_a_timeout_and_a_cap() {
+        let (mut s, root, _adb, _emulator) = session("exec");
+        let out =
+            run(&mut s, "exec", json!({"program": "sh", "args": ["-c", "echo \"$1\"; echo e >&2; exit 4", "sh", "a 'b'"]})).expect("exec");
+        assert!(out["pid"].as_i64().is_some_and(|p| p > 0), "{out}");
+        assert_eq!(
+            (&out["stdout"], &out["stderr"], &out["exit_code"], &out["truncated"]),
+            (&json!("a 'b'\n"), &json!("e\n"), &json!(4), &json!(false))
+        );
+        let env = run(&mut s, "exec", json!({"program": "sh", "args": ["-c", "echo $SIMEE_Y"], "env": {"SIMEE_Y": "z"}})).expect("env");
+        assert_eq!(env["stdout"], "z\n");
+        let capped = run(&mut s, "exec", json!({"program": "yes", "max_bytes": 10})).expect("capped");
+        assert_eq!(
+            (&capped["stdout"], &capped["truncated"], &capped["exit_code"]),
+            (&json!("y\ny\ny\ny\ny\n"), &json!(true), &Value::Null)
+        );
+        let err = run(&mut s, "exec", json!({"program": "sleep", "args": ["5"], "timeout_s": 1})).expect_err("timeout");
+        assert!(err.starts_with("`sleep` timed out after 1s"), "{err}");
+        assert_eq!(run(&mut s, "exec", json!({})), Err("missing string parameter `program`".into()));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn exec_refuses_parameters_it_cant_pass_through() {
+        let (mut s, root, adb, _emulator) = session("execparams");
+        for args in [json!(["a", 1]), json!("a"), json!([null])] {
+            assert_eq!(run(&mut s, "exec", json!({"program": "echo", "args": args})), Err("`args` must be a list of strings".into()));
+        }
+        for env in [json!({"A": 1}), json!(["A=1"])] {
+            assert_eq!(
+                run(&mut s, "exec", json!({"program": "echo", "env": env})),
+                Err("`env` must be an object of strings (names to values)".into())
+            );
+        }
+        for timeout in [u64::MAX, 86_401] {
+            assert_eq!(
+                run(&mut s, "exec", json!({"program": "true", "timeout_s": timeout})),
+                Err("timeout_s must be at most 86400 (a day)".into())
+            );
+        }
+        assert!(adb.calls().is_empty(), "{:?}", adb.calls());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn help_row(method: &str) -> Value {
+        let help = call(&mut Session::default(), "help", &Value::Null).expect("help");
+        help.as_array().and_then(|a| a.iter().find(|x| x["method"] == method)).cloned().expect(method)
+    }
+
+    #[test]
+    fn audio_state_volume_and_mute_work_on_both_platforms() {
+        for method in ["audio_state", "audio_volume", "audio_mute"] {
+            let row = help_row(method);
+            assert_eq!(row["platforms"], json!(["android", "ios"]), "{method}");
+            // The iOS device set stays an iOS parameter (#409's form).
+            assert!(row["params"].as_str().is_some_and(|p| p.contains("iOS: set?")), "{row}");
+        }
+    }
+
+    #[test]
+    fn audio_route_and_capture_stay_ios_only_and_say_why() {
+        for method in ["audio_route", "audio_capture_start", "audio_capture_stop"] {
+            let row = help_row(method);
+            assert_eq!(row["platforms"], json!(["ios"]), "{method}");
+            let description = row["doc"].as_str().unwrap_or_default();
+            assert!(description.contains("Android: not available"), "{method}: {description}");
+        }
+        let (mut s, root, adb, _emulator) = session("audioios");
+        let err = run(&mut s, "audio_route", json!({"scope": "output", "uid": "default"})).expect_err("ios only");
+        assert_eq!(err, "`audio_route` isn't available on Android devices (it works on iOS)");
+        assert!(adb.calls().is_empty(), "{:?}", adb.calls());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The iOS side is untouched: the same platforms and the same result shapes.
+    #[test]
+    fn the_ios_audio_methods_keep_their_shapes() {
+        use crate::methods::platforms;
+        use sim_core::platform::Platform;
+        for method in ["audio_state", "audio_volume", "audio_route", "audio_capture_start", "audio_capture_stop", "audio_mute"] {
+            assert!(platforms(method).contains(&Platform::Ios), "{method}");
+        }
+        let shape = |m: &str| {
+            crate::outputs::OUTPUTS.iter().find(|(name, _)| *name == m).map(|(_, s)| s.split_whitespace().collect::<Vec<_>>().join(" "))
+        };
+        assert_eq!(shape("audio_state").as_deref(), Some("{settings: object|null, muted: boolean, host_devices: [object]|null}"));
+        assert_eq!(shape("audio_volume").as_deref(), Some("null"));
+        assert_eq!(shape("audio_mute").as_deref(), Some("{muted: boolean}"));
+    }
+
+    #[test]
+    fn audio_state_answers_in_the_ios_shape_from_dumpsys_audio() {
+        let (mut s, root, adb, _emulator) = session("audiostate");
+        let state = run(&mut s, "audio_state", json!({})).expect("audio_state");
+        assert_eq!((&state["muted"], &state["host_devices"]), (&json!(false), &Value::Null), "{state}");
+        let settings = &state["settings"];
+        // The media stream's index 5 of 0..25, as audio_volume's level.
+        assert_eq!(settings["volume"], json!(20), "{settings}");
+        assert_eq!(settings["ringer_mode"], json!("VIBRATE"), "the external mode, what the user sees: {settings}");
+        assert_eq!(settings["focus_owner"], json!("com.example.app"), "the top of the focus stack: {settings}");
+        assert_eq!(
+            settings["focus"][1],
+            json!({"package": "com.example.app", "uid": 10190, "gain": "GAIN",
+                "client": "android.media.AudioManager@6b7c8d9com.example.app.Player@1a2b3c"})
+        );
+        let streams = settings["streams"].as_array().expect("streams");
+        assert_eq!(streams.iter().map(|s| s["stream"].clone()).collect::<Vec<_>>(), [json!("voice_call"), json!("ring"), json!("music")]);
+        assert_eq!(streams[2], json!({"stream": "music", "volume": 5, "min": 0, "max": 25, "muted": false, "devices": ["speaker"]}));
+        assert_eq!(adb.calls(), ["shell dumpsys audio"]);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn audio_volume_scales_the_level_to_the_media_streams_range() {
+        let (mut s, root, adb, _emulator) = session("audiovol");
+        assert_eq!(run(&mut s, "audio_volume", json!({"level": 60})), Ok(Value::Null));
+        assert_eq!(
+            adb.calls(),
+            ["shell cmd media_session volume --stream 3 --get", "shell cmd media_session volume --stream 3 --set 15 --get"]
+        );
+        assert_eq!(run(&mut s, "audio_state", json!({})).expect("state")["settings"]["volume"], json!(60));
+        // As on iOS, a level over 100 is 100: the stream's top index.
+        assert_eq!(run(&mut s, "audio_volume", json!({"level": 150})), Ok(Value::Null));
+        assert!(adb.calls().last().is_some_and(|c| c.ends_with("--set 25 --get")), "{:?}", adb.calls());
+        assert_eq!(run(&mut s, "audio_volume", json!({"level": 0})), Ok(Value::Null));
+        assert_eq!(run(&mut s, "audio_state", json!({})).expect("state")["settings"]["streams"][2]["volume"], json!(0));
+        let before = adb.calls().len();
+        assert_eq!(run(&mut s, "audio_volume", json!({})), Err("missing number parameter `level`".into()));
+        assert_eq!(adb.calls().len(), before, "refused before adb");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn audio_volume_uses_the_media_tool_on_older_images() {
+        let (mut s, root, adb, _emulator) = session("audioold");
+        adb.image("old-media");
+        assert_eq!(run(&mut s, "audio_volume", json!({"level": 100})), Ok(Value::Null));
+        let calls = adb.calls();
+        assert_eq!(
+            calls,
+            [
+                "shell cmd media_session volume --stream 3 --get",
+                "shell media volume --stream 3 --get",
+                "shell cmd media_session volume --stream 3 --set 25 --get",
+                "shell media volume --stream 3 --set 25 --get",
+            ]
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn audio_mute_mutes_the_media_stream_and_reads_it_back() {
+        let (mut s, root, adb, _emulator) = session("audiomute");
+        assert_eq!(run(&mut s, "audio_mute", json!({"on": true})), Ok(json!({"muted": true})));
+        assert_eq!(adb.calls(), ["shell getprop ro.build.version.sdk", "shell cmd audio adj-mute 3", "shell dumpsys audio"]);
+        assert_eq!(run(&mut s, "audio_state", json!({})).expect("state")["muted"], json!(true));
+        assert_eq!(run(&mut s, "audio_mute", json!({"on": false})), Ok(json!({"muted": false})));
+        assert_eq!(run(&mut s, "audio_state", json!({})).expect("state")["muted"], json!(false));
+        let before = adb.calls().len();
+        assert_eq!(run(&mut s, "audio_mute", json!({})), Err("missing boolean parameter `on`".into()));
+        assert_eq!(adb.calls().len(), before, "refused before adb");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn audio_mute_on_api_34_says_what_the_image_lacks() {
+        let (mut s, root, adb, _emulator) = session("audio34");
+        adb.image("api34");
+        let err = run(&mut s, "audio_mute", json!({"on": true})).expect_err("no adj-mute");
+        assert!(err.contains("API 35") && err.contains("API 34"), "{err}");
+        assert!(!adb.calls().iter().any(|c| c.contains("adj-mute")), "refused before sending it: {:?}", adb.calls());
+        // The volume and the state still work there.
+        assert_eq!(run(&mut s, "audio_volume", json!({"level": 40})), Ok(Value::Null));
+        assert_eq!(run(&mut s, "audio_state", json!({})).expect("state")["muted"], json!(false));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_volume_or_mute_that_does_not_apply_is_an_error() {
+        let (mut s, root, adb, _emulator) = session("audionoapply");
+        adb.image("fixed-volume");
+        let err = run(&mut s, "audio_volume", json!({"level": 40})).expect_err("not applied");
+        assert!(err.contains("didn't change"), "{err}");
+        adb.image("mute-ignored");
+        let err = run(&mut s, "audio_mute", json!({"on": true})).expect_err("not applied");
+        assert!(err.contains("still not muted"), "{err}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn settle_profile_and_device_types_work_on_both_platforms() {
+        let help = call(&mut Session::default(), "help", &Value::Null).expect("help");
+        for method in ["settle", "profile", "device_types"] {
+            let row = help.as_array().and_then(|a| a.iter().find(|x| x["method"] == method)).expect(method);
+            assert_eq!(row["platforms"], json!(["android", "ios"]), "{method}");
+        }
+    }
+
+    #[test]
+    fn settle_waits_for_a_quiet_guest_and_answers_in_the_ios_shape() {
+        let (mut s, root, adb, _emulator) = session("settle");
+        // The fake guest: system_server at 60% of a core over the first second, 2% after.
+        let r = run(&mut s, "settle", json!({"window_s": 1, "cpu_pct": 10, "timeout_s": 30})).expect("settled");
+        let mut keys: Vec<&str> = r.as_object().expect("object").keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["background_cpu_pct", "background_cpu_s", "cpu_pct", "cpu_s", "foreground_cpu_pct", "procs", "settle_s"]);
+        // init, system_server and System UI: the probe's own shell and cat are left out.
+        assert_eq!(r["procs"], 3);
+        assert_eq!((&r["cpu_pct"], &r["foreground_cpu_pct"], &r["background_cpu_pct"]), (&json!(2.0), &json!(2.0), &json!(0.0)));
+        // 0.6 s then 0.02 s of system_server's CPU over the wait; nothing runs at a background QoS.
+        assert_eq!((&r["cpu_s"], &r["background_cpu_s"]), (&json!(0.6), &json!(0.0)));
+        assert!(r["settle_s"].as_f64().is_some_and(|t| t < 30.0), "{r}");
+        let probes = adb.calls().iter().filter(|c| c.starts_with("shell echo @self")).count();
+        assert_eq!(probes, 3, "busy, then one quiet window");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn settle_checks_its_parameters_and_the_device() {
+        let (mut s, root, adb, emulator) = session("settleparams");
+        assert_eq!(run(&mut s, "settle", json!({"cpu_pct": -1})), Err("cpu_pct must be a number of % of a core, not -1".into()));
+        assert_eq!(run(&mut s, "settle", json!({"window_s": 1.5})), Err("window_s must be whole seconds, not 1.5".into()));
+        assert!(adb.calls().is_empty(), "{:?}", adb.calls());
+        // No longer advertised: the device is shut down.
+        drop(emulator);
+        std::fs::remove_dir_all(root.join("running")).ok();
+        assert_eq!(run(&mut s, "settle", json!({})), Err("phone isn't booted".into()));
+        assert_eq!(run(&mut s, "profile", json!({"name": "slim"})), Err("phone isn't booted".into()));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_guest_counts_as_up_once_it_booted_with_the_framework_running() {
+        let proc = |pid, name: &str| sim_android::settle::ProcCpu { pid, ppid: 1, name: name.into(), cpu_s: 2.5 };
+        let sample = |boot_completed, procs| sim_android::settle::CpuSample { uptime_s: 9.0, boot_completed, procs };
+        let up = super::settle_tree(&sample(true, vec![proc(1, "init"), proc(612, "system_server")]));
+        assert!(up.springboard);
+        assert_eq!(up.cpu[&612], crate::settle::Cpu { total_s: 2.5, background_s: 0.0 }, "no background split on Android");
+        assert!(!super::settle_tree(&sample(false, vec![proc(612, "system_server")])).springboard, "still booting");
+        assert!(!super::settle_tree(&sample(true, vec![proc(1, "init")])).springboard, "the framework restarting");
+    }
+
+    #[test]
+    fn the_slim_profile_turns_packages_off_and_undo_turns_them_on() {
+        let (mut s, root, adb, _emulator) = session("profile");
+        let restore = "com.google.android.apps.restore";
+        let partner = "com.google.android.partnersetup";
+        let applied = run(&mut s, "profile", json!({"name": "slim"})).expect("applied");
+        assert_eq!(applied, json!({"name": "slim", "disabled": 2, "already": 0, "failed": [partner], "not_loaded": [restore]}));
+        // Again: the two that are off are left alone, the refused one is asked again.
+        let again = run(&mut s, "profile", json!({"name": "slim"})).expect("again");
+        assert_eq!(again, json!({"name": "slim", "disabled": 2, "already": 2, "failed": [partner], "not_loaded": [restore]}));
+        let calls = adb.calls();
+        let flush = sim_android::profile::FLUSH;
+        assert_eq!(
+            calls[1],
+            format!(
+                "shell pm disable-user --user 0 com.google.android.apps.turbo; pm disable-user --user 0 com.google.android.apps.wellbeing; pm disable-user --user 0 {partner}; t=$(date +%s); echo @disabled; pm list packages -d; {flush}"
+            )
+        );
+        assert_eq!(
+            calls[3],
+            format!("shell pm disable-user --user 0 {partner}; t=$(date +%s); echo @disabled; pm list packages -d; {flush}")
+        );
+        let undone = run(&mut s, "profile", json!({"name": "slim", "undo": true})).expect("undone");
+        assert_eq!(undone, json!({"name": "slim", "enabled": 3, "failed": []}));
+        assert_eq!(
+            adb.calls()[5],
+            format!(
+                "shell pm enable --user 0 com.google.android.apps.turbo; pm enable --user 0 com.google.android.apps.wellbeing; t=$(date +%s); echo @disabled; pm list packages -d; {flush}"
+            )
+        );
+        assert_eq!(run(&mut s, "profile", json!({"name": "tiny"})), Err("unknown profile `tiny` (slim)".into()));
+        assert_eq!(run(&mut s, "profile", json!({})), Err("missing string parameter `name`".into()));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn device_types_lists_the_android_hardware_in_the_ios_shape() {
+        let types = call(&mut Session::default(), "device_types", &json!({"platform": "android"})).expect("types");
+        let types = types.as_array().expect("array");
+        assert_eq!(types.len(), 9);
+        let fold = types.iter().find(|t| t["identifier"] == "pixel_fold").expect("pixel_fold");
+        assert_eq!(
+            fold,
+            &json!({"identifier": "pixel_fold", "name": "Pixel Fold", "model": "pixel_fold", "product_family": "Android",
+                "screen_width": 2208.0, "screen_height": 1840.0, "screen_scale": 2.625, "platform": "android", "form_factor": "foldable"})
+        );
+        let families: std::collections::BTreeSet<&str> = types.iter().filter_map(|t| t["form_factor"].as_str()).collect();
+        assert_eq!(families, ["auto", "foldable", "phone", "tablet", "tv", "vision", "watch"].into_iter().collect());
     }
 
     #[test]

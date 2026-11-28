@@ -11,23 +11,22 @@ use sim_core::rotation::Rotation;
 
 use crate::{Action, Input, State, icons};
 
-const GREEN: Color = Color { r: 0.20, g: 0.78, b: 0.45, a: 1.0 };
-const GREY: Color = Color { r: 0.55, g: 0.55, b: 0.58, a: 1.0 };
-const AMBER: Color = Color { r: 0.95, g: 0.70, b: 0.25, a: 1.0 };
-
 /// The window is always drawn in the dark theme.
 const DARK: bool = true;
 
-pub fn view(s: &State, _: &mut Cx<State>) -> El {
+pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let t = tok::theme(DARK);
-    let mut root = row().w_full().h_full().fill(t.bg).child(sidebar(s, t)).child(stage(s, t));
-    if s.showing_screen() {
-        root = root.child(match s.selected_info().map(|d| d.platform) {
-            Some(Platform::Android) => android_panel(s, t),
-            _ => crate::debug::panel(s, t),
-        });
-    }
-    root
+    // The mark's clock: none under the system's reduced motion, so every mark rests.
+    let clock = (!cx.system_reduced_motion()).then_some(s.mark_t);
+    // The panel is there whether or not a screen is (#560): a selection, a boot or a pop-out
+    // never shows or hides it.
+    let panel = match s.selected_info().map(|d| d.platform) {
+        _ if !s.showing_screen() => empty_panel(s, t),
+        Some(Platform::Android) => android_panel(s, t),
+        _ => crate::debug::panel(s, t),
+    };
+    // The panes' widths and visibility, and their drag handles.
+    crate::panes::layout(s, t, sidebar(s, t, clock), stage(s, t, clock), panel)
 }
 
 /// A toolbar button: an icon (labelled for accessibility), with visible text only for the primary
@@ -39,76 +38,45 @@ fn button(key: &str, glyph: &'static Icon, label: &str, action: Action, primary:
     if primary { b.fill(tok::accent(0, true)) } else { b }
 }
 
-fn sidebar(s: &State, t: Theme) -> El {
+fn sidebar(s: &State, t: Theme, clock: Option<f32>) -> El {
     let mut list = col().key("device-list").gap(2.0);
     if s.devices.is_empty() {
         list = list.child(text("No devices").key("devices-empty").font(type_::BODY).color(t.text_secondary).padding(8.0));
     }
-    let mut runtime = "";
-    let mut platform = None;
-    for (i, d) in s.devices.iter().enumerate() {
-        if platform != Some(d.platform) {
-            platform = Some(d.platform);
-            runtime = "";
-            list = list.child(
-                text(d.platform.label())
-                    .key(format!("platform-{}", d.platform.as_str()))
-                    .font(type_::TITLE)
-                    .color(t.text)
-                    .px(4.0)
-                    .padding(4.0),
-            );
-        }
-        if d.runtime_id != runtime {
-            runtime = &d.runtime_id;
-            let short = runtime_label(runtime);
-            list = list.child(text(short).font(type_::SECTION).color(t.text_secondary).px(8.0).padding(4.0));
-        }
-        let selected = s.selected.as_deref() == Some(d.udid.as_str());
-        let highlight = selection(t, DARK);
-        let color = match d.state {
-            DeviceState::Booted => GREEN,
-            DeviceState::Booting | DeviceState::ShuttingDown | DeviceState::Creating => AMBER,
-            _ => GREY,
-        };
-        let udid = d.udid.clone();
-        let mut badge = platform_badge(d, t).key(format!("device-{i}-platform"));
-        if selected {
-            // The secondary colour is too faint on the tint.
-            badge = badge.color(t.text);
-        }
-        // The bar's slot is there on every row, so names line up whichever is selected.
-        let bar =
-            el().key(format!("device-{i}-bar")).w(3.0).h(16.0).radius(1.5).fill(if selected { highlight.bar } else { Color::TRANSPARENT });
-        let mut item = row()
-            .key(format!("device-{i}"))
-            .role("button")
-            .label(format!("{}, {}", d.name, d.label()))
-            .focus_selected(selected)
-            .w_full()
-            .h(30.0)
-            .center_y()
-            .radius(radius::SM)
-            .on_press(move |s: &mut State| s.actions.push(Action::Select(udid.clone())))
-            .child(bar)
-            .child(
-                row()
-                    .grow(1.0)
-                    .min_w(0.0)
-                    .h_full()
-                    .pl(5.0)
-                    .pr(8.0)
-                    .gap(8.0)
-                    .center_y()
-                    .child(el().size(8.0, 8.0).radius(4.0).fill(color))
-                    .child(text(d.name.clone()).font(type_::BODY).color(t.text).grow(1.0).truncate())
-                    .child(badge),
-            );
-        if selected {
-            item = item.fill(highlight.fill);
-        }
-        list = list.child(item);
+    let highlighted = crate::list::highlighted(s);
+    for row in crate::list::rows(s) {
+        list = list.child(match row {
+            crate::list::Row::Section { key, label } => text(label).key(key).font(type_::TITLE).color(t.text).px(4.0).padding(4.0),
+            crate::list::Row::Runtime(label) => text(label).font(type_::SECTION).color(t.text_secondary).px(8.0).padding(4.0),
+            crate::list::Row::NoMatches => {
+                text("No matches").key("devices-no-match").font(type_::BODY).color(t.text_secondary).padding(8.0)
+            }
+            crate::list::Row::Device(i) => device_row(s, i, highlighted == Some(i), t, clock),
+        });
     }
+    // Work for the whole window, and how many other devices have a job, beside Refresh.
+    let window_work = s.window_busy.map(str::to_owned).or_else(|| crate::jobs::others_summary(&s.jobs, s.selected.as_deref()));
+    let mut header = row().w_full().center_y().gap(6.0).child(text("simee").font(type_::TITLE).color(t.text).grow(1.0));
+    if let Some(work) = window_work {
+        header = header
+            .child(crate::mark::mark(sim_core::mark::Motion::Working, clock, 14.0).key("window-busy-mark"))
+            .child(text(work).key("window-busy").font(type_::MONO_CAPTION).color(t.text_secondary).truncate().min_w(0.0));
+    }
+    header = header.child(button("refresh-button", &icons::REFRESH, "Refresh", Action::Refresh, false, t));
+    let search = rune::text_input(&s.search, type_::BODY)
+        .key(crate::list::SEARCH_KEY)
+        .label("Search devices")
+        .single_line()
+        .placeholder("Search devices (⌘K)", t.text_secondary)
+        .color(t.text)
+        .w_full()
+        .px(8.0)
+        .py(5.0)
+        .radius(radius::SM)
+        .fill(t.control_off)
+        .on_edit(|s: &mut State| &mut s.search)
+        .on_input_change(|s: &mut State, _: &mut Tx| crate::list::query_changed(s))
+        .on_input_key(crate::list::search_key);
     col()
         .w(240.0)
         .h_full()
@@ -118,15 +86,77 @@ fn sidebar(s: &State, t: Theme) -> El {
         .border(1.0, t.card_border)
         // Clear the window's title-bar buttons, which overlap the top-left corner.
         .child(el().h(22.0))
-        .child(row().w_full().center_y().child(text("simee").font(type_::TITLE).color(t.text).grow(1.0)).child(button(
-            "refresh-button",
-            &icons::REFRESH,
-            "Refresh",
-            Action::Refresh,
-            false,
-            t,
-        )))
+        .child(header)
+        .child(search)
         .child(list.scroll(ScrollSpec { stick_bottom: false }).shrink().min_h(0.0))
+}
+
+/// One device's row: its state mark (booting while a boot from here runs), name and platform. A
+/// click or Return selects it and boots it when it is shut down; ⌥ selects only ([`crate::list::activate`]).
+/// Its keys name the device ([`row_key`]), never its place: focus follows the device when a
+/// rescan or a boot reorders the list, so Return presses the row the user focused.
+fn device_row(s: &State, i: usize, highlighted: bool, t: Theme, clock: Option<f32>) -> El {
+    let d = &s.devices[i];
+    let selected = s.selected.as_deref() == Some(d.udid.as_str());
+    let highlight = selection(t, DARK);
+    // The row's mark agrees with the stage: a job on the device turns it.
+    let job = s.jobs.label(&d.udid);
+    let motion = job.map_or_else(|| crate::mark::for_device(d.state), crate::mark::for_busy);
+    let moving = job.is_some() || crate::mark::moves(d.state);
+    let state_mark = crate::mark::toned(motion, clock.filter(|_| moving), Some(crate::mark::tone(d.platform)), 16.0)
+        .key(row_key("device-mark", &d.udid));
+    let (udid, menu_udid) = (d.udid.clone(), d.udid.clone());
+    let popped = s.popouts.is_open(&d.udid).then(|| crate::popout::row_mark(&d.udid, t));
+    let mut badge = platform_badge(d, t).key(row_key("device-platform", &d.udid));
+    if selected {
+        // The secondary colour is too faint on the tint.
+        badge = badge.color(t.text);
+    }
+    // The bar's slot is there on every row, so names line up whichever is selected.
+    let bar =
+        el().key(row_key("device-bar", &d.udid)).w(3.0).h(16.0).radius(1.5).fill(if selected { highlight.bar } else { Color::TRANSPARENT });
+    let mut item = row()
+        .key(row_key("device-row", &d.udid))
+        .role("button")
+        .label(format!("{}, {}", d.name, d.label()))
+        .focusable(true)
+        .press_on_return()
+        .focus_selected(selected)
+        .w_full()
+        .h(30.0)
+        .center_y()
+        .radius(radius::SM)
+        .on_press_tx(move |s: &mut State, tx: &mut Tx| crate::list::activate(s, &udid, tx.mods().alt))
+        .on_secondary_press(move |s: &mut State, press, tx: &mut Tx| crate::popout::row_menu(s, menu_udid.clone(), press, tx))
+        .child(bar)
+        .child(
+            row()
+                .grow(1.0)
+                .min_w(0.0)
+                .h_full()
+                .pl(5.0)
+                .pr(8.0)
+                .gap(8.0)
+                .center_y()
+                .child(state_mark)
+                .child(text(d.name.clone()).font(type_::BODY).color(t.text).grow(1.0).truncate())
+                .children(popped)
+                .child(badge),
+        );
+    if selected {
+        item = item.fill(highlight.fill);
+    } else if highlighted {
+        item = item.fill(t.hover);
+    }
+    item
+}
+
+/// The key of a device row's `part` (`device-row`, `device-mark`, `device-bar`,
+/// `device-platform`, `device-popped`) for `udid`: `device-row:pixel_9`. The colon can't be in a
+/// fixed key (`device-screen`) nor in a part, so no AVD name makes a key that's another's: an AVD
+/// named `screen` is `device-row:screen`, and `x-mark`'s row isn't `x`'s mark (#571).
+pub fn row_key(part: &str, udid: &str) -> String {
+    format!("{part}:{udid}")
 }
 
 /// How the selected device's row is drawn.
@@ -164,26 +194,55 @@ pub fn runtime_label(id: &str) -> String {
     }
 }
 
-fn stage(s: &State, t: Theme) -> El {
-    let mut controls = row().key("controls").w_full().gap(8.0).center_y();
-    let title =
-        s.selected_info().map_or_else(|| "Select a device".to_string(), |d| format!("{} · {} · {}", d.name, d.label(), d.state.as_str()));
+fn stage(s: &State, t: Theme, clock: Option<f32>) -> El {
+    // The device list's toggle leads the toolbar, so it stays in reach while the list is hidden.
+    let mut controls =
+        row().key("controls").w_full().gap(8.0).center_y().child(crate::panes::toolbar_toggle(s, crate::panes::Side::Sidebar, t));
+    // A boot from here says Booting before the service or the emulator does.
+    let state = |d: &DeviceInfo| if s.jobs.booting(&d.udid) && d.state != DeviceState::Booted { "Booting" } else { d.state.as_str() };
+    let title = s.selected_info().map_or_else(|| "Select a device".to_string(), |d| format!("{} · {} · {}", d.name, d.label(), state(d)));
     controls = controls.child(text(title).key("device-title").font(type_::SECTION).color(t.text).grow(1.0).truncate());
     let booted = s.selected_info().is_some_and(|d| d.state == DeviceState::Booted);
-    if let Some(busy) = s.busy {
-        controls = controls.child(text(busy).key("busy").font(type_::BODY).color(t.text_secondary));
-    } else if s.selected.is_some() && !booted {
-        controls = controls.child(button("boot-button", &icons::PLAY, "Boot", Action::Boot, true, t));
+    let popped = s.selected.as_deref().filter(|u| s.popouts.is_open(u));
+    // The selected device's own job only (#558): another device's boot isn't this one's.
+    let job = s.selected.as_deref().and_then(|u| s.jobs.label(u));
+    if let Some(busy) = job {
+        controls = controls
+            .child(crate::mark::mark(crate::mark::for_busy(busy), clock, 20.0).key("busy-mark"))
+            .child(text(busy).key("busy").font(type_::BODY).color(t.text_secondary));
+    } else if let Some(udid) = s.selected.as_ref().filter(|_| !booted) {
+        controls = controls.child(button("boot-button", &icons::PLAY, "Boot", Action::Boot(udid.clone()), true, t));
     }
     if s.showing_screen()
+        && popped.is_none()
         && let Some(d) = s.selected_info()
     {
         for c in crate::controls::for_device(d) {
             controls = controls.child(button(c.key, c.icon, c.label, c.action, false, t));
         }
+        if booted {
+            controls = controls.child(crate::popout::stage_button(&d.udid, t));
+        }
     }
-    let body = if s.showing_screen() { screen(s) } else { placeholder(s, t) };
+    // The 3D view's own: face on (⌘0) and flip (⌘F); orbit, pan and zoom are on the pointer.
+    if crate::scene::active(s).is_some() {
+        use crate::scene::Command;
+        controls = controls
+            .child(button("face-on-button", &icons::FACE_ON, "Face on (⌘0)", Action::View3d(Command::FaceOn), false, t))
+            .child(button("flip-button", &icons::FLIP, "Flip (⌘F)", Action::View3d(Command::Flip), false, t));
+    }
+    // The panel's toggle ends it, beside where the panel is.
+    controls = controls.child(crate::panes::toolbar_toggle(s, crate::panes::Side::Inspector, t));
+    let body = match popped {
+        Some(udid) => crate::popout::placeholder(udid, t),
+        None if s.showing_screen() => screen(s),
+        None => placeholder(s, t, clock),
+    };
     let mut stage = col().w_full().h_full().grow(1.0).min_w(0.0).padding(16.0).gap(12.0).child(controls).child(body);
+    // A pane the window is too narrow for: why it's gone, and that it comes back.
+    if let Some(note) = crate::panes::narrow_note(s) {
+        stage = stage.child(text(note).key("narrow-note").font(type_::LABEL).color(t.text).truncate());
+    }
     let footer = match (&s.status, &s.socket) {
         (Some(msg), _) => Some(msg.clone()),
         (None, Some(sock)) => Some(format!("API: {sock}")),
@@ -195,9 +254,18 @@ fn stage(s: &State, t: Theme) -> El {
     stage
 }
 
-fn placeholder(s: &State, t: Theme) -> El {
-    let msg = if s.busy == Some("Booting…") { "Waiting for the device to finish booting…" } else { "Boot a device to see its screen" };
-    col().key("placeholder").w_full().grow(1.0).center().child(text(msg).font(type_::BODY).color(t.text_secondary))
+fn placeholder(s: &State, t: Theme, clock: Option<f32>) -> El {
+    let booting = s.selected.as_deref().is_some_and(|u| s.jobs.booting(u));
+    let msg = if booting { "Waiting for the device to finish booting…" } else { "Boot a device to see its screen" };
+    let motion = if booting { sim_core::mark::Motion::Boot } else { sim_core::mark::Motion::Idle };
+    col()
+        .key("placeholder")
+        .w_full()
+        .grow(1.0)
+        .center()
+        .gap(18.0)
+        .child(crate::mark::mark(motion, clock.filter(|_| booting), 96.0).key("placeholder-mark"))
+        .child(text(msg).font(type_::BODY).color(t.text_secondary))
 }
 
 /// Keys on the focused screen (or the 3D slot over it): the keystroke or shortcut goes to the
@@ -275,7 +343,7 @@ fn screen(s: &State) -> El {
         let inset = if s.selected_info().and_then(crate::controls::bezel).is_some() { crate::bezel::BAND } else { 0.0 };
         // The slot takes the pointer, so it takes focus too (a click on the 3D view must not
         // blur the screen) and the screen's keys.
-        stage.child(crate::scene::slot(inset, ratio).focusable(true).on_key(device_key))
+        stage.child(crate::scene::slot(inset, ratio, &s.view3d.view).focusable(true).on_key(device_key))
     } else {
         stage
     }
@@ -287,7 +355,7 @@ fn screen(s: &State) -> El {
 /// the box (sideways, its width is the box's height and its height the box's width), centred,
 /// so it fills the box from the first frame and follows it as the window resizes. It takes no
 /// input: `device` keeps its upright box, so pointer positions in it are the upright screen's.
-fn turned(device: El, pixels: &rune::Pixels, turn: Rotation, ratio: f32, corners: f32) -> El {
+pub fn turned(device: El, pixels: &rune::Pixels, turn: Rotation, ratio: f32, corners: f32) -> El {
     let (w, h) = if turn.is_sideways() { (1.0 / ratio.max(f32::EPSILON), ratio) } else { (1.0, 1.0) };
     let picture = el()
         .key("device-pixels")
@@ -318,6 +386,27 @@ pub fn screen_radius(shape: Shape, width: f32) -> f32 {
 const EMPTY_LOG: &str = "No log yet. Devices booted here stream logcat (info and up) to this panel. \
                          The kernel console only has critical messages: for the full kernel log, \
                          start emu with -show-kernel or EMU_CONSOLE=full.";
+
+/// The panel while no device screen shows (none selected, one shut down or booting, one out in
+/// its own window): what it will show, and the resource panel's toggle in its corner.
+fn empty_panel(s: &State, t: Theme) -> El {
+    let msg = match s.selected.as_deref() {
+        Some(udid) if s.popouts.is_open(udid) => "This device's window has its screen; its panel shows here once it's back",
+        Some(_) => "The device's details show here once it's running",
+        None => "Select a device to see its details here",
+    };
+    col()
+        .key("inspector-empty")
+        .w(340.0)
+        .h_full()
+        .padding(12.0)
+        .gap(10.0)
+        .fill(t.card)
+        .border(1.0, t.card_border)
+        .child(el().h(22.0))
+        .child(text("DEVICE").font(type_::SECTION).color(t.text_secondary))
+        .child(text(msg).key("inspector-empty-note").font(type_::BODY).color(t.text_secondary).wrap())
+}
 
 /// An Android device's panel: what it is, and its guest log (the console's critical lines, then
 /// logcat).

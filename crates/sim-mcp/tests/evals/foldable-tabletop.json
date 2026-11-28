@@ -1,0 +1,21 @@
+{
+  "name": "foldable-tabletop",
+  "goal": "Put the booted Android foldable in tabletop posture: landscape, hinge half open.",
+  "toolsets": "core,input",
+  "world": {
+    "devices": [
+      {"udid": "pixel-fold", "name": "Pixel Fold", "platform": "android", "form_factor": "foldable", "state": "Booted"}
+    ]
+  },
+  "plan": [
+    {"tool": "devices", "args": {"booted": true}, "expect": {"contains": ["foldable"]}},
+    {"tool": "rotate", "args": {"device": "pixel-fold"}, "expect": {"contains": ["landscape"]}},
+    {"tool": "fold", "args": {"device": "pixel-fold", "posture": "half-opened"}, "expect": {"contains": ["half-opened"]}},
+    {"tool": "screenshot", "args": {"device": "pixel-fold"}}
+  ],
+  "end": {
+    "orientation": {"pixel-fold": "landscape-right"},
+    "posture": {"pixel-fold": "half-opened"},
+    "screenshot_shows": {"pixel-fold": ["posture=half-opened", "orientation=landscape-right"]}
+  }
+}

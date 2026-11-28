@@ -1,13 +1,18 @@
 //! Tasks (the `io.modelcontextprotocol/tasks` extension): a long method call run on its own thread,
 //! with a handle the client polls (`tasks/get`) or is told about (`notifications/tasks`).
 //!
-//! Cancellation is cooperative, as the extension allows: a cancelled task is `cancelled` at once and
-//! its result is thrown away, but a device call already in flight (a boot, an install) can't be
-//! interrupted through the API, so the call itself runs to its end in the background.
+//! Cancellation is cooperative, as the extension allows: a cancelled task is `cancelled` at once,
+//! and the call sees the flag ([`Ctl`]) at its next safe point (#297). A `boot_many` starts no more
+//! devices and shuts down those it was booting, then returns the ones that finished, which the
+//! cancelled task keeps as its `result`; a `boot` shuts down the device it was booting; a `create`
+//! or `clone` deletes what it made; a call only waiting (a boot held back by admission) stops
+//! waiting. Any other result of a cancelled task is thrown away: the work that can't be interrupted
+//! once running (an install, an erase) ends in the background. While it runs, the call's steps
+//! (devices booted of all, an install's phases) are the task's status message.
 
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -30,10 +35,85 @@ enum State {
     Working,
     Completed(Value),
     Failed(Value),
-    Cancelled,
+    /// With the partial result the call returned after the cancel (a `boot_many`'s devices done).
+    Cancelled(Option<Value>),
+}
+
+/// What a call last said about how far it is: its count of units (once it has counted any) and
+/// its message, which is either that step's or a note on what it waits on since.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Note {
+    pub done: u64,
+    pub total: Option<u64>,
+    pub message: String,
+    /// The message is a step's (it says the count itself), not a note after one.
+    pub counted: bool,
+}
+
+impl Note {
+    /// The message, with the count after a note that doesn't say it; `None` before anything.
+    pub fn say(&self) -> Option<String> {
+        if self.message.is_empty() {
+            return None;
+        }
+        Some(match self.total {
+            Some(total) if !self.counted => format!("{} ({} of {total} done)", self.message, self.done),
+            _ => self.message.clone(),
+        })
+    }
+}
+
+/// Told of each counted step of a call, on the call's thread.
+pub type OnStep = Arc<dyn Fn(&Note) + Send + Sync>;
+
+/// What a running call sees of its caller: whether the caller cancelled it, and what it last said
+/// about how far it is (shown in the task's status and in progress messages).
+#[derive(Clone, Default)]
+pub struct Ctl {
+    pub cancelled: Arc<AtomicBool>,
+    pub note: Arc<Mutex<Note>>,
+    on_step: Vec<OnStep>,
+}
+
+impl Ctl {
+    /// This, also telling `f` of each counted step.
+    pub fn on_step(mut self, f: OnStep) -> Ctl {
+        self.on_step.push(f);
+        self
+    }
+
+    /// The hooks that hand this to `sim-api`'s calls on the thread that runs them.
+    pub fn hooks(&self) -> sim_api::CallHooks {
+        let (cancelled, note, on_step) = (self.cancelled.clone(), self.note.clone(), self.on_step.clone());
+        sim_api::CallHooks {
+            cancelled: Box::new(move || cancelled.load(Ordering::Relaxed)),
+            progress: Box::new(move |p: &sim_api::Progress| {
+                let now = {
+                    let mut n = note.lock().unwrap_or_else(|e| e.into_inner());
+                    n.message = p.message.clone();
+                    n.counted = p.total.is_some();
+                    if let Some(total) = p.total {
+                        (n.done, n.total) = (p.done, Some(total));
+                    }
+                    n.clone()
+                };
+                if now.counted {
+                    for f in &on_step {
+                        f(&now);
+                    }
+                }
+            }),
+        }
+    }
+
+    /// What the call last said, if anything.
+    pub fn say(&self) -> Option<String> {
+        self.note.lock().unwrap_or_else(|e| e.into_inner()).say()
+    }
 }
 
 struct Entry {
+    ctl: Ctl,
     method: String,
     created: SystemTime,
     updated: SystemTime,
@@ -96,12 +176,11 @@ pub fn iso8601(t: SystemTime) -> String {
     format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
-/// An unguessable task id: 128 random bits as hex.
-fn new_id() -> String {
-    use std::io::Read;
+/// A random 128-bit id as 32 hex digits: a task's, a page snapshot's. Nobody can guess another's.
+pub(crate) fn new_id() -> String {
     let mut bytes = [0u8; 16];
-    if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).is_err() {
-        // No urandom: mix the clock and the process's random hash keys instead.
+    if sim_core::entropy::fill(&mut bytes).is_err() {
+        // No OS entropy: mix the clock and the process's random hash keys instead.
         use std::hash::{BuildHasher, Hasher};
         for chunk in bytes.chunks_mut(8) {
             let mut h = std::collections::hash_map::RandomState::new().build_hasher();
@@ -132,7 +211,10 @@ impl Tasks {
             "pollIntervalMs": POLL_MS,
         });
         let (status, message) = match &e.state {
-            State::Working => ("working", format!("{} has been running for {secs} s", e.method)),
+            State::Working => {
+                let note = e.ctl.say().map(|n| format!(": {n}")).unwrap_or_default();
+                ("working", format!("{} has been running for {secs} s{note}", e.method))
+            }
             State::Completed(result) => {
                 task["result"] = result.clone();
                 if result["isError"] == true {
@@ -146,10 +228,18 @@ impl Tasks {
                 task["error"] = error.clone();
                 ("failed", format!("{} failed: {}", e.method, error["message"].as_str().unwrap_or("internal error")))
             }
-            State::Cancelled => (
+            State::Cancelled(Some(partial)) => {
+                task["result"] = partial.clone();
+                let done = e.ctl.say().map(|n| format!(" ({n})")).unwrap_or_default();
+                ("cancelled", format!("cancelled by the client; {} stopped and returned what it had done{done}, in `result`", e.method))
+            }
+            State::Cancelled(None) => (
                 "cancelled",
                 format!(
-                    "cancelled by the client; a running {} call can't be interrupted, so it finishes in the background and its result is discarded",
+                    "cancelled by the client; {} stops at its next safe point: a boot_many starts no more devices and shuts down \
+                     those it was booting (its result keeps the ones done), a boot shuts down the device it was booting, a create or \
+                     clone deletes what it made, a call waiting for admission stops waiting. Work that can't be interrupted once \
+                     running (an install, an erase) finishes in the background and its result is discarded",
                     e.method
                 ),
             ),
@@ -169,7 +259,20 @@ impl Tasks {
     /// result (a `CallToolResult`). The handle (a `CreateTaskResult`'s fields) is returned at once;
     /// with [`MAX_RUNNING`] calls running (cancelled tasks' too), it fails instead.
     pub fn create(&self, method: &str, work: impl FnOnce() -> Value + Send + 'static) -> Result<Value, String> {
+        self.create_with(method, |_| work())
+    }
+
+    /// [`Tasks::create`], with the task's [`Ctl`] for the work: the flag `tasks/cancel` sets, and
+    /// the note its status shows.
+    pub fn create_with(&self, method: &str, work: impl FnOnce(Ctl) -> Value + Send + 'static) -> Result<Value, String> {
         let id = new_id();
+        // Each counted step is news to the task's listeners (weakly held: the table holds the Ctl).
+        let (table, ttl, step_id) = (Arc::downgrade(&self.table), self.ttl, id.clone());
+        let ctl = Ctl::default().on_step(Arc::new(move |_: &Note| {
+            if let Some(table) = table.upgrade() {
+                Tasks { table, running: Arc::default(), ttl }.touch(&step_id);
+            }
+        }));
         let now = SystemTime::now();
         let (handle, running) = {
             let mut table = self.lock();
@@ -182,6 +285,7 @@ impl Tasks {
             }
             self.running.fetch_add(1, Ordering::SeqCst);
             let entry = Entry {
+                ctl: ctl.clone(),
                 method: method.to_owned(),
                 created: now,
                 updated: now,
@@ -196,7 +300,7 @@ impl Tasks {
         let (tasks, task_id) = (self.clone(), id.clone());
         let spawned = std::thread::Builder::new().name(format!("simee-task-{}", &id[..8])).spawn(move || {
             let _running = running;
-            let outcome = catch_unwind(AssertUnwindSafe(work));
+            let outcome = catch_unwind(AssertUnwindSafe(|| work(ctl)));
             tasks.finish(&task_id, outcome.map_err(|_| RpcError::new(INTERNAL_ERROR, "the task's thread panicked").to_json()));
         });
         if let Err(e) = spawned {
@@ -205,10 +309,29 @@ impl Tasks {
         Ok(handle)
     }
 
-    /// Records how a task ended, unless it was cancelled first, and tells its listeners.
+    /// A working task's call said how far it is: its listeners hear the new status message.
+    fn touch(&self, id: &str) {
+        let mut table = self.lock();
+        let Some(entry) = table.entries.get_mut(id).filter(|e| matches!(e.state, State::Working)) else { return };
+        entry.updated = SystemTime::now();
+        self.announce(&table, id);
+    }
+
+    /// Records how a task ended, unless it was cancelled first, and tells its listeners. A
+    /// cancelled task keeps the result its call returned when that result says it is partial
+    /// (`cancelled: true`: what it finished before it stopped), and its listeners hear it again
+    /// with that result; any other is discarded.
     fn finish(&self, id: &str, outcome: Result<Value, Value>) {
         let mut table = self.lock();
         let Some(entry) = table.entries.get_mut(id) else { return };
+        if let (State::Cancelled(partial @ None), Ok(result)) = (&mut entry.state, &outcome)
+            && result["structuredContent"]["cancelled"] == true
+        {
+            *partial = Some(result.clone());
+            entry.updated = SystemTime::now();
+            self.announce(&table, id);
+            return;
+        }
         if !matches!(entry.state, State::Working) {
             return;
         }
@@ -245,7 +368,8 @@ impl Tasks {
         let mut table = self.lock();
         let Some(entry) = table.entries.get_mut(id) else { return false };
         if matches!(entry.state, State::Working) {
-            entry.state = State::Cancelled;
+            entry.ctl.cancelled.store(true, Ordering::Relaxed);
+            entry.state = State::Cancelled(None);
             entry.updated = SystemTime::now();
             entry.finished = Some(Instant::now());
             self.announce(&table, id);
@@ -272,6 +396,9 @@ mod tests {
     use std::sync::mpsc::{Sender, channel};
 
     use super::*;
+
+    /// How long one side of a test waits for the other before it fails.
+    const WAIT: Duration = Duration::from_secs(10);
 
     fn gated() -> (Sender<()>, impl FnOnce() -> Value + Send + 'static) {
         let (release, wait) = channel::<()>();
@@ -352,6 +479,127 @@ mod tests {
         wait_for(&tasks, &finished, "completed");
         assert!(tasks.cancel(&finished));
         assert_eq!(status(&tasks, &finished), "completed");
+    }
+
+    #[test]
+    fn a_tasks_status_is_its_calls_last_step_and_a_cancelled_one_keeps_its_partial_result() {
+        let tasks = Tasks::default();
+        // Each side waits on the other with a deadline, never a bare barrier: a side that panics
+        // fails the test instead of leaving the other waiting forever (#533).
+        let (said_tx, said) = channel::<()>();
+        let (go, go_rx) = channel::<()>();
+        let id = tasks
+            .create_with("boot_many", move |ctl| {
+                sim_api::with_call_hooks(ctl.hooks(), || {
+                    // Each says something, then waits while the test reads it.
+                    sim_api::call_step("booted", 4, 8, "4 of 8 done");
+                    said_tx.send(()).ok();
+                    go_rx.recv_timeout(WAIT).expect("the test read the step");
+                    sim_api::call_progress("boot_many: 2 waiting at 5 s, admission hold: memory");
+                    said_tx.send(()).ok();
+                    go_rx.recv_timeout(WAIT).expect("the test cancelled");
+                    // Cancelled meanwhile: it stops and says what it finished.
+                    assert!(sim_api::call_cancelled());
+                    json!({"content": [{"type": "text", "text": "partial"}], "structuredContent": {"cancelled": true, "failed": 4},
+                        "isError": false})
+                })
+            })
+            .expect("create")["taskId"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+        said.recv_timeout(WAIT).expect("the step");
+        let message = tasks.get(&id).expect("task")["statusMessage"].as_str().expect("message").to_owned();
+        assert!(message.starts_with("boot_many has been running for ") && message.ends_with(" s: 4 of 8 done"), "{message}");
+        go.send(()).expect("go");
+        said.recv_timeout(WAIT).expect("the note");
+        // A note after a step keeps the count beside it.
+        let message = tasks.get(&id).expect("task")["statusMessage"].as_str().expect("message").to_owned();
+        assert!(message.ends_with("admission hold: memory (4 of 8 done)"), "{message}");
+        assert!(tasks.cancel(&id));
+        go.send(()).expect("go");
+        let task = wait_for_result(&tasks, &id);
+        assert_eq!((task["status"].as_str(), task["result"]["structuredContent"]["failed"].as_u64()), (Some("cancelled"), Some(4)));
+        assert!(task["statusMessage"].as_str().is_some_and(|m| m.contains("returned what it had done")), "{task}");
+    }
+
+    /// The task once its call has returned a partial result.
+    fn wait_for_result(tasks: &Tasks, id: &str) -> Value {
+        for _ in 0..500 {
+            let task = tasks.get(id).expect("task");
+            if task.get("result").is_some() {
+                return task;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("no result");
+    }
+
+    #[test]
+    fn listeners_hear_each_step_of_a_working_task() {
+        let tasks = Tasks::default();
+        let (release, wait) = channel::<()>();
+        let id = tasks
+            .create_with("install", move |ctl| {
+                sim_api::with_call_hooks(ctl.hooks(), || {
+                    wait.recv().ok();
+                    sim_api::call_step("installing", 1, 2, "installing a.apk on phone (2.0 MB)");
+                    json!({"content": [], "isError": false})
+                })
+            })
+            .expect("create")["taskId"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+        let (tx, rx) = channel::<String>();
+        let tx = Mutex::new(tx);
+        let sink: Sink = Arc::new(move |line| {
+            tx.lock().expect("tx").send(line).ok();
+        });
+        tasks.subscribe(json!(1), std::slice::from_ref(&id), sink, |_| {});
+        release.send(()).expect("release");
+        let statuses: Vec<(String, String)> = (0..2)
+            .map(|_| {
+                let note: Value = serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).expect("note")).expect("json");
+                (
+                    note["params"]["status"].as_str().unwrap_or("").to_owned(),
+                    note["params"]["statusMessage"].as_str().unwrap_or("").to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(statuses[0].0, "working");
+        assert!(statuses[0].1.ends_with(": installing a.apk on phone (2.0 MB)"), "{statuses:?}");
+        assert_eq!(statuses[1].0, "completed");
+    }
+
+    #[test]
+    fn listeners_hear_a_cancelled_task_get_its_partial_result() {
+        let tasks = Tasks::default();
+        let (release, wait) = channel::<()>();
+        let id = tasks
+            .create("boot_many", move || {
+                wait.recv().ok();
+                json!({"content": [], "structuredContent": {"cancelled": true, "failed": 3}, "isError": false})
+            })
+            .expect("create")["taskId"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+        let (tx, rx) = channel::<String>();
+        let tx = Mutex::new(tx);
+        let sink: Sink = Arc::new(move |line| {
+            tx.lock().expect("tx").send(line).ok();
+        });
+        tasks.subscribe(json!(1), std::slice::from_ref(&id), sink, |_| {});
+        assert!(tasks.cancel(&id));
+        release.send(()).expect("release");
+        let notes: Vec<Value> =
+            (0..2).map(|_| serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).expect("note")).expect("json")).collect();
+        // Cancelled at once with nothing yet, then again with what the call had done.
+        assert_eq!((notes[0]["params"]["status"].as_str(), notes[0]["params"].get("result")), (Some("cancelled"), None));
+        assert_eq!(notes[1]["params"]["status"], "cancelled");
+        assert_eq!(notes[1]["params"]["result"]["structuredContent"]["failed"], 3);
+        assert!(notes[1]["params"]["statusMessage"].as_str().is_some_and(|m| m.contains("returned what it had done")), "{}", notes[1]);
     }
 
     #[test]

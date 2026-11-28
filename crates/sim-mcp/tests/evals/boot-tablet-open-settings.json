@@ -1,0 +1,23 @@
+{
+  "name": "boot-tablet-open-settings",
+  "goal": "Boot an iOS tablet and open the Settings app on it. Leave the other devices as they are.",
+  "toolsets": "core",
+  "world": {
+    "devices": [
+      {"udid": "iphone-17", "name": "iPhone 17", "platform": "ios", "form_factor": "phone", "state": "Shutdown"},
+      {"udid": "ipad-air", "name": "iPad Air 13-inch (M3)", "platform": "ios", "form_factor": "tablet", "state": "Shutdown"}
+    ]
+  },
+  "plan": [
+    {"tool": "devices", "args": {"platform": "ios", "form_factor": "tablet"}, "expect": {"contains": ["ipad-air"]}},
+    {"tool": "boot", "args": {"device": "ipad-air", "admission": "wait"}},
+    {"tool": "launch", "args": {"device": "ipad-air", "bundle_id": "com.apple.Preferences"}},
+    {"tool": "screenshot", "args": {"device": "ipad-air"}}
+  ],
+  "end": {
+    "booted": ["ipad-air"],
+    "shutdown": ["iphone-17"],
+    "foreground": {"ipad-air": "com.apple.Preferences"},
+    "screenshot_shows": {"ipad-air": ["app=com.apple.Preferences"]}
+  }
+}

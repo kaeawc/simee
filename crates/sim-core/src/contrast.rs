@@ -600,8 +600,9 @@ fn thin_frame(img: &Img, r: Rect) -> Option<(Rgb, Rgb)> {
     if outside.iter().filter(|&&c| near(c, out, 12)).count() * 10 < outside.len() * 8 {
         return None;
     }
-    // A border is thin next to the box (a stroke of a big letter or a filled shape is not), and starts
-    // near its side unless the outline curves away there.
+    // A border is thin next to the box (a stroke of a big letter or a filled shape is not), on at least
+    // three sides (a drop shadow thickens the fourth), and starts near its side unless the outline
+    // curves away there.
     let min_side = w.min(h);
     let thickest = min_side / 10 + 1;
     let reach = min_side / 6 + 3;
@@ -616,60 +617,74 @@ fn thin_frame(img: &Img, r: Rect) -> Option<(Rgb, Rgb)> {
         };
         let d = (0..=reach).find(|&d| at(d).is_some_and(|c| !near(c, out, INK_STEP as u8)))?;
         let ink = |c: Rgb| (0..3).map(|k| c[k].abs_diff(out[k])).max().unwrap_or(0);
-        let (start, c) = [d, d + 1].into_iter().filter_map(|d| at(d).map(|c| (d, c))).max_by_key(|&(_, c)| ink(c))?;
-        let run = (start..=start + thickest).take_while(|&d| at(d).is_some_and(|p| near(p, c, 12))).count() as i64;
+        // The side of the outside colour a pixel is on: a shadow is darker than the page, a card lighter.
+        let above = |c: Rgb| (0..3).map(|k| i32::from(c[k]) - i32::from(out[k])).sum::<i32>() > 0;
+        let first = at(d)?;
+        let (start, c) = match at(d + 1) {
+            Some(next) if above(next) == above(first) && ink(next) > ink(first) => (d + 1, next),
+            _ => (d, first),
+        };
+        // A faint border is told from the inside by less than a bright one: half its own step from outside.
+        let tol = (ink(c) / 2).clamp(2, 12);
+        let run = (start..=start + 2 * thickest).take_while(|&d| at(d).is_some_and(|p| near(p, c, tol))).count() as i64;
         Some((d, c, run))
     };
-    let mut edge: Option<Rgb> = None;
-    let mut thickness = 0;
-    let mut nearest = [0; 4];
+    // Each side is judged on its own: one colour along its length, but opposite sides may differ (a
+    // card's drop shadow darkens its bottom edge).
+    let mut sides = [[0u8; 3]; 4];
+    let mut thin_sides = 0;
+    let mut curve = [0; 4];
+    let mut squared = true;
     let mut straight = [0; 2];
     for side in 0..4 {
         let span = if side < 2 { xs.clone() } else { ys.clone() };
         let probes: Vec<Option<(i64, Rgb, i64)>> = span.map(|i| probe(side, i)).collect();
         let c = round(mode_colour(probes.iter().flatten().map(|p| p.1))?);
-        let mine = |p: &Option<(i64, Rgb, i64)>| p.is_some_and(|(_, pc, run)| near(pc, c, 12) && run <= thickest);
-        if probes.iter().filter(|p| mine(p)).count() * 10 < probes.len() * 9 || edge.is_some_and(|e| !near(e, c, 12)) {
+        let mine = |p: &Option<(i64, Rgb, i64)>| p.is_some_and(|(_, pc, run)| near(pc, c, 12) && run <= 2 * thickest);
+        if probes.iter().filter(|p| mine(p)).count() * 10 < probes.len() * 9 {
             return None;
         }
-        edge = Some(c);
+        sides[side] = c;
         let mut runs: Vec<i64> = probes.iter().flatten().map(|p| p.2).collect();
         runs.sort_unstable();
-        thickness = thickness.max(runs[runs.len() / 2]);
+        thin_sides += usize::from(runs[runs.len() / 2] <= thickest);
         let depths: Vec<Option<i64>> = probes.iter().map(|p| p.map(|p| p.0)).collect();
-        nearest[side] = depths.iter().flatten().copied().min()?;
-        if nearest[side] > 3 {
+        let nearest = depths.iter().flatten().copied().min()?;
+        if nearest > 3 {
             return None;
         }
+        curve[side] = depths.iter().flatten().copied().max()? - nearest;
         // The top and bottom: the longest run where the border is as near as it gets, a straight edge.
         // A pill has one between its ends; a circle has only a short one.
         if side < 2 {
             let (mut longest, mut now) = (0, 0);
             for d in &depths {
-                now = if *d == Some(nearest[side]) { now + 1 } else { 0 };
+                now = if *d == Some(nearest) { now + 1 } else { 0 };
                 longest = longest.max(now);
             }
             straight[side] = longest;
+            // Whether the border turns away before the corners: the end of the side is deeper in.
+            squared &= [2, w - 3].iter().all(|&i| probe(side, i).is_some_and(|p| p.0 <= nearest + 1));
         }
     }
-    if thickness > thickest {
+    if thin_sides < 3 {
         return None;
     }
-    // The corners of the border's own box (a blob's box is a pixel loose on some sides): all box
-    // (square) or all outside (rounded); a letter like a D is half and half.
-    let (cx0, cx1, cy0, cy1) = (x0 + nearest[2], x1 - nearest[3], y0 + nearest[0], y1 - nearest[1]);
-    let corners = [(cx0, cy0), (cx1, cy0), (cx0, cy1), (cx1, cy1)].map(|(x, y)| px(x, y).is_some_and(|c| !near(c, out, INK_STEP as u8)));
-    if corners.iter().any(|&c| c != corners[0]) {
+    // The sides share a hue of line (a shadow's darker edge is still the box's), the way a pill's two
+    // ends curve alike and a D's do not: a D is no frame.
+    if sides.iter().any(|&c| !near(c, sides[0], 48)) || curve[2].abs_diff(curve[3]) > 1 {
         return None;
     }
-    // Rounded corners leave a straight run along the top and bottom that is a good part of the width
-    // and not a few pixels: a ring or an O is rounded all the way, its flat is about `2 * sqrt(r)`
-    // wide, and the smaller it is the flatter its curve looks.
-    let wanted = if corners[0] { w * 2 / 5 } else { (w * 2 / 5).max(12) };
+    // A box whose sides are straight right out to square corners is a box. One with a curved side or
+    // rounded corners (a pill, a ring, an O) must leave a straight run along the top and bottom that is a
+    // good part of the width and not a few pixels: a circle's flat is about `2 * sqrt(r)` wide, and the
+    // smaller it is the flatter its curve looks.
+    let wanted = if squared && curve.iter().all(|&c| c <= 1) { w * 2 / 5 } else { (w * 2 / 5).max(12) };
     if straight.iter().any(|&run| run < wanted) {
         return None;
     }
-    Some((edge?, out))
+    let edge = sides.into_iter().max_by(|a, b| contrast_ratio(*a, out).total_cmp(&contrast_ratio(*b, out)))?;
+    Some((edge, out))
 }
 
 /// What a box of ink is judged as: squarish and tall enough is an icon or control, else text,

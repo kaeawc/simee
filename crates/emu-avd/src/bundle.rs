@@ -65,6 +65,12 @@ fn host_path(value: &str) -> bool {
     v.starts_with('/') || v.starts_with('~') || v.contains(":\\")
 }
 
+/// A relative path with `/` between its parts, as `image.sysdir.N` and the bundle spell it on
+/// every host (`Path::display` would put a `\` there on Windows).
+fn slashed(p: &Path) -> String {
+    p.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/")
+}
+
 /// `config.ini` for a bundle: without `image.sysdir.N` (an import writes its own) and without
 /// any key whose value is a host path (`skin.path`, `sdcard.path`, ...), which come back as the
 /// dropped keys.
@@ -113,7 +119,7 @@ impl Env {
         let build = std::fs::read_to_string(sysdir.join("build.prop")).map(|t| parse_ini(&t)).unwrap_or_default();
         let fingerprint =
             build.get("ro.system.build.fingerprint").or_else(|| build.get("ro.build.fingerprint")).cloned().unwrap_or_default();
-        let rel = self.sdk_root.as_deref().and_then(|r| sysdir.strip_prefix(r).ok()).map(|p| p.display().to_string());
+        let rel = self.sdk_root.as_deref().and_then(|r| sysdir.strip_prefix(r).ok()).map(slashed);
         Ok(AndroidImage {
             api: prop("AndroidVersion.ApiLevel")?,
             tag: prop("SystemImage.TagId")?,
@@ -148,7 +154,7 @@ impl Env {
             if !(is("AndroidVersion.ApiLevel", &want.api) && is("SystemImage.TagId", &want.tag) && is("SystemImage.Abi", &want.abi)) {
                 continue;
             }
-            let rel = sysdir.strip_prefix(root).map(|p| p.display().to_string()).unwrap_or_default();
+            let rel = sysdir.strip_prefix(root).map(slashed).unwrap_or_default();
             if !is("Pkg.Revision", &want.revision) {
                 let revision = props.get("Pkg.Revision").cloned().unwrap_or_else(|| "?".into());
                 near.push(format!("{} is revision {revision}", package_of(&rel)));
@@ -242,6 +248,7 @@ impl Env {
             compression: String::new(),
             disks: Vec::new(),
             files: Vec::new(),
+            tree: Vec::new(),
         };
         let (manifest, summary) = sim_bundle::export(header, &contents, to, opts)?;
         drop(lock);
@@ -274,7 +281,9 @@ impl Env {
         if m.platform != Platform::Android {
             return Err(Error::Config(format!("the bundle is an {} device's; this imports Android AVDs", m.platform.label())));
         }
-        let Identity::Android(image) = &m.identity;
+        let Identity::Android(image) = &m.identity else {
+            return Err(Error::Config("the bundle's manifest names no Android system image".into()));
+        };
         if let Some(p) = m.disks.iter().map(|d| &d.path).chain(m.files.iter().map(|f| &f.path)).find(|p| !allowed_path(p)) {
             return Err(Error::Config(format!("the bundle holds `{p}`, which isn't part of an AVD (config.ini, boot.prop, simee/<disk>)")));
         }
@@ -409,7 +418,7 @@ mod tests {
             let ex = env.export_avd("golden", &bundle, &Options::default()).expect("export");
             assert_no_host_path(&tmp, &bundle);
             let m = &ex.manifest;
-            let Identity::Android(img) = &m.identity;
+            let Identity::Android(img) = &m.identity else { panic!("an Android identity") };
             assert_eq!(
                 (img.api.as_str(), img.tag.as_str(), img.abi.as_str(), img.revision.as_str()),
                 ("36", "google_apis", "arm64-v8a", "7")

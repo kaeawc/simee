@@ -617,13 +617,15 @@ fn a_region_drawn_tightly_round_a_label_checks_it() {
 /// of `c` round a `fill` inside, over what is there.
 fn rounded(f: &mut Frame, at: Rect, r: f64, t: f64, c: Rgb, fill: Rgb) {
     let Rect { x, y, width: w, height: h } = at;
-    let (a, b) = ((r, r), (f64::from(w) - r, f64::from(h) - r));
+    let half = (f64::from(w) / 2.0, f64::from(h) / 2.0);
     for yy in 0..h {
         for xx in 0..w {
             let (px, py) = (f64::from(xx) + 0.5, f64::from(yy) + 0.5);
-            let d = ((px - px.clamp(a.0, b.0)).powi(2) + (py - py.clamp(a.1, b.1)).powi(2)).sqrt();
-            let outer = (r - d + 0.5).clamp(0.0, 1.0);
-            let inner = (r - t - d + 0.5).clamp(0.0, 1.0);
+            // How far the pixel is inside (negative) or outside the rounded box.
+            let (qx, qy) = ((px - half.0).abs() - (half.0 - r), (py - half.1).abs() - (half.1 - r));
+            let sd = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r;
+            let outer = (0.5 - sd).clamp(0.0, 1.0);
+            let inner = (0.5 - (sd + t)).clamp(0.0, 1.0);
             let under = get(f, x + xx, y + yy);
             set(f, x + xx, y + yy, blend(blend(under, c, outer), fill, inner));
         }
@@ -706,6 +708,142 @@ fn a_small_ring_or_o_is_a_letter_not_a_frame() {
                 assert!(report.regions.iter().all(|r| r.kind != Kind::Component), "{w}x{h} stroke {t}: {:?}", report.regions);
                 assert_eq!(report.findings().count(), 1, "{w}x{h} stroke {t}: {:?}", report.regions);
             }
+        }
+    }
+}
+
+/// A white card on white with a 1 px `edge` border, and a `shadow` `off` px down (none when `off` is 0, the
+/// shadow then a 1 px ring round the card), with `text` inside. Returns the frame and the text's box.
+fn card(radius: f64, edge: u8, shadow: u8, off: u32, text: Rgb) -> (Frame, Rect) {
+    let mut f = solid(520, 260, rgb(0xffffff));
+    let g = |v: u8| [v, v, v];
+    let at = Rect { x: 60, y: 60, width: 300, height: 90 };
+    if off == 0 {
+        rounded(
+            &mut f,
+            Rect { x: at.x - 1, y: at.y - 1, width: at.width + 2, height: at.height + 2 },
+            radius + 1.0,
+            1.0,
+            g(shadow),
+            rgb(0xffffff),
+        );
+    } else {
+        rounded(&mut f, Rect { y: at.y + off, ..at }, radius, 1.0, g(shadow), g(shadow));
+    }
+    rounded(&mut f, at, radius, 1.0, g(edge), rgb(0xffffff));
+    let text = draw_text(&mut f, 90, 90, 3, "Email", text);
+    (f, text)
+}
+
+#[test]
+fn a_cards_drop_shadow_does_not_hide_failing_text_inside_it() {
+    // The shadow darkens the bottom edge (#eeeeee on the top and sides, #e0e0e0 below).
+    for radius in [0.0, 2.0, 4.0, 8.0] {
+        for off in 0..=3 {
+            let (f, text) = card(radius, 0xee, 0xe0, off, rgb(0x8e8e93));
+            failing_text_inside(&f, text, Rect { x: 62, y: 62, width: 296, height: 86 }, 2.0);
+        }
+    }
+}
+
+#[test]
+fn a_shadowed_card_with_dark_text_passes_and_its_edge_is_its_own_finding() {
+    let (f, _) = card(0.0, 0xee, 0xe0, 2, rgb(0x111111));
+    let report = check(&f, &Options { region: None, scale: 2.0 });
+    let edge = boxes(&report, 290);
+    assert_eq!(edge.len(), 1, "{:?}", report.regions);
+    assert_eq!(edge[0].kind, Kind::Component);
+    assert!(report.findings().all(|r| r.rect.width >= 290), "the text passes: {:?}", report.regions);
+}
+
+#[test]
+fn what_a_border_shadow_and_text_sweep_finds_is_what_the_text_says() {
+    // Light borders and shadows of several strengths round boxes of several sizes: the grey text
+    // inside is a finding in every one, never swallowed by the box.
+    for (w, h) in [(300, 90), (200, 60), (130, 44)] {
+        for radius in [0.0, 2.0, 4.0, 8.0] {
+            for (edge, shadow) in [(0xee, 0xe0), (0xee, 0xee), (0xe6, 0xc8), (0xf5, 0xe0), (0xe8, 0xd8), (0xf0, 0xd2)] {
+                for off in 0..=3 {
+                    let mut f = solid(520, 260, rgb(0xffffff));
+                    let g = |v: u8| [v, v, v];
+                    let at = Rect { x: 60, y: 60, width: w, height: h };
+                    rounded(&mut f, Rect { y: at.y + off, ..at }, radius, 1.0, g(shadow), g(shadow));
+                    rounded(&mut f, at, radius, 1.0, g(edge), rgb(0xffffff));
+                    let text = draw_text(&mut f, 80, 60 + h / 2 - 10, 3, "Em", rgb(0x8e8e93));
+                    let inside = Rect { x: 62, y: 62, width: w - 4, height: h - 4 };
+                    failing_text_inside(&f, text, inside, 2.0);
+                }
+            }
+        }
+    }
+}
+
+/// The error function, to 1.5e-7 (Abramowitz and Stegun 7.1.26).
+fn erf(x: f64) -> f64 {
+    let t = 1.0 / (1.0 + 0.327_591_1 * x.abs());
+    let y =
+        1.0 - (((((1.061_405_429 * t - 1.453_152_027) * t) + 1.421_413_741) * t - 0.284_496_736) * t + 0.254_829_592) * t * (-x * x).exp();
+    y.copysign(x)
+}
+
+/// A white card on `page` with a blurred drop shadow (a Gaussian of `sigma` px, black at `alpha`, `dy` px
+/// down), and `text` inside.
+fn soft_card(page: u8, sigma: f64, alpha: f64, dy: f64, text: Rgb) -> (Frame, Rect) {
+    let mut f = solid(520, 260, [page, page, page]);
+    let (x0, y0, x1, y1) = (60.0, 60.0, 360.0, 150.0);
+    let cover = |p: f64, a: f64, b: f64| 0.5 * (erf((p - a) / (sigma * 2f64.sqrt())) - erf((p - b) / (sigma * 2f64.sqrt())));
+    for y in 20..220 {
+        for x in 20..400 {
+            let (px, py) = (f64::from(x) + 0.5, f64::from(y) + 0.5);
+            let dark = alpha * cover(px, x0, x1) * cover(py, y0 + dy, y1 + dy);
+            let under = f64::from(page) * (1.0 - dark);
+            let v = if (x0..x1).contains(&px) && (y0..y1).contains(&py) { 255 } else { under.round() as u8 };
+            set(&mut f, x, y, [v, v, v]);
+        }
+    }
+    let text = draw_text(&mut f, 90, 90, 3, "Email", text);
+    (f, text)
+}
+
+#[test]
+fn a_card_on_an_off_white_page_with_a_soft_shadow_does_not_hide_failing_text() {
+    // The card is lighter than the page and the shadow darker: the border's first pixel is shadow and
+    // the next is the card, on the other side of the page's colour.
+    for page in [0xfa, 0xf8, 0xf5, 0xff] {
+        for (sigma, alpha, dy) in [(4.0, 0.3, 3.0), (3.0, 0.25, 2.0), (6.0, 0.4, 4.0), (2.0, 0.3, 1.0)] {
+            let (f, text) = soft_card(page, sigma, alpha, dy, rgb(0x8e8e93));
+            failing_text_inside(&f, text, Rect { x: 62, y: 62, width: 296, height: 86 }, 2.0);
+        }
+    }
+}
+
+/// Draws an antialiased elliptical outline filling `at`, a `t` pixel stroke of `c` round a `fill` inside.
+fn ellipse(f: &mut Frame, at: Rect, t: f64, c: Rgb, fill: Rgb) {
+    let (a, b) = (f64::from(at.width) / 2.0, f64::from(at.height) / 2.0);
+    for yy in 0..at.height {
+        for xx in 0..at.width {
+            let (px, py) = (f64::from(xx) + 0.5 - a, f64::from(yy) + 0.5 - b);
+            let (k0, k1) = ((px / a).hypot(py / b), (px / (a * a)).hypot(py / (b * b)));
+            let sd = if k1 > 0.0 { k0 * (k0 - 1.0) / k1 } else { -b.min(a) };
+            let (outer, inner) = ((0.5 - sd).clamp(0.0, 1.0), (0.5 - (sd + t)).clamp(0.0, 1.0));
+            let under = get(f, at.x + xx, at.y + yy);
+            set(f, at.x + xx, at.y + yy, blend(blend(under, c, outer), fill, inner));
+        }
+    }
+}
+
+#[test]
+fn a_bold_oval_wider_than_tall_is_a_letter_not_a_frame() {
+    // A big O in a heavy weight: a 4 to 6 px stroke is thin enough next to the box, but its top and
+    // bottom have no straight run.
+    for w in [40, 50, 60, 70, 90, 120, 160] {
+        for t in [4.0, 5.0, 6.0] {
+            let mut f = solid(400, 240, rgb(0xffffff));
+            ellipse(&mut f, Rect { x: 60, y: 30, width: w, height: w * 3 / 5 }, t, rgb(0x8e8e93), rgb(0xffffff));
+            // At a scale that keeps it under 16 pt, where a squarish shape is a control, not text.
+            let report = check(&f, &Options { region: None, scale: (f64::from(w) * 0.6 / 12.0).max(3.0) });
+            assert!(report.regions.iter().all(|r| r.kind != Kind::Component), "{w} stroke {t}: {:?}", report.regions);
+            assert_eq!(report.findings().count(), 1, "{w} stroke {t}: {:?}", report.regions);
         }
     }
 }

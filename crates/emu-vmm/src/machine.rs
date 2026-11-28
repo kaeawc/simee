@@ -1,5 +1,5 @@
 //! The machine: builds the board, its devices and vCPUs, and runs the guest (Apple silicon only).
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -42,6 +42,9 @@ pub struct GpuSpec {
     /// pipe gets a render channel of its own, and the renderer offers none of the
     /// virtio-gpu-only extensions.
     pub pipe_gles: bool,
+    /// `-gpu metal`: posted frames are also copied on the GPU into shared IOSurfaces for clients
+    /// that take them (`emu_gfxstream::metal`, issue #356), besides being read back.
+    pub metal_present: bool,
 }
 
 static RENDERER: std::sync::OnceLock<Arc<emu_gfxstream::Renderer>> = std::sync::OnceLock::new();
@@ -49,10 +52,14 @@ static RENDERER: std::sync::OnceLock<Arc<emu_gfxstream::Renderer>> = std::sync::
 /// A Vulkan-only renderer's post notices (see `init_renderer`).
 static TICKER: std::sync::OnceLock<Arc<crate::display::PostTicker>> = std::sync::OnceLock::new();
 
-/// Post notices of a Vulkan-only renderer ([`crate::display::PostTicker`]): at most one per
-/// display frame (60 Hz) while the renderer signals fences, and for 50 ms (three frames) after.
+/// Post notices of a Vulkan-only renderer ([`crate::display::PostTicker`]): one per post while
+/// the renderer signals fences, and for 50 ms (three frames) after; at most one per display frame
+/// (60 Hz) while the last post can't be read.
 const POST_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 const POST_NOTICE_TAIL: std::time::Duration = std::time::Duration::from_millis(50);
+/// How often the ticker asks the renderer for a new post while fences come: a notice follows its
+/// post within this, instead of the fence before it (issue #201).
+const POST_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
 
 type RendererInit = std::sync::mpsc::Receiver<Result<Arc<emu_gfxstream::Renderer>>>;
 
@@ -118,6 +125,7 @@ pub fn warm_renderer(lib64: PathBuf, vulkan_only: bool, virtual_queue: bool) -> 
         virtual_queue,
         // Warming is for the virtio-gpu guests (API 33 and newer), not the GLES-pipe ones.
         pipe_gles: false,
+        metal_present: false,
     };
     renderer(&spec)?;
     Ok(t.elapsed())
@@ -209,9 +217,20 @@ fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     //   ANGLE) asserts it and aborts without.
     // EMU_RENDERER_FEATURES adds overrides, e.g. "HostComposition:disabled".
     let features = renderer_features(spec.virtual_queue, spec.pipe_gles, std::env::var("EMU_RENDERER_FEATURES").ok().as_deref());
-    // Without GL there's no post callback: fences drive the post notices instead.
-    let ticker = vulkan_only
-        .then(|| crate::display::PostTicker::start(spec.display.clone(), spec.width, spec.height, POST_NOTICE_INTERVAL, POST_NOTICE_TAIL));
+    // Without GL there's no post callback: fences wake the ticker, and it notices each change of
+    // the posted color buffer (a plain load in the renderer). Host composition cycles through
+    // three targets, so each post changes it: on API 36, 888 of 889 frames SurfaceFlinger
+    // composited over swipes were noticed, and a tap's changed frame came after 1.4 unchanged
+    // readbacks with 8.9 ms of host time (median; p90 24.7) before, none and 6.4 ms (p90 7.9)
+    // after (issue #201's tap-to-frame benchmark).
+    // Its notices are all at the display's size: each post the probe tells apart is noted at it.
+    let (pw, ph) = (spec.width, spec.height);
+    let probe: crate::display::PostProbe = Arc::new(move || RENDERER.get().and_then(|r| r.note_post(pw, ph).ok()));
+    let ticker = vulkan_only.then(|| {
+        let (w, h) = (spec.width, spec.height);
+        let probe = Some((probe, POST_PROBE_INTERVAL));
+        crate::display::PostTicker::start_probed(spec.display.clone(), w, h, POST_NOTICE_INTERVAL, POST_NOTICE_TAIL, probe)
+    });
     let fences = virtio::gpu::fence_handler();
     if let Some(t) = &ticker {
         let _ = TICKER.set(t.clone());
@@ -235,6 +254,18 @@ fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
     if direct {
         display.set_readback(Box::new(|w, h, buf| RENDERER.get().is_some_and(|r| r.read_last_posted_to(w, h, buf).is_ok())));
     }
+    if spec.metal_present {
+        // Decided before any frame: a GPU that can't alias the renderer's heaps (a VM's
+        // paravirtual one) never runs the copy.
+        match (direct && r.can_present_metal(), emu_gfxstream::metal::system_gate()) {
+            (true, Ok(())) => display.set_surface_readback(Box::new(|w, h| {
+                let s = RENDERER.get()?.last_posted_surface(w, h).ok()??;
+                Some(s as Arc<dyn crate::display::SharedSurface>)
+            })),
+            (true, Err(why)) => eprintln!("emu: -gpu metal: {why}; frames are read back"),
+            (false, _) => eprintln!("emu: -gpu metal: this renderer has no Metal handle for its color buffers; frames are read back"),
+        }
+    }
     if vulkan_only {
         return Ok(RENDERER.get_or_init(|| Arc::new(r)).clone());
     }
@@ -246,6 +277,11 @@ fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
             return;
         }
         if direct {
+            // The buffer this callback is for is still the last posted one (posts are one at a
+            // time): noted with its size before the display hears of it.
+            if let Some(r) = RENDERER.get() {
+                let _ = r.note_post(f.width, f.height);
+            }
             display.posted(f.width, f.height);
             return;
         }
@@ -261,6 +297,17 @@ fn init_renderer(spec: &GpuSpec) -> Result<Arc<emu_gfxstream::Renderer>> {
         eprintln!("emu: no host frame readback ({e}); screenshots come from the guest only");
     }
     Ok(RENDERER.get_or_init(|| Arc::new(r)).clone())
+}
+
+/// A frame the `-gpu metal` path copied into an IOSurface, as the display store holds it.
+impl crate::display::SharedSurface for emu_gfxstream::metal::MetalSurface {
+    fn size(&self) -> (u32, u32) {
+        emu_gfxstream::metal::MetalSurface::size(self)
+    }
+
+    fn mach_port(&self) -> Option<u32> {
+        emu_gfxstream::metal::MetalSurface::mach_port(self)
+    }
 }
 
 pub struct MachineConfig {
@@ -298,11 +345,16 @@ pub struct MachineConfig {
     pub telephony: Arc<telephony::Telephony>,
     /// The console's network conditions: the guest's NAT shapes its traffic by them, live.
     pub network: Arc<Mutex<sim_core::network::Conditions>>,
+    /// `net-segment` (#539): a second NIC, `eth1`, on a link subnet whose frames are relayed to
+    /// the other members' emu processes. `None`: the guest has the NAT's `eth0` alone.
+    pub net_segment: Option<sim_core::segment::SegmentSpec>,
     /// The vehicle HAL channel (`qemud:car`, console `car`). Like stock, only for car images;
     /// other guests asking for the pipe are refused.
     pub car: Option<Arc<pipe::car::Car>>,
     /// The virtio-snd card (ALSA card 0) and what it may do on the host.
     pub sound: Option<crate::audio::Options>,
+    /// The tap on the card's playback (console `audio capture`).
+    pub sound_tap: Arc<crate::audio::tap::Tap>,
     /// Touchscreen size; enables the virtio-input touchscreen, keyboard and rotary devices.
     pub input: Option<(u32, u32)>,
     /// With `input`: a multi-touch screen (false for `hw.screen=no-touch`, TV's).
@@ -335,9 +387,7 @@ pub struct Outcome {
 
 fn random_bytes<const N: usize>() -> [u8; N] {
     let mut b = [0u8; N];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut b);
-    }
+    let _ = sim_core::entropy::fill(&mut b);
     b
 }
 
@@ -448,6 +498,10 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         bail!("cpus must be in 1..=16 (got {})", cfg.cpus);
     }
     let vm = Vm::new().context("creating the VM (is the binary signed with com.apple.security.hypervisor?)")?;
+    if cfg.launched.is_some() {
+        let why = if vm.granule_kib() == 4 { "" } else { " (4 KiB needs macOS 26: hv_vm_config_set_ipa_granule)" };
+        eprintln!("emu: guest memory granule {} KiB{why}", vm.granule_kib());
+    }
     let mem = Arc::new(GuestRam::new(RAM_BASE, cfg.ram_bytes)?);
     vm.map_ram(&mem)?;
     let gic = vm.create_gic(GIC_DIST_BASE, GIC_REDIST_BASE)?;
@@ -485,6 +539,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         cmdline: &cfg.cmdline,
         initrd,
         virtio_slots: VIRTIO_MMIO_SLOTS,
+        late_slot: cfg.net_segment.is_some().then_some(slots::SEGMENT),
         pci: cfg.gpu.is_some(),
         goldfish_pipe: cfg.gpu.is_some(),
         rng_seed: random_bytes(),
@@ -589,8 +644,18 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
         }
     };
     slots[slots::NET as usize] = Some(Box::new(virtio::net::Net::new(net)));
+    // The segment's NIC, a second virtio-net: no NAT, no gateway, only the other members.
+    if let Some(spec) = &cfg.net_segment {
+        match crate::net::segment::SegmentPort::open(spec) {
+            Ok(port) => {
+                slots[slots::SEGMENT as usize] = Some(Box::new(virtio::net::Net::with_mac(spec.mac(), Box::new(port))));
+                eprintln!("emu: net-segment: member {} of {} at {}", spec.member, spec.dir.display(), spec.ip());
+            }
+            Err(e) => eprintln!("emu: net-segment: not joined ({e}); the guest has no second NIC"),
+        }
+    }
     if let Some(opts) = cfg.sound {
-        slots[slots::SOUND as usize] = Some(Box::new(virtio::snd::Snd::new(opts)));
+        slots[slots::SOUND as usize] = Some(Box::new(virtio::snd::Snd::with_tap(opts, cfg.sound_tap.clone())));
     }
     let mut dma_renderer = None;
     let mut gpu_renderer = None;
@@ -674,7 +739,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
             registry.register("qemud:car", Box::new(pipe::car::CarService { car: car.clone() }));
         }
         registry.register("multidisplay", Box::new(pipe::misc::Silent("multidisplay")));
-        registry.register("qemud:camera", Box::new(pipe::fingerprint::CameraService));
+        registry.register("qemud:camera", Box::new(pipe::camera::CameraService::new(as_area.clone())));
         // The GLES encoder's pipes on API 29–32 images, each to a render channel of its own.
         let gl_backend = cfg
             .gpu
@@ -892,6 +957,7 @@ mod tests {
             vulkan_only: false,
             virtual_queue: false,
             pipe_gles: false,
+            metal_present: false,
         }
     }
 

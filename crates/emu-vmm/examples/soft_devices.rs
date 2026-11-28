@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     registry.register("qemud:gps", Box::new(simee_emu_vmm::pipe::gps::GpsService { gps: Arc::default() }));
     registry.register("multidisplay", Box::new(simee_emu_vmm::pipe::misc::Silent("multidisplay")));
-    registry.register("qemud:camera", Box::new(simee_emu_vmm::pipe::fingerprint::CameraService));
+    registry.register("qemud:camera", Box::new(simee_emu_vmm::pipe::camera::CameraService::new(None)));
     registry.register("GLProcessPipe", Box::new(GlProcess::default()));
     let on_last_ref = gpu.as_ref().map(|(_, _, _, r)| -> simee_emu_vmm::devices::goldfish_pipe::OnLastRef {
         let r = r.clone();
@@ -176,9 +176,13 @@ fn gpu(
 
     let (w, h) = (720, 1280);
     // SwiftShader: the SDK's lavapipe crashes in a render thread minutes into a boot, and
-    // SwiftShader booted faster (docs/android.md). `EMU_VK_ICD=lavapipe` picks lavapipe.
-    let icd = if std::env::var("EMU_VK_ICD").is_ok_and(|v| v == "lavapipe") { Icd::Lavapipe } else { Icd::SwiftShader };
-    emu_gfxstream::configure_environment(lib64.parent().ok_or("lib64 has no parent")?, icd);
+    // SwiftShader booted faster (docs/android.md). `EMU_VK_ICD=lavapipe` (or gfxstream's own
+    // `ANDROID_EMU_VK_ICD=lavapipe`, which scripts/tcg-bench.py sets) picks lavapipe.
+    let lavapipe = ["EMU_VK_ICD", "ANDROID_EMU_VK_ICD"].iter().any(|k| std::env::var(k).is_ok_and(|v| v == "lavapipe"));
+    let icd = if lavapipe { Icd::Lavapipe } else { Icd::SwiftShader };
+    for n in emu_gfxstream::configure_environment(lib64.parent().ok_or("lib64 has no parent")?, icd) {
+        eprintln!("{n}");
+    }
     let r = Arc::new(Renderer::load(lib64)?);
     let store = Arc::new(FrameStore::with_idle(Duration::from_secs(5)));
     let ticker = PostTicker::start(store.clone(), w, h, Duration::from_millis(16), Duration::from_millis(50));

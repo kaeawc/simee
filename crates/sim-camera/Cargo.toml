@@ -1,0 +1,57 @@
+[package]
+name = "simee-camera"
+description = "Host camera sources for simulator and emulator devices: webcams, virtual cameras, files, synthetic patterns and other devices' screens."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["camera", "webcam", "simulator", "emulator", "v4l2"]
+categories = ["development-tools::testing", "multimedia::video", "os::macos-apis"]
+include = ["/Cargo.toml", "/LICENSE", "/fixtures", "/src"]
+
+[lib]
+doctest = false
+
+# No Android or iOS stack here, behind a feature or not: emu links this crate for its camera HAL,
+# and a feature simee enabled would reach emu too when both build in one cargo invocation (features
+# unify). `device:` sources are read by `sim-api`; emu reads them as a `feed:` from the server.
+[dependencies]
+font8x8.workspace = true
+png.workspace = true
+qrcodegen.workspace = true
+serde.workspace = true
+sim-core.workspace = true
+thiserror.workspace = true
+zune-jpeg.workspace = true
+
+# Host camera enumeration and capture: AVFoundation through the Objective-C runtime (loaded on
+# first use, so a binary that links this crate doesn't load AVFoundation until it asks for a camera).
+[target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
+libc.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+
+# V4L2 enumeration: `open` and `ioctl` on /dev/video*.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+# FFI boundary: `unsafe` is denied crate-wide and allowed only in the two host modules
+# (`src/avf.rs`, AVFoundation; `src/v4l2.rs`, V4L2 ioctls). Everything else mirrors the workspace
+# lints.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "warn"
+unwrap_used = "warn"
+undocumented_unsafe_blocks = "deny"

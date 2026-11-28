@@ -33,6 +33,7 @@ fn header() -> Manifest {
         compression: String::new(),
         disks: Vec::new(),
         files: Vec::new(),
+        tree: Vec::new(),
     }
 }
 
@@ -123,8 +124,12 @@ fn both_forms_unpack_to_the_same_bytes_with_holes_kept() {
         assert_eq!(fs::read(dest.join("simee/userdata.img")).expect("disk"), data);
         assert_eq!(fs::read(dest.join("config.ini")).expect("config"), b"AvdId=pixel\n");
         assert_eq!(fs::read(dest.join("boot.prop")).expect("boot.prop"), b"");
-        let blocks = fs::metadata(dest.join("simee/userdata.img")).expect("meta").blocks() * 512;
-        assert!(blocks < data.len() as u64 - 16 * CHUNK_SIZE, "the zero chunks stay holes: {blocks} allocated");
+        // Windows has no allocated size to read, and a copy there isn't sparse.
+        #[cfg(unix)]
+        {
+            let blocks = sim_core::hostfs::allocated_bytes(&fs::metadata(dest.join("simee/userdata.img")).expect("meta"));
+            assert!(blocks < data.len() as u64 - 16 * CHUNK_SIZE, "the zero chunks stay holes: {blocks} allocated");
+        }
     }
     // Refuses to overwrite.
     assert!(matches!(export(header(), &contents(&disk), &tmp.join("b"), &Options::default()), Err(Error::Exists(_))));
@@ -219,17 +224,20 @@ fn damaged_bundles_are_refused() {
     assert!(matches!(extract("grown.tar"), Err(Error::ChunkHash(h)) if h == hash(&big)));
 
     // A directory bundle whose manifest or chunk is a link is refused before it is read.
-    let linked = tmp.join("linked");
-    fs::create_dir_all(linked.join("chunks")).expect("dir");
-    std::os::unix::fs::symlink(tmp.join("b/manifest.json"), linked.join(MANIFEST)).expect("symlink");
-    assert!(matches!(Reader::open(&linked), Err(Error::Unsupported(_))));
-    fs::remove_file(linked.join(MANIFEST)).expect("rm");
-    fs::copy(tmp.join("b/manifest.json"), linked.join(MANIFEST)).expect("copy");
-    for h in m.chunk_hashes() {
-        fs::create_dir_all(linked.join(chunk_name(h)).parent().expect("parent")).expect("dir");
-        std::os::unix::fs::symlink("/dev/zero", linked.join(chunk_name(h))).expect("symlink");
+    #[cfg(unix)]
+    {
+        let linked = tmp.join("linked");
+        fs::create_dir_all(linked.join("chunks")).expect("dir");
+        std::os::unix::fs::symlink(tmp.join("b/manifest.json"), linked.join(MANIFEST)).expect("symlink");
+        assert!(matches!(Reader::open(&linked), Err(Error::Unsupported(_))));
+        fs::remove_file(linked.join(MANIFEST)).expect("rm");
+        fs::copy(tmp.join("b/manifest.json"), linked.join(MANIFEST)).expect("copy");
+        for h in m.chunk_hashes() {
+            fs::create_dir_all(linked.join(chunk_name(h)).parent().expect("parent")).expect("dir");
+            std::os::unix::fs::symlink("/dev/zero", linked.join(chunk_name(h))).expect("symlink");
+        }
+        assert!(matches!(extract("linked"), Err(Error::Unsupported(_))));
     }
-    assert!(matches!(extract("linked"), Err(Error::Unsupported(_))));
 
     // A base delta (#171) is reserved: a format 1 reader refuses it before writing.
     let mut delta = m.clone();
@@ -250,12 +258,20 @@ fn damaged_bundles_are_refused() {
 
 #[test]
 fn paths_and_hashes_are_checked_by_shape() {
-    for ok in ["config.ini", "simee/userdata.img", "a.b/c-d_e"] {
+    for ok in ["config.ini", "simee/userdata.img", "a.b/c-d_e", "\u{e9}t\u{e9}/stra\u{df}e"] {
         assert!(safe_path(ok), "{ok}");
     }
-    for bad in ["", "/abs", "../x", "a/../b", "a/./b", ".", "a/", "a\\b", "a\0b"] {
+    // Ignorable and format code points: a zero-width space, joiner and no-break space, a bidi
+    // override, a soft hyphen, a variation selector and a tag.
+    let ignorables = ["a\u{200b}b", "a\u{200d}b", "\u{feff}a", "a\u{202e}b", "a\u{ad}b", "a\u{fe0f}", "a\u{e0041}"];
+    for bad in ["", "/abs", "../x", "a/../b", "a/./b", ".", "a/", "a\\b", "a\0b"].into_iter().chain(ignorables) {
         assert!(!safe_path(bad), "{bad:?}");
     }
+    assert!(safe_target("../a/b") && safe_target("/System/Library") && safe_target(&"a".repeat(crate::MAX_TARGET)));
+    for bad in ["", "a\0b", "a\u{200b}"] {
+        assert!(!safe_target(bad), "{bad:?}");
+    }
+    assert!(!safe_target(&"a".repeat(crate::MAX_TARGET + 1)), "longer than macOS makes");
     assert!(is_hash(&hash(b"x")));
     assert!(!is_hash(&hash(b"x").to_uppercase()) && !is_hash("abc"));
 }

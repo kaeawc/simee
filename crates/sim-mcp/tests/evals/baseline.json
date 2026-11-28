@@ -1,0 +1,55 @@
+{
+  "about": "tests/evals.rs compares against this: the suite fails when the core tools/list grows more than 10% over core_tools_list_bytes. The tasks' tokens are for the table's comparison column. SIMEE_EVALS_UPDATE_BASELINE=1 cargo test -p simee-mcp --test evals rewrites it.",
+  "all_tools_list_bytes": 115847,
+  "core_tools_list_bytes": 24432,
+  "tasks": {
+    "audit-contrast": {
+      "all": 32976,
+      "core": 10746
+    },
+    "boot-tablet-open-settings": {
+      "all": 31479,
+      "core": 8625
+    },
+    "crash-log-line": {
+      "all": 31412,
+      "core": 8558
+    },
+    "dark-mode-screenshot": {
+      "all": 31279,
+      "core": 8425
+    },
+    "foldable-tabletop": {
+      "all": 31474,
+      "core": 11512
+    },
+    "install-and-launch": {
+      "all": 31494,
+      "core": 8640
+    },
+    "prompt-across-form-factors": {
+      "all": 35168,
+      "core": 17745
+    },
+    "prompt-audit-contrast": {
+      "all": 36701,
+      "core": 14471
+    },
+    "prompt-boot-and-install": {
+      "all": 33035,
+      "core": 15612
+    },
+    "prompt-find-slowness": {
+      "all": 31131,
+      "core": 13523
+    },
+    "prompt-reproduce-bug": {
+      "all": 42528,
+      "core": 23320
+    },
+    "read-resources-find-heavy-process": {
+      "all": 33390,
+      "core": 10622
+    }
+  }
+}

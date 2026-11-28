@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
+    <script>
+      // The reader's theme (src/theme.rs keeps the same key) before anything paints: on <html
+      // data-theme>, which the CSS below and Rune's first frame (theme::load) read, and on the
+      // browser's toolbar colour. scripts/build.sh checks every page carries this, first in <head>.
+      try { const t = localStorage.getItem("simee-theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t } catch {}
+      {
+        const root = document.documentElement
+        // The toolbar's colour: the chosen theme's, or the system's (each meta's own media).
+        const tint = () => {
+          const t = root.dataset.theme
+          for (const meta of document.querySelectorAll('meta[name="theme-color"]')) {
+            meta.dataset.media ??= meta.media
+            meta.media = t ? ((t === "dark") === (meta.content === "#000000") ? "all" : "not all") : meta.dataset.media
+          }
+        }
+        tint()
+        // Either toggle (this page's or Rune's, theme::store) changes data-theme: retint.
+        new MutationObserver(tint).observe(root, { attributes: true, attributeFilter: ["data-theme"] })
+        // The static page's theme toggle (the running head's "Theme: …" button), labelled as
+        // soon as the parser adds it, before it paints: the export carries System's label.
+        // Rune's own toggle takes over once Rune draws the page.
+        const order = ["system", "light", "dark"]
+        const name = (t) => t[0].toUpperCase() + t.slice(1)
+        const current = () => root.dataset.theme || "system"
+        let wired = false
+        const wire = () => {
+          const toggle = document.querySelector('[data-rune-static] [aria-label^="Theme: "]')
+          const text = toggle && [...toggle.querySelectorAll("*")].reverse().find((e) => !e.children.length && e.textContent.trim())
+          if (wired || !text) return
+          wired = true
+          const show = (t) => { text.textContent = name(t); toggle.setAttribute("aria-label", "Theme: " + name(t)) }
+          show(current())
+          toggle.style.cursor = "pointer"
+          toggle.addEventListener("click", (e) => {
+            e.preventDefault()
+            const next = order[(order.indexOf(current()) + 1) % order.length]
+            if (next === "system") delete root.dataset.theme
+            else root.dataset.theme = next
+            try { localStorage.setItem("simee-theme", next) } catch {}
+            show(next)
+          })
+        }
+        const watch = new MutationObserver(() => { wire(); if (wired) watch.disconnect() })
+        watch.observe(root, { childList: true, subtree: true })
+        document.addEventListener("DOMContentLoaded", () => { watch.disconnect(); wire() }, { once: true })
+      }
+    </script>
+    <!--robots-->
+    <title>__TITLE__</title>
+    <meta name="description" content="__DESCRIPTION__" />
+    <!--canonical-->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="simee" />
+    <meta property="og:title" content="__TITLE__" />
+    <meta property="og:description" content="__DESCRIPTION__" />
+    <meta property="og:url" content="__URL__" />
+    <meta property="og:image" content="__ORIGIN__/img/desktop.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="alternate" type="text/plain" href="/llms.txt" title="llms.txt" />
+    <!-- The live demo's relay: public/live.js plays its streams on /demos/. -->
+    <meta name="simee-media" content="__MEDIA__" />
+    <!-- Rune loads the same files (App::font_url), so the page and the canvas share one download. -->
+    <link rel="preload" href="/fonts/cmunrm.otf" as="font" type="font/otf" crossorigin />
+    <link rel="preload" href="/fonts/cmunbx.otf" as="font" type="font/otf" crossorigin />
+    <style>
+      @font-face { font-family: "CMU Serif"; src: url("/fonts/cmunrm.otf") format("opentype"); font-weight: 400; font-display: swap; }
+      @font-face { font-family: "CMU Serif"; src: url("/fonts/cmunti.otf") format("opentype"); font-weight: 400; font-style: italic; font-display: swap; }
+      @font-face { font-family: "CMU Serif"; src: url("/fonts/cmunbx.otf") format("opentype"); font-weight: 700; font-display: swap; }
+      :root {
+        --rune-sans: "CMU Serif", "Latin Modern Roman", Georgia, serif;
+        --rune-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+        --rune-selection: oklch(0.82 0.14 165 / 0.35);
+        --rune-focus: oklch(0.46 0.1 165);
+      }
+      html { background: #fff; color: #222; font: 400 17px/26px var(--rune-sans); text-size-adjust: 100%; color-scheme: light; }
+      /* Dark: the static page is the light export, inverted (white becomes Rune's black page);
+         pictures and the gem are turned back so they keep their colours. Rune then draws the
+         dark theme itself. Twice: for a reader who chose dark, and for the system's dark. */
+      :root[data-theme="dark"] { background: #000; color-scheme: dark; }
+      :root[data-theme="dark"] [data-rune-static] { filter: invert(1) hue-rotate(180deg); }
+      :root[data-theme="dark"] [data-rune-static] :is(img, svg[viewBox="0 0 440 300"], #brand svg) { filter: invert(1) hue-rotate(180deg); }
+      @media (prefers-color-scheme: dark) {
+        :root:not([data-theme="light"]) { background: #000; color-scheme: dark; }
+        :root:not([data-theme="light"]) [data-rune-static] { filter: invert(1) hue-rotate(180deg); }
+        :root:not([data-theme="light"]) [data-rune-static] :is(img, svg[viewBox="0 0 440 300"], #brand svg) { filter: invert(1) hue-rotate(180deg); }
+      }
+      body { margin: 0; }
+      /* Rune's export sets every element flex and only a text's own children back to inline, so a
+         link's text inside a paragraph (an <a> holding styled spans) stood on a line of its own. */
+      [data-rune-static] .t a span { display: inline; position: static; }
+      /* A path or key in code longer than a phone's line breaks, as Rune breaks it, instead of
+         widening the page. */
+      [data-rune-static] .t { overflow-wrap: break-word; }
+      :focus-visible { outline: 2px solid var(--rune-focus); outline-offset: 2px; border-radius: 4px; }
+      ::selection { background: var(--rune-selection); }
+    </style>
+    <!-- rune:css -->
+  </head>
+  <body>
+    <!-- rune:body -->
+    <script src="/live.js" defer></script>
+    <script type="module">
+      // The page is already here as static HTML; this hands it to Rune, which draws the same page
+      // on the GPU and hides the static copy once its first frame is up. Without WebGPU, or if
+      // the wasm fails, the static page stays. The wasm loads after the page has painted.
+      const start = () => import("/app/app.js").then(rune => rune.default()).catch(error => console.error(error))
+      function afterFirstPaint(then) {
+        const type = PerformanceObserver.supportedEntryTypes?.includes("largest-contentful-paint") ? "largest-contentful-paint" : "paint"
+        let done = false
+        const go = () => { if (done) return; done = true; observer.disconnect(); setTimeout(then, 0) }
+        const observer = new PerformanceObserver(go)
+        observer.observe({ type, buffered: true })
+        setTimeout(go, 3000)
+      }
+      // Rune keeps the section in view when it takes over, but its layout can differ from the
+      // static page's by a few lines per screen: put a linked heading back at the top.
+      document.addEventListener("runepresent", () => {
+        const target = location.hash && document.getElementById(decodeURIComponent(location.hash.slice(1)))
+        if (target) target.scrollIntoView()
+      }, { once: true })
+      if ("gpu" in navigator) afterFirstPaint(start)
+    </script>
+  </body>
+</html>

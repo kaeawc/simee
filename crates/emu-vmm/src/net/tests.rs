@@ -620,10 +620,14 @@ fn shaped(c: sim_core::network::Conditions) -> (Arc<std::sync::Mutex<sim_core::n
 }
 
 fn cond(up: f64, down: f64, min: i32, max: i32) -> sim_core::network::Conditions {
-    sim_core::network::Conditions { upload_bps: up, download_bps: down, min_latency_ms: min, max_latency_ms: max }
+    sim_core::network::Conditions { upload_bps: up, download_bps: down, min_latency_ms: min, max_latency_ms: max, ..Default::default() }
 }
 
 /// A host server that answers its first datagram with `count` datagrams of `size` bytes.
+///
+/// Loopback UDP is not reliable on a loaded host: macOS's `sendto` can fail with ENOBUFS and a
+/// datagram can be dropped on the way in (#569). The server retries a failed send and leaves a
+/// moment between datagrams, and [`arrivals`] tolerates the few that are still lost.
 fn burst_server(count: usize, size: usize) -> (u16, std::thread::JoinHandle<()>) {
     let server = UdpSocket::bind("127.0.0.1:0").expect("bind");
     let port = server.local_addr().expect("addr").port();
@@ -631,22 +635,64 @@ fn burst_server(count: usize, size: usize) -> (u16, std::thread::JoinHandle<()>)
         let mut b = [0u8; 64];
         let (_, from) = server.recv_from(&mut b).expect("recv");
         for i in 0..count {
-            server.send_to(&vec![i as u8; size], from).expect("send");
+            let d = vec![i as u8; size];
+            let mut tries = 0;
+            while let Err(e) = server.send_to(&d, from) {
+                tries += 1;
+                assert!(tries < 1000, "send {i}: {e}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_micros(200));
         }
     });
     (port, h)
 }
 
-/// Receives `count` datagrams, returning when each arrived since `start`.
-fn arrivals(n: &mut Nat, count: usize, start: Instant, mut each: impl FnMut(&mut Nat, usize)) -> Vec<Duration> {
+/// How long the link stays silent, with the server done sending, before [`arrivals`] decides the
+/// rest of the burst was lost. A throttled burst here releases a datagram every 80 ms at most.
+const QUIET: Duration = Duration::from_secs(2);
+
+/// The fewest datagrams of a burst of `count` that must arrive: loopback may lose a few.
+fn enough(count: usize) -> usize {
+    count - count / 5
+}
+
+/// Receives up to `count` datagrams from `server`'s burst, returning when each arrived since
+/// `start`. It stops early once the server has sent everything and nothing has arrived for
+/// [`QUIET`], and fails if fewer than [`enough`] arrived. `each` sees every arrival's ordinal.
+fn arrivals(
+    n: &mut Nat,
+    count: usize,
+    server: &std::thread::JoinHandle<()>,
+    start: Instant,
+    mut each: impl FnMut(&mut Nat, usize),
+) -> Vec<Duration> {
     let mut at = Vec::new();
+    let mut last = Instant::now();
     while at.len() < count {
-        let f = next_frame(n, Duration::from_secs(10), |f| matches!(packet::parse(f), Frame::Udp { .. }))
-            .unwrap_or_else(|| panic!("datagram {} of {count} never came (the one before it at {:?})", at.len() + 1, at.last()));
-        assert!(matches!(packet::parse(&f), Frame::Udp { .. }));
-        at.push(start.elapsed());
-        each(n, at.len());
+        // Drain before looking at the clock, so a descheduled thread still takes what is there.
+        let mut got = false;
+        while let Some(f) = n.receive() {
+            if matches!(packet::parse(&f), Frame::Udp { .. }) {
+                at.push(start.elapsed());
+                got = true;
+                each(n, at.len());
+                if at.len() == count {
+                    break;
+                }
+            }
+        }
+        if got {
+            last = Instant::now();
+            continue;
+        }
+        if server.is_finished() && last.elapsed() >= QUIET {
+            break;
+        }
+        assert!(last.elapsed() < Duration::from_secs(10), "no datagram for 10 s after {} of {count}", at.len());
+        std::thread::sleep(Duration::from_millis(1));
     }
+    assert!(at.len() >= enough(count), "only {} of {count} datagrams arrived", at.len());
     at
 }
 
@@ -657,19 +703,22 @@ fn download_is_throttled_to_the_rate_and_unlimited_is_unchanged() {
     let (_, mut n) = shaped(cond(0.0, 200_000.0, 0, 0));
     let t0 = Instant::now();
     n.transmit(&udp_frame(SocketAddrV4::new(GUEST, 40001), SocketAddrV4::new(GW, port), b"go"));
-    let at = arrivals(&mut n, 20, t0, |_, _| {});
+    let at = arrivals(&mut n, 20, &server, t0, |_, _| {});
     server.join().expect("server");
-    assert!(at[19] >= Duration::from_millis(500), "throttled: {:?}", at[19]);
-    assert!(at[19] <= Duration::from_secs(5), "{:?}", at[19]);
+    // With as few as `enough(20)` = 16 arriving, the last still waits over 0.6 s.
+    let last = *at.last().expect("arrivals");
+    assert!(last >= Duration::from_millis(500), "throttled: {last:?}");
+    assert!(last <= Duration::from_secs(5), "{last:?}");
 
     // Pin: 0 = unlimited delivers the same burst whole, with nothing held back.
     let (port, server) = burst_server(20, 1000);
     let (_, mut n) = shaped(cond(0.0, 0.0, 0, 0));
     let t0 = Instant::now();
     n.transmit(&udp_frame(SocketAddrV4::new(GUEST, 40002), SocketAddrV4::new(GW, port), b"go"));
-    let at = arrivals(&mut n, 20, t0, |_, _| {});
+    let at = arrivals(&mut n, 20, &server, t0, |_, _| {});
     server.join().expect("server");
-    assert!(at[19] < Duration::from_millis(400), "unshaped: {:?}", at[19]);
+    let last = *at.last().expect("arrivals");
+    assert!(last < Duration::from_millis(400), "unshaped: {last:?}");
 }
 
 #[test]
@@ -679,13 +728,14 @@ fn lifting_the_throttle_mid_stream_frees_what_is_held() {
     let (shared, mut n) = shaped(cond(0.0, 100_000.0, 0, 0));
     let t0 = Instant::now();
     n.transmit(&udp_frame(SocketAddrV4::new(GUEST, 40003), SocketAddrV4::new(GW, port), b"go"));
-    let at = arrivals(&mut n, 20, t0, |_, got| {
+    let at = arrivals(&mut n, 20, &server, t0, |_, got| {
         if got == 3 {
             shared.lock().expect("conditions").download_bps = 0.0;
         }
     });
     server.join().expect("server");
-    assert!(at[19] < Duration::from_millis(1300), "{:?}", at[19]);
+    let last = *at.last().expect("arrivals");
+    assert!(last < Duration::from_millis(1300), "{last:?}");
 }
 
 #[test]
@@ -948,4 +998,103 @@ fn control_frames_past_a_full_queue_hold_a_bounded_reserve_and_bulk_is_still_ref
     assert!(arp < 2000, "the reserve is bounded: {arp} replies");
     assert!(bulk <= 40, "bulk stays within the queue: {bulk}");
     drop(server);
+}
+
+// Loss: the console's `network loss`, applied at the NAT to the guest's TCP, UDP and ICMP.
+
+/// A NAT losing `up`% and `down`% of packets, its loss drawn from `seed`.
+fn lossy(up: f64, down: f64, seed: u64) -> (Arc<std::sync::Mutex<sim_core::network::Conditions>>, Nat) {
+    let c = sim_core::network::Conditions { upload_loss_pct: up, download_loss_pct: down, ..Default::default() };
+    let shared = Arc::new(std::sync::Mutex::new(c));
+    (shared.clone(), nat(Config { network: shared, loss_seed: Some(seed), ..Config::default() }))
+}
+
+fn is_echo_reply(f: &[u8]) -> bool {
+    f.len() > 34 && f[23] == packet::PROTO_ICMP && f[34] == packet::ICMP_ECHO_REPLY
+}
+
+/// The payloads a host UDP server reads until it has been quiet for `quiet`.
+fn received(server: &UdpSocket, quiet: Duration) -> Vec<Vec<u8>> {
+    server.set_read_timeout(Some(quiet)).expect("timeout");
+    let mut got = Vec::new();
+    let mut b = [0u8; 64];
+    while let Ok((n, _)) = server.recv_from(&mut b) {
+        got.push(b[..n].to_vec());
+    }
+    got
+}
+
+#[test]
+fn full_upload_loss_drops_the_guests_datagrams_and_pings_but_never_arp() {
+    let server = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let dst = SocketAddrV4::new(GW, server.local_addr().expect("addr").port());
+    let src = SocketAddrV4::new(GUEST, 40100);
+    let (shared, mut n) = lossy(100.0, 0.0, 1);
+    n.transmit(&arp_request(GW));
+    assert!(next_frame(&mut n, Duration::from_secs(5), is_arp_reply).is_some(), "ARP is link control, never lost");
+    for i in 0..5u8 {
+        n.transmit(&udp_frame(src, dst, &[i]));
+    }
+    n.transmit(&ping_frame(GW, 0x99, 1, b"lost"));
+    assert!(received(&server, Duration::from_millis(300)).is_empty(), "every datagram was lost");
+    assert!(next_frame(&mut n, Duration::from_millis(200), is_echo_reply).is_none(), "the echo request was lost");
+    // `network loss none`: the next look at the conditions lets traffic through again.
+    assert_eq!(shared.lock().expect("network").set_loss("none"), Ok(()));
+    std::thread::sleep(Duration::from_millis(120));
+    n.transmit(&udp_frame(src, dst, b"back"));
+    assert_eq!(received(&server, Duration::from_secs(2)), [b"back".to_vec()]);
+    n.transmit(&ping_frame(GW, 0x99, 2, b"back"));
+    assert!(next_frame(&mut n, Duration::from_secs(5), is_echo_reply).is_some());
+}
+
+/// For other devices' tests: a NAT at 100% loss both ways, sent a ping, loses it (true), so a
+/// test that runs beside it knows the loss is live.
+pub(crate) fn full_loss_drops_a_ping() -> bool {
+    let (_, mut n) = lossy(100.0, 100.0, 1);
+    n.transmit(&arp_request(GW));
+    assert!(next_frame(&mut n, Duration::from_secs(5), is_arp_reply).is_some(), "ARP is link control, never lost");
+    n.transmit(&ping_frame(GW, 0x97, 1, b"lost"));
+    next_frame(&mut n, Duration::from_millis(300), is_echo_reply).is_none()
+}
+
+#[test]
+fn full_download_loss_drops_what_the_host_sends_back_but_the_host_still_hears_the_guest() {
+    let server = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let dst = SocketAddrV4::new(GW, server.local_addr().expect("addr").port());
+    let echo = std::thread::spawn(move || {
+        let mut b = [0u8; 64];
+        let (len, from) = server.recv_from(&mut b).expect("recv");
+        server.send_to(&b[..len], from).expect("send");
+        b[..len].to_vec()
+    });
+    let (_, mut n) = lossy(0.0, 100.0, 1);
+    n.transmit(&arp_request(GW));
+    assert!(next_frame(&mut n, Duration::from_secs(5), is_arp_reply).is_some(), "ARP is link control, never lost");
+    n.transmit(&udp_frame(SocketAddrV4::new(GUEST, 40101), dst, b"hello"));
+    assert_eq!(echo.join().expect("echo"), b"hello", "the upload is lossless");
+    assert!(
+        next_frame(&mut n, Duration::from_millis(300), |f| matches!(packet::parse(f), Frame::Udp { .. })).is_none(),
+        "the reply was lost"
+    );
+    n.transmit(&ping_frame(GW, 0x98, 1, b"lost"));
+    assert!(next_frame(&mut n, Duration::from_millis(200), is_echo_reply).is_none(), "the echo reply was lost");
+}
+
+/// The NAT draws its loss from the seed it was given: half the guest's datagrams are lost,
+/// exactly the ones that seed's pattern picks.
+#[test]
+fn a_seeded_half_loss_drops_exactly_the_seeds_pattern() {
+    let server = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let dst = SocketAddrV4::new(GW, server.local_addr().expect("addr").port());
+    let src = SocketAddrV4::new(GUEST, 40102);
+    let frames: Vec<Vec<u8>> = (0..40u8).map(|i| udp_frame(src, dst, &[i])).collect();
+    let mut expect = super::shape::Loss::new(99);
+    expect.set(50.0, 0.0);
+    let kept: Vec<Vec<u8>> = (0..40u8).zip(&frames).filter(|(_, f)| !expect.drop_up(f)).map(|(i, _)| vec![i]).collect();
+    assert!((10..=30).contains(&kept.len()), "{}", kept.len());
+    let (_, mut n) = lossy(50.0, 0.0, 99);
+    for f in &frames {
+        n.transmit(f);
+    }
+    assert_eq!(received(&server, Duration::from_millis(500)), kept);
 }

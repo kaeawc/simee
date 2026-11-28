@@ -1,0 +1,38 @@
+# The live demo's relay: MediaMTX (website/media/README.md). WHIP/WHEP signaling over HTTPS on
+# the shared edge; WebRTC media on 8189, UDP and TCP, which needs a dedicated IPv4
+# (`fly ips allocate-v4 -a simee-media`).
+app = "simee-media"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  # Fly delivers UDP only to sockets bound to fly-global-services.
+  MTX_WEBRTCLOCALUDPADDRESS = "fly-global-services:8189"
+  # MTX_WEBRTCADDITIONALHOSTS (the dedicated IPv4) and MTX_AUTHINTERNALUSERS_1_PASS (the
+  # publisher's password) are secrets: README.md.
+
+[http_service]
+  internal_port = 8889
+  force_https = true
+  # A viewer's session and the publisher's are long-lived: keep one machine up.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[services]]
+  protocol = "udp"
+  internal_port = 8189
+  [[services.ports]]
+    port = 8189
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 8189
+  [[services.ports]]
+    port = 8189
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

@@ -7,7 +7,7 @@
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
 use std::fs::File;
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
@@ -119,6 +119,8 @@ pub struct Instance {
     /// What `network speed|delay` (and `-netspeed`/`-netdelay`) ask for: the console writes it,
     /// the guest's NAT shapes by it, and it survives a guest reset.
     pub network: std::sync::Arc<std::sync::Mutex<sim_core::network::Conditions>>,
+    /// The tap on the sound card's playback, started and stopped by the console's `audio capture`.
+    pub audio_tap: std::sync::Arc<emu_vmm::audio::tap::Tap>,
     /// Android XR images: the guest's XR service link.
     pub xr: Option<std::sync::Arc<emu_vmm::pipe::xr::Xr>>,
     /// The vehicle HAL channel, for Automotive images only (as stock).
@@ -173,7 +175,10 @@ impl Instance {
         emu_vmm::disk::ensure_sparse(&dir.join("cache.img"), CACHE_BYTES)?;
         let key_src = avd.sysdir.join("encryptionkey.img");
         if key_src.is_file() {
-            emu_vmm::disk::ensure_copy(&key_src, &dir.join("encryptionkey.img"))?;
+            let key_dst = dir.join("encryptionkey.img");
+            if !key_dst.exists() {
+                emu_avd::golden::clone_file_atomic(&key_src, &key_dst)?;
+            }
         } else {
             emu_vmm::disk::ensure_sparse(&dir.join("encryptionkey.img"), 18 << 20)?;
         }
@@ -215,15 +220,36 @@ impl Instance {
             if choice.guest_fallback {
                 eprintln!("{}", emu_avd::gpu::GUEST_FALLBACK_NOTICE);
             }
+            if let Some(n) = choice.notice {
+                eprintln!("{n}");
+            }
             let icd = match choice.backend {
                 emu_avd::gpu::Backend::SwiftShader => emu_gfxstream::Icd::SwiftShader,
                 emu_avd::gpu::Backend::Lavapipe => emu_gfxstream::Icd::Lavapipe,
-                // MoltenVK (host GPU) unless it fails on this machine; then software.
-                _ if crate::vkprobe::moltenvk_works(lib64) => emu_gfxstream::Icd::MoltenVk,
-                _ => {
-                    eprintln!("emu: MoltenVK unavailable here; using lavapipe (software Vulkan)");
-                    emu_gfxstream::Icd::Lavapipe
-                }
+                // The host GPU (MoltenVK, or KosmicKrisp for an API 35 UI on Skia GL on the
+                // guest's ANGLE) unless MoltenVK fails on this machine; then software.
+                _ => match crate::vkprobe::moltenvk(lib64) {
+                    crate::vkprobe::Verdict::Pass => {
+                        let asked = std::env::var("ANDROID_EMU_VK_ICD").ok();
+                        let kosmickrisp = emu_gfxstream::Icd::KosmicKrisp.ships_in(lib64);
+                        let picked = host_gpu_icd(avd, &guest_egl(avd), kosmickrisp, asked.as_deref());
+                        let (icd, notice) = checked_host_icd(picked, || crate::vkprobe::kosmickrisp(lib64));
+                        if let Some(n) = notice {
+                            eprintln!("{n}");
+                        } else if icd == emu_gfxstream::Icd::KosmicKrisp && opts.verbose && asked.is_none() {
+                            eprintln!("{KOSMICKRISP_NOTICE}");
+                        }
+                        icd
+                    }
+                    crate::vkprobe::Verdict::Fail => {
+                        eprintln!("emu: MoltenVK unavailable here; using lavapipe (software Vulkan)");
+                        emu_gfxstream::Icd::Lavapipe
+                    }
+                    crate::vkprobe::Verdict::Unclear(why) => {
+                        eprintln!("emu: MoltenVK's probe {why}; using lavapipe (software Vulkan) for this boot");
+                        emu_gfxstream::Icd::Lavapipe
+                    }
+                },
             };
             // The launcher directory is the parent of lib64: the SDK's `emulator/` or
             // `<sdk>/simee/renderer/<revision>/`; gfxstream finds `lib64/vulkan` and
@@ -237,7 +263,11 @@ impl Instance {
                 }
                 emu_gfxstream::prefer_angle_platform(platform);
             }
-            emu_gfxstream::configure_environment(emulator_dir, icd);
+            // gfxstream gets the driver chosen here whatever ANDROID_EMU_VK_ICD said; a user's
+            // value is reported honoured or overridden.
+            for n in emu_gfxstream::configure_environment(emulator_dir, icd) {
+                eprintln!("{n}");
+            }
         }
         let display = gpu_lib64.as_ref().map(|_| std::sync::Arc::new(emu_vmm::display::FrameStore::default()));
         let watch = display.clone().filter(|_| follows_rotation(avd));
@@ -256,6 +286,7 @@ impl Instance {
             battery: Default::default(),
             telephony: Default::default(),
             network: std::sync::Arc::new(std::sync::Mutex::new(opts.network)),
+            audio_tap: Default::default(),
             xr: is_xr(avd).then(Default::default),
             car: avd.is_car().then(Default::default),
             adb: std::sync::Arc::new(adb),
@@ -283,6 +314,7 @@ impl Instance {
             virtual_queue: virtual_queue(&guest_egl(&self.avd), AngleImage::of(&self.avd)),
             // Their GLES encoder's transport (see `pipe_gles`).
             pipe_gles: pipe_gles(&self.avd),
+            metal_present: opts.metal_present,
         })
     }
 
@@ -332,12 +364,14 @@ impl Instance {
             battery: self.battery.clone(),
             telephony: self.telephony.clone(),
             network: self.network.clone(),
+            net_segment: opts.net_segment.clone(),
             car: self.car.clone(),
             sound: plan.sound.then_some(emu_vmm::audio::Options {
                 output: !opts.no_audio,
                 input: opts.allow_host_audio && !opts.no_audio,
                 verbose: opts.verbose,
             }),
+            sound_tap: self.audio_tap.clone(),
             on_guest_event: {
                 let started = std::time::Instant::now();
                 let verbose = opts.verbose;
@@ -370,7 +404,7 @@ impl Instance {
     /// Software mode's config (#55): the plan on QEMU's TCG with emu's devices
     /// (`emu_vmm::soft`). The renderer runs on SwiftShader: the SDK's lavapipe crashed in a render
     /// thread on every booted guest (docs/android.md); `-gpu lavapipe` picks it anyway.
-    pub fn soft_config(&self, opts: &Opts, qemu: PathBuf) -> Result<emu_vmm::soft::Config> {
+    pub fn soft_config(&self, opts: &Opts, qemu: PathBuf, accel: emu_vmm::soft::Accel) -> Result<emu_vmm::soft::Config> {
         let plan = self.plan(opts);
         if !plan.x86 {
             bail!(
@@ -435,6 +469,8 @@ impl Instance {
             console,
             logcat: self.logcat.clone(),
             verbose: opts.verbose,
+            accel,
+            accel_fallback: opts.accel.is_none(),
         })
     }
 }
@@ -474,7 +510,7 @@ fn port_free(p: u16) -> bool {
 /// Creates `image` as a sparse, empty ext4 filesystem of `size` bytes.
 fn create_userdata(image: &std::path::Path, size: u64) -> Result<()> {
     let mut uuid = [0u8; 16];
-    File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut uuid)).context("reading /dev/urandom")?;
+    sim_core::entropy::fill(&mut uuid).context("reading random bytes from the OS")?;
     uuid[6] = (uuid[6] & 0x0F) | 0x40; // RFC 4122 version 4 (random)
     uuid[8] = (uuid[8] & 0x3F) | 0x80;
     let file = File::options().read(true).write(true).create_new(true).open(image)?;
@@ -690,6 +726,8 @@ pub struct BootPlan {
     pub pipe_gles: bool,
     /// An x86_64 image: stock's x86 board under QEMU's TCG (software mode, #55).
     pub x86: bool,
+    /// `-net-segment`: the second NIC on a link subnet (#539).
+    pub net_segment: Option<sim_core::segment::SegmentSpec>,
 }
 
 impl BootPlan {
@@ -736,6 +774,7 @@ impl BootPlan {
             dual_mode_mouse: xr && avd.image_feature("VirtioDualModeMouse").unwrap_or(true),
             pipe_gles: pipe_gles(avd),
             x86: avd.is_x86_64(),
+            net_segment: opts.net_segment.clone(),
         };
         let bc = bootconfig(avd, opts, plan.renderer.is_some());
         if takes_bootconfig(avd) {
@@ -830,6 +869,9 @@ impl std::fmt::Display for BootPlan {
             None => writeln!(f, "graphics  none: no renderer (-gpu off, or none installed: emu -provision-renderer)")?,
         }
         writeln!(f, "devices   {}", self.devices().join(", "))?;
+        if let Some(seg) = &self.net_segment {
+            writeln!(f, "segment   eth1 at {} on the link in {}, member {}", seg.ip(), seg.dir.display(), seg.member)?;
+        }
         let sensors: Vec<&str> =
             emu_vmm::pipe::sensors::NAMES.iter().enumerate().filter(|(h, _)| self.sensor_mask & (1 << h) != 0).map(|(_, n)| *n).collect();
         writeln!(f, "sensors   {}", sensors.join(", "))?;
@@ -964,6 +1006,55 @@ fn pipe_gles(avd: &Avd) -> bool {
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
 fn host_angle(api: Option<u32>, first_boot: bool, without_gl: bool) -> Option<&'static str> {
     (without_gl || (first_boot && api == Some(29))).then_some("swiftshader")
+}
+
+/// What `-verbose` says when a boot runs on KosmicKrisp ([`host_gpu_icd`]).
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+const KOSMICKRISP_NOTICE: &str = "emu: API 35 draws its UI with Skia GL on the guest's ANGLE: host Vulkan is KosmicKrisp, \
+     which compiles the pipelines MoltenVK refuses (#412; ANDROID_EMU_VK_ICD=moltenvk overrides)";
+
+/// The host-GPU Vulkan driver for `avd` with guest GLES `egl`: KosmicKrisp when the guest's UI
+/// draws with Skia GL on its own ANGLE on API 35 (phones, Automotive 35) and the renderer ships
+/// it (`kosmickrisp`), else MoltenVK; `asked` (`ANDROID_EMU_VK_ICD`) picks either by name. That
+/// ANGLE asks for vertex inputs whose numeric type differs from the shader's (a float format for
+/// a `uvec2` input), which Vulkan allows and Metal refuses: under MoltenVK each such pipeline
+/// fails to compile (15,303 `Render pipeline compile failed` on one API 34 boot) and the draw is
+/// lost. KosmicKrisp compiles them. API 34 has the same stack, but on KosmicKrisp its screen
+/// stays blank (guest `screencap` all white, host frame all black, #495), while MoltenVK still
+/// draws most of it, so API 34 (phones, TV, Automotive, google-xr) stays on MoltenVK;
+/// `ANDROID_EMU_VK_ICD=kosmickrisp` runs it on KosmicKrisp. API 36 and newer draw their UI with
+/// Skia on Vulkan and API 30 to 33 with the GLES encoder; they stay on MoltenVK. The selection
+/// is by API level as well as by the missing `VulkanVirtualQueue` tag: an API 36 image without
+/// it (Wear OS 36) stays on MoltenVK until a device check shows KosmicKrisp draws it. See
+/// docs/research/api34-moltenvk.md.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn host_gpu_icd(avd: &Avd, egl: &str, kosmickrisp: bool, asked: Option<&str>) -> emu_gfxstream::Icd {
+    let api_35 = avd.api_level() == Some(35);
+    let ui_gl_on_angle = api_35 && egl == "angle" && takes_bootconfig(avd) && !AngleImage::of(avd).virtual_queue;
+    emu_gfxstream::gpu_icd(ui_gl_on_angle, kosmickrisp, asked)
+}
+
+/// The driver a host-GPU boot runs: `picked` ([`host_gpu_icd`]), except that KosmicKrisp needs
+/// its probe (`kosmickrisp`, run only then) to pass; otherwise MoltenVK, with the notice saying
+/// why. An unclear probe (a timeout, a crash) isn't cached, so the next boot probes again.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn checked_host_icd(
+    picked: emu_gfxstream::Icd,
+    kosmickrisp: impl FnOnce() -> crate::vkprobe::Verdict,
+) -> (emu_gfxstream::Icd, Option<String>) {
+    use crate::vkprobe::Verdict;
+    use emu_gfxstream::Icd;
+    if picked != Icd::KosmicKrisp {
+        return (picked, None);
+    }
+    match kosmickrisp() {
+        Verdict::Pass => (Icd::KosmicKrisp, None),
+        Verdict::Fail => (Icd::MoltenVk, Some("emu: KosmicKrisp didn't come up here; using MoltenVK".into())),
+        Verdict::Unclear(why) => {
+            (Icd::MoltenVk, Some(format!("emu: KosmicKrisp's probe {why}; using MoltenVK for this boot (the next boot probes again)")))
+        }
+    }
 }
 
 /// The guest draws with ANGLE on its Vulkan (an image that boots on bootconfig, its GLES ANGLE),
@@ -1317,6 +1408,80 @@ mod tests {
             assert_eq!(host_angle(api, true, true), Some("swiftshader"), "{api:?}");
             assert_eq!(host_angle(api, false, true), Some("swiftshader"), "{api:?}");
         }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_host_gpu_driver_per_api_is_kosmickrisp_only_on_api_35_where_the_ui_is_skia_gl_on_angle() {
+        use emu_gfxstream::Icd::{KosmicKrisp, MoltenVk};
+        let s = sdk("gpu-icd");
+        // The form-factor images with the API level a real one states (the selection reads it).
+        for (dir, api) in [
+            ("android-36/android-wear-signed", 36),
+            ("android-34/android-tv", 34),
+            ("android-34-ext9/android-automotive", 34),
+            ("android-34/google-xr", 34),
+        ] {
+            let props = s.root.join("sdk/system-images").join(dir).join("arm64-v8a/source.properties");
+            std::fs::write(props, format!("AndroidVersion.ApiLevel={api}\n")).expect("source.properties");
+        }
+        add_image(&s, "r", 30, "");
+        add_image(&s, "t", 33, "AndroidbootProps2 = on\n");
+        add_image(&s, "u", 34, "AndroidbootProps2 = on\n");
+        add_image(&s, "v", 35, "AndroidbootProps2 = on\n");
+        add_image(&s, "w", 36, "AndroidbootProps2 = on\nVulkanVirtualQueue = on\n");
+        let icd = |name: &str, kosmickrisp: bool, asked: Option<&str>| {
+            let avd = s.env.load(name).expect("load");
+            host_gpu_icd(&avd, default_egl(avd.api_level()), kosmickrisp, asked)
+        };
+        // API 30 to 33: the GLES encoder. API 34 and 35: Skia GL on the guest's ANGLE, whose
+        // pipelines MoltenVK can't compile (#412); KosmicKrisp draws API 35 but leaves API 34's
+        // screen blank (#495), so API 34 stays on MoltenVK. API 36: Skia on Vulkan (skiavk).
+        let want = [("r", 30, MoltenVk), ("t", 33, MoltenVk), ("u", 34, MoltenVk), ("v", 35, KosmicKrisp), ("w", 36, MoltenVk)];
+        let wrong: Vec<String> = want
+            .iter()
+            .filter(|(name, _, want)| icd(name, true, None) != *want)
+            .map(|(name, api, want)| format!("API {api}: {:?}, want {want:?}", icd(name, true, None)))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
+        // Automotive 34, google-xr 34 and Google TV 34 draw the same way as the API 34 phone, so
+        // they stay on MoltenVK with it. An API 36 image that doesn't advertise
+        // VulkanVirtualQueue (Wear OS 36) stays on MoltenVK, as every API 36 image did before #412.
+        for name in ["car", "headset", "tv", "watch"] {
+            assert_eq!(icd(name, true, None), MoltenVk, "{name}");
+        }
+        // ANDROID_EMU_VK_ICD=kosmickrisp still puts API 34 (and its form factors) on KosmicKrisp
+        // where the renderer ships it, for investigating #495.
+        for name in ["u", "car", "headset", "tv"] {
+            assert_eq!(icd(name, true, Some("kosmickrisp")), KosmicKrisp, "{name}");
+            assert_eq!(icd(name, false, Some("kosmickrisp")), MoltenVk, "{name}");
+        }
+        // A renderer without KosmicKrisp, or ANDROID_EMU_VK_ICD=moltenvk, keeps MoltenVK.
+        for (name, ..) in want {
+            assert_eq!(icd(name, false, None), MoltenVk, "{name}");
+            assert_eq!(icd(name, true, Some("moltenvk")), MoltenVk, "{name}");
+        }
+        // The GLES encoder on an API 35 image (EMU_GUEST_EGL=emulation) has no guest ANGLE.
+        let v = s.env.load("v").expect("load");
+        assert_eq!(host_gpu_icd(&v, "emulation", true, None), MoltenVk);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn kosmickrisp_falls_back_to_moltenvk_unless_its_probe_passes() {
+        use emu_gfxstream::Icd::{KosmicKrisp, MoltenVk};
+
+        use crate::vkprobe::Verdict;
+        assert_eq!(checked_host_icd(KosmicKrisp, || Verdict::Pass), (KosmicKrisp, None));
+        let (icd, notice) = checked_host_icd(KosmicKrisp, || Verdict::Fail);
+        assert_eq!(icd, MoltenVk);
+        assert!(notice.is_some_and(|n| n.contains("using MoltenVK")));
+        // A hung or crashed probe: MoltenVK for this boot, and the notice says why.
+        let (icd, notice) = checked_host_icd(KosmicKrisp, || Verdict::Unclear("timed out after 10.0 s; killed pid 7".into()));
+        assert_eq!(icd, MoltenVk);
+        assert!(notice.is_some_and(|n| n.contains("timed out") && n.contains("using MoltenVK for this boot")));
+        // MoltenVK needs no KosmicKrisp probe.
+        assert_eq!(checked_host_icd(MoltenVk, || panic!("probed KosmicKrisp for a MoltenVK boot")), (MoltenVk, None));
     }
 
     #[test]
@@ -1738,6 +1903,19 @@ mod tests {
         ] {
             assert!(text.contains(line), "{line:?} missing from\n{text}");
         }
+    }
+
+    #[test]
+    fn the_plan_shows_the_segment_nic_only_when_asked_for() {
+        let s = sdk("segment");
+        let avd = s.env.load("phone").expect("load");
+        let plain = BootPlan::new(&avd, &Opts::default(), None);
+        assert!(plain.net_segment.is_none() && !plain.to_string().contains("segment   eth1"), "unlinked devices are unchanged");
+        let spec: sim_core::segment::SegmentSpec = "dir=/tmp/seg/pair,subnet=3,member=1".parse().expect("spec");
+        let linked = BootPlan::new(&avd, &Opts { net_segment: Some(spec), ..Opts::default() }, None);
+        assert!(linked.to_string().contains("segment   eth1 at 10.77.3.2 on the link in /tmp/seg/pair, member 1"), "{linked}");
+        // The NAT's NIC is still there, and it is still the first.
+        assert!(linked.devices().contains(&"virtio-net (link only)"));
     }
 
     /// x86_64 images get stock's x86 board (software mode, #55): the console on the first 8250

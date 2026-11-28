@@ -31,6 +31,8 @@ pub struct ConsoleInfo {
     /// What `network speed|delay` asked for (seeded by `-netspeed`/`-netdelay`). Reported by
     /// `network status` and shared with the guest's NAT, which shapes its traffic by it.
     pub network: Arc<std::sync::Mutex<sim_core::network::Conditions>>,
+    /// The tap on the sound card's playback (`audio capture`).
+    pub audio: Arc<emu_vmm::audio::tap::Tap>,
     /// A foldable's hinge (`fold`, `unfold`, `posture`).
     pub fold: Option<Arc<crate::fold::Foldable>>,
     /// The guest may turn its display without emu knowing (`crate::instance::rotation_unknown`):
@@ -52,9 +54,15 @@ fn sub_help(description: &str, subcommands: &[(&str, &str)], ko: &str) -> String
 
 /// `network status|speed <speed>|delay <latency>` (stock syntax and replies; names and
 /// values in [`sim_core::network`]). Stock reads the whole rest of the line as the argument.
+/// simee adds `network loss <percent>|<up>:<down>|none` (stock has no loss command), which the
+/// NAT applies to each direction's IP packets and `network status` reports while set.
 fn network(info: &ConsoleInfo, words: &[&str]) -> String {
-    const SUBCOMMANDS: &[(&str, &str)] =
-        &[("status", "dump network status"), ("speed", "change network speed"), ("delay", "change network latency")];
+    const SUBCOMMANDS: &[(&str, &str)] = &[
+        ("status", "dump network status"),
+        ("speed", "change network speed"),
+        ("delay", "change network latency"),
+        ("loss", "change network packet loss (simee)"),
+    ];
     const ABOUT: &str = "allows you to manage the settings related to the network data connection of the\r\nemulated device.";
     let mut conditions = info.network.lock().unwrap_or_else(|e| e.into_inner());
     match words {
@@ -66,6 +74,11 @@ fn network(info: &ConsoleInfo, words: &[&str]) -> String {
         ["delay"] => "KO: missing <delay> argument, see 'help network delay'".into(),
         ["delay", arg @ ..] if conditions.set_latency(&arg.join(" ")) => "OK".into(),
         ["delay", ..] => "KO: invalid <delay> argument, see 'help network delay' for valid values".into(),
+        ["loss"] => "KO: missing <loss> argument: network loss <percent> or <up>:<down>, each 0 to 100 (none: no loss)".into(),
+        ["loss", arg @ ..] => match conditions.set_loss(&arg.join(" ")) {
+            Ok(()) => "OK".into(),
+            Err(why) => format!("KO: invalid <loss> argument: {why}; use <percent> or <up>:<down>"),
+        },
         _ => sub_help(ABOUT, SUBCOMMANDS, "KO:  bad sub-command"),
     }
 }
@@ -97,8 +110,9 @@ fn avd_snapshot(words: &[&str]) -> String {
             format!("KO: Unable to load snapshot: Snapshots are not supported with the current graphics settings. ({SNAPSHOT_RENDERER})")
         }
         // Stock's message names `list` here.
-        ["del" | "delete"] => "KO: Argument missing, try 'avd snapshot list <name>'".into(),
-        ["del" | "delete", ..] => "OK".into(),
+        // The names come from `sim_core::console`, which the MCP server reads to ask before a delete.
+        [name] if sim_core::console::is_snapshot_delete(name) => "KO: Argument missing, try 'avd snapshot list <name>'".into(),
+        [name, ..] if sim_core::console::is_snapshot_delete(name) => "OK".into(),
         _ => sub_help(ABOUT, SUBCOMMANDS, "KO:  bad sub-command"),
     }
 }
@@ -475,6 +489,70 @@ fn xr(info: &ConsoleInfo, words: &[&str]) -> String {
     }
 }
 
+/// `audio capture start <path|unix:socket> [wav|raw]`, `audio capture stop`, `audio capture status`
+/// (simee): copies what the guest plays, as the guest wrote it, to a file (a WAV by default) or a
+/// Unix socket (raw by default). Works under `-no-audio`. The format is in the WAV header, and in
+/// every status reply once the guest has played something.
+fn audio(info: &ConsoleInfo, words: &[&str]) -> String {
+    use emu_vmm::audio::tap::{Container, Sink, Status};
+    const USAGE: &str = "KO: usage: audio capture start <path|unix:socket> [wav|raw] | audio capture stop | audio capture status";
+    fn report(s: &Status) -> String {
+        let format = s.format.map_or_else(|| "unknown (the guest hasn't played yet)".to_string(), |f| f.to_string());
+        let mut out = format!(
+            "capture: {}\r\nformat: {format}\r\nframes captured: {}\r\nframes dropped: {}\r\n",
+            if s.capturing { "running" } else { "stopped" },
+            s.captured_frames,
+            s.dropped_frames
+        );
+        if let Some(e) = &s.error {
+            out.push_str(&format!("error: {e}\r\n"));
+        }
+        out.push_str("OK");
+        out
+    }
+    let tap = &info.audio;
+    match words {
+        ["capture", "start", target, rest @ ..] if rest.len() <= 1 => {
+            if !tap.status().card {
+                return "KO: this device has no sound card to capture".into();
+            }
+            let (socket, path) = match target.strip_prefix("unix:") {
+                Some(p) => (true, p),
+                None => (false, *target),
+            };
+            let container = match (rest.first().copied(), socket) {
+                (Some("wav"), _) | (None, false) => Container::Wav,
+                (Some("raw"), _) | (None, true) => Container::Raw,
+                _ => return USAGE.into(),
+            };
+            // Opened only once the tap knows no capture is running: a refused start leaves the
+            // running capture's file alone.
+            let open = || {
+                let sink = if socket {
+                    sim_core::net::UnixStream::connect(path).map(|s| {
+                        // A reader that stops reading drops frames (counted); `stop` waits for it at most a couple of seconds.
+                        let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+                        Sink::Stream(Box::new(s))
+                    })
+                } else {
+                    std::fs::File::create(path).map(|f| Sink::Seekable(Box::new(f)))
+                };
+                sink.map_err(|e| format!("cannot open {path}: {e}"))
+            };
+            match tap.start_with(open, container) {
+                Ok(()) => "OK".into(),
+                Err(e) => format!("KO: {e}"),
+            }
+        }
+        ["capture", "stop"] => match tap.stop() {
+            Some(s) => report(&s),
+            None => "KO: no capture is running".into(),
+        },
+        ["capture", "status"] => report(&tap.status()),
+        _ => USAGE.into(),
+    }
+}
+
 const NO_TOUCH: &str = "KO: this device has no touch screen (hw.screen=no-touch)";
 
 /// Commands this console implements (stock names first, then simee extensions).
@@ -494,6 +572,7 @@ const HELP: &[(&str, &str)] = &[
     ("sms", "SMS related commands"),
     ("gsm", "GSM related commands"),
     ("network", "manage network settings"),
+    ("audio", "capture what the guest plays: capture start|stop|status (simee)"),
     ("ping", "check if the emulator is alive"),
     ("sensor", "manage emulator sensors"),
     ("screenshot", "take a screenshot of the display"),
@@ -505,10 +584,39 @@ const HELP: &[(&str, &str)] = &[
     ("frames", "number of frames presented (simee)"),
     ("xr", "Android XR head pose, room, input mode and pointer (simee)"),
     ("car", "get or set vehicle HAL properties on Automotive images (simee)"),
+    ("camera", "list or relink the back and front cameras' sources (simee)"),
 ];
 
+/// `camera list` (each camera's source) and `camera link <back|front> <source>`: a relink takes
+/// effect on the guest's next frame, at the size its camera is open at.
+fn camera(args: &[&str]) -> String {
+    use emu_vmm::pipe::camera::{Cameras, Facing, parse_link};
+    let cameras = Cameras::global();
+    match args {
+        ["list"] => {
+            let lines: Vec<String> = Facing::ALL
+                .iter()
+                .map(|&f| format!("{}: {}", f.dir(), cameras.linked(f).map_or("none".to_string(), |s| s.to_string())))
+                .collect();
+            format!("{}\r\nOK", lines.join("\r\n"))
+        }
+        ["link", facing, source @ ..] if !source.is_empty() => {
+            let Some(facing) = Facing::parse(facing) else { return "KO: no such camera (back or front)".into() };
+            match parse_link(&source.join(" ")) {
+                Ok(link) => {
+                    cameras.link(facing, link);
+                    "OK".into()
+                }
+                Err(e) => format!("KO: {e}"),
+            }
+        }
+        _ => "KO: usage: camera list | camera link back|front <source id>|emulated|none".into(),
+    }
+}
+
 fn token_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".emulator_console_auth_token"))
+    // `HOME` on unix, `USERPROFILE` on Windows, as the stock emulator has it.
+    std::env::home_dir().map(|h| h.join(".emulator_console_auth_token"))
 }
 
 /// The auth token, creating one like the stock emulator does when the file is missing.
@@ -522,10 +630,7 @@ fn token_at(path: &std::path::Path) -> Option<String> {
     match std::fs::read_to_string(path) {
         Ok(t) => Some(t.trim().to_string()).filter(|t| !t.is_empty()),
         Err(_) => {
-            let mut raw = [0u8; 12];
-            use std::io::Read;
-            std::fs::File::open("/dev/urandom").ok()?.read_exact(&mut raw).ok()?;
-            let token: String = raw.iter().map(|b| format!("{b:02x}")).collect::<String>()[..16].to_string();
+            let token = sim_core::entropy::hex(12).ok()?[..16].to_string();
             std::fs::write(path, &token).ok()?;
             Some(token)
         }
@@ -585,7 +690,7 @@ fn session(stream: TcpStream, info: &ConsoleInfo) -> std::io::Result<()> {
             // prints everything it reads, so an extra OK leaks into answers like `avd name`.
             ("quit" | "exit", _) => return Ok(()),
             (_, false) => "KO: unknown command, try 'help'".to_string(),
-            ("kill", true) => {
+            (kill, true) if kill == sim_core::console::KILL => {
                 out.write_all(b"OK: killing emulator, bye bye\r\n")?;
                 // While the guest still runs: a folded foldable's forced size goes with emu.
                 if let Some(fold) = &info.fold {
@@ -631,6 +736,7 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
         "xr" => xr(info, &words[1..]),
         "car" => car(info, &words[1..]),
         "network" => network(info, &words[1..]),
+        "audio" => audio(info, &words[1..]),
         "fold" if words.get(1) == Some(&"status") => crate::fold::status(info.fold.as_deref()),
         "fold" | "unfold" | "posture" => crate::fold::console(info.fold.as_deref(), words),
         // Stock: rotate the device 90° clockwise. Gravity in device coordinates turns the
@@ -655,6 +761,8 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
             }
             _ => "KO: usage: finger touch <fingerid> | finger remove".into(),
         },
+        // simee extension: `camera list` / `camera link back|front <source id>|emulated|none`.
+        "camera" => camera(&words[1..]),
         // simee extension: `clipboard get` / `clipboard set <text>`.
         "clipboard" => match words.get(1).copied() {
             Some("get") => format!("{}\r\nOK", String::from_utf8_lossy(&info.clipboard.get())),
@@ -830,6 +938,7 @@ mod tests {
             xr: (form_factor == FormFactor::Vision).then(Arc::default),
             car: (form_factor == FormFactor::Auto).then(Arc::default),
             network: Arc::default(),
+            audio: Arc::default(),
             fold,
             rotation_unknown: false,
         }
@@ -938,6 +1047,51 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn audio_capture_starts_stops_and_reports_the_format() {
+        let info = console(FormFactor::Phone);
+        let usage = "KO: usage: audio capture start <path|unix:socket> [wav|raw] | audio capture stop | audio capture status";
+        let path = std::env::temp_dir().join(format!("emu-audio-capture-{}.wav", std::process::id()));
+        let start = format!("audio capture start {}", path.display());
+        assert_eq!(run(&info, &start), "KO: this device has no sound card to capture");
+        info.audio.set_card(true);
+        assert_eq!(run(&info, "audio capture stop"), "KO: no capture is running");
+        assert!(run(&info, "audio capture status").starts_with("capture: stopped\r\nformat: unknown"));
+        for round in 0..2 {
+            assert_eq!(run(&info, &start), "OK", "round {round}");
+            assert!(run(&info, &start).starts_with("KO: already capturing"));
+            assert!(run(&info, "audio capture status").starts_with("capture: running\r\n"));
+            let pcm = emu_vmm::audio::tap::PcmFormat { rate: 44_100, channels: 1, format: emu_vmm::audio::Format::S16 };
+            info.audio.offer(pcm, &[1, 0, 2, 0]);
+            let stopped = run(&info, "audio capture stop");
+            assert_eq!(
+                stopped, "capture: stopped\r\nformat: 44100 Hz 1 ch s16\r\nframes captured: 2\r\nframes dropped: 0\r\nOK",
+                "round {round}"
+            );
+            let wav = std::fs::read(&path).expect("capture file");
+            assert_eq!(wav, [emu_vmm::audio::tap::wav_header(pcm, 4), vec![1, 0, 2, 0]].concat());
+        }
+        let _ = std::fs::remove_file(&path);
+        // A refused second start leaves the running capture's file alone.
+        {
+            assert_eq!(run(&info, &start), "OK");
+            info.audio
+                .offer(emu_vmm::audio::tap::PcmFormat { rate: 8_000, channels: 1, format: emu_vmm::audio::Format::S16 }, &[1, 0, 2, 0]);
+            while info.audio.status().captured_frames < 2 {
+                std::thread::yield_now();
+            }
+            assert_eq!(run(&info, &start), "KO: already capturing; stop it first");
+            run(&info, "audio capture stop");
+            let wav = std::fs::read(&path).expect("capture file");
+            assert_eq!(wav.len(), 44 + 4, "the first capture's samples survived the refused start");
+            let _ = std::fs::remove_file(&path);
+        }
+        assert!(run(&info, "audio capture start /nonexistent-dir/x.wav").starts_with("KO: cannot open /nonexistent-dir/x.wav: "));
+        assert_eq!(run(&info, "audio capture start x.wav mp3"), usage);
+        assert_eq!(run(&info, "audio"), usage);
+    }
+
     #[test]
     fn help_lists_every_command_dispatched() {
         let info = console(FormFactor::Phone);
@@ -989,6 +1143,38 @@ mod tests {
         assert!(run(&info, "network warp").ends_with("\r\nKO:  bad sub-command"));
     }
 
+    /// simee's `network loss <percent>|<up>:<down>|none`: shown in `network status` while set,
+    /// its errors say what is wrong and what it takes, and a refused argument changes nothing.
+    #[test]
+    fn network_loss_sets_each_direction_and_shows_in_status() {
+        let info = console(FormFactor::Phone);
+        assert_eq!(run(&info, "network loss 10:25"), "OK");
+        let status = run(&info, "network status");
+        assert!(status.ends_with("  maximum latency:  0 ms\r\n  download loss:    25 %\r\n  upload loss:      10 %\r\nOK"), "{status}");
+        let c = *info.network.lock().expect("network");
+        assert_eq!((c.upload_loss_pct, c.download_loss_pct), (10.0, 25.0));
+        assert_eq!(run(&info, "network loss 5"), "OK");
+        assert!(run(&info, "network status").contains("download loss:    5 %\r\n  upload loss:      5 %"));
+        assert_eq!(
+            run(&info, "network loss"),
+            "KO: missing <loss> argument: network loss <percent> or <up>:<down>, each 0 to 100 (none: no loss)"
+        );
+        assert_eq!(
+            run(&info, "network loss 120"),
+            "KO: invalid <loss> argument: `120` is out of range, each loss is 0 to 100 percent; use <percent> or <up>:<down>"
+        );
+        assert_eq!(run(&info, "network loss half"), "KO: invalid <loss> argument: `half` isn't a percentage; use <percent> or <up>:<down>");
+        assert!(run(&info, "network status").contains("upload loss:      5 %"), "a rejected argument changes nothing");
+        // Speed and delay leave it alone; `none` clears it, and the report is stock's again.
+        assert_eq!(run(&info, "network speed full"), "OK");
+        assert_eq!(run(&info, "network delay none"), "OK");
+        assert!(info.network.lock().expect("network").is_shaped());
+        assert_eq!(run(&info, "network loss none"), "OK");
+        assert!(!run(&info, "network status").contains("loss"));
+        assert!(!info.network.lock().expect("network").is_shaped());
+        assert!(run(&info, "network").contains("\r\n    loss             change network packet loss (simee)\r\n"));
+    }
+
     /// Stock's replies when it can't snapshot: every `save`/`load` is a KO a tool can fall
     /// back on, nothing is listed, and deleting succeeds with nothing to delete.
     #[test]
@@ -1002,6 +1188,10 @@ mod tests {
             run(&info, "avd snapshot load am_capture"),
             "KO: Unable to load snapshot: Snapshots are not supported with the current graphics settings. (gfxstream)"
         );
+        // Every name the MCP server asks about before a delete is one this console deletes by.
+        for name in sim_core::console::SNAPSHOT_DELETE {
+            assert_eq!(run(&info, &format!("avd snapshot {name} am_capture")), "OK", "{name}");
+        }
         assert_eq!(run(&info, "avd snapshot del am_capture"), "OK");
         assert_eq!(run(&info, "avd snapshot delete am_capture"), "OK");
         assert_eq!(run(&info, "avd snapshot list"), "There is no snapshot available.\nOK");

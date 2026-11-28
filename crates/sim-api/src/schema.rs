@@ -8,6 +8,7 @@
 //! name, platform?(ios|android); iOS: device_type      `;` starts a platform's parameters
 //! text? | base64?                                      `|` is "one of these"
 //! device, level(0-100)                                 (a-b) is a range; (x) is the default
+//! profile?("slim")                                     a quoted (x) is the one choice, no default
 //! ```
 //!
 //! [`input_schema`] reads that grammar, so a new method (or a new parameter on one) is described
@@ -49,6 +50,30 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         // mem_* (and launch's stack logging for them)
         "address" => Str,
         "raw" | "malloc_stack_logging" => Bool,
+        // camera_* and boot's camera links (#323)
+        "facing" | "source" | "kind" | "camera_back" | "camera_front" => Str,
+        // link, unlink, links and link_status (docs/design/device-links.md)
+        "link" => Str,
+        "active" => Bool,
+        "ports" if method == "link" => Obj,
+        "state" if method == "links" => Str,
+        // boot, boot_many, create and clone's admission, and admission_check (#275)
+        "admission" => Str,
+        "admission_timeout_s" | "count" => Int,
+        // every iOS method's device set (#409)
+        "set" => Str,
+        // Android's kill and exec (#414)
+        "force" => Bool,
+        "max_bytes" => Int,
+        // stream_* (#266)
+        "whip_url" | "token" | "stream_id" => Str,
+        "fps" | "max_size" | "bitrate" => Int,
+        "input" if method == "car_start" => Str,
+        "input" => Bool,
+        // car_start (#437)
+        "resolution" => Str,
+        "dpi" => Int,
+        "headless" => Bool,
         "device" | "platform" | "form_factor" | "name" | "device_type" | "runtime" | "system_image" | "path" | "url" | "bundle_id"
         | "text" | "base64" | "domain" | "key" | "language" | "uid" | "capture_id" | "program" | "command" | "predicate" | "last"
         | "preset" | "direction" | "gesture" | "button" | "phase" | "action" | "service" | "scope" | "display" | "orientation"
@@ -60,10 +85,18 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         "hold_ms" | "duration_ms" | "timeout_s" | "settle_timeout_s" | "concurrency" | "first_port" | "usage" | "pid" | "signal"
         | "ticks" | "pressure" | "level" | "wifi_bars" | "cellular_bars" | "battery_level" | "state" | "port_base" | "port_count"
         | "settle_ms" => Int,
+        // wait_idle (#114)
+        "quiet_ms" | "timeout_ms" => Int,
+        "screenshot" => Bool,
         "booted" | "on" | "suppressed" | "undo" | "shaped" | "settle" | "settle_foreground" | "audio" | "mute" | "sizes" | "offline"
         | "proxy" | "face" | "foreground" | "eraser" | "folded" | "restart" | "stream" | "all" | "allow_mismatch" | "fresh" => Bool,
+        // The Android file methods' opt-ins: `adb root` and `pm clear`.
+        "root" | "pm_clear" => Bool,
         "env" => StrMap,
         "payload" | "region" => Obj,
+        // Android notify and biometric (#419)
+        "extras" => Obj,
+        "finger_id" => Int,
         "rules" => Objects,
         _ => return None,
     })
@@ -146,8 +179,9 @@ fn parse_atom(atom: &str, only: Option<&'static str>) -> Option<Param> {
         } else if alts.len() > 1 && alts.iter().all(|a| is_choice(a)) {
             param.choices = alts.iter().map(|a| literal(a)).collect();
         } else if alts.len() == 1 && is_choice(body) && !body.trim().starts_with('.') {
-            // `timeout_s?(600)` is a default; `name(slim)`, with no `?`, is the one choice there is.
-            if optional {
+            // `timeout_s?(600)` is a default; `name(slim)`, with no `?`, is the one choice there is,
+            // and so is `profile?("slim")`, quoted: optional, with nothing applied when left out.
+            if optional && !body.trim().starts_with('"') {
                 param.default = Some(literal(body));
             } else {
                 param.choices = vec![literal(body)];
@@ -263,6 +297,25 @@ fn object(v: Value) -> Map<String, Value> {
     }
 }
 
+/// Methods whose `x`/`y` (and `x1`…`to_y`) are the device's pixels, the space `screen` reports.
+/// (`touchpad` takes touchpad units; `xr` turns and moves in radians and metres.)
+const IN_PIXELS: &[&str] = &["tap", "swipe", "touch", "stylus", "pointer"];
+
+/// The unit of a parameter, from its name: `_ms`, `_s`, `_pct`, `_kbps`, and pixel coordinates.
+fn unit(method: &str, name: &str) -> Option<&'static str> {
+    if IN_PIXELS.contains(&method) && matches!(name, "x" | "y" | "x1" | "y1" | "x2" | "y2" | "to_x" | "to_y") {
+        return Some("device pixels (the space `screen` reports), not points");
+    }
+    Some(match name {
+        _ if name.ends_with("_ms") => "milliseconds",
+        _ if name.ends_with("_s") => "seconds",
+        "cpu_pct" | "settle_cpu_pct" => "percent of one core",
+        _ if name.ends_with("_pct") => "percent",
+        _ if name.ends_with("_kbps") => "kilobits per second",
+        _ => return None,
+    })
+}
+
 /// The schema of one parameter.
 fn property(method: &str, param: &Param) -> Value {
     let ty = param_type(method, &param.name);
@@ -308,6 +361,9 @@ fn property(method: &str, param: &Param) -> Value {
     if let Some(only) = param.only {
         notes.push(format!("{only} only"));
     }
+    if let Some(unit) = unit(method, &param.name) {
+        notes.push(unit.to_owned());
+    }
     if let Some(note) = &param.note {
         notes.push(note.clone());
     }
@@ -320,6 +376,7 @@ fn property(method: &str, param: &Param) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sim_core::platform::Platform;
 
     fn schema(method: &str) -> Value {
         input_schema(method).unwrap_or_else(|| panic!("{method} is a method"))
@@ -331,7 +388,7 @@ mod tests {
         assert_eq!(tap["required"], json!(["device", "x", "y"]));
         assert_eq!(tap["properties"]["x"]["type"], "number");
         assert_eq!(tap["properties"]["hold_ms"]["type"], "integer");
-        assert_eq!(tap["properties"]["display"]["enum"], json!(["main", "outer", "inner", "carplay"]));
+        assert_eq!(tap["properties"]["display"]["enum"], json!(["main", "outer", "inner", "carplay", "car"]));
         assert_eq!(tap["properties"]["device"]["description"], "A device's UDID, name or `booted`");
         assert_eq!(schema("devices").get("required"), None, "every parameter is optional");
         assert_eq!(schema("help"), json!({"type": "object", "properties": {}}));
@@ -343,11 +400,19 @@ mod tests {
         assert_eq!(create["required"], json!(["name"]));
         assert_eq!(create["properties"]["device_type"]["description"], "iOS only");
         assert_eq!(create["properties"]["system_image"]["description"], "Android only");
+        // #421: bundles on both platforms; `allow_mismatch` is Android's, a device set iOS's.
+        let (export, import) = (schema("export"), schema("import"));
+        assert_eq!((&export["required"], &export["properties"]["to"]["type"]), (&json!(["device", "to"]), &json!("string")));
+        assert_eq!((&import["required"], &import["properties"]["from"]["type"]), (&json!(["from", "name"]), &json!("string")));
+        assert_eq!(import["properties"]["allow_mismatch"]["description"], "Android only");
+        assert_eq!((&export["properties"]["set"]["type"], &import["properties"]["set"]["type"]), (&json!("string"), &json!("string")));
         let boot = schema("boot");
         assert_eq!(boot["required"], json!(["device"]));
         assert_eq!(boot["properties"]["env"]["type"], "object");
         assert_eq!(boot["properties"]["settle_foreground"]["default"], true);
-        assert_eq!(boot["properties"]["profile"]["default"], "slim");
+        // #223: leaving `profile` out applies none, so the schema names `slim` without defaulting to it.
+        assert_eq!((boot["properties"]["profile"].get("default"), &boot["properties"]["profile"]["enum"]), (None, &json!(["slim"])));
+        assert_eq!(schema("boot_many")["properties"]["profile"]["enum"], json!(["slim"]));
         // `profile`'s `name(slim)` has no `?`: the iOS dispatcher requires it, and `slim` is its one value.
         let profile = schema("profile");
         assert_eq!(profile["required"], json!(["device", "name"]));
@@ -358,22 +423,48 @@ mod tests {
     }
 
     #[test]
+    fn admission_is_a_choice_on_every_lifecycle_call() {
+        // #275: boot and boot_many may wait; create and clone report or refuse.
+        for (method, modes) in [
+            ("boot", json!(["ignore", "refuse", "wait"])),
+            ("boot_many", json!(["ignore", "refuse", "wait"])),
+            ("create", json!(["ignore", "refuse"])),
+            ("clone", json!(["ignore", "refuse"])),
+        ] {
+            let s = schema(method);
+            assert_eq!((&s["properties"]["admission"]["enum"], s["properties"]["admission"].get("default")), (&modes, None), "{method}");
+            assert!(!s["required"].as_array().expect("required").contains(&json!("admission")), "{method}");
+        }
+        let boot = schema("boot_many");
+        assert_eq!(boot["properties"]["admission_timeout_s"], json!({"type": "integer", "description": "seconds"}));
+        let check = schema("admission_check");
+        assert_eq!(check["required"], json!(["platform"]));
+        assert_eq!(check["properties"]["platform"]["enum"], json!(["ios", "android"]));
+        assert_eq!(
+            (&check["properties"]["form_factor"]["default"], &check["properties"]["count"]["default"]),
+            (&json!("phone"), &json!(1))
+        );
+    }
+
+    #[test]
     fn alternatives_are_all_optional() {
         let write = schema("write");
         assert_eq!(write["required"], json!(["device", "path"]));
         assert!(write["properties"]["text"].is_object() && write["properties"]["base64"].is_object());
         assert_eq!(schema("console")["required"], json!(["device"]));
         assert!(schema("console")["properties"]["commands"].is_object());
-        // `audio_route`'s `uid | "default"` is the uid alone, and required: the quoted word is a value, not a name.
-        assert_eq!(schema("audio_route")["properties"].as_object().map(|p| p.len()), Some(3));
+        // `audio_route`'s `uid | "default"` is the uid alone, and required: the quoted word is a value, not a name
+        // (beside `device`, `scope` and the device set).
+        assert_eq!(schema("audio_route")["properties"].as_object().map(|p| p.len()), Some(4));
         assert_eq!(schema("audio_route")["required"], json!(["device", "scope", "uid"]));
         let rotary = schema("rotary");
         assert_eq!(rotary["required"], json!(["device"]));
         assert_eq!(rotary["properties"]["delta"]["description"], "Digital Crown units; iOS; give one of `ticks`, `delta`");
         assert_eq!(one_of("fold"), [["folded", "angle", "posture"]]);
         assert_eq!(one_of("console"), [["command", "commands"]]);
+        assert_eq!(one_of("write"), [["text", "base64"]]);
         // `text? | base64?` are both optional, and a lone name or a quoted word is no group.
-        assert!(one_of("write").is_empty() && one_of("audio_route").is_empty() && one_of("tap").is_empty());
+        assert!(parse("device, text? | base64?").1.is_empty() && one_of("audio_route").is_empty() && one_of("tap").is_empty());
     }
 
     #[test]
@@ -416,6 +507,99 @@ mod tests {
             (json!("boolean"), json!("integer"))
         );
         assert_eq!(schema("button")["properties"]["button"]["type"], "string");
+    }
+
+    /// What a dispatcher makes of `p` for the parameters that have defaults: the options it parses
+    /// them into, as text. `None`: no reader is known for that method on that platform.
+    fn parsed(method: &str, platform: Platform, p: &Value) -> Option<Result<String, String>> {
+        fn text<T: std::fmt::Debug>(r: Result<T, String>) -> Option<Result<String, String>> {
+            Some(r.map(|v| format!("{v:?}")))
+        }
+        match (platform, method) {
+            (Platform::Android, "boot") => text(crate::android::boot_options(p)),
+            (Platform::Android, "boot_many") => text(crate::android::boot_many_options(p)),
+            (Platform::Android, "import") => text(crate::android::import_allows_mismatch(p)),
+            (Platform::Android, "car_start") => text(crate::android_car::start_options(p)),
+            // Android's `settle` reads what iOS's does.
+            (Platform::Android, "settle") => text(crate::settle::options(p)),
+            // It needs a platform to read the rest.
+            (_, "admission_check") => text(crate::methods::check_params(&{
+                let mut p = p.clone();
+                p["platform"] = json!("android");
+                p
+            })),
+            (_, "contrast_check") => text(crate::contrast::sweep_options(p)),
+            (_, "stream_start") => text(crate::stream::settings(p)),
+            #[cfg(target_os = "macos")]
+            (Platform::Ios, "boot") => text(crate::ios::boot_plan_text(p, false)),
+            #[cfg(target_os = "macos")]
+            (Platform::Ios, "boot_many") => text(crate::ios::boot_plan_text(p, true)),
+            #[cfg(target_os = "macos")]
+            (Platform::Ios, "settle") => text(crate::ios::settle_options(p)),
+            #[cfg(target_os = "macos")]
+            (Platform::Ios, "logs") => text(crate::ios::log_options(p)),
+            #[cfg(target_os = "macos")]
+            (Platform::Ios, "wait_idle") => text(crate::ios::wait_idle_options(p)),
+            #[cfg(target_os = "macos")]
+            (Platform::Ios, "mem_leaks" | "mem_heap" | "mem_vmmap" | "mem_history") => text(Ok(crate::ios::mem_deadline(p))),
+            _ => None,
+        }
+    }
+
+    /// Every `default` a schema advertises is what the server does when the key is left out (#223:
+    /// `boot`'s `profile` said "slim" while the server applied none; #221: `contrast_check`'s
+    /// `appearance` said "both"). Driven by the table: each method's schema defaults, on each
+    /// platform that reads the parameter, through the options its dispatcher parses them into.
+    #[test]
+    fn every_advertised_default_is_what_the_server_does_without_the_key() {
+        let (mut checked, mut unread) = (Vec::new(), Vec::new());
+        for (method, ..) in METHODS {
+            let s = schema(method);
+            for (name, prop) in s["properties"].as_object().expect("properties") {
+                let Some(default) = prop.get("default") else { continue };
+                // The other parameters a reader needs to reach this one (settle's rule only with settle).
+                let mut base = json!({"device": "d", "settle": true});
+                let only = prop["description"].as_str().unwrap_or("");
+                for &platform in crate::platforms(method) {
+                    let reads = match platform {
+                        Platform::Ios => !only.contains("Android only"),
+                        Platform::Android => !only.contains("iOS only"),
+                    };
+                    if !reads || (platform == Platform::Ios && !cfg!(target_os = "macos")) {
+                        continue;
+                    }
+                    let Some(omitted) = parsed(method, platform, &base) else {
+                        unread.push(format!("{method}.{name} ({platform:?})"));
+                        continue;
+                    };
+                    base[name] = default.clone();
+                    let given = parsed(method, platform, &base).expect("the same reader");
+                    base.as_object_mut().expect("object").remove(name);
+                    assert_eq!(omitted, given, "{method}.{name} on {platform:?}: the schema says {default}, the server does otherwise");
+                    assert!(omitted.is_ok(), "{method} on {platform:?}: {omitted:?}");
+                    checked.push(format!("{method}.{name}"));
+                }
+            }
+        }
+        assert!(unread.is_empty(), "add a reader to `parsed` for these defaults: {unread:?}");
+        // Off macOS the iOS readers are skipped, so fewer defaults are reachable.
+        assert!(checked.len() >= if cfg!(target_os = "macos") { 8 } else { 4 }, "{checked:?}");
+        // The check can fail: a value that isn't the default parses differently.
+        let other = |method: &str, p: Value| {
+            let base = parsed(method, Platform::Android, &json!({})).expect("reader");
+            assert_ne!(base, parsed(method, Platform::Android, &p).expect("reader"), "{method} {p}");
+        };
+        other("boot", json!({"audio": true}));
+        other("contrast_check", json!({"settle_ms": 10}));
+        // `profile` has no default: leaving it out applies none, and `slim` is the one it may name.
+        let boot = schema("boot");
+        assert_eq!((boot["properties"]["profile"].get("default"), &boot["properties"]["profile"]["enum"]), (None, &json!(["slim"])));
+        #[cfg(target_os = "macos")]
+        assert_ne!(
+            parsed("boot", Platform::Ios, &json!({})),
+            parsed("boot", Platform::Ios, &json!({"profile": "slim"})),
+            "boot without a profile applies none"
+        );
     }
 
     #[test]

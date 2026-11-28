@@ -1,0 +1,4 @@
+# Text files are checked out with LF on every host. Windows' autocrlf would otherwise turn
+# committed fixtures, snapshots and generated assets (the brand SVGs, the MCP tools snapshot, the
+# helper sources a test compares byte for byte) into CRLF, and their tests fail there.
+* text=auto eol=lf

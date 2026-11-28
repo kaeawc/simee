@@ -1,8 +1,9 @@
 //! Form factors: phone, tablet, foldable, watch, tv, auto and vision, which platforms support each,
 //! and what a device of each kind looks like (screen, density, shape, fold) and takes as input.
 //!
-//! A [`Kind`] is a validated (platform, form factor) pair; [`Kind::new`] rejects combinations no
-//! platform offers (a foldable iPhone) with the reason, so callers never fall into a silent gap.
+//! A [`Kind`] is a validated (platform, form factor) pair; [`Kind::new`] would reject a combination
+//! a platform doesn't offer with the reason, so callers never fall into a silent gap. Today every
+//! pair exists: iOS's foldable is the iPhone Duo (iOS 27.1 runtimes on, [`crate::duo`]).
 
 use std::fmt;
 
@@ -84,7 +85,6 @@ impl std::error::Error for Unsupported {}
 /// The sub-platform that offers `form_factor` on `platform`, or why none does.
 pub fn sub_platform(platform: Platform, form_factor: FormFactor) -> Result<SubPlatform, Unsupported> {
     use FormFactor as F;
-    let unsupported = |reason| Unsupported { platform, form_factor, reason };
     match (platform, form_factor) {
         (Platform::Ios, F::Phone) => Ok(SubPlatform::Apple(AppleOs::Ios)),
         (Platform::Ios, F::Tablet) => Ok(SubPlatform::Apple(AppleOs::IpadOs)),
@@ -92,7 +92,8 @@ pub fn sub_platform(platform: Platform, form_factor: FormFactor) -> Result<SubPl
         (Platform::Ios, F::Tv) => Ok(SubPlatform::Apple(AppleOs::TvOs)),
         (Platform::Ios, F::Vision) => Ok(SubPlatform::Apple(AppleOs::VisionOs)),
         (Platform::Ios, F::Auto) => Ok(SubPlatform::Apple(AppleOs::CarPlay)),
-        (Platform::Ios, F::Foldable) => Err(unsupported("no Apple device or simulator runtime folds; foldables are Android-only")),
+        // The iPhone Duo (iOS 27.1 runtimes on): an iPhone, so iOS.
+        (Platform::Ios, F::Foldable) => Ok(SubPlatform::Apple(AppleOs::Ios)),
         (Platform::Android, F::Phone | F::Tablet | F::Foldable) => Ok(SubPlatform::Android(AndroidOs::Mobile)),
         (Platform::Android, F::Watch) => Ok(SubPlatform::Android(AndroidOs::WearOs)),
         (Platform::Android, F::Tv) => Ok(SubPlatform::Android(AndroidOs::Tv)),
@@ -158,10 +159,19 @@ impl Kind {
             (Platform::Ios, F::Tv) => (1920, 1080, Density::Scale(1), Shape::Rectangle),
             (Platform::Ios, F::Vision) => (2732, 2048, Density::Scale(2), Shape::Rectangle),
             (Platform::Ios, F::Auto) => (800, 480, Density::Scale(2), Shape::Rectangle),
-            // `Kind::new` never builds this.
-            (Platform::Ios, F::Foldable) => (0, 0, Density::Scale(1), Shape::Rectangle),
+            // The iPhone Duo unfolded: its inner panel as it lies open (`duo::INNER_PX` turned).
+            (Platform::Ios, F::Foldable) => (crate::duo::INNER_PX.1, crate::duo::INNER_PX.0, Density::Scale(3), Shape::Rounded),
         };
-        let fold = (self.form_factor == F::Foldable).then_some(Fold { angle: 180.0, folded_width: 1080, folded_height: 2092 });
+        let fold = match (self.platform, self.form_factor) {
+            // The Pixel Fold, open flat; its cover screen folded.
+            (Platform::Android, F::Foldable) => Some(Fold { angle: 180.0, folded_width: 1080, folded_height: 2092 }),
+            // The iPhone Duo boots closed, on its outer screen.
+            (Platform::Ios, F::Foldable) => {
+                let (w, h) = crate::duo::OUTER_PX;
+                Some(Fold { angle: crate::duo::CLOSED as f32, folded_width: w, folded_height: h })
+            }
+            _ => None,
+        };
         Profile { kind: *self, width, height, density, shape, fold, inputs: self.inputs().to_vec() }
     }
 
@@ -348,7 +358,9 @@ fn last_segment(id: &str) -> String {
 pub fn apple_kind(device_type_id: &str, runtime_id: &str) -> Option<Kind> {
     let ty = last_segment(device_type_id);
     let rt = last_segment(runtime_id);
-    let form_factor = if ty.starts_with("ipad") {
+    let form_factor = if crate::duo::folds(device_type_id) {
+        FormFactor::Foldable
+    } else if ty.starts_with("ipad") {
         FormFactor::Tablet
     } else if ty.starts_with("iphone") || ty.starts_with("ipod") {
         FormFactor::Phone
@@ -364,6 +376,12 @@ pub fn apple_kind(device_type_id: &str, runtime_id: &str) -> Option<Kind> {
         return None;
     };
     Kind::new(Platform::Ios, form_factor).ok()
+}
+
+/// An Apple device type's form factor, from its identifier and product family: the iPhone Duo
+/// (`...SimDeviceType.iPhone-Duo`) is a foldable, other types follow their family.
+pub fn apple_type_form_factor(device_type_id: &str, product_family: &str) -> Option<FormFactor> {
+    if crate::duo::folds(device_type_id) { Some(FormFactor::Foldable) } else { apple_family_form_factor(product_family) }
 }
 
 /// An Apple device type's form factor, from its product family (`iPhone`, `Apple Watch`, ...).
@@ -433,7 +451,7 @@ mod tests {
         let expect = [
             (FormFactor::Phone, Platform::Ios, Some("ios")),
             (FormFactor::Tablet, Platform::Ios, Some("ipados")),
-            (FormFactor::Foldable, Platform::Ios, None),
+            (FormFactor::Foldable, Platform::Ios, Some("ios")),
             (FormFactor::Watch, Platform::Ios, Some("watchos")),
             (FormFactor::Tv, Platform::Ios, Some("tvos")),
             (FormFactor::Auto, Platform::Ios, Some("carplay")),
@@ -450,18 +468,30 @@ mod tests {
             assert_eq!(Kind::new(p, f).ok().map(|k| k.sub_platform.as_str()), sub, "{f:?} on {p:?}");
         }
         assert_eq!(matrix().len(), 14);
-        // A foldable iPhone is the only gap.
-        assert_eq!(matrix().iter().filter(|(.., k)| k.is_err()).count(), 1);
+        // Every form factor exists on both platforms (the iPhone Duo is iOS's foldable).
+        assert!(matrix().iter().all(|(.., k)| k.is_ok()));
+        assert_eq!(Kind::new(Platform::Android, FormFactor::Vision).map(|k| k.label()), Ok("Android XR · Vision".to_owned()));
+        assert_eq!(Kind::new(Platform::Ios, FormFactor::Foldable).map(|k| k.label()), Ok("iOS · Foldable".to_owned()));
     }
 
     #[test]
     fn unsupported_pairs_say_why() {
-        let e = Kind::new(Platform::Ios, FormFactor::Foldable).expect_err("no foldable iPhone");
-        assert_eq!(
-            e.to_string(),
-            "foldable is not supported on iOS: no Apple device or simulator runtime folds; foldables are Android-only"
-        );
-        assert_eq!(Kind::new(Platform::Android, FormFactor::Vision).map(|k| k.label()), Ok("Android XR · Vision".to_owned()));
+        let e = Unsupported { platform: Platform::Ios, form_factor: FormFactor::Auto, reason: "a reason" };
+        assert_eq!(e.to_string(), "auto is not supported on iOS: a reason");
+    }
+
+    #[test]
+    fn the_iphone_duo_is_ios_s_foldable() {
+        let duo = Kind::new(Platform::Ios, FormFactor::Foldable).expect("duo").profile();
+        assert_eq!((duo.width, duo.height, duo.density, duo.shape), (2853, 2007, Density::Scale(3), Shape::Rounded));
+        let fold = duo.fold.expect("a hinge");
+        assert_eq!((fold.folded_width, fold.folded_height, fold.posture()), (1398, 2034, Posture::Closed));
+        assert!(duo.inputs.contains(&InputMethod::Hinge));
+        let dt = "com.apple.CoreSimulator.SimDeviceType.";
+        let k = apple_kind(&format!("{dt}iPhone-Duo"), "com.apple.CoreSimulator.SimRuntime.iOS-27-1").expect("kind");
+        assert_eq!((k.form_factor, k.sub_platform.as_str()), (FormFactor::Foldable, "ios"));
+        assert_eq!(apple_type_form_factor(&format!("{dt}iPhone-Duo"), "iPhone"), Some(FormFactor::Foldable));
+        assert_eq!(apple_type_form_factor(&format!("{dt}iPhone-17"), "iPhone"), Some(FormFactor::Phone));
     }
 
     #[test]

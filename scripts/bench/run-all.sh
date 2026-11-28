@@ -3,7 +3,7 @@
 #
 #   scripts/bench/run-all.sh --list                      the names, what each needs, its command
 #   scripts/bench/run-all.sh [--only NAME[,NAME]] [--kind host|android|ios|linux] [--quick]
-#                            [--rounds N] [--out DIR]
+#                            [--rounds N] [--out DIR] [--quiet | --no-quiet-gate]
 #
 # Without --only or --kind it runs all of them, which takes hours and boots devices (one at a
 # time, except the farms). Each benchmark creates and deletes its own devices; a benchmark this
@@ -11,8 +11,19 @@
 # passes --quick to each (one short round: a smoke test, not a number to publish). Results: one
 # JSON per benchmark in bench/results/ (or --out), and each one's Markdown table on stdout.
 # docs/benchmarks.md names the benchmark behind every published number.
+#
+# Every benchmark waits for a quiet host before it measures (scripts/bench/quiet.sh) and refuses,
+# exit status 4, when the host stays busy; the run stops there, since the next benchmark would wait
+# for the same busy host. --quiet is the run whose numbers get published: it looks once up front
+# (a refusal costs nothing), refuses --quick, --rounds under 3 and --no-quiet-gate, and reports a
+# benchmark whose result is noisy or otherwise not publishable (scripts/bench/summarize.py check)
+# as NOISY and exits 1. --no-quiet-gate runs without the gate (CI's smoke runs). The protocol:
+# docs/research/bench-protocol.md.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
+summarize="$here/summarize.py"
+quiet_sh="$here/quiet.sh"
+outdir=${BENCH_OUT:-$(cd "$here/../.." && pwd)/bench/results}
 # name|kind|command (relative to scripts/bench)|docs/benchmarks.md section
 # RUN_ALL_REGISTRY=FILE (with RUN_ALL_DIR for the scripts) replaces the list: scripts/bench/test-run-all.sh.
 if [ -n "${RUN_ALL_REGISTRY:-}" ]; then here=${RUN_ALL_DIR:-$here}; fi
@@ -30,12 +41,15 @@ android-gles-first|android|android-idle.sh --arms "emu emu:ANGLE_DEFAULT_PLATFOR
 android-gles-warm|android|android-idle.sh --warm --arms "emu emu:ANGLE_DEFAULT_PLATFORM=swiftshader" --launcher --window 0|API 29 (GLES over the goldfish pipe), warm boots by host GLES
 android-frames-phone|android|android-frames.sh --device phone|Frame pacing
 android-frames-tablet|android|android-frames.sh --device tablet|Frame pacing
+android-renderers|android|renderers.sh|Android renderers (docs/research/renderers.md)
 android-net|android|android-net.sh|Idle host CPU (the NAT) and NAT throughput
 android-reset|android|android-reset.sh|Emulator internals: guest resets
 android-steps|android|api-steps.sh --android|Software mode through emu -avd (tap, screenshot)
 android-farm|android|android-farm.sh|Android farm
 android-bundle|android|android-bundle.sh|Android: device bundles
 software-mode|linux|software-mode.sh|Boot to sys.boot_completed with emu's devices
+encode-linux|linux|encode-linux.sh|Video encode (H.264, OpenH264 on Linux)
+software-profile|linux|software-profile.sh|Software mode: a smaller screen and 30 Hz
 ios-boot|ios|ios-boot.sh|iOS: simee against simctl (boots)
 ios-command|ios|ios-command.sh|iOS: simee against simctl (one screenshot as a command)
 ios-steps|ios|api-steps.sh|iOS: simee against simctl (time per automation step)
@@ -56,6 +70,10 @@ EOF
 only=""
 kind=""
 pass=()
+quiet=0
+nogate=0
+rounds=""
+quick=0
 while [ $# -gt 0 ]; do
   case $1 in
     -h | --help)
@@ -77,9 +95,25 @@ while [ $# -gt 0 ]; do
       ;;
     --quick)
       pass+=(--quick)
+      quick=1
+      shift
+      ;;
+    --quiet)
+      quiet=1
+      shift
+      ;;
+    --no-quiet-gate)
+      pass+=(--no-quiet-gate)
+      nogate=1
       shift
       ;;
     --rounds | --out)
+      [ $# -ge 2 ] || {
+        echo "run-all.sh: $1 needs a value" >&2
+        exit 2
+      }
+      [ "$1" = --rounds ] && rounds=$2
+      [ "$1" = --out ] && outdir=$2
       pass+=("$1" "$2")
       shift 2
       ;;
@@ -89,6 +123,23 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+if [ "$quiet" = 1 ]; then
+  [ "$nogate" = 0 ] || {
+    echo "run-all.sh: --quiet and --no-quiet-gate contradict each other" >&2
+    exit 2
+  }
+  [ "$quick" = 0 ] || {
+    echo "run-all.sh: --quiet is the run that gets published; --quick is a smoke test" >&2
+    exit 2
+  }
+  case ${rounds:-3} in '' | *[!0-9]*) rounds=0 ;; *) ;; esac
+  [ "${rounds:-3}" -ge 3 ] || {
+    echo "run-all.sh: --quiet needs 3 or more rounds (--rounds $rounds)" >&2
+    exit 2
+  }
+  # Fail now, not after the first benchmark's build: look once, with no waiting.
+  BENCH_QUIET_WAIT=0 BENCH_QUIET_WHO=run-all.sh bash "$quiet_sh" gate >/dev/null || exit 4
+fi
 if [ -n "$only" ]; then
   for n in ${only//,/ }; do registry | grep -q "^$n|" || {
     echo "run-all.sh: no benchmark $n (--list)" >&2
@@ -98,6 +149,8 @@ fi
 summary=()
 failed=0
 interrupted=0
+marker=$(mktemp "${TMPDIR:-/tmp}/run-all-marker.XXXXXX")
+trap 'rm -f "$marker"' EXIT
 while IFS='|' read -r name k cmd section; do
   [ -n "$kind" ] && [ "$k" != "$kind" ] && continue
   if [ -n "$only" ]; then case ",$only," in *",$name,"*) ;; *) continue ;; esac fi
@@ -105,6 +158,7 @@ while IFS='|' read -r name k cmd section; do
   # The registry's commands are plain words and double-quoted --arms values.
   eval "set -- $cmd"
   script=$1
+  [ "$quiet" = 1 ] && touch "$marker"
   shift
   case $script in
     *.py)
@@ -117,8 +171,28 @@ while IFS='|' read -r name k cmd section; do
       ;;
   esac
   case $rc in
-    0) summary+=("ok       $name") ;;
+    0)
+      if [ "$quiet" = 1 ]; then
+        # The records this benchmark just wrote: all of them must be publishable.
+        records=$(find "$outdir" -name '*.host.json' -newer "$marker" 2>/dev/null)
+        # shellcheck disable=SC2086 # file names from find, no spaces in bench's own names
+        if [ -z "$records" ] || ! verdict=$(python3 -I "$summarize" check $records); then
+          summary+=("NOISY    $name: ${verdict:-no result record in $outdir}")
+          failed=1
+        else
+          summary+=("ok       $name")
+        fi
+      else
+        summary+=("ok       $name")
+      fi
+      ;;
     3) summary+=("skipped  $name") ;;
+    # 4: the host is not quiet (bench_gate). Stop: every later benchmark would wait for the same host.
+    4)
+      summary+=("REFUSED  $name: the host is not quiet; the remaining benchmarks were not run")
+      interrupted=4
+      break
+      ;;
     # 130 and 143: the child was interrupted (lib.sh turns SIGINT and SIGTERM into these exits).
     # Stop the whole run: the next benchmark would boot another device the user asked to stop.
     130 | 143)

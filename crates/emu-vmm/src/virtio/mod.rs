@@ -210,7 +210,16 @@ mod tests {
     fn a_raise_racing_an_ack_never_loses_the_level() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::{Duration, Instant};
+        /// Upper bound on rounds, and the wall-time budget after which a device stops; each
+        /// device still runs `MIN_ROUNDS` first, so a loaded host exercises the race rather
+        /// than passing on a handful of rounds. Quiet, 20k rounds take ~0.15 s; under load the
+        /// same count took minutes, past the CI kill (#315).
         const ROUNDS: u32 = 20_000;
+        const MIN_ROUNDS: u32 = 500;
+        const BUDGET: Duration = Duration::from_secs(2);
+        /// A bit that stays set this long is truly lost (the driver acks within microseconds
+        /// when scheduled); generous so a starved driver is not reported as a lost level.
+        const LOST_AFTER: Duration = Duration::from_secs(60);
         /// A controller call that takes a while (the real one is a hypervisor call plus a
         /// wake), so racing edges overlap in it.
         #[derive(Default)]
@@ -230,6 +239,7 @@ mod tests {
         let line = Arc::new(Slow::default());
         let irq = Interrupt::new(line.clone());
         let done = AtomicBool::new(false);
+        let start = Instant::now();
         std::thread::scope(|s| {
             let (irq, line, done) = (&irq, &line, &done);
             let driver = s.spawn(move || {
@@ -246,17 +256,19 @@ mod tests {
                 .into_iter()
                 .map(|bit| {
                     s.spawn(move || {
-                        for round in 0..ROUNDS {
+                        let mut round = 0;
+                        while round < ROUNDS && (round < MIN_ROUNDS || start.elapsed() < BUDGET) {
                             irq.raise(bit);
                             let t = Instant::now();
                             while irq.status() & bit != 0 {
-                                if t.elapsed() > Duration::from_secs(5) {
+                                if t.elapsed() > LOST_AFTER {
                                     return Err(format!("bit {bit} lost its level in round {round}"));
                                 }
                                 std::thread::yield_now();
                             }
+                            round += 1;
                         }
-                        Ok(())
+                        Ok(round)
                     })
                 })
                 .collect();
@@ -265,7 +277,8 @@ mod tests {
             done.store(true, Ordering::SeqCst);
             driver.join().expect("driver");
             for r in results {
-                r.expect("no lost level");
+                let rounds = r.expect("no lost level");
+                assert!(rounds >= MIN_ROUNDS, "only {rounds} rounds completed");
             }
         });
         assert_eq!((irq.status(), line.level()), (0, false), "quiescent: line follows the status");

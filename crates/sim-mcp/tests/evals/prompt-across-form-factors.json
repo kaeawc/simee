@@ -1,0 +1,37 @@
+{
+  "name": "prompt-across-form-factors",
+  "goal": "Follow the across-form-factors prompt: /fixtures/Notes.app on an iOS phone, tablet and car, then shut the devices down.",
+  "toolsets": "core,lifecycle",
+  "prompt": {"name": "across-form-factors", "arguments": {"app_path": "/fixtures/Notes.app", "form_factors": "phone,tablet,auto"}},
+  "world": {
+    "devices": [
+      {"udid": "iphone-17", "name": "iPhone 17", "platform": "ios", "form_factor": "phone", "state": "Shutdown"}
+    ],
+    "packages": {"/fixtures/Notes.app": "com.example.notes"}
+  },
+  "plan": [
+    {"tool": "form_factors", "args": {"platform": "ios"}, "expect": {"contains": ["CarPlay"]}},
+    {"tool": "devices", "args": {"platform": "ios", "form_factor": "phone"}, "expect": {"contains": ["iphone-17"]}},
+    {"tool": "devices", "args": {"platform": "ios", "form_factor": "tablet"}, "expect": {"contains": ["[]"]}},
+    {"tool": "create", "args": {"name": "iPad Pro", "platform": "ios", "form_factor": "tablet",
+                                "device_type": "com.apple.CoreSimulator.SimDeviceType.iPad-Pro-13-inch-M5",
+                                "runtime": "com.apple.CoreSimulator.SimRuntime.iOS-27-2"},
+     "expect": {"contains": ["created-ipad-pro"]}},
+    {"tool": "boot_many", "args": {"devices": ["iphone-17", "created-ipad-pro"], "admission": "wait"}, "expect": {"contains": ["\"failed\":0"]}},
+    {"tool": "install", "args": {"device": "iphone-17", "path": "/fixtures/Notes.app"}},
+    {"tool": "apps", "args": {"device": "iphone-17"}, "expect": {"contains": ["com.example.notes"]}},
+    {"tool": "launch", "args": {"device": "iphone-17", "bundle_id": "com.example.notes"}},
+    {"tool": "screenshot", "args": {"device": "iphone-17"}},
+    {"tool": "install", "args": {"device": "created-ipad-pro", "path": "/fixtures/Notes.app"}},
+    {"tool": "apps", "args": {"device": "created-ipad-pro"}, "expect": {"contains": ["com.example.notes"]}},
+    {"tool": "launch", "args": {"device": "created-ipad-pro", "bundle_id": "com.example.notes"}},
+    {"tool": "screenshot", "args": {"device": "created-ipad-pro"}},
+    {"tool": "shutdown", "args": {"device": "iphone-17"}},
+    {"tool": "shutdown", "args": {"device": "created-ipad-pro"}}
+  ],
+  "end": {
+    "shutdown": ["iphone-17", "created-ipad-pro"],
+    "installed": {"iphone-17": ["com.example.notes"], "created-ipad-pro": ["com.example.notes"]},
+    "screenshot_shows": {"iphone-17": ["app=com.example.notes"], "created-ipad-pro": ["app=com.example.notes", "form_factor=tablet"]}
+  }
+}

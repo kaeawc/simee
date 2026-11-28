@@ -18,7 +18,8 @@ on macOS and depends (normal or dev) on a crate that is in. Code gated off on ma
 missing from the list (or listed without reason), so the macOS test run can't silently drop one.
 `check` also derives what Software mode's `cargo build -p` compiles on Linux (`cargo metadata`,
 then the module trees) and fails when its pull_request paths skip a file that build reads, or
-name a crate it doesn't build.
+name a crate it doesn't build. And it checks that desktop/Cargo.toml's `ci` profile builds every
+workspace crate the desktop depends on at opt-level 0 (its registry dependencies stay at 2).
 
 `changes` reads changed paths (one per line; renames as both paths) and prints `lint`,
 `desktop`, `emu` and `macos` (desktop or emu) as true/false: whether the change can affect the
@@ -621,12 +622,15 @@ def cmd_check():
                           % (LIST, n, "; ".join(derived[n][:3])))
     sw_errors, sw_crates = software_errors(crates)
     errors += sw_errors
+    profile_errors, local = desktop_profile_errors(crates)
+    errors += profile_errors
     for e in errors:
         print("ci-scope: " + e, file=sys.stderr)
     if not errors:
         print("ci-scope: %s matches the %d crates that can behave differently on macOS" % (LIST, sum(1 for v in derived.values() if v)))
         print("ci-scope: %s's pull_request paths take every file its build of %d crates reads on Linux"
               % (SOFTWARE, len(sw_crates)))
+        print("ci-scope: %s's ci profile builds its %d path dependencies at opt-level 0" % (DESKTOP, len(local)))
     return 1 if errors else 0
 
 
@@ -656,7 +660,9 @@ def glob_re(pattern):
 
 
 def filter_runs(patterns, path):
-    """Whether a paths filter takes path: the last pattern that matches wins, `!` excludes."""
+    """Whether a paths filter takes path: the last pattern that matches wins, `!` excludes.
+    The patterns and git name files with `/`, so a path joined by Windows's `os.path` does too."""
+    path = path.replace(os.sep, "/")
     hit = False
     for pat in patterns:
         if glob_re(pat.lstrip("!")).match(path):
@@ -758,7 +764,7 @@ def software_inputs(crates, names):
                 if not p:
                     raise ValueError("%s:%d includes a path ci-scope can't read" % (f, ln))
                 out.add(p)
-    return out
+    return {f.replace(os.sep, "/") for f in out}
 
 
 def software_errors(crates):
@@ -807,11 +813,35 @@ def desktop_deps(crates):
     return out
 
 
+DESKTOP = "desktop/Cargo.toml"
+
+
+def desktop_profile_errors(crates):
+    """The desktop's `ci` profile names every workspace crate it builds as a path dependency, and
+    nothing else, at opt-level 0: one it misses builds at `dev`'s opt-level 2 in CI, and one it
+    names that the desktop doesn't build makes cargo warn (#213)."""
+    local = desktop_deps(crates)
+    named = {}
+    for h, lines in toml_sections(read(DESKTOP)):
+        m = re.match(r'profile\.ci\.package\."?([A-Za-z0-9_-]+)"?$', h)
+        if m:
+            named[m.group(1)] = any(re.match(r"opt-level\s*=\s*0$", ln) for ln in lines)
+    errors = []
+    for n in sorted(local - set(named)):
+        errors.append("%s: the desktop builds %s; add [profile.ci.package.%s] with opt-level = 0" % (DESKTOP, n, n))
+    for n in sorted(set(named) - local):
+        errors.append("%s: [profile.ci.package.%s] names a package the desktop doesn't build from this workspace" % (DESKTOP, n))
+    for n in sorted(k for k, zero in named.items() if not zero and k in local):
+        errors.append("%s: [profile.ci.package.%s] should set opt-level = 0" % (DESKTOP, n))
+    return errors, local
+
+
 REFERENCED = re.compile(r'"(?:\.\./)*((?:docs|scripts)/[A-Za-z0-9_./-]+)"')
 
-# Paths no job here reads: docs, other workflows, local tooling, the script and docs linters'
-# configs, and scripts nothing below names.
-NONE = re.compile(r"^(docs/|\.github/workflows/(?:software-mode|release)\.yml$|\.githooks/|\.local/|LICENSE$|\.gitignore$"
+# Paths no job here reads: docs, other workflows, the website (its own workspace and workflow,
+# website.yml), local tooling, the script and docs linters' configs, and scripts nothing below
+# names.
+NONE = re.compile(r"^(docs/|website/|\.github/workflows/(?:software-mode|release|website)\.yml$|\.githooks/|\.local/|LICENSE$|\.gitignore$"
                   r"|Makefile$|bacon\.toml$|rustfmt\.toml$|\.editorconfig$|\.shellcheckrc$|\.yamllint\.yml$"
                   r"|lychee\.toml$|_typos\.toml$)|\.md$|^scripts/")
 # Scripts only the docs-scripts job runs: it runs on every change, so they reach no scoped job.

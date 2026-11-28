@@ -1,0 +1,51 @@
+name: Windows
+
+# The Windows build (#243): the workspace builds, lints and runs its device-free tests on
+# `windows-latest` (x86_64-pc-windows-msvc). Its own workflow, so ci.yml's jobs and its macOS
+# scoping stay as they are; the checks are `cargo xtask check` (xtask/), the program that does
+# what scripts/check.sh does where there is no bash. Android devices only: iOS stays macOS, and
+# booting a guest on Windows (a hypervisor backend) is a separate issue, so no test boots one.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: short
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      # Two commits deep: `cargo xtask check` lists the changed files against the first parent.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: ./.github/actions/rust-toolchain
+      # Restore only. The repository's Actions cache is over its 10 GB limit, so a Windows entry
+      # (GBs of targets) would evict the entries the other jobs hit. Nothing saves `windows`, so
+      # this restores nothing until a run is allowed to (`save-if` to main), and every run builds
+      # its dependencies cold.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: windows
+          save-if: false
+      - run: cargo build --workspace --locked
+      # fmt, clippy -D warnings, and the workspace's tests (cargo test: nextest isn't installed
+      # here), with the tests that need a Unix socket, `/bin/sh` or a hypervisor compiled out.
+      - run: cargo xtask check

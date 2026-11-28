@@ -44,6 +44,7 @@ mod tests {
         // Every tool the page calls is a tool this server has.
         for tool in ["screenshot", "tap", "swipe", "type", "button"] {
             assert!(page.contains(&format!("'{tool}'")) && crate::tools::exists(tool), "{tool}");
+            assert!(crate::tools::Toolsets::default().contains(tool), "{tool} is in the default toolset, beside the view");
         }
         assert!(!page.contains("http://") && !page.contains("https://"), "no external origins");
         assert_eq!(contents()["mimeType"], MIME);

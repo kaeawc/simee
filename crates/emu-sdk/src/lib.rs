@@ -9,6 +9,7 @@
 //! (see [`renderer`]). Other hosts (Linux, for preparing images and AVDs) use the `curl` and
 //! `unzip` on their `PATH`.
 
+pub mod dhu;
 mod manifest;
 pub mod renderer;
 
@@ -19,7 +20,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 pub use manifest::{
-    Archive, Download, Host, Manifest, RemotePackage, Revision, SysImagePath, install_dir, parse_site_list, system_image_path,
+    Archive, Download, Host, License, Manifest, RemotePackage, Revision, SysImagePath, install_dir, parse_site_list, system_image_path,
 };
 
 /// Google's SDK repository.
@@ -79,6 +80,8 @@ pub enum Error {
     Verify { path: PathBuf, what: &'static str, expected: String, got: String },
     #[error("{0}: expected exactly one top-level directory in the archive, found {1} entries")]
     Layout(PathBuf, usize),
+    #[error("package license '{0}' not accepted")]
+    License(String),
     #[error("{0}: no emulator/lib64/{1} in the archive")]
     NoRenderer(PathBuf, &'static str),
 }
@@ -115,15 +118,44 @@ pub fn format_size(bytes: u64) -> String {
     if b >= 1e9 { format!("{:.2} GB", b / 1e9) } else { format!("{:.1} MB", b / MB) }
 }
 
-/// Moves the unpacked directory `src` to `dest`, replacing whatever is there.
-fn replace_dir(src: &Path, dest: &Path) -> Result<()> {
+/// Moves the unpacked directory `src` to `dest`, replacing whatever is there. The old directory
+/// is set aside first and put back if the move fails, so `dest` is never left half-replaced.
+fn replace_dir(src: &Path, dest: &Path, aside_dir: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(io(parent))?;
     }
-    if dest.symlink_metadata().is_ok() {
-        std::fs::remove_dir_all(dest).map_err(io(dest))?;
+    if dest.symlink_metadata().is_err() {
+        return std::fs::rename(src, dest).map_err(io(dest));
     }
-    std::fs::rename(src, dest).map_err(io(dest))
+    // Under the downloads directory, not beside `dest`: a leftover must not look like a package.
+    std::fs::create_dir_all(aside_dir).map_err(io(aside_dir))?;
+    let name = dest.file_name().unwrap_or_default().to_string_lossy();
+    let aside = aside_dir.join(format!("{name}.old-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&aside);
+    std::fs::rename(dest, &aside).map_err(io(dest))?;
+    if let Err(e) = std::fs::rename(src, dest) {
+        let _ = std::fs::rename(&aside, dest);
+        return Err(io(dest)(e));
+    }
+    if let Err(e) = std::fs::remove_dir_all(&aside) {
+        eprintln!("warning: could not remove the replaced {} ({e}); delete it by hand", aside.display());
+    }
+    Ok(())
+}
+
+/// Whether an archive member name is absolute or climbs out with `..`.
+fn unsafe_member(name: &str) -> bool {
+    let b = name.as_bytes();
+    name.starts_with(['/', '\\']) || (b.len() >= 2 && b[1] == b':') || name.split(['/', '\\']).any(|c| c == "..")
+}
+
+/// Links the directory `target` (relative to `link`'s parent, or absolute) at `link`. On Windows
+/// that is a directory symlink, which needs Developer Mode or an elevated process.
+fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    return std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    return std::os::windows::fs::symlink_dir(target, link);
 }
 
 /// A directory removed on drop.
@@ -275,6 +307,13 @@ impl Sdk {
     /// into `d.install_dir()`. Returns the installed directory. Replaces any incomplete install
     /// already there; callers skip installed packages with [`Sdk::is_installed`].
     pub fn install(&self, d: &Download) -> Result<PathBuf> {
+        self.install_with(d, false, |_| Ok(()))
+    }
+
+    /// [`Sdk::install`], calling `prepare` on the unpacked package before it moves into place
+    /// (a failure there leaves the existing install alone). With `allow_flat`, an archive whose
+    /// files sit at the top, not under one directory, is the package itself.
+    pub(crate) fn install_with(&self, d: &Download, allow_flat: bool, prepare: impl FnOnce(&Path) -> Result<()>) -> Result<PathBuf> {
         let part = self.fetch_verified(d)?;
         // Disk images stream out of the archive into sparse files: most of a system image is
         // zeros (8.1 of TV 34's 8.6 GB), which unzip would write out in full. Everything else
@@ -302,13 +341,15 @@ impl Sdk {
             .collect();
         let top = match entries.as_slice() {
             [one] if one.is_dir() => one.clone(),
+            [_, ..] if allow_flat => tmp.0.clone(),
             _ => return Err(Error::Layout(part, entries.len())),
         };
+        prepare(&top)?;
         if !top.join("source.properties").is_file() {
             self.say(&format!("warning: {} has no source.properties", d.file_name()));
         }
         let dest = self.root.join(d.install_dir());
-        replace_dir(&top, &dest)?;
+        replace_dir(&top, &dest, &self.downloads())?;
         // The unpacked package is the cache; a system image archive is close to 2 GB.
         let _ = std::fs::remove_file(&part);
         Ok(dest)
@@ -332,7 +373,7 @@ impl Sdk {
         std::fs::write(&m, marker.to_string()).map_err(io(&m))?;
 
         let dest = renderer::dir(&self.root, d.revision);
-        replace_dir(&top, &dest)?;
+        replace_dir(&top, &dest, &self.downloads())?;
         let _ = std::fs::remove_file(&part);
 
         // Repoint `current` atomically, then drop superseded revisions (a running emu keeps the
@@ -341,7 +382,10 @@ impl Sdk {
         let current = root.join(renderer::CURRENT);
         let link = root.join(format!(".{}.tmp", renderer::CURRENT));
         let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(d.revision.to_string(), &link).map_err(io(&link))?;
+        symlink_dir(Path::new(&d.revision.to_string()), &link).map_err(io(&link))?;
+        // Windows won't rename a link over another, so there `current` is briefly absent.
+        #[cfg(windows)]
+        let _ = std::fs::remove_dir(&current);
         std::fs::rename(&link, &current).map_err(io(&current))?;
         for old in renderer::installed(&self.root).into_iter().filter(|i| i.dir != dest) {
             self.say(&format!("removing renderer r{}", old.marker.revision));
@@ -378,7 +422,11 @@ impl Sdk {
         if !out.status.success() {
             return Err(Error::Command(format!("listing {} failed ({})", archive.display(), out.status)));
         }
-        Ok(String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.is_empty() && !l.ends_with('/')).map(str::to_owned).collect())
+        let names: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
+        if let Some(bad) = names.iter().find(|n| unsafe_member(n)) {
+            return Err(Error::Command(format!("{} holds the member '{bad}', which would leave the install directory", archive.display())));
+        }
+        Ok(names.into_iter().filter(|l| !l.ends_with('/')).collect())
     }
 
     /// Unzips one member to `out` (`unzip -p`), writing only its non-zero 4 KiB blocks: zero runs
@@ -462,7 +510,7 @@ mod tests;
 /// file grows by a write past its end or by truncating, so on macOS each zero run is punched out
 /// explicitly. A filesystem without holes keeps the file dense.
 pub fn write_sparse(mut src: impl std::io::Read, dst: &std::fs::File) -> std::io::Result<(u64, u64)> {
-    use std::os::unix::fs::FileExt;
+    use sim_core::hostfs::FileExt;
     const BLOCK: usize = 4096;
     let mut buf = vec![0u8; 1 << 20];
     let (mut offset, mut written) = (0u64, 0u64);

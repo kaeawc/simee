@@ -1,9 +1,10 @@
 //! `manifest.json`: what a bundle holds and how to put it back together.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 use sim_core::platform::Platform;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::{Error, Result};
 
@@ -47,6 +48,10 @@ pub struct Manifest {
     pub compression: String,
     pub disks: Vec<Disk>,
     pub files: Vec<File>,
+    /// A file tree's directories and symlinks, and its files' modes (an iOS data directory):
+    /// what `disks` and `files` don't say. Empty for a bundle of disk images.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tree: Vec<Entry>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,12 +62,52 @@ pub struct Device {
     pub form_factor: Option<String>,
 }
 
-/// The system image (Android) a device needs. iOS's runtime and device type come in its own
-/// variant.
+/// What a device needs on the receiving host: the system image (Android), or the runtime and
+/// device type (iOS).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Identity {
     Android(AndroidImage),
+    Ios(IosSimulator),
+}
+
+/// An iOS simulator's device type and runtime, by the service's identifiers. An import needs the
+/// same runtime build; the version and name only say what to install when it is missing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IosSimulator {
+    /// `com.apple.CoreSimulator.SimDeviceType.iPhone-17`.
+    pub device_type: String,
+    /// `com.apple.CoreSimulator.SimRuntime.iOS-26-1`.
+    pub runtime: String,
+    /// The runtime's build (`23B80`).
+    pub build: String,
+    /// The runtime's version (`26.1`).
+    pub version: String,
+    /// The runtime's name (`iOS 26.1`).
+    pub runtime_name: String,
+}
+
+/// What a [tree](Manifest::tree) entry is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryKind {
+    Dir,
+    /// A regular file, stored as the disk (or file) at the same path.
+    File,
+    Symlink,
+}
+
+/// One directory, file or symlink of a file tree, at its path in the bundle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Entry {
+    pub path: String,
+    pub kind: EntryKind,
+    /// Permission bits (at most `0o7777`) of a directory or file; none for a symlink.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+    /// A symlink's target, as the link holds it (relative, or a path inside the device).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 /// An Android system image by content: `source.properties`'s API level, tag, ABI and revision,
@@ -164,13 +209,84 @@ impl Extent {
     }
 }
 
-/// Whether `path` is safe to join to a destination directory: relative, `/`-separated, with no
-/// empty, `.` or `..` component, no backslash and no NUL.
+/// Whether `path` is safe to join to a destination directory: at most [`MAX_TARGET`] bytes, relative, `/`-separated, with no
+/// empty, `.` or `..` component, no backslash, no NUL and no [`ignorable`] code point.
 pub fn safe_path(path: &str) -> bool {
     !path.is_empty()
+        && path.len() <= MAX_TARGET
         && !path.starts_with('/')
         && !path.contains(['\\', '\0'])
+        && !path.chars().any(ignorable)
         && path.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// The longest symlink target macOS makes: `symlink` refuses a longer one (`ENAMETOOLONG`).
+pub const MAX_TARGET: usize = 1023;
+
+/// Whether `target` is a symlink target a bundle may hold: not empty, at most [`MAX_TARGET`]
+/// bytes, with no NUL and no [`ignorable`] code point.
+pub fn safe_target(target: &str) -> bool {
+    !target.is_empty() && target.len() <= MAX_TARGET && !target.contains('\0') && !target.chars().any(ignorable)
+}
+
+/// Whether `c` is a format code point (Unicode category Cf) or a default-ignorable one: what a
+/// volume may skip when it compares names (HFS+ skips some, APFS none) and a renderer draws as
+/// nothing. A simulator's data has no use for one in a name, and a name that holds one can fold
+/// like another that the volume keeps apart, so a bundle path or link target with one is refused.
+pub fn ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}'
+            | '\u{34f}'
+            | '\u{600}'..='\u{605}'
+            | '\u{61c}'
+            | '\u{6dd}'
+            | '\u{70f}'
+            | '\u{890}'..='\u{891}'
+            | '\u{8e2}'
+            | '\u{115f}'..='\u{1160}'
+            | '\u{17b4}'..='\u{17b5}'
+            | '\u{180b}'..='\u{180f}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{feff}'
+            | '\u{ffa0}'
+            | '\u{fff0}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0000}'..='\u{e0fff}'
+    )
+}
+
+/// The most bytes (logical, holes included) a bundle's disks and files may add up to: an import
+/// reads every byte back to check its hash, so a sparse disk of a petabyte would take days.
+pub const MAX_SIZE: u64 = 1 << 40;
+
+/// `path` as a case-insensitive, normalization-insensitive volume (APFS's default, HFS+)
+/// compares names: canonically decomposed (NFD), case-folded, without the code points HFS+
+/// ignores. Two paths that fold alike are one file there. It folds at least as much as the
+/// volume does, so it may join names the volume keeps apart, never the reverse. Case is folded
+/// by lowercasing, uppercasing and lowercasing again, so every case of a letter whose uppercase
+/// is more than one letter joins it: `ẞ` lowercases to `ß`, which uppercases to `SS`, so `ẞ`,
+/// `ß` and `ss` are one name, as on APFS. An ASCII path is only lowercased, which is the same.
+pub(crate) fn fold(path: &str) -> String {
+    if path.is_ascii() {
+        return path.to_ascii_lowercase();
+    }
+    let hfs_ignores = |c: &char| matches!(*c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}');
+    path.nfd()
+        .flat_map(char::to_lowercase)
+        .flat_map(char::to_uppercase)
+        .flat_map(char::to_lowercase)
+        .filter(|c| !hfs_ignores(c))
+        .nfd()
+        .collect()
 }
 
 /// Whether `h` is a BLAKE3 hash as the manifest writes it: 64 lowercase hex digits.
@@ -219,6 +335,7 @@ impl Manifest {
             return bad(format!("chunk_size {} is not a power of two from 4 KiB to 64 MiB", self.chunk_size));
         }
         let mut seen = BTreeSet::new();
+        let mut folded = BTreeMap::new();
         for path in self.disks.iter().map(|d| &d.path).chain(self.files.iter().map(|f| &f.path)) {
             if !safe_path(path) {
                 return Err(Error::Path(path.clone()));
@@ -226,6 +343,13 @@ impl Manifest {
             if !seen.insert(path.as_str()) {
                 return bad(format!("`{path}` appears twice"));
             }
+            if let Some(other) = folded.insert(fold(path), path) {
+                return bad(format!("`{other}` and `{path}` are one file on a case-insensitive volume"));
+            }
+        }
+        let total = self.disks.iter().map(|d| d.size).chain(self.files.iter().map(|f| f.size)).try_fold(0u64, u64::checked_add);
+        if total.is_none_or(|t| t > MAX_SIZE) {
+            return bad(format!("the disks and files add up to more than {MAX_SIZE} bytes"));
         }
         for d in &self.disks {
             if !is_hash(&d.blake3) {
@@ -262,7 +386,74 @@ impl Manifest {
                 return bad(format!("{}: {} chunks for {} bytes", f.path, f.chunks.len(), f.size));
             }
         }
+        self.validate_tree(&seen)
+    }
+
+    /// The tree's checks: each entry's path is safe and appears once, also as a case- and
+    /// normalization-insensitive volume compares names ([`fold`]); a file entry is a disk or file
+    /// of the bundle and no other entry is; a symlink has a target and no mode, and nothing lies
+    /// under one in any spelling that folds alike (extracting through a link would write outside
+    /// the destination, and on such a volume `data/l/x` goes through a link `data/L`).
+    fn validate_tree(&self, stored: &BTreeSet<&str>) -> Result<()> {
+        let bad = |s: String| Err(Error::Manifest(s));
+        let mut paths = BTreeSet::new();
+        let mut folded = BTreeMap::new();
+        let mut links: HashMap<String, &str> = HashMap::new();
+        for e in &self.tree {
+            if !safe_path(&e.path) {
+                return Err(Error::Path(e.path.clone()));
+            }
+            if !paths.insert(e.path.as_str()) {
+                return bad(format!("tree: `{}` appears twice", e.path));
+            }
+            if let Some(other) = folded.insert(fold(&e.path), e.path.as_str()) {
+                return bad(format!("tree: `{other}` and `{}` are one path on a case-insensitive volume", e.path));
+            }
+            let is_stored = stored.contains(e.path.as_str());
+            if (e.kind == EntryKind::File) != is_stored {
+                let what = if is_stored { "stored" } else { "not stored" };
+                return bad(format!("tree: `{}` is a {:?} entry but {what} in the bundle", e.path, e.kind));
+            }
+            match (e.kind, &e.target, e.mode) {
+                (EntryKind::Symlink, Some(t), None) if safe_target(t) => {
+                    links.insert(fold(&e.path), e.path.as_str());
+                }
+                (EntryKind::Symlink, ..) => {
+                    return bad(format!(
+                        "tree: the symlink `{}` needs a target (at most {MAX_TARGET} bytes, with no NUL or ignorable code point) \
+                         and no mode",
+                        e.path
+                    ));
+                }
+                (_, Some(_), _) => return bad(format!("tree: `{}` has a target but isn't a symlink", e.path)),
+                (_, None, Some(m)) if m > 0o7777 => return bad(format!("tree: `{}` has mode {m:o}", e.path)),
+                _ => {}
+            }
+        }
+        if !self.tree.is_empty()
+            && let Some(p) = stored.iter().find(|p| !paths.contains(*p))
+        {
+            return bad(format!("tree: `{p}` is stored but not in the tree"));
+        }
+        if !links.is_empty() {
+            // The links in one map by folded path, each ancestor prefix looked up by hash: a path of
+            // L bytes costs O(L) (and `safe_path` bounds L), not O(L^2).
+            for p in paths.iter().chain(stored.iter()) {
+                let f = fold(p);
+                for (i, _) in f.match_indices('/') {
+                    if let Some(link) = links.get(&f[..i]) {
+                        return bad(format!("tree: `{p}` lies under the symlink `{link}`"));
+                    }
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// The bytes an extract writes: the disks' stored extents and the files (zeros stay holes).
+    pub fn stored_bytes(&self) -> u64 {
+        let disks = self.disks.iter().flat_map(|d| d.extents.iter().filter(|e| e.hash.is_some()).map(|e| e.len));
+        disks.chain(self.files.iter().map(|f| f.size)).fold(0, u64::saturating_add)
     }
 
     /// Every stored chunk's hash, once, in the order the manifest first names it.

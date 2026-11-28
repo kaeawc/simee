@@ -1,14 +1,16 @@
 //! A client for a running emulator's display socket (`<avd>/simee/display.sock`, protocol in
 //! `sim_core::stream`): input lines out, frames in. Frames arrive on the socket, or, for a client
 //! that asked ([`Display::request_shared`]), in a shared ring file the emulator writes and this
-//! side reads with `pread` ([`Frames`] takes either).
+//! side reads with `pread` ([`Frames`] takes either). A client that asked for IOSurfaces
+//! (`Input::Surfaces`) gets their records from [`Frames::newest_into`]; the surface itself comes
+//! over Mach, which this crate doesn't touch.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::FileExt;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
+use sim_core::hostfs::FileExt;
+use sim_core::net::UnixStream;
 use sim_core::rotation::Rotation;
 use sim_core::stream::{FrameHeader, HEADER_LEN, Input, Record, ring};
 
@@ -87,6 +89,16 @@ fn read_exactly_into(r: &mut impl Read, len: usize, out: &mut Vec<u8>) -> std::i
 /// Bytes of socket input read ahead: room for 256 queued ring notices, so one `read` sees every
 /// notice that piled up while the previous frame was being read and shown.
 const READ_AHEAD: usize = 8 * 1024;
+
+/// What [`Frames::newest_into`] read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Next {
+    /// A frame whose RGBA rows are now in the buffer.
+    Pixels(FrameHeader),
+    /// A frame the server handed over as IOSurface `seq` (`sim_core::stream::Record::Surface`):
+    /// its surface is in the client's Mach port, and the client sends `release <seq>` when done.
+    Surface { header: FrameHeader, seq: u32 },
+}
 
 /// The frames of one display connection, wherever the server puts their pixels.
 pub struct Frames<R> {
@@ -176,6 +188,13 @@ impl<R: Read> Frames<R> {
         self.read_next_into(true, wanted, buf)
     }
 
+    /// [`Frames::newest_frame_into`] for a client that asked for IOSurfaces: a surface record is
+    /// returned as it is ([`Next::Surface`], never skipped, since each one has to be released),
+    /// and any other frame's pixels are read into `buf`.
+    pub fn newest_into(&mut self, buf: &mut Vec<u8>, wanted: impl Fn() -> bool) -> std::io::Result<Next> {
+        self.read_record(true, wanted, buf, true)
+    }
+
     fn read_next(&mut self, skip_to_newest: bool, wanted: impl Fn() -> bool) -> std::io::Result<(FrameHeader, Vec<u8>)> {
         let mut rgba = Vec::new();
         let header = self.read_next_into(skip_to_newest, wanted, &mut rgba)?;
@@ -183,6 +202,16 @@ impl<R: Read> Frames<R> {
     }
 
     fn read_next_into(&mut self, skip_to_newest: bool, wanted: impl Fn() -> bool, buf: &mut Vec<u8>) -> std::io::Result<FrameHeader> {
+        match self.read_record(skip_to_newest, wanted, buf, false)? {
+            Next::Pixels(header) => Ok(header),
+            // Never returned without `surfaces`.
+            Next::Surface { .. } => Err(std::io::Error::other("unexpected surface frame")),
+        }
+    }
+
+    /// The next frame; surface records are returned when `surfaces`, else passed over (a client
+    /// that never asked for them gets none).
+    fn read_record(&mut self, skip_to_newest: bool, wanted: impl Fn() -> bool, buf: &mut Vec<u8>, surfaces: bool) -> std::io::Result<Next> {
         loop {
             let mut hdr = [0u8; HEADER_LEN];
             self.reader.read_exact(&mut hdr)?;
@@ -196,8 +225,10 @@ impl<R: Read> Frames<R> {
                 }
                 Record::Frame(header) => {
                     read_exactly_into(&mut self.reader, header.len as usize, buf)?;
-                    return Ok(header);
+                    return Ok(Next::Pixels(header));
                 }
+                Record::Surface { header, seq } if surfaces => return Ok(Next::Surface { header, seq }),
+                Record::Surface { .. } => self.skipped += 1,
                 Record::Ring { path_len } => {
                     let path = read_exactly(&mut self.reader, path_len as usize)?;
                     // A ring that can't be opened leaves none: its frames are skipped, and the
@@ -220,7 +251,7 @@ impl<R: Read> Frames<R> {
                         (header, slot) = newer;
                     }
                     match self.ring.as_ref().map(|r| r.read_into(slot, &header, buf)) {
-                        Some(Ok(true)) => return Ok(header),
+                        Some(Ok(true)) => return Ok(Next::Pixels(header)),
                         Some(Err(e)) => return Err(e),
                         Some(Ok(false)) | None => self.torn += 1,
                     }
@@ -274,10 +305,15 @@ impl Ring {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use sim_core::gesture::Phase;
+    #[cfg(unix)]
+    use sim_core::net::UnixListener;
+    #[cfg(unix)]
     use std::io::{BufRead, BufReader};
-    use std::os::unix::net::UnixListener;
 
+    // Sockets under /tmp: Windows has no Unix sockets here yet.
+    #[cfg(unix)]
     #[test]
     fn sends_input_lines_and_reads_frames() {
         // Under /tmp: the socket path must fit a unix socket address (104 bytes on macOS).
@@ -333,7 +369,7 @@ mod tests {
         const BURSTS: usize = 40;
         let (w, h) = (1080u32, 2400u32);
         let len = w * h * 4;
-        let dir = std::env::temp_dir().join(format!("sa-burst-{}", std::process::id()));
+        let dir = PathBuf::from("/tmp").join(format!("sa-burst-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("frames.ring");
         let layout = ring::Layout::new(SLOTS, u64::from(len));
@@ -419,8 +455,10 @@ mod tests {
     }
 
     /// A reader that hands out at most one record header's worth of bytes per read.
+    #[cfg(unix)]
     struct Trickle<R>(R);
 
+    #[cfg(unix)]
     impl<R: Read> Read for Trickle<R> {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             let n = buf.len().min(HEADER_LEN);
@@ -430,9 +468,10 @@ mod tests {
 
     /// A fake emulator announces 120 frames at once (the window was busy): the client reads
     /// only the newest from the ring, once.
+    #[cfg(unix)]
     #[test]
     fn a_backlog_of_notices_reads_only_the_newest_frame() {
-        let dir = std::env::temp_dir().join(format!("sa-backlog-{}", std::process::id()));
+        let dir = PathBuf::from("/tmp").join(format!("sa-backlog-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("frames.ring");
         let layout = ring::Layout::new(3, 8);
@@ -478,8 +517,30 @@ mod tests {
     }
 
     #[test]
+    fn surface_records_go_to_clients_that_take_them_and_past_the_rest() {
+        let header = |frame| FrameHeader::new(2, 1, 2, 1, frame).expect("size");
+        let mut msg = Record::Surface { header: header(1), seq: 10 }.encode().to_vec();
+        msg.extend(Record::Surface { header: header(2), seq: 11 }.encode());
+        msg.extend(Record::Frame(header(3)).encode());
+        msg.extend([7; 8]);
+        // Every surface record is returned, the newest not skipping the older: each one has to be
+        // released. A socket frame after them still comes with its pixels.
+        let mut frames = Frames::new(std::io::Cursor::new(msg.clone()));
+        let mut buf = Vec::new();
+        assert_eq!(frames.newest_into(&mut buf, || true).expect("first"), Next::Surface { header: header(1), seq: 10 });
+        assert_eq!(frames.newest_into(&mut buf, || true).expect("second"), Next::Surface { header: header(2), seq: 11 });
+        assert_eq!(frames.newest_into(&mut buf, || true).expect("pixels"), Next::Pixels(header(3)));
+        assert_eq!(buf, vec![7; 8]);
+        // A client reading only pixels passes them over.
+        let mut frames = Frames::new(std::io::Cursor::new(msg));
+        assert_eq!(frames.newest_frame().expect("pixels"), (header(3), vec![7; 8]));
+        assert_eq!(frames.skipped, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn frames_come_from_the_socket_or_the_ring() {
-        let dir = std::env::temp_dir().join(format!("sa-frames-{}", std::process::id()));
+        let dir = PathBuf::from("/tmp").join(format!("sa-frames-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("frames.ring");
         let layout = ring::Layout::new(3, 8);
@@ -529,7 +590,7 @@ mod tests {
     /// into that same allocation, so a steady stream allocates nothing per frame (#17).
     #[test]
     fn frames_refill_a_recycled_buffer_in_place() {
-        let dir = std::env::temp_dir().join(format!("sa-recycle-{}", std::process::id()));
+        let dir = PathBuf::from("/tmp").join(format!("sa-recycle-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("frames.ring");
         let layout = ring::Layout::new(2, 8);
@@ -563,7 +624,7 @@ mod tests {
 
     #[test]
     fn unwanted_frames_are_passed_over_unread() {
-        let dir = std::env::temp_dir().join(format!("sa-unwanted-{}", std::process::id()));
+        let dir = PathBuf::from("/tmp").join(format!("sa-unwanted-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("frames.ring");
         let layout = ring::Layout::new(2, 8);

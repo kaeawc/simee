@@ -24,11 +24,14 @@ sim-android = { package = "simee-android", path = "../crates/sim-android" }
 sim-netshape = { package = "simee-netshape", path = "../crates/sim-netshape" }
 serde = "1"
 serde_json = "1"
+# SIGINT and SIGTERM quit the app like ⌘Q (`src/signals.rs`). The root workspace's entry,
+# repeated here because this is a workspace of its own.
+signal-hook = { version = "0.4.6", default-features = false, features = ["iterator"] }
 # The 3D view's own pipeline (`src/scene/`) in a Rune compositor, which hands it Rune's wgpu
 # device. Rune doesn't re-export wgpu: this is the version and features Rune already builds, so
 # it adds no crate (its backends come from Rune's per-target features). Bump it with Rune's.
 wgpu = { version = "30.0.2", default-features = false, features = ["std", "wgsl"] }
-rune = { git = "https://github.com/anomalyco/rune", rev = "f6f6e045b8cd1bce6111ab65e1b50d84f93d045b" }
+rune = { git = "https://github.com/anomalyco/rune", rev = "e08594ce74a1e9100e5842ab44be0ec5794a76c3" }
 
 [features]
 # Live Rust editing through Rune's devserver (`scripts/rune-dev` in the Rune repo).
@@ -41,14 +44,14 @@ tooling = ["rune/tooling"]
 # Rune doesn't propagate its patches; apps must repeat them at the same rev. Bump all of these
 # together with `rune` above.
 [patch.crates-io]
-winit = { git = "https://github.com/anomalyco/rune", rev = "f6f6e045b8cd1bce6111ab65e1b50d84f93d045b" }
-sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "f6f6e045b8cd1bce6111ab65e1b50d84f93d045b" }
-parley_engine = { git = "https://github.com/anomalyco/rune", rev = "f6f6e045b8cd1bce6111ab65e1b50d84f93d045b" }
-wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "f6f6e045b8cd1bce6111ab65e1b50d84f93d045b" }
-accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "f6f6e045b8cd1bce6111ab65e1b50d84f93d045b" }
-accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "f6f6e045b8cd1bce6111ab65e1b50d84f93d045b" }
-accesskit_atspi_common = { git = "https://github.com/anomalyco/rune", rev = "f6f6e045b8cd1bce6111ab65e1b50d84f93d045b" }
-naga = { git = "https://github.com/anomalyco/rune", rev = "f6f6e045b8cd1bce6111ab65e1b50d84f93d045b" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "e08594ce74a1e9100e5842ab44be0ec5794a76c3" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "e08594ce74a1e9100e5842ab44be0ec5794a76c3" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "e08594ce74a1e9100e5842ab44be0ec5794a76c3" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "e08594ce74a1e9100e5842ab44be0ec5794a76c3" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "e08594ce74a1e9100e5842ab44be0ec5794a76c3" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "e08594ce74a1e9100e5842ab44be0ec5794a76c3" }
+accesskit_atspi_common = { git = "https://github.com/anomalyco/rune", rev = "e08594ce74a1e9100e5842ab44be0ec5794a76c3" }
+naga = { git = "https://github.com/anomalyco/rune", rev = "e08594ce74a1e9100e5842ab44be0ec5794a76c3" }
 
 # `deny`, not `forbid`: only `src/surface.rs` (the zero-copy IOSurface bridge) opts back in.
 [lints.rust]
@@ -82,3 +85,38 @@ incremental = true
 inherits = "dev"
 debug = false
 incremental = false
+
+# `ci` inherits `dev`, so CI's clippy and tests build every dependency at opt-level 2. Keep that for
+# the registry and git crates (Rune's GPU stack): they come from rust-cache, and opt-level 0 makes
+# that cache 22% larger. The workspace's own crates, path dependencies here, rebuild on most pull
+# requests, and nothing in the view tests needs them fast: build those at 0. A warm `cargo test
+# --profile ci` after a sim-core edit, 4-CPU Linux VM: 29.8 s at 2, 17.4 s this way (#213).
+# `scripts/ci-scope.py check` keeps this list equal to the path dependencies.
+[profile.ci.package.simee-android]
+opt-level = 0
+[profile.ci.package.simee-api]
+opt-level = 0
+[profile.ci.package.simee-audio]
+opt-level = 0
+[profile.ci.package.simee-bundle]
+opt-level = 0
+[profile.ci.package.simee-camera]
+opt-level = 0
+[profile.ci.package.simee-core]
+opt-level = 0
+[profile.ci.package.simee-coresim]
+opt-level = 0
+[profile.ci.package.simee-debug]
+opt-level = 0
+[profile.ci.package.simee-emu-avd]
+opt-level = 0
+[profile.ci.package.simee-emu-hvf]
+opt-level = 0
+[profile.ci.package.simee-encode]
+opt-level = 0
+[profile.ci.package.simee-host]
+opt-level = 0
+[profile.ci.package.simee-netshape]
+opt-level = 0
+[profile.ci.package.simee-rtc]
+opt-level = 0

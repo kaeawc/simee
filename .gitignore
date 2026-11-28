@@ -3,6 +3,9 @@
 junit.xml
 *.png
 !docs/**/*.png
+# The brand assets scripts/brand.sh draws.
+!assets/brand/**/*.png
 /desktop/target
 /scratch
 /bench
+__pycache__/

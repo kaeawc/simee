@@ -37,6 +37,8 @@ icons! {
     PLUS = "plus", r#"<path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>"#;
     CONTRAST = "contrast", r#"<g fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18Z" fill="currentColor"/></g>"#;
     KEYBOARD = "keyboard", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="2.5" y="6" width="19" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M6 14h.01M18 14h.01M9 14h6"/></g>"#;
+    FACE_ON = "face-on", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8V4h4M17 4h4v4M21 16v4h-4M7 20H3v-4"/><rect x="8.5" y="6.5" width="7" height="11" rx="1.5"/></g>"#;
+    FLIP = "flip", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="8.5" y="4" width="7" height="16" rx="1.5"/><path d="M5 9a8 4 0 0 0 0 6M3.5 13.5 5 15l1.5-1.5M19 15a8 4 0 0 0 0-6M20.5 10.5 19 9l-1.5 1.5"/></g>"#;
     LAYERS = "layers", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5M3 16l9 5 9-5"/></g>"#;
     WIFI_OFF = "wifi-off", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 3l18 18"/><path d="M8.5 16.5a5 5 0 0 1 7 0M5 12.5a10 10 0 0 1 5-2.6M14.3 10a10 10 0 0 1 4.7 2.5M2 8.8a15 15 0 0 1 4.2-2.6M10.5 5.1A15 15 0 0 1 22 8.8"/><path d="M12 20h.01"/></g>"#;
     GAUGE = "gauge", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 18a9 9 0 1 1 15 0"/><path d="m12 13 4-5"/><circle cx="12" cy="13" r="1.2" fill="currentColor"/></g>"#;
@@ -57,6 +59,10 @@ icons! {
     SELECT = "select", r#"<g fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="3" fill="currentColor"/></g>"#;
     PEN = "pen", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15.5 4.5 19.5 8.5 8.5 19.5H4.5v-4L15.5 4.5Z"/><path d="m13 7 4 4"/></g>"#;
     ISLAND = "island", r#"<g fill="none" stroke="currentColor" stroke-width="1.8"><rect x="6" y="2.5" width="12" height="19" rx="3"/><rect x="9.5" y="4.8" width="5" height="1.8" rx="0.9" fill="currentColor"/></g>"#;
+    CAR = "car", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 11 7 6h10l2 5"/><rect x="3" y="11" width="18" height="6" rx="1.5"/><path d="M6 17v2M18 17v2"/><circle cx="7.5" cy="14" r="0.8" fill="currentColor"/><circle cx="16.5" cy="14" r="0.8" fill="currentColor"/></g>"#;
+    // macOS's sidebar.left and sidebar.right: a window with its leading or trailing column.
+    SIDEBAR_LEFT = "sidebar-left", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="M9.5 4.5v15M5.5 8.5h1.5M5.5 11h1.5"/></g>"#;
+    SIDEBAR_RIGHT = "sidebar-right", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="M14.5 4.5v15M17 8.5h1.5M17 11h1.5"/></g>"#;
 }
 
 /// Every icon, for tests that check each one renders.
@@ -90,6 +96,8 @@ pub static ALL: &[&Icon] = &[
     &CONTRAST,
     &KEYBOARD,
     &LAYERS,
+    &FACE_ON,
+    &FLIP,
     &ISLAND,
     &BACK,
     &RECENTS,
@@ -105,4 +113,7 @@ pub static ALL: &[&Icon] = &[
     &CHEVRON_RIGHT,
     &SELECT,
     &PEN,
+    &CAR,
+    &SIDEBAR_LEFT,
+    &SIDEBAR_RIGHT,
 ];

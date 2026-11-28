@@ -1,0 +1,36 @@
+[package]
+name = "simee-rtc"
+description = "A WebRTC publisher for H.264 device video: a WHIP client (RFC 9725), RFC 6184 packetization and PLI/NACK/TWCC feedback on str0m, with no async runtime."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["webrtc", "whip", "h264", "rtp", "streaming"]
+categories = ["multimedia::video", "network-programming"]
+include = ["/Cargo.toml", "/LICENSE", "/src"]
+
+[lib]
+doctest = false
+
+[features]
+# The DTLS backend on Linux: RustCrypto, whose certificate generation (rcgen) builds aws-lc's C.
+# Off by default so the workspace still lints the Linux target from macOS with no C cross
+# toolchain; without it (and off Apple targets) `Publisher::connect` is `Error::Unsupported`.
+rust-crypto = ["str0m/rust-crypto"]
+
+[dependencies]
+str0m.workspace = true
+
+# CryptoKit (Security.framework and a Swift shim built by str0m-apple-crypto): no C to build.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+str0m = { workspace = true, features = ["apple-crypto"] }
+
+# The tests' fake WHIP server answers with a str0m receiver of its own.
+[dev-dependencies]
+str0m.workspace = true
+
+[lints]
+workspace = true

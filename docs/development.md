@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- macOS on Apple silicon to run devices: Xcode (`xcode-select -p`, or `DEVELOPER_DIR`) with at
+- macOS on Apple silicon to run devices (versions per feature: [Support matrix](#support-matrix)): Xcode (`xcode-select -p`, or `DEVELOPER_DIR`) with at
   least one simulator runtime for iOS; for Android, an SDK system image (`emu -provision` fetches
   one, no Java needed).
   Xcode 26 and 27 both work, and several can be installed side by side: `DEVELOPER_DIR` picks one
@@ -14,6 +14,111 @@
 - Rust 1.99.1 (pinned in `rust-toolchain.toml`).
 - On Linux the shared core, the API, the CLI and the desktop window build and test (CI runs them
   there); there are no devices to run, since both runtimes need macOS.
+- On Windows (`x86_64-pc-windows-msvc`) the workspace builds, lints and runs its device-free tests;
+  see [Windows](#windows).
+
+## Windows
+
+The workspace builds for `x86_64-pc-windows-msvc` and CI's `windows` job
+(`.github/workflows/windows.yml`, on `windows-latest`) builds it, lints it with
+`clippy -D warnings` and runs its tests. This is the first step of
+[#243](https://github.com/kaeawc/simee/issues/243): the target for Windows is Android devices
+only (iOS stays on macOS), and a device can't boot there yet, so everything that needs one is
+compiled to a clear "not on Windows yet" answer instead of being left out of the build.
+
+Check it from any host, without Windows: `rustup target add x86_64-pc-windows-msvc`, then
+`cargo install cargo-xwin` (it fetches the MSVC headers and libraries; no Visual Studio) and
+`cargo xwin clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings`.
+`cargo check --target x86_64-pc-windows-msvc` alone stops at the C dependencies' build scripts,
+which need an MSVC-compatible compiler. Tests only run on Windows (CI): a runtime failure a
+cross-check can't see shows up there.
+
+`scripts/check.sh` is bash and stays the macOS and Linux path. `cargo xtask check [--quick|--all]`
+(`xtask/`) runs the same steps with the same names on any host, with no bash: it is what the
+Windows job runs, and what a Windows contributor runs before pushing. A test keeps its step names
+equal to the script's.
+
+| Part | On Windows | Where it goes next |
+| --- | --- | --- |
+| `sim-core`, `sim-bundle`, `sim-debug`, `sim-camera`, `sim-mcp`, `emu-ext4`, `emu-fdt` | build and test | |
+| `emu-sdk` | builds and tests; an install shells out to `curl` and `unzip`, and Windows has no `unzip`, so `-provision` and the install tests that unpack archives are unix only | [#245](https://github.com/kaeawc/simee/issues/245) |
+| `emu-hvf` | guest RAM (`VirtualAlloc`), `SharedMap` (a file mapping) and `host::process_alive`; no hypervisor | [#247](https://github.com/kaeawc/simee/issues/247) |
+| `emu-vmm` | the device models build and test; the NAT (`net::Nat::new`) and the adb bridge (`pipe::adb`) answer `Unsupported`, and no machine runs | [#247](https://github.com/kaeawc/simee/issues/247), [#248](https://github.com/kaeawc/simee/issues/248) |
+| `emu-avd` | builds; the SDK and AVD homes still use the unix defaults, `clone_file` is a plain copy (no clone, holes not kept), the `.ini` cache stores nothing | [#245](https://github.com/kaeawc/simee/issues/245) |
+| `sim-api`, `simee`, `sim-android` | build; `sim_core::net`'s `UnixStream` and `UnixListener` there can't be built (`ErrorKind::Unsupported`), so no server or client connects (`serve` and `shutdown::watch` answer `Unsupported`), and the tests that use a fake emulator (a Unix socket, `/bin/sh` scripts) are compiled out | [#246](https://github.com/kaeawc/simee/issues/246) |
+| `emu` | builds; lists, creates and provisions AVDs like on any host that can't boot; the stop request is the console's control events (`apps/emu/src/host_windows.rs`, in place of `on_signal.rs`'s `sigwait`; `tests/signals` sends real signals and is unix only) | [#245](https://github.com/kaeawc/simee/issues/245), [#247](https://github.com/kaeawc/simee/issues/247) |
+| `emu-container` | empty: the container backend needs a Linux host (the crate is `cfg(unix)`) | |
+| `emu-gfxstream` | not built: no renderer loads | [#249](https://github.com/kaeawc/simee/issues/249) |
+| iOS crates (`sim-coresim`, `sim-netshape`, `sim-audio`) | macOS only, as before | |
+| `desktop/` | not built | [#250](https://github.com/kaeawc/simee/issues/250) |
+
+Where std has no Windows spelling of a unix call, `sim_core::hostfs` (positional file I/O,
+`stat` fields, permission modes, process groups) and `sim_core::net` (Unix sockets) name the type
+once: std's own on unix, and on Windows a stand-in whose limits are written on it. Code that must
+compile on Windows imports those instead of `std::os::unix`.
+
+The Windows job restores `rust-cache` and never saves it: the repository's Actions cache is over
+its limit, so a Windows entry would evict the Linux and macOS ones, and each run builds its
+dependencies cold (about as long as the Linux job's cold build). Allow `main` to save it
+(`save-if` in `windows.yml`) when there is room.
+
+## Support matrix
+
+`simee doctor` (`--json` for the same as JSON) checks this host against the table below. It
+prints the chip, the macOS and Xcode versions, whether Hypervisor.framework is available
+(`kern.hv_support`) and whether `emu` is signed with the hypervisor entitlement, the host's thermal
+and power state (the `host` method), and which features are on or off and why. `emu` checks the
+Android rows when it starts: below the Android floor it refuses to boot and names the floor, and it
+prints a line for each optional feature that is off. The table is `sim_core::support::FLOORS`; a
+test fails if a row here goes missing.
+
+**Chips.** Apple silicon, M1 and later, is supported. Intel Macs are not yet: iOS on Intel is
+planned in [#241](https://github.com/kaeawc/simee/issues/241) and Android on Intel (x86_64 images)
+in [#242](https://github.com/kaeawc/simee/issues/242). Every macOS release that runs on Apple
+silicon runs on M1, so a feature's floor is the same on every Apple silicon chip.
+
+| Feature | Id | macOS | What sets the floor | Below it |
+| --- | --- | --- | --- | --- |
+| iOS simulator devices | `ios` | Xcode's own floor | Xcode with a simulator runtime | no iOS devices |
+| iOS audio capture and mute | `audio_capture` | 14.2 | the Core Audio process tap, `AudioHardwareCreateProcessTap` | `audio_capture` and `audio_mute` fail with "needs macOS 14.2" |
+| Android emulator (`emu`) | `android` | 15.0 | the in-kernel GICv3, `hv_gic_create` (emu has no userspace GIC) | `emu` refuses to boot with "needs macOS 15" |
+| 4 KiB guest memory granule | `granule_4k` | 26.0 | `hv_vm_config_set_ipa_granule` | guest memory is mapped in 16 KiB pages, so host-visible GPU memory the guest maps at 4 KiB offsets can't be; `emu` says which granule it got |
+
+Where each floor comes from:
+
+- `AudioHardwareCreateProcessTap` is `API_AVAILABLE(macos(14.2))` in the macOS 26.5 SDK's
+  `CoreAudio/AudioHardwareTapping.h`, and Apple's reference lists macOS 14.2
+  ([AudioHardwareCreateProcessTap](https://developer.apple.com/documentation/coreaudio/audiohardwarecreateprocesstap(_:_:))).
+  The audio helper (`crates/sim-audio/native/simaudio.swift`) marks its tap `@available(macOS 14.2, *)`
+  and answers an error naming the floor before it; `sim-audio` checks the floor before it builds the
+  helper.
+- Every `hv_gic_*` function emu calls is `API_AVAILABLE(macos(15.0))` in the SDK's
+  `Hypervisor/hv_gic*.h`, and Apple's reference lists macOS 15.0
+  ([hv_gic_create](https://developer.apple.com/documentation/hypervisor/hv_gic_create(_:))).
+- `hv_vm_config_set_ipa_granule` and `HV_IPA_GRANULE_4KB` are `API_AVAILABLE(macos(26.0))` in
+  `Hypervisor/hv_vm_config.h`, and Apple's reference lists macOS 26.0
+  ([hv_vm_config_set_ipa_granule](https://developer.apple.com/documentation/hypervisor/hv_vm_config_set_ipa_granule(_:_:))).
+- The VM configuration (`hv_vm_config_create`, the IPA size) is macOS 13.0
+  ([hv_vm_config_create](https://developer.apple.com/documentation/hypervisor/hv_vm_config_create())),
+  below the Android floor.
+- emu-hvf links only the Hypervisor.framework functions every Apple silicon macOS has and looks the
+  newer ones up at run time (`crates/emu-hvf/src/ffi.rs`): a linked function the framework lacks
+  stops dyld from loading the binary, so emu would exit before `main` on an older macOS instead of
+  naming what it needs. emu also links CoreAudio weakly (`apps/emu/build.rs`), because cpal imports
+  the macOS 14.2 process tap functions; below macOS 15 emu exits at startup, before any audio code.
+  `scripts/check-imports.sh` (run by `scripts/check.sh` on macOS) fails if a release `emu` or
+  `simee` strongly imports a symbol newer than macOS 11.0.
+
+**Xcode.** simee is tested with Xcode 26 and 27 (the SimulatorKit path change between them is
+under Requirements); `simee doctor` marks an older Xcode "unverified". Apple's
+[Xcode system requirements](https://developer.apple.com/xcode/system-requirements/): Xcode 26.0 to
+26.3 need macOS 15.6, Xcode 26.4 and later need macOS 26.2, and Xcode 27 needs macOS 26.6. So the
+tested iOS floor is macOS 15.6 with Xcode 26.3 or earlier.
+
+**Unverified.** Every floor above is read from the SDK headers and Apple's documentation, and is
+exercised only on macOS 26 (M3 Max). No host below a floor has run simee: the macOS 14 and 15
+behaviour (the audio helper's error, emu's refusal, the 16 KiB granule) is the code's, not yet
+observed; nor has M1 or M2 hardware run it.
 
 
 Build and check commands, the working rules and the code map are in [AGENTS.md](../AGENTS.md).
@@ -25,6 +130,16 @@ gunzip, the NAT, checksums, base64, PNG, audio), which are listed in the root `C
 dependency that a hot loop in `emu` or `simee` calls into belongs on that list, or a debug `emu`
 gets slow. The desktop's `cargo test` builds Rune unoptimized too; its `cargo build`/`run` keep
 opt-level 2. Numbers and what was tried are in [benchmarks.md](benchmarks.md#build-times-local).
+
+## Benchmarks
+
+Every script under `scripts/bench/` waits for a quiet host (`scripts/bench/quiet.sh`) before it
+measures, refuses with exit status 4 and a list of what is busy when the host stays busy, and writes
+a host record beside its results. `--no-quiet-gate` skips the gate for a smoke run, and `run-all.sh
+--quiet` is the run whose numbers get published. The protocol, the record's fields and the noise
+budgets are in [research/bench-protocol.md](research/bench-protocol.md); its tests are
+`scripts/bench/test-quiet.sh`, `test-run-all.sh`, `test-renderers.sh`, `test-ios-slim.sh` and `test-soft-host.sh`,
+which need no device.
 
 ## Harness
 

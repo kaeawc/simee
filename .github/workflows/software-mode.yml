@@ -1,10 +1,13 @@
 name: Software mode
 
-# Boots an API 36 x86_64 image in emu's software mode (QEMU's TCG with emu's devices, #55) on a
-# hosted runner, and checks it the way a user would: `sys.boot_completed`, a screenshot over
+# Boots an API 36 x86_64 image in emu's software mode (QEMU with emu's devices, #55) on a hosted
+# runner, and checks it the way a user would: `sys.boot_completed`, a screenshot over
 # display.sock, a tap and a clean stop through the console; on main and manual runs also the
-# launcher drawn. Software mode doesn't use the runner's /dev/kvm. QEMU 11.1 (Ubuntu's is older) is
-# built once and cached, as are the system image and the SDK's Linux renderer.
+# launcher drawn. It runs twice: on the runner's KVM (x86_64 hosted runners expose /dev/kvm), and
+# with `-accel off` in QEMU's TCG, as on a host without KVM. The KVM run then benchmarks emu
+# against the stock emulator on the same runner (scripts/bench/android-boot.sh). QEMU
+# 11.1 (Ubuntu's is older) is built once and cached, as are the system image and the SDK's Linux
+# renderer.
 on:
   # Every push to main runs the full check.
   push:
@@ -26,22 +29,35 @@ on:
       - "crates/emu-fdt/**"
       - "crates/emu-gfxstream/**"
       - "crates/emu-hvf/**"
+      - "crates/emu-kvm/**"
       - "crates/emu-sdk/**"
       - "crates/emu-vmm/**"
       - "crates/sim-android/**"
       - "crates/sim-api/**"
       - "crates/sim-audio/**"
       - "crates/sim-bundle/**"
+      - "crates/sim-camera/**"
       - "crates/sim-core/**"
       - "crates/sim-coresim/**"
       - "crates/sim-debug/**"
+      - "crates/sim-encode/**"
+      - "crates/sim-host/**"
       - "crates/sim-mcp/**"
       - "crates/sim-netshape/**"
+      - "crates/sim-rtc/**"
       - "Cargo.lock"
       - "Cargo.toml"
       - ".cargo/**"
       - "rust-toolchain.toml"
       - ".github/actions/rust-toolchain/**"
+      - ".github/actions/enable-kvm/**"
+      # What the KVM leg's benchmark runs.
+      - "scripts/android-bench.sh"
+      - "scripts/bench/android-boot.sh"
+      - "scripts/bench/lib.sh"
+      - "scripts/bench/quiet.sh"
+      - "scripts/bench/noise-budgets.tsv"
+      - "scripts/bench/summarize.py"
       - ".github/workflows/software-mode.yml"
       - "!**/*.md"
       - "!**/tests/**"
@@ -85,8 +101,13 @@ env:
 
 jobs:
   boot:
+    name: boot (${{ matrix.accel }})
     runs-on: ubuntu-latest
     timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        accel: [kvm, tcg]
     steps:
       # Everything outside the checkout lives under the runner's temp dir. The runner exports
       # ANDROID_SDK_ROOT for its preinstalled SDK, and emu prefers it, so both point at the
@@ -103,18 +124,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - if: matrix.accel == 'kvm'
+        uses: ./.github/actions/enable-kvm
       - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: software-mode
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # QEMU's build dependencies also bring the libraries it runs on; the renderer needs X11's.
+      # QEMU's build dependencies also bring the libraries it runs on; the renderer needs X11's,
+      # the stock emulator also PulseAudio's, ALSA's, GL's and NSS's.
       - name: Packages
         run: |
           sudo apt-get update -q
           sudo apt-get install -yq --no-install-recommends ninja-build libglib2.0-dev libpixman-1-dev libslirp-dev \
-            libfdt-dev flex bison python3-venv libx11-6 libxcb1
+            libfdt-dev flex bison python3-venv libx11-6 libxcb1 libpulse0 libasound2t64 libgl1 libnss3 libxkbfile1 libx11-xcb1
       - id: qemu-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -156,6 +180,7 @@ jobs:
       - name: Boot, screenshot, tap, stop
         env:
           FULL: ${{ github.event_name != 'pull_request' }}
+          ACCEL: ${{ matrix.accel }}
         run: |
           # Exits 0 when the PNG is 720x1280, over $2 bytes and not one solid colour.
           cat > "$RUNNER_TEMP/drawn.py" <<'EOF'
@@ -189,9 +214,12 @@ jobs:
           EOF
           adb="$ANDROID_HOME/platform-tools/adb"
           "$adb" start-server
-          target/release/emu -avd ci -verbose > emu.log 2>&1 &
+          # The KVM run lets emu choose (auto) and checks it chose KVM; the TCG run turns KVM off.
+          if [ "$ACCEL" = kvm ]; then accel=(); else accel=(-accel off); fi
+          start=$(date +%s.%N)
+          target/release/emu -avd ci -verbose "${accel[@]}" > emu.log 2>&1 &
           pid=$!
-          # A fresh userdata's first boot: 375 s on a 4-vCPU Xeon; allow 30 minutes.
+          # A fresh userdata's first boot under TCG: 375 s on a 4-vCPU Xeon; allow 30 minutes.
           for _ in $(seq 1 900); do
             grep -q "boot completed" emu.log && break
             kill -0 "$pid" || { echo "emu exited before boot completed"; exit 1; }
@@ -199,6 +227,8 @@ jobs:
           done
           grep "boot completed" emu.log
           test "$("$adb" -s emulator-5554 shell getprop sys.boot_completed | tr -d '\r')" = 1
+          echo "EMU_BOOT_S=$(echo "$(date +%s.%N) - $start" | bc)" >> "$GITHUB_ENV"
+          if [ "$ACCEL" = kvm ]; then grep "guest CPU on KVM" emu.log; else grep "guest CPU on TCG (-accel off)" emu.log; fi
           if [ "$FULL" = true ]; then sleep 30; min=20000; else min=0; fi
           drawn=
           for _ in $(seq 1 40); do
@@ -210,12 +240,49 @@ jobs:
           "$adb" -s emulator-5554 emu kill
           for _ in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
           ! kill -0 "$pid" 2>/dev/null
+      # emu against the stock emulator on the same runner and KVM (scripts/bench/android-boot.sh):
+      # each round a new AVD, both cold and warm boots to `sys.boot_completed`, peak RSS and the
+      # guest microbenchmarks, the order alternating. A pull request runs one round (--quick, a
+      # smoke test); main and manual runs three, the medians docs/benchmarks.md quotes. The stock
+      # emulator is a pinned release, checked against its SHA-256, in an SDK of its own that links
+      # the cached SDK's image, platform-tools and renderer, so it never enters the SDK cache.
+      # --no-quiet-gate keeps this run as it was: a hosted runner is a shared VM that has just built
+      # the workspace, and its rows are labelled by runner, never mixed with a quiet-host row.
+      # How runner data is gated is #453's.
+      - name: emu against the stock emulator on KVM
+        if: matrix.accel == 'kvm'
+        env:
+          ROUNDS: ${{ github.event_name == 'pull_request' && '--quick' || '--rounds 3' }}
+          # 37.3.10, the stable channel's emulator on 2026-11-27.
+          STOCK_ZIP: emulator-linux_x64-16970787.zip
+          STOCK_SHA256: a4405349d8a9c52136ab7861e5331dc40e85574bd91cb8889a298a2ff4c52e26
+        run: |
+          stock_sdk="$RUNNER_TEMP/stock-sdk"
+          mkdir -p "$stock_sdk"
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/$STOCK_ZIP" "https://dl.google.com/android/repository/$STOCK_ZIP"
+          echo "$STOCK_SHA256  $RUNNER_TEMP/$STOCK_ZIP" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/$STOCK_ZIP" -d "$stock_sdk"
+          for d in platform-tools system-images simee; do ln -s "$ANDROID_HOME/$d" "$stock_sdk/$d"; done
+          "$stock_sdk/emulator/emulator" -version | head -1
+          # shellcheck disable=SC2086 # ROUNDS is one or two words.
+          ANDROID_HOME="$stock_sdk" ANDROID_SDK_ROOT="$stock_sdk" \
+            scripts/bench/android-boot.sh --image system-images/android-36/default/x86_64 --lcd 720x1280@320 --port 5580 \
+            --out bench/results --no-quiet-gate $ROUNDS | tee bench-table.md
+          {
+            echo "### emu against the stock emulator on KVM ($(nproc) vCPUs, $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs))"
+            echo
+            cat bench-table.md
+          } >> "$GITHUB_STEP_SUMMARY"
+      - if: always() && matrix.accel == 'tcg'
+        run: |
+          printf '### First boot to sys.boot_completed under TCG (-accel off): %.1f s\n' "${EMU_BOOT_S:-0}" >> "$GITHUB_STEP_SUMMARY"
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: software-mode
+          name: software-mode-${{ matrix.accel }}
           path: |
             emu.log
             shot.png
+            bench/
             ${{ runner.temp }}/avd/ci.avd/simee/console.log
           if-no-files-found: ignore

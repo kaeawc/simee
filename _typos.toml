@@ -17,9 +17,17 @@ extend-exclude = [
 extend-ignore-re = [
   # docs/benchmarks.md's typing benchmark: the string is typed as written, typo included.
   "Teh quick, Brown FOX",
+  # docs/research/container-backend.md quotes SurfaceFlinger's abort message as the log printed it.
+  "output buffer not gpu writeable",
 ]
 
 [default.extend-words]
+# passt, the project (and Debian/Fedora package) that ships pasta, the container network's uplink.
+passt = "passt"
+# RTP's single-time aggregation packet (RFC 6184 STAP-A/STAP-B).
+stap = "stap"
+# V4L2's stream parameters (VIDIOC_S_PARM, struct v4l2_streamparm).
+parm = "parm"
 # Fragments typos splits out of real tokens: "PNGs" (PN), Linux's KEY_102ND (ND), lsof's `-F pcPnT`
 # field letters (Pn), and two-letter hex/register fragments (BA).
 pn = "pn"

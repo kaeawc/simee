@@ -1,8 +1,15 @@
 //! Tools: one per method in `sim-api`'s table, generated from it, plus the one that opens the
-//! device view. A method added to the table is a tool the next build.
+//! device view. A method added to the table is a tool the next build: its description, input and
+//! output schemas, annotations and toolset all come from `sim-api` (`METHODS`, `input_schema`,
+//! `output_schema`, `catalog`), the same text `help` and docs/api.md show.
+
+use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use sim_api::{METHODS, input_schema, platforms};
+use sim_api::catalog::{self, Effect, Group};
+use sim_api::{METHODS, input_schema, output_schema as api_output, platforms};
 
 use crate::app;
 use crate::backend::Backend;
@@ -14,52 +21,131 @@ pub const VIEW_TOOL: &str = "device_view";
 /// Methods that can run for many seconds: a client that declares the Tasks extension gets a task
 /// handle for these, and everything else a progress heartbeat while the call blocks. A method not
 /// listed runs inline. (`provision` and `record` aren't API methods, so they aren't tools.)
-pub const LONG_RUNNING: &[&str] =
-    &["boot", "boot_many", "create", "clone", "install", "settle", "erase", "shutdown", "export", "import", "mem_leaks", "mem_heap"];
+pub const LONG_RUNNING: &[&str] = &[
+    "boot",
+    "boot_many",
+    "create",
+    "clone",
+    "install",
+    "settle",
+    "wait_idle",
+    "erase",
+    // A Wear OS or Bluetooth pairing takes many seconds (docs/design/device-links.md).
+    "link",
+    "shutdown",
+    "export",
+    "import",
+    "mem_leaks",
+    "mem_heap",
+    "stream_start",
+];
 
-/// What a method does to a device or the host, for the annotations a client's approval prompts
-/// read. Every method in the table is classified here on purpose (a test fails for one that isn't),
-/// since a client may auto-approve what is marked read-only.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Effect {
-    /// Changes nothing, on the device or the host.
-    Read,
-    /// Sets something to a value; repeating it changes nothing more.
-    Set,
-    /// Does something each time it is called (input, a boot) without destroying anything.
-    Act,
-    /// May lose data, run code or change what's running; repeating it can differ.
-    Danger,
-    /// Destroys or overwrites something; repeating it changes nothing more.
-    Destroy,
+/// The environment variable that picks the toolsets: names separated by commas (`core,debug`), or
+/// `all`.
+pub const TOOLSETS_ENV: &str = "SIMEE_MCP_TOOLSETS";
+
+/// The toolset a server serves when none is named: the methods of [`catalog::CORE`] and the view.
+pub const CORE: &str = "core";
+
+/// Which tools a server serves: `core`, any of `sim-api`'s groups, or all of them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Toolsets {
+    core: bool,
+    groups: Vec<Group>,
+    /// A narrower set this one is limited to: a client's own toolsets within the server's.
+    limit: Option<Box<Toolsets>>,
 }
 
-/// The effect of `method`, or `None` for one nobody has classified (it then gets the specification's
-/// defaults: it writes, and may destroy).
-fn effect(method: &str) -> Option<Effect> {
-    use Effect::*;
-    Some(match method {
-        "prefs_stores" | "prefs_read" | "prefs_watch" => Read,
-        "prefs_write" | "prefs_delete" | "prefs_batch" => Destroy,
-        // Read a corpse of the app: nothing on the device changes.
-        "mem_leaks" | "mem_heap" | "mem_vmmap" | "mem_history" => Read,
-        "help" | "identity" | "form_factors" | "devices" | "runtimes" | "device_types" | "screen" | "screenshot" | "apps"
-        | "ca_debug_state" | "logs" | "processes" | "connections" | "traffic" | "containers" | "ls" | "read" | "du" | "crash_reports"
-        | "info" | "defaults_read" | "network_state" | "network_flows" | "network_env" | "audio_state" | "settle" | VIEW_TOOL => Read,
-        "appearance" | "location" | "status_bar" | "clear_status_bar" | "content_size" | "increase_contrast" | "dynamic_island"
-        | "backlight" | "keyboard_language" | "hardware_keyboard" | "ca_debug" | "network_clear" | "audio_volume" | "audio_route"
-        | "audio_mute" | "fold" | "carplay" | "profile" | "privacy" => Set,
-        "create" | "boot" | "boot_many" | "clone" | "tap" | "swipe" | "touch" | "button" | "type" | "key" | "open_url" | "install"
-        | "memory_warning" | "notify" | "biometric" | "rotate" | "rotary" | "watch_gesture" | "remote_swipe" | "xr" | "touchpad"
-        | "stylus" | "pointer" | "vehicle" | "audio_capture_stop" | "contrast_check" | "import" => Act,
-        // Runs programs, starts apps with an environment, replaces a network profile (inject "boot"
-        // reboots the device), delivers a payload, writes a recording or a bundle to a path, drives
-        // the console.
-        "exec" | "launch" | "push" | "network_shape" | "console" | "audio_capture_start" | "kill" | "export" => Danger,
-        "delete" | "erase" | "shutdown" | "rm" | "uninstall" | "terminate" | "reset_keychain" | "clear_container" | "write"
-        | "defaults_write" => Destroy,
-        _ => return None,
-    })
+impl Default for Toolsets {
+    /// `core`: what a general agent needs to drive a device.
+    fn default() -> Toolsets {
+        Toolsets { core: true, groups: Vec::new(), limit: None }
+    }
+}
+
+impl Toolsets {
+    /// Every tool.
+    pub fn all() -> Toolsets {
+        Toolsets { core: true, groups: Group::ALL.to_vec(), limit: None }
+    }
+
+    /// Reads `core,debug` (names separated by commas or spaces; `all` is every one). Empty is the
+    /// default. An unknown name is refused with the names there are.
+    pub fn parse(text: &str) -> Result<Toolsets, String> {
+        let names: Vec<&str> = text.split([',', ' ']).map(str::trim).filter(|n| !n.is_empty()).collect();
+        if names.is_empty() {
+            return Ok(Toolsets::default());
+        }
+        let mut sets = Toolsets { core: false, groups: Vec::new(), limit: None };
+        let mut all = false;
+        for name in names {
+            match name {
+                "all" => all = true,
+                CORE => sets.core = true,
+                _ => match Group::from_name(name) {
+                    Some(g) if !sets.groups.contains(&g) => sets.groups.push(g),
+                    Some(_) => {}
+                    None => return Err(format!("unknown toolset `{name}` in {TOOLSETS_ENV} (choose from {})", Toolsets::names())),
+                },
+            }
+        }
+        Ok(if all { Toolsets::all() } else { sets })
+    }
+
+    /// The toolsets `SIMEE_MCP_TOOLSETS` names.
+    pub fn from_env() -> Result<Toolsets, String> {
+        Toolsets::parse(&std::env::var(TOOLSETS_ENV).unwrap_or_default())
+    }
+
+    /// Every toolset's name, for messages.
+    pub fn names() -> String {
+        std::iter::once(CORE).chain(Group::ALL.iter().map(|g| g.name())).chain(["all"]).collect::<Vec<_>>().join(", ")
+    }
+
+    /// Whether `tool` is served.
+    pub fn contains(&self, tool: &str) -> bool {
+        let own = (self.core && in_core(tool)) || group(tool).is_some_and(|g| self.groups.contains(&g));
+        own && self.limit.as_ref().is_none_or(|l| l.contains(tool))
+    }
+
+    /// These toolsets, limited to the tools `other` serves too.
+    pub fn intersect(&self, other: &Toolsets) -> Toolsets {
+        let mut limited = self.clone();
+        limited.limit = Some(Box::new(match limited.limit.take() {
+            Some(l) => l.intersect(other),
+            None => other.clone(),
+        }));
+        limited
+    }
+
+    /// What a client's limit is, if it has one.
+    pub fn limit(&self) -> Option<&Toolsets> {
+        self.limit.as_deref()
+    }
+
+    /// The names, as `SIMEE_MCP_TOOLSETS` would spell them.
+    pub fn label(&self) -> String {
+        if self.core && self.groups.len() == Group::ALL.len() {
+            return "all".into();
+        }
+        let core = self.core.then_some(CORE);
+        core.into_iter().chain(self.groups.iter().map(|g| g.name())).collect::<Vec<_>>().join(",")
+    }
+}
+
+/// Whether `tool` is in the `core` toolset.
+fn in_core(tool: &str) -> bool {
+    tool == VIEW_TOOL || catalog::CORE.contains(&tool)
+}
+
+/// The group a tool belongs to (the view is an observation).
+fn group(tool: &str) -> Option<Group> {
+    if tool == VIEW_TOOL { Some(Group::Observe) } else { catalog::group(tool) }
+}
+
+/// What a tool does (the view only reads).
+fn effect(tool: &str) -> Option<Effect> {
+    if tool == VIEW_TOOL { Some(Effect::Read) } else { catalog::effect(tool) }
 }
 
 /// Parameters the API takes but a tool doesn't: `screenshot`'s `path` writes a file anywhere on the
@@ -67,6 +153,14 @@ fn effect(method: &str) -> Option<Effect> {
 /// comes back in the result instead.
 const WITHHELD: &[(&str, &str, &str)] = &[
     ("screenshot", "path", "The device's screen as a PNG image, returned in the result"),
+    (
+        "wait_idle",
+        "path",
+        "Wait until the screen is still: no frame has changed it for quiet_ms, at most timeout_ms (fails if it kept changing). \
+         Follows the display's frame callback and surface seed, reading no pixels while nothing is presented; where the seed \
+         ticks on a still screen (iOS 26.5, 10 times a second) a content hash decides. Returns waited_ms and frames (seed \
+         changes seen), and with screenshot the still screen as a PNG image in the result",
+    ),
     (
         "contrast_check",
         "path",
@@ -83,73 +177,275 @@ fn withheld(method: &str) -> Option<&'static str> {
     WITHHELD.iter().find(|(m, ..)| *m == method).map(|(_, p, _)| *p)
 }
 
-/// Whether `name` is a tool.
+/// Tools whose results can be long lists, and where the list is (`None`: the result is the list).
+/// They take `limit` and `cursor`; without either the result is the whole list, as the API's.
+pub const PAGED: &[(&str, Option<&str>)] =
+    &[("processes", None), ("logs", None), ("connections", None), ("devices_usage", Some("devices"))];
+
+/// The most a page holds.
+pub const MAX_LIMIT: u64 = 1000;
+
+fn paged(tool: &str) -> Option<Option<&'static str>> {
+    PAGED.iter().find(|(m, _)| *m == tool).map(|(_, field)| *field)
+}
+
+/// Whether `tool` changes nothing (the catalog's `Read`; a tool nobody classified may).
+pub fn read_only(tool: &str) -> bool {
+    effect(tool).is_some_and(Effect::read_only)
+}
+
+/// Whether `name` is a tool (served or not).
 pub fn exists(name: &str) -> bool {
     name == VIEW_TOOL || METHODS.iter().any(|(m, ..)| *m == name)
 }
 
-/// The annotations the MCP spec defines. An unclassified method gets only `readOnlyHint: false`, so
-/// a client applies the specification's defaults (it may destroy, and isn't idempotent).
-fn annotations(method: &str) -> Value {
-    let mut a = json!({"title": method, "openWorldHint": false});
-    match effect(method) {
-        Some(Effect::Read) => a["readOnlyHint"] = true.into(),
-        Some(effect) => {
+/// The annotations the MCP spec defines, from what `sim-api`'s catalog says the method does. An
+/// unclassified method gets only `readOnlyHint: false`, so a client applies the specification's
+/// defaults (it may destroy, and isn't idempotent).
+fn annotations(tool: &str) -> Value {
+    let title = if tool == VIEW_TOOL { "Device view" } else { tool };
+    let mut a = json!({"title": title, "openWorldHint": catalog::open_world(tool)});
+    match effect(tool) {
+        Some(e) if e.read_only() => a["readOnlyHint"] = true.into(),
+        Some(e) => {
             a["readOnlyHint"] = false.into();
-            a["destructiveHint"] = matches!(effect, Effect::Danger | Effect::Destroy).into();
-            a["idempotentHint"] = matches!(effect, Effect::Set | Effect::Destroy).into();
+            a["destructiveHint"] = e.destructive().into();
+            a["idempotentHint"] = e.idempotent().into();
         }
         None => a["readOnlyHint"] = false.into(),
     }
     a
 }
 
-fn describe(method: &str, params: &str, doc: &str) -> String {
-    let on: Vec<&str> = platforms(method).iter().map(|p| p.label()).collect();
-    let mut text = format!("{doc}{}\n\nPlatforms: {}.", if doc.ends_with('.') { "" } else { "." }, on.join(", "));
+/// A tool's description, for an agent: the method's own text from the table (what `help` and
+/// docs/api.md say), what it does to the device, the units it takes, how slow it is, where it works
+/// and its parameters.
+fn describe(method: &str, params: &str, doc: &str, schema: &Value) -> String {
+    let mut text = format!("{doc}{}", if doc.ends_with('.') { "" } else { "." });
+    if let Some(e) = effect(method) {
+        text.push(' ');
+        text.push_str(e.sentence());
+    }
+    let pixels = schema["properties"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .any(|(_, p)| p["description"].as_str().is_some_and(|d| d.contains("device pixels")));
+    if pixels {
+        text.push_str(" Coordinates are device pixels, the space `screen` reports (not points).");
+    }
+    if LONG_RUNNING.contains(&method) {
+        text.push_str(" Can take a while (seconds to minutes): a client with the tasks extension gets a task to poll.");
+    }
+    if crate::safety::may_confirm(method) {
+        text.push_str(&format!(" {}", crate::safety::confirm_sentence(method)));
+    }
+    if paged(method).is_some() {
+        text.push_str(&format!(
+            " A long list pages: give `limit` (at most {MAX_LIMIT}) and pass back `next_cursor` as `cursor` for the next page; \
+             without either, the whole list."
+        ));
+    }
+    // The view works wherever `screen` does.
+    let on: Vec<&str> = platforms(if method == VIEW_TOOL { "screen" } else { method }).iter().map(|p| p.label()).collect();
+    text.push_str(&format!("\n\nPlatforms: {}.", on.join(", ")));
     if !params.is_empty() {
         text.push_str(&format!(" Parameters: {params}."));
     }
-    if LONG_RUNNING.contains(&method) {
-        text.push_str(" Can take a while: a client with the tasks extension gets a task to poll.");
+    match group(method) {
+        Some(g) if in_core(method) => text.push_str(&format!(" Toolsets: {CORE}, {}.", g.name())),
+        Some(g) => text.push_str(&format!(" Toolset: {}.", g.name())),
+        None => {}
     }
     text
 }
 
-/// Every tool: the method table in its order, then the view.
-pub fn list() -> Vec<Value> {
+/// The `confirm` field of a tool that asks for the user's confirmation.
+fn confirm_property() -> Value {
+    json!({"type": "boolean",
+        "description": "Only after the user has agreed, for a client that can't be asked itself: true confirms this call. \
+            A client that can be asked is asked, and this is ignored"})
+}
+
+/// Says in a listed tool that this client's policy makes it confirm, as the tools that always do
+/// say it: the sentence, and the `confirm` field. (A tool that confirms for every client has both
+/// already.)
+pub fn mark_confirming(tool: &mut Value) {
+    let Some(name) = tool["name"].as_str().map(str::to_owned) else { return };
+    if crate::safety::may_confirm(&name) {
+        return;
+    }
+    if let Some(description) = tool["description"].as_str() {
+        // Before the platforms line, where the others put it.
+        let sentence = crate::safety::confirm_sentence(&name);
+        tool["description"] = match description.split_once("\n\nPlatforms:") {
+            Some((head, rest)) => format!("{head} {sentence}\n\nPlatforms:{rest}"),
+            None => format!("{description} {sentence}"),
+        }
+        .into();
+    }
+    if let Some(properties) = tool["inputSchema"]["properties"].as_object_mut() {
+        properties.insert("confirm".into(), confirm_property());
+    }
+}
+
+/// A tool's input schema: the method's, less what's withheld, plus paging.
+fn input(method: &str) -> Value {
+    let mut schema = input_schema(method).unwrap_or_else(|| json!({"type": "object"}));
+    if let (Some(name), Some(properties)) = (withheld(method), schema["properties"].as_object_mut()) {
+        properties.remove(name);
+    }
+    if crate::safety::may_confirm(method) {
+        schema["properties"]["confirm"] = confirm_property();
+    }
+    if paged(method).is_some() {
+        schema["properties"]["limit"] = json!({"type": "integer", "minimum": 1, "maximum": MAX_LIMIT,
+            "description": "At most this many items; the result is a page with `next_cursor` (null on the last page) and `total`"});
+        schema["properties"]["cursor"] = json!({"type": "string",
+            "description": "A previous page's `next_cursor`: the page after it, of the same list (kept 10 minutes)"});
+    }
+    schema
+}
+
+/// What a tool's `structuredContent` is, before the client's revision has its say: the method's
+/// result as `sim-api` describes it (nullable where the method may return nothing), with the
+/// shapes the tool changes.
+fn output(tool: &str) -> Value {
+    let number = json!({"type": "number"});
+    let size = json!({"type": "object", "properties": {"width": number, "height": number}, "required": ["width", "height"]});
+    let mut schema = match tool {
+        VIEW_TOOL => {
+            json!({"type": "object", "properties": {"device": {"type": "string"}, "screen": size}, "required": ["device", "screen"]})
+        }
+        // The PNG is an image block; the structure is its size.
+        "screenshot" => size,
+        _ => api_output(tool).unwrap_or_else(|| json!({})),
+    };
+    if tool == "contrast_check" {
+        // Each PNG is an image block, which `image` (its place among them) and `image_of` name.
+        if let Some(properties) = schema["properties"].as_object_mut() {
+            properties.remove("png");
+            properties.remove("path");
+            properties.insert("image".into(), json!({"type": "number"}));
+            properties.insert("image_of".into(), json!({"type": "string"}));
+        }
+    }
+    if tool == "wait_idle"
+        && let Some(properties) = schema["properties"].as_object_mut()
+    {
+        // The still screen is an image block, and `path` isn't offered.
+        properties.remove("png");
+        properties.remove("path");
+    }
+    match paged(tool) {
+        Some(None) => {
+            let page = json!({"type": "object", "properties": {"items": schema, "next_cursor": {"type": ["string", "null"]},
+                "total": number}, "required": ["items", "next_cursor", "total"]});
+            json!({"anyOf": [schema, page]})
+        }
+        Some(Some(_)) => {
+            schema["properties"]["next_cursor"] = json!({"type": ["string", "null"]});
+            schema["properties"]["total"] = number;
+            schema
+        }
+        None => schema,
+    }
+}
+
+/// `schema` with a `null` result written as `{}`, which is what [`structured`] makes of one.
+fn without_null(mut schema: Value) -> Value {
+    if schema == json!({"type": "null"}) {
+        return json!({"type": "object", "properties": {}, "additionalProperties": false});
+    }
+    if let Some(types) = schema["type"].as_array().filter(|t| t.contains(&json!("null"))) {
+        let rest: Vec<Value> = types.iter().filter(|t| **t != "null").cloned().collect();
+        if rest == [json!("object")] {
+            // `{}` has none of the keys the object requires.
+            schema["type"] = "object".into();
+            if let Some(o) = schema.as_object_mut() {
+                o.remove("required");
+            }
+        }
+        return schema;
+    }
+    if let Some(alts) = schema.get_mut("anyOf").and_then(Value::as_array_mut) {
+        for alt in alts.iter_mut().filter(|a| **a == json!({"type": "null"})) {
+            *alt = json!({"type": "object", "maxProperties": 0});
+        }
+    }
+    schema
+}
+
+/// `schema` as an object, as revisions before 2026-07-28 have `structuredContent`: anything else
+/// is under `result`, as [`structured`] puts it.
+fn as_object(schema: Value) -> Value {
+    let wrap = |s: Value| {
+        if s["type"] == "object" { s } else { json!({"type": "object", "properties": {"result": s}, "required": ["result"]}) }
+    };
+    match schema.get("anyOf").and_then(Value::as_array) {
+        Some(alts) => json!({"type": "object", "anyOf": alts.iter().cloned().map(wrap).collect::<Vec<_>>()}),
+        None => wrap(schema),
+    }
+}
+
+/// A tool's output schema for a client of `era`.
+pub fn output_schema(tool: &str, era: Era) -> Value {
+    let schema = without_null(output(tool));
+    if era == Era::Modern { schema } else { as_object(schema) }
+}
+
+/// One tool's definition for this client.
+fn definition(method: &str, params: &str, doc: &str, ctx: &Ctx) -> Value {
+    let schema = input(method);
+    let (mut params, mut doc) = (params.to_string(), doc.to_string());
+    if let Some((_, name, text)) = WITHHELD.iter().find(|(m, ..)| *m == method) {
+        doc = (*text).to_owned();
+        params = params.split(", ").filter(|t| t != name && !t.starts_with(&format!("{name}?"))).collect::<Vec<_>>().join(", ");
+    }
+    let mut tool = json!({
+        "name": method,
+        "title": method,
+        "description": describe(method, &params, &doc, &schema),
+        "inputSchema": schema,
+        "annotations": annotations(method),
+    });
+    if ctx.output_schemas() {
+        tool["outputSchema"] = output_schema(method, ctx.era);
+    }
+    tool
+}
+
+/// The tools `toolsets` serves, for this client: the method table in its order, then the view.
+pub fn list(toolsets: &Toolsets, ctx: &Ctx) -> Vec<Value> {
     let mut tools: Vec<Value> = METHODS
         .iter()
-        .map(|(method, params, doc)| {
-            let mut schema = input_schema(method).unwrap_or_else(|| json!({"type": "object"}));
-            let (mut params, mut doc) = (params.to_string(), doc.to_string());
-            if let Some((_, name, text)) = WITHHELD.iter().find(|(m, ..)| m == method) {
-                doc = (*text).to_owned();
-                if let Some(properties) = schema["properties"].as_object_mut() {
-                    properties.remove(*name);
-                }
-                params = params.split(", ").filter(|t| t != name && !t.starts_with(&format!("{name}?"))).collect::<Vec<_>>().join(", ");
-            }
-            json!({
-                "name": method,
-                "title": method,
-                "description": describe(method, &params, &doc),
-                "inputSchema": schema,
-                "annotations": annotations(method),
-            })
-        })
+        .filter(|(method, ..)| toolsets.contains(method))
+        .map(|(method, params, doc)| definition(method, params, doc, ctx))
         .collect();
-    tools.push(json!({
-        "name": VIEW_TOOL,
-        "title": "Device view",
-        "description": "Open a live view of a device: its screen, refreshed about once a second, with tap, swipe, type and button \
-            controls (an MCP App; a client without app support gets the screen size). Platforms: Android, iOS.",
-        "inputSchema": {"type": "object", "properties": {"device": {"type": "string",
-            "description": "A device's UDID, name or `booted` (the default)"}}},
-        "annotations": {"title": "Device view", "readOnlyHint": true, "openWorldHint": false},
-        "_meta": {"ui": {"resourceUri": app::URI}},
-    }));
+    if toolsets.contains(VIEW_TOOL) {
+        let schema = json!({"type": "object", "properties": {"device": {"type": "string",
+            "description": "A device's UDID, name or `booted` (the default)"}}});
+        let doc = "Open a live view of a device: its screen, refreshed about once a second, with tap, swipe, type and button \
+            controls (an MCP App; a client without app support gets the screen size)";
+        let mut view = json!({
+            "name": VIEW_TOOL,
+            "title": "Device view",
+            "description": describe(VIEW_TOOL, "", doc, &schema),
+            "inputSchema": schema,
+            "annotations": annotations(VIEW_TOOL),
+            "_meta": {"ui": {"resourceUri": app::URI}},
+        });
+        if ctx.output_schemas() {
+            view["outputSchema"] = output_schema(VIEW_TOOL, ctx.era);
+        }
+        tools.push(view);
+    }
     tools
+}
+
+/// Whether `name` is a tool this server has: a method in `sim-api`'s table, or the device view.
+pub fn is_tool(name: &str) -> bool {
+    name == VIEW_TOOL || METHODS.iter().any(|(method, ..)| *method == name)
 }
 
 /// The tool's arguments as the method's params: a missing or null `arguments` is none, anything
@@ -162,8 +458,143 @@ pub fn arguments(params: &Value) -> Result<Value, RpcError> {
     }
 }
 
+/// Snapshots of long lists a client is paging through: the first page's call is the list's
+/// snapshot, and each cursor names one, so the pages after it are the same list (a process list or
+/// a log window doesn't shift under the client). A snapshot belongs to the client that made it
+/// (one HTTP server's stateless sessions share these) and its id is a random 128-bit number, so a
+/// cursor works for nobody else; serving a page asks the client's backend again whether the call
+/// that made the snapshot is still allowed ([`Backend::permits`]). Kept [`Pages::TTL`]; at most
+/// [`Pages::KEPT`] of them and [`Pages::MAX_BYTES`] of JSON in all (the oldest go first), and none
+/// for a first page that holds the whole list.
+#[derive(Default)]
+pub struct Pages {
+    kept: Mutex<VecDeque<Snapshot>>,
+}
+
+struct Snapshot {
+    id: String,
+    /// The client it was made for.
+    owner: String,
+    tool: String,
+    /// The call that made it, as the method took it (without paging).
+    args: Value,
+    at: Instant,
+    /// The whole result.
+    value: Value,
+    /// Its size as JSON text.
+    bytes: usize,
+}
+
+impl Pages {
+    pub const TTL: Duration = Duration::from_secs(600);
+    pub const KEPT: usize = 4;
+    pub const MAX_BYTES: usize = 32 << 20;
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<Snapshot>> {
+        self.kept.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn keep(&self, owner: &str, tool: &str, args: &Value, value: &Value) -> String {
+        self.keep_within(owner, tool, args, value, Pages::KEPT, Pages::MAX_BYTES)
+    }
+
+    fn keep_within(&self, owner: &str, tool: &str, args: &Value, value: &Value, entries: usize, max_bytes: usize) -> String {
+        let bytes = value.to_string().len();
+        let mut kept = self.lock();
+        let id = crate::tasks::new_id();
+        kept.retain(|s| s.at.elapsed() < Pages::TTL);
+        // Make room: the oldest go until this one fits both caps (it is kept even when alone over).
+        while !kept.is_empty() && (kept.len() >= entries || kept.iter().map(|s| s.bytes).sum::<usize>() + bytes > max_bytes) {
+            kept.pop_front();
+        }
+        kept.push_back(Snapshot {
+            id: id.clone(),
+            owner: owner.to_owned(),
+            tool: tool.to_owned(),
+            args: args.clone(),
+            at: Instant::now(),
+            value: value.clone(),
+            bytes,
+        });
+        id
+    }
+
+    /// The snapshot `id` that `owner` made for `tool`: its list, and the call that made it.
+    fn find(&self, owner: &str, tool: &str, id: &str) -> Option<(Value, Value)> {
+        let kept = self.lock();
+        let found = kept.iter().find(|s| s.id == id && s.owner == owner && s.tool == tool && s.at.elapsed() < Pages::TTL);
+        found.map(|s| (s.value.clone(), s.args.clone()))
+    }
+
+    /// One page of `tool`'s list: from a new call, or from the snapshot `cursor` names.
+    fn page(&self, backend: &dyn Backend, owner: &str, tool: &str, field: Option<&str>, args: &Value) -> Result<Value, String> {
+        let limit = match args.get("limit") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(
+                v.as_u64()
+                    .filter(|n| (1..=MAX_LIMIT).contains(n))
+                    .ok_or_else(|| format!("`limit` must be a whole number from 1 to {MAX_LIMIT}, not {v}"))?,
+            ),
+        };
+        let expired =
+            || format!("`cursor` has expired (pages are kept 10 minutes) or isn't one of this server's: call `{tool}` again without it");
+        let mut made = args.clone();
+        if let Some(o) = made.as_object_mut() {
+            o.remove("limit");
+            o.remove("cursor");
+        }
+        let (value, offset, limit, id) = match args.get("cursor") {
+            None | Some(Value::Null) => (backend.call(tool, &made)?, 0, limit.unwrap_or(MAX_LIMIT), None),
+            Some(Value::String(cursor)) => {
+                let mut parts = cursor.split('.');
+                let (Some(id), Some(Ok(offset)), Some(Ok(was)), None) =
+                    (parts.next(), parts.next().map(str::parse::<u64>), parts.next().map(str::parse::<u64>), parts.next())
+                else {
+                    return Err(expired());
+                };
+                if !(1..=MAX_LIMIT).contains(&was) {
+                    return Err(expired());
+                }
+                let (value, original) = self.find(owner, tool, id).ok_or_else(expired)?;
+                // The list was read when the call was allowed: ask again before showing more of it.
+                backend.permits(tool, &original)?;
+                (value, offset, limit.unwrap_or(was), Some(id.to_owned()))
+            }
+            Some(other) => return Err(format!("`cursor` is a previous page's `next_cursor`, not {other}")),
+        };
+        let list = match field {
+            Some(f) => value.get(f),
+            None => Some(&value),
+        };
+        let Some(items) = list.and_then(Value::as_array) else {
+            // Not a list after all (an error the method reported as data): as it is.
+            return Ok(value);
+        };
+        let total = items.len() as u64;
+        let end = offset.saturating_add(limit).min(total);
+        let page: Vec<Value> = items.iter().skip(offset as usize).take((end.saturating_sub(offset)) as usize).cloned().collect();
+        let next = if end < total {
+            let id = id.unwrap_or_else(|| self.keep(owner, tool, &made, &value));
+            json!(format!("{id}.{end}.{limit}"))
+        } else {
+            Value::Null
+        };
+        Ok(match field {
+            Some(f) => {
+                let mut out = value.clone();
+                out[f] = page.into();
+                out["next_cursor"] = next;
+                out["total"] = total.into();
+                out
+            }
+            None => json!({"items": page, "next_cursor": next, "total": total}),
+        })
+    }
+}
+
 /// Runs one tool: the method's outcome (a failure is a tool error, not a protocol error).
-pub fn run(backend: &dyn Backend, name: &str, args: &Value) -> Result<Value, String> {
+/// `owner` is the client the call is for, whose snapshots its pages are.
+pub fn run(backend: &dyn Backend, pages: &Pages, owner: &str, name: &str, args: &Value) -> Result<Value, String> {
     if let Some(param) = withheld(name).filter(|p| args.get(*p).is_some_and(|v| !v.is_null())) {
         return Err(format!("`{param}` isn't available through MCP: `{name}` returns the image in its result"));
     }
@@ -172,12 +603,27 @@ pub fn run(backend: &dyn Backend, name: &str, args: &Value) -> Result<Value, Str
         let screen = backend.call("screen", &json!({"device": device}))?;
         return Ok(json!({"device": device, "screen": screen}));
     }
+    if let Some(field) = paged(name)
+        && ["limit", "cursor"].iter().any(|k| args.get(*k).is_some_and(|v| !v.is_null()))
+    {
+        return pages.page(backend, owner, name, field, args);
+    }
     backend.call(name, args)
 }
 
+/// A result as `structuredContent`: nothing is `{}`, an object is itself, anything else is itself
+/// for the current revision and under `result` for the ones before it (which want an object).
+fn structured(value: Value, era: Era) -> Value {
+    match value {
+        Value::Null => json!({}),
+        v if v.is_object() || era == Era::Modern => v,
+        v => json!({"result": v}),
+    }
+}
+
 /// A method's outcome as a `CallToolResult`. A screenshot's PNG becomes an image block instead of
-/// base64 in text; everything else is its JSON as text, and as `structuredContent` too (an object,
-/// for a client of an older revision).
+/// base64 in text; everything else is its JSON as text (`ok` for nothing), and as
+/// `structuredContent` (what the tool's output schema describes).
 pub fn result(name: &str, outcome: Result<Value, String>, era: Era) -> Value {
     let value = match outcome {
         Ok(value) => value,
@@ -199,12 +645,27 @@ pub fn result(name: &str, outcome: Result<Value, String>, era: Era) -> Value {
     if name == "contrast_check" {
         return contrast_result(value);
     }
-    let text = if value.is_null() { "ok".to_owned() } else { value.to_string() };
-    let mut result = json!({"content": [{"type": "text", "text": text}]});
-    if !value.is_null() {
-        result["structuredContent"] = if era == Era::Modern || value.is_object() { value } else { json!({"result": value}) };
+    // `wait_idle`'s still screen, when asked for, is an image block too; the rest stays structure.
+    if let (Some(png), true) = (value.get("png").and_then(Value::as_str), name == "wait_idle") {
+        let mut meta = value.clone();
+        meta.as_object_mut().map(|o| o.remove("png"));
+        return json!({"content": [{"type": "image", "data": png, "mimeType": "image/png"},
+            {"type": "text", "text": meta.to_string()}], "structuredContent": meta});
     }
-    result
+    let text = if value.is_null() { "ok".to_owned() } else { lifecycle_text(name, &value) };
+    json!({"content": [{"type": "text", "text": text}], "structuredContent": structured(value, era)})
+}
+
+/// A result's JSON as text. A lifecycle call's `admission` and `pacing` are in `structuredContent`
+/// already, so the text keeps the rest and the verdict in a few words (`ok (admit)`): the same
+/// numbers twice would double what every boot costs the agent's context.
+fn lifecycle_text(name: &str, value: &Value) -> String {
+    let verdict = value.get("admission").and_then(|a| a["verdict"].as_str());
+    let (true, Some(verdict), Some(fields)) = (name != "admission_check", verdict, value.as_object()) else { return value.to_string() };
+    let mut rest = fields.clone();
+    rest.remove("admission");
+    rest.remove("pacing");
+    if rest.is_empty() { format!("ok ({verdict})") } else { format!("{} ({verdict})", Value::Object(rest)) }
 }
 
 /// `contrast_check`'s outcome: each annotated PNG (one, or one per appearance) becomes an image block
@@ -230,13 +691,53 @@ fn contrast_result(mut value: Value) -> Value {
     json!({"content": content, "structuredContent": value})
 }
 
+/// The name of the toolset that has `tool` (`all` for one no set claims).
+pub fn toolset_of(tool: &str) -> &'static str {
+    group(tool).map_or("all", Group::name)
+}
+
+/// The refusal of `tool`, which `toolsets` doesn't serve, naming the toolset that has it. A
+/// resource that reads through a tool is refused the same way.
+pub fn not_enabled(tool: &str, toolsets: &Toolsets) -> RpcError {
+    let set = toolset_of(tool);
+    if let Some(limit) = toolsets.limit().filter(|l| !l.contains(tool)) {
+        return RpcError::invalid_params(format!(
+            "Tool `{tool}` isn't allowed for this client: it is in the `{set}` toolset, and this client's policy allows `{}`. \
+             The operator changes it with `toolsets` in the policy file (`simee mcp --policy`, docs/mcp-safety.md)",
+            limit.label()
+        ))
+        .with_data(json!({"tool": tool, "toolset": set, "allowed": limit.label()}));
+    }
+    RpcError::invalid_params(format!(
+        "Tool `{tool}` isn't enabled on this server: it is in the `{set}` toolset, and this server serves `{}`. \
+         Start it with {TOOLSETS_ENV}={},{set} (or all)",
+        toolsets.label(),
+        toolsets.label()
+    ))
+    .with_data(json!({"tool": tool, "toolset": set, "enabled": toolsets.label()}))
+}
+
 /// What a tool call needs from the request to decide how to run: its name and arguments, checked.
-pub fn parse_call(params: &Value) -> Result<(String, Value), RpcError> {
+/// A tool this server doesn't serve is refused with the toolset that has it.
+pub fn parse_call(params: &Value, toolsets: &Toolsets) -> Result<(String, Value), RpcError> {
     let name = params.get("name").and_then(Value::as_str).ok_or_else(|| RpcError::invalid_params("`name` is required"))?;
     if !exists(name) {
         return Err(RpcError::invalid_params(format!("Unknown tool: {name}")));
     }
-    Ok((name.to_owned(), arguments(params)?))
+    if !toolsets.contains(name) {
+        return Err(not_enabled(name, toolsets));
+    }
+    let args = arguments(params)?;
+    // `input: true` lets the viewer touch, type and press buttons: it needs the input tools served.
+    if name == "stream_start" && args.get("input") == Some(&json!(true)) && !toolsets.contains("touch") {
+        return Err(RpcError::invalid_params(format!(
+            "`stream_start` with `input: true` lets viewers drive the device, which needs the `input` toolset, and this server serves `{}`. \
+             Start it with {TOOLSETS_ENV}={},input (or all), or leave `input` off",
+            toolsets.label(),
+            toolsets.label()
+        )));
+    }
+    Ok((name.to_owned(), args))
 }
 
 /// Whether this call should be a task for this client.
@@ -245,213 +746,4 @@ pub fn as_task(name: &str, ctx: &Ctx) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::backend::fake::Fake;
-
-    #[test]
-    fn there_is_a_tool_for_every_method_in_the_table() {
-        let tools = list();
-        for (method, params, doc) in METHODS {
-            let tool = tools.iter().find(|t| t["name"] == *method).unwrap_or_else(|| panic!("no tool for {method}"));
-            let description = tool["description"].as_str().expect("description");
-            if withheld(method).is_none() {
-                assert!(description.starts_with(doc), "{method}");
-                assert!(params.is_empty() || description.contains(params), "{method} lists its parameters");
-            }
-            assert!(description.contains("Platforms: "), "{method} says where it works");
-            assert_eq!(tool["inputSchema"]["type"], "object", "{method}");
-        }
-        assert_eq!(tools.len(), METHODS.len() + 1, "the table plus the view");
-        assert_eq!(tools.last().map(|t| t["name"].clone()), Some(json!(VIEW_TOOL)));
-        // Tool names are what the spec allows, and unique.
-        let mut names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-        assert!(names.iter().all(|n| n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')));
-        names.sort();
-        names.dedup();
-        assert_eq!(names.len(), tools.len());
-    }
-
-    #[test]
-    fn descriptions_say_which_platforms_a_method_works_on() {
-        let tools = list();
-        let find = |m: &str| tools.iter().find(|t| t["name"] == m).and_then(|t| t["description"].as_str()).expect(m).to_owned();
-        assert!(find("tap").contains("Platforms: Android, iOS."));
-        assert!(find("xr").contains("Platforms: Android."));
-        assert!(!find("xr").contains("iOS."));
-        assert!(find("fold").contains("Platforms: Android, iOS."), "the iPhone Duo folds too");
-        assert!(find("status_bar").contains("Platforms: iOS."));
-        assert!(find("boot").contains("task"));
-        assert!(!find("tap").contains("task"));
-    }
-
-    #[test]
-    fn every_method_is_classified_on_purpose() {
-        // A method that isn't in `effect` would get the specification's defaults: add it there.
-        let unclassified: Vec<&str> = METHODS.iter().map(|(m, ..)| *m).filter(|m| effect(m).is_none()).collect();
-        assert!(unclassified.is_empty(), "classify these in `effect` in tools.rs: {unclassified:?}");
-        assert!(effect(VIEW_TOOL).is_some());
-        for name in LONG_RUNNING {
-            assert!(METHODS.iter().any(|(m, ..)| m == name), "{name} is not a method");
-        }
-    }
-
-    #[test]
-    fn annotations_follow_what_a_method_does() {
-        let tools = list();
-        let ann = |m: &str| tools.iter().find(|t| t["name"] == m).map(|t| t["annotations"].clone()).expect(m);
-        assert_eq!(ann("devices")["readOnlyHint"], true);
-        assert_eq!(ann("devices").get("destructiveHint"), None);
-        assert_eq!((ann("delete")["destructiveHint"].clone(), ann("delete")["idempotentHint"].clone()), (json!(true), json!(true)));
-        assert_eq!((ann("tap")["readOnlyHint"].clone(), ann("tap")["destructiveHint"].clone()), (json!(false), json!(false)));
-        assert_eq!(ann("appearance")["idempotentHint"], true);
-        assert_eq!(ann("tap")["openWorldHint"], false);
-        // What runs code, replaces state or overwrites files is marked destructive, not harmless.
-        for risky in ["exec", "write", "defaults_write", "network_shape", "push", "launch", "console", "kill", "audio_capture_start"] {
-            assert_eq!((ann(risky)["readOnlyHint"].clone(), ann(risky)["destructiveHint"].clone()), (json!(false), json!(true)), "{risky}");
-        }
-        // Read-only means it changes nothing: not a capture that stops and writes a recording.
-        assert_eq!(ann("audio_capture_stop")["readOnlyHint"], false);
-        assert_eq!(ann("screenshot")["readOnlyHint"], true);
-        // A method nobody classified gets the specification's defaults, not a claim of safety.
-        let unknown = annotations("a_new_method");
-        assert_eq!(unknown["readOnlyHint"], false);
-        assert_eq!((unknown.get("destructiveHint"), unknown.get("idempotentHint")), (None, None));
-        // Every read-only tool is one of the listings and reads, by name.
-        let read_only: Vec<&str> = METHODS.iter().map(|(m, ..)| *m).filter(|m| effect(m) == Some(Effect::Read)).collect();
-        assert!(read_only.iter().all(|m| !m.starts_with("audio_capture") && !["write", "rm", "exec", "kill"].contains(m)), "{read_only:?}");
-    }
-
-    #[test]
-    fn screenshot_does_not_take_a_host_path() {
-        let tools = list();
-        let shot = tools.iter().find(|t| t["name"] == "screenshot").expect("screenshot");
-        assert_eq!(shot["inputSchema"]["properties"].get("path"), None);
-        assert!(!shot["description"].as_str().expect("description").contains("path"));
-        assert!(shot["inputSchema"]["properties"]["device"].is_object());
-        let fake = Fake::default();
-        let err = run(&fake, "screenshot", &json!({"device": "d", "path": "/home/me/.zshrc"})).expect_err("refused");
-        assert!(err.contains("`path` isn't available through MCP"), "{err}");
-        assert!(fake.called("screenshot").is_empty(), "never reaches the API");
-        assert!(run(&fake, "screenshot", &json!({"device": "d", "path": null})).is_ok());
-        // Other methods keep their parameters.
-        assert!(
-            tools.iter().find(|t| t["name"] == "audio_capture_start").is_some_and(|t| t["inputSchema"]["properties"].get("path").is_some())
-        );
-    }
-
-    #[test]
-    fn the_docs_name_every_tool_and_resource() {
-        // docs/mcp.md lives at the repository root, outside the published crate: in the
-        // workspace a missing doc fails, from an unpacked .crate the test has nothing to check.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        if !root.join("crates/sim-mcp/Cargo.toml").is_file() {
-            eprintln!("skipped: not in the simee workspace, so docs/mcp.md isn't here");
-            return;
-        }
-        let docs = std::fs::read_to_string(root.join("docs/mcp.md")).expect("docs/mcp.md");
-        for tool in list() {
-            let name = tool["name"].as_str().expect("name");
-            assert!(docs.contains(&format!("`{name}`")), "docs/mcp.md doesn't name the tool `{name}`: add it to the tool table");
-        }
-        for uri in [
-            crate::resources::DEVICES,
-            crate::resources::RUNTIMES,
-            crate::resources::DEVICE_TYPES,
-            crate::resources::FORM_FACTORS,
-            app::URI,
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .chain(crate::resources::templates().as_array().into_iter().flatten().filter_map(|t| t["uriTemplate"].as_str().map(str::to_owned)))
-        {
-            assert!(docs.contains(&format!("`{uri}`")), "docs/mcp.md doesn't name the resource `{uri}`");
-        }
-        for method in LONG_RUNNING {
-            assert!(docs.contains(&format!("`{method}`")), "{method}");
-        }
-    }
-
-    #[test]
-    fn the_view_tool_points_at_the_app() {
-        let tools = list();
-        let view = tools.last().expect("view");
-        assert_eq!(view["_meta"]["ui"]["resourceUri"], app::URI);
-        assert!(tools.iter().filter(|t| t.get("_meta").is_some()).count() == 1);
-    }
-
-    #[test]
-    fn arguments_are_objects() {
-        assert_eq!(arguments(&json!({"name": "tap"})), Ok(json!({})));
-        assert_eq!(arguments(&json!({"arguments": null})), Ok(json!({})));
-        assert_eq!(arguments(&json!({"arguments": {"x": 1}})), Ok(json!({"x": 1})));
-        assert_eq!(arguments(&json!({"arguments": [1]})).expect_err("array").code, crate::rpc::INVALID_PARAMS);
-        assert_eq!(parse_call(&json!({"name": "nope"})).expect_err("unknown").message, "Unknown tool: nope");
-        assert!(parse_call(&json!({})).is_err());
-        assert_eq!(parse_call(&json!({"name": "tap", "arguments": {"x": 1}})), Ok(("tap".to_owned(), json!({"x": 1}))));
-    }
-
-    #[test]
-    fn results_are_content_and_structure() {
-        let ok = result("devices", Ok(json!([{"udid": "a"}])), Era::Modern);
-        assert_eq!(ok["content"][0]["text"], r#"[{"udid":"a"}]"#);
-        assert_eq!(ok["structuredContent"], json!([{"udid": "a"}]));
-        // An older revision's structuredContent is an object.
-        let old = result("devices", Ok(json!([1])), Era::Legacy);
-        assert_eq!(old["structuredContent"], json!({"result": [1]}));
-        assert_eq!(result("info", Ok(json!({"a": 1})), Era::Legacy)["structuredContent"], json!({"a": 1}));
-        let none = result("tap", Ok(Value::Null), Era::Modern);
-        assert_eq!((none["content"][0]["text"].clone(), none.get("structuredContent")), (json!("ok"), None));
-        let failed = result("tap", Err("no device matches `x`".into()), Era::Modern);
-        assert_eq!((failed["isError"].clone(), failed["content"][0]["text"].clone()), (json!(true), json!("no device matches `x`")));
-        let shot = result("screenshot", Ok(json!({"width": 2, "height": 1, "png": "iVBOR"})), Era::Modern);
-        assert_eq!(shot["content"][0], json!({"type": "image", "data": "iVBOR", "mimeType": "image/png"}));
-        assert_eq!(shot["structuredContent"], json!({"width": 2, "height": 1}));
-        // A contrast check's PNGs become image blocks and leave the text a few lines of findings.
-        let check = result(
-            "contrast_check",
-            Ok(json!({"failing": 1, "appearances": {"light": {"png": "AAA", "findings": []}, "dark": {"png": "BBB", "findings": []}}})),
-            Era::Modern,
-        );
-        // `image` is a result's place among the image blocks (JSON objects have no order to lean on).
-        let at = |mode: &str| check["structuredContent"]["appearances"][mode]["image"].as_u64().expect("image") as usize + 1;
-        assert_eq!(check["content"][at("light")], json!({"type": "image", "data": "AAA", "mimeType": "image/png"}));
-        assert_eq!(check["content"][at("dark")]["data"], "BBB");
-        assert_ne!(at("light"), at("dark"));
-        assert!(!check["content"][0]["text"].as_str().expect("text").contains("AAA"));
-        let single = result("contrast_check", Ok(json!({"png": "CCC", "findings": []})), Era::Modern);
-        assert_eq!(
-            (single["content"][1]["data"].clone(), single["structuredContent"]["image_of"].clone()),
-            (json!("CCC"), json!("screen"))
-        );
-        // Written to a path, a screenshot is plain data.
-        let path = result("screenshot", Ok(json!({"path": "/tmp/x.png", "width": 2, "height": 1})), Era::Modern);
-        assert_eq!(path["structuredContent"]["path"], "/tmp/x.png");
-    }
-
-    #[test]
-    fn running_a_tool_calls_the_method_or_reads_the_screen_for_the_view() {
-        let fake = Fake::default();
-        fake.answer("screen", Ok(json!({"width": 1080, "height": 2400})));
-        assert_eq!(run(&fake, "tap", &json!({"device": "d", "x": 1, "y": 2})), Ok(Value::Null));
-        assert_eq!(fake.called("tap"), [json!({"device": "d", "x": 1, "y": 2})]);
-        let view = run(&fake, VIEW_TOOL, &json!({})).expect("view");
-        assert_eq!(view, json!({"device": "booted", "screen": {"width": 1080, "height": 2400}}));
-        assert_eq!(fake.called("screen"), [json!({"device": "booted"})]);
-        let shown = result(VIEW_TOOL, Ok(view), Era::Modern);
-        assert!(shown["content"][0]["text"].as_str().is_some_and(|t| t.contains("1080")));
-        assert_eq!(shown["structuredContent"]["device"], "booted");
-        fake.answer("screen", Err("booted: no such device".into()));
-        assert!(run(&fake, VIEW_TOOL, &json!({"device": "x"})).is_err());
-    }
-
-    #[test]
-    fn only_long_methods_for_task_clients_become_tasks() {
-        let caps = json!({"extensions": {crate::rpc::EXT_TASKS: {}}});
-        let tasks = Ctx { era: Era::Modern, caps, progress_token: None };
-        let plain = Ctx { era: Era::Modern, caps: json!({}), progress_token: None };
-        let legacy = Ctx { era: Era::Legacy, caps: tasks.caps.clone(), progress_token: None };
-        assert!(as_task("boot", &tasks) && as_task("install", &tasks));
-        assert!(!as_task("tap", &tasks) && !as_task("boot", &plain) && !as_task("boot", &legacy));
-    }
-}
+mod tests;

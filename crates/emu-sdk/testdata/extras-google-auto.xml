@@ -1,0 +1,97 @@
+<?xml version='1.0' encoding='utf-8'?>
+<!-- Shaped like repository2-3.xml's extras;google;auto entries (r2.0 stable, r2.1 beta; four hosts); file names, sizes and checksums are made up -->
+<sdk:sdk-repository xmlns:sdk="http://schemas.android.com/sdk/android/repo/repository2/03" xmlns:generic="http://schemas.android.com/repository/android/generic/02" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <license id="android-sdk-license" type="text">Terms and Conditions (trimmed)</license>
+  <channel id="channel-0">stable</channel>
+  <channel id="channel-1">beta</channel>
+  <remotePackage path="extras;google;auto">
+    <type-details xsi:type="generic:genericDetailsType"/>
+    <revision><major>2</major><minor>0</minor></revision>
+    <display-name>Android Auto Desktop Head Unit Emulator</display-name>
+    <uses-license ref="android-sdk-license"/>
+    <channelRef ref="channel-0"/>
+    <archives>
+      <archive>
+        <complete>
+          <size>1000000</size>
+          <checksum type="sha1">0000000000000000000000000000000000000000</checksum>
+          <url>desktop-head-unit-mac-arm_r2.0.zip</url>
+        </complete>
+        <host-os>macosx</host-os>
+        <host-arch>aarch64</host-arch>
+      </archive>
+      <archive>
+        <complete>
+          <size>1000001</size>
+          <checksum type="sha1">0101010101010101010101010101010101010101</checksum>
+          <url>desktop-head-unit-mac_r2.0.zip</url>
+        </complete>
+        <host-os>macosx</host-os>
+        <host-arch>x64</host-arch>
+      </archive>
+      <archive>
+        <complete>
+          <size>1000002</size>
+          <checksum type="sha1">0202020202020202020202020202020202020202</checksum>
+          <url>desktop-head-unit-linux_r2.0.zip</url>
+        </complete>
+        <host-os>linux</host-os>
+        <host-arch>x64</host-arch>
+      </archive>
+      <archive>
+        <complete>
+          <size>1000003</size>
+          <checksum type="sha1">0303030303030303030303030303030303030303</checksum>
+          <url>desktop-head-unit-win_r2.0.zip</url>
+        </complete>
+        <host-os>windows</host-os>
+        <host-arch>x64</host-arch>
+      </archive>
+    </archives>
+  </remotePackage>
+  <remotePackage path="extras;google;auto">
+    <type-details xsi:type="generic:genericDetailsType"/>
+    <revision><major>2</major><minor>1</minor></revision>
+    <display-name>Android Auto Desktop Head Unit Emulator</display-name>
+    <uses-license ref="android-sdk-license"/>
+    <channelRef ref="channel-1"/>
+    <archives>
+      <archive>
+        <complete>
+          <size>1001000</size>
+          <checksum type="sha1">1010101010101010101010101010101010101010</checksum>
+          <url>desktop-head-unit-mac-arm_r2.1.zip</url>
+        </complete>
+        <host-os>macosx</host-os>
+        <host-arch>aarch64</host-arch>
+      </archive>
+      <archive>
+        <complete>
+          <size>1001001</size>
+          <checksum type="sha1">1111111111111111111111111111111111111111</checksum>
+          <url>desktop-head-unit-mac_r2.1.zip</url>
+        </complete>
+        <host-os>macosx</host-os>
+        <host-arch>x64</host-arch>
+      </archive>
+      <archive>
+        <complete>
+          <size>1001002</size>
+          <checksum type="sha1">1212121212121212121212121212121212121212</checksum>
+          <url>desktop-head-unit-linux_r2.1.zip</url>
+        </complete>
+        <host-os>linux</host-os>
+        <host-arch>x64</host-arch>
+      </archive>
+      <archive>
+        <complete>
+          <size>1001003</size>
+          <checksum type="sha1">1313131313131313131313131313131313131313</checksum>
+          <url>desktop-head-unit-win_r2.1.zip</url>
+        </complete>
+        <host-os>windows</host-os>
+        <host-arch>x64</host-arch>
+      </archive>
+    </archives>
+  </remotePackage>
+</sdk:sdk-repository>

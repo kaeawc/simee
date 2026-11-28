@@ -94,6 +94,15 @@ pub fn is_control(frame: &[u8]) -> bool {
     }
 }
 
+/// Whether `network loss` may drop a frame: an IPv4 TCP, UDP or ICMP packet (any fragment of
+/// one), either way. ARP and anything not IPv4 never are: the link itself is not lossy.
+pub fn droppable(frame: &[u8]) -> bool {
+    frame.len() >= ETH_HDR + IP_HDR
+        && be16(frame, 12) == ETHERTYPE_IPV4
+        && frame[ETH_HDR] >> 4 == 4
+        && matches!(frame[ETH_HDR + 9], PROTO_TCP | PROTO_UDP | PROTO_ICMP)
+}
+
 fn parse_arp(b: &[u8]) -> Frame<'_> {
     // Ethernet/IPv4 ARP only: htype 1, ptype 0x0800, hlen 6, plen 4.
     if b.len() < 28 || be16(b, 0) != 1 || be16(b, 2) != ETHERTYPE_IPV4 || b[4] != 6 || b[5] != 4 {

@@ -4,9 +4,9 @@
 //! (no whole-file or whole-image buffer). An inflated image is cached (`<cache>/kernel-*`, keyed
 //! by the gzip file's path, size, mtime, inode and trailer CRC32/ISIZE, and accepted only at the
 //! trailer's length), so later launches `pread` it like a raw one.
+use sim_core::hostfs::{FileExt, MetadataExt};
 use std::fs::File;
 use std::io::Read;
-use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -187,11 +187,10 @@ const STALE_TEMP: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl CacheKey {
     fn new(path: &Path, meta: &std::fs::Metadata, trailer: [u8; 8]) -> CacheKey {
-        use std::os::unix::ffi::OsStrExt;
         let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let stamp = [meta.len(), meta.mtime() as u64, meta.mtime_nsec() as u64, meta.ino(), meta.dev(), u64::from_le_bytes(trailer)];
         CacheKey {
-            file: fnv(path.as_os_str().as_bytes().iter().copied(), FNV_SEED),
+            file: fnv(path.as_os_str().as_encoded_bytes().iter().copied(), FNV_SEED),
             stamp: fnv(stamp.iter().flat_map(|v| v.to_le_bytes()), FNV_SEED),
             isize: trailer_isize(trailer),
         }

@@ -5,11 +5,11 @@
 //! - `Ephemeral`: a read-only base (a system image in the SDK) with guest writes kept in
 //!   memory for the life of the process — the stock emulator's behaviour for system and vendor
 //!   images unless `-writable-system` is given.
+use sim_core::hostfs::FileExt;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use emu_hvf::GuestRam;
@@ -46,6 +46,8 @@ pub struct Disk {
     /// Cleared once the host filesystem reports it can't punch holes.
     punch: bool,
     overlay: Option<Overlay>,
+    /// Syncs [`Disk::sync`] made (the stop's; a guest FLUSH under `-disk-cache fsync` isn't one).
+    syncs: u32,
 }
 
 /// An ephemeral disk's in-memory changes on top of its read-only base.
@@ -125,14 +127,14 @@ impl Disk {
     pub fn persistent(path: &Path) -> io::Result<Disk> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let size = file.metadata()?.len();
-        let block = rustix::fs::fstatvfs(&file).ok().map(|s| s.f_frsize).filter(|b| b.is_power_of_two() && *b >= 512).unwrap_or(CHUNK);
-        Ok(Disk { file, size, block, punch: true, overlay: None, fsync: false })
+        let block = fs_block_size(&file).filter(|b| b.is_power_of_two() && *b >= 512).unwrap_or(CHUNK);
+        Ok(Disk { file, size, block, punch: true, overlay: None, fsync: false, syncs: 0 })
     }
 
     pub fn ephemeral(path: &Path) -> io::Result<Disk> {
         let file = File::open(path)?;
         let size = file.metadata()?.len();
-        Ok(Disk { file, size, block: CHUNK, punch: false, overlay: Some(Overlay::default()), fsync: false })
+        Ok(Disk { file, size, block: CHUNK, punch: false, overlay: Some(Overlay::default()), fsync: false, syncs: 0 })
     }
 
     pub fn size(&self) -> u64 {
@@ -266,7 +268,7 @@ impl Disk {
         match emu_hvf::host::punch_hole(&self.file, first, last - first) {
             Ok(()) => Ok(()),
             Err(e) => {
-                if [Some(libc::ENOTSUP), Some(libc::EOPNOTSUPP)].contains(&e.raw_os_error()) {
+                if no_holes(&e) {
                     self.punch = false;
                 }
                 write_zeroes(&self.file, first, last)
@@ -276,21 +278,69 @@ impl Disk {
 
     /// Whether guest flushes reach the drive (`-disk-cache fsync`). Off by default: writes are
     /// already in the host page cache, which survives an emulator crash; only a host crash or
-    /// power loss can lose them.
+    /// power loss while the guest runs can lose them ([`Disk::sync`] runs when it stops).
     pub fn set_fsync(&mut self, on: bool) {
         self.fsync = on;
     }
 
     pub fn flush(&self) -> io::Result<()> {
-        if self.overlay.is_some() || !self.fsync {
+        if !self.fsync {
+            return Ok(());
+        }
+        self.fsync_file()
+    }
+
+    /// Hands a persistent disk's writes to the drive once, whatever `-disk-cache` says: the
+    /// machine is stopping (#388), so userdata isn't left half-written in the page cache when a
+    /// host crash or power loss follows the stop. Nothing for an ephemeral disk, whose writes
+    /// are discarded.
+    pub fn sync(&mut self) -> io::Result<()> {
+        self.fsync_file()?;
+        if self.overlay.is_none() {
+            self.syncs += 1;
+        }
+        Ok(())
+    }
+
+    /// How many times [`Disk::sync`] synced the file.
+    pub fn syncs(&self) -> u32 {
+        self.syncs
+    }
+
+    fn fsync_file(&self) -> io::Result<()> {
+        if self.overlay.is_some() {
             return Ok(());
         }
         // Plain fsync hands dirty pages to the drive. std's sync_data/sync_all use F_FULLFSYNC on
         // macOS, which also drains the drive's cache: it made guest FLUSHes (ext4 commits,
         // fsync-heavy first boot) the dominant cost of booting. Data written before a flush has
         // already reached the host page cache, so an emulator crash loses nothing either way.
-        rustix::fs::fsync(&self.file).map_err(io::Error::from)
+        #[cfg(unix)]
+        return rustix::fs::fsync(&self.file).map_err(io::Error::from);
+        // Windows' FlushFileBuffers is what sync_data calls; there is no F_FULLFSYNC to avoid.
+        #[cfg(windows)]
+        return self.file.sync_data();
     }
+}
+
+/// The file system's block size, which holes are punched in multiples of.
+#[cfg(unix)]
+fn fs_block_size(file: &File) -> Option<u64> {
+    rustix::fs::fstatvfs(file).ok().map(|s| s.f_frsize)
+}
+
+/// Windows has no `fstatvfs` this crate reads: the default chunk stands in.
+#[cfg(windows)]
+fn fs_block_size(_file: &File) -> Option<u64> {
+    None
+}
+
+/// Whether `e` says the file system can't punch holes.
+fn no_holes(e: &io::Error) -> bool {
+    #[cfg(unix)]
+    return [Some(libc::ENOTSUP), Some(libc::EOPNOTSUPP)].contains(&e.raw_os_error());
+    #[cfg(windows)]
+    return e.kind() == io::ErrorKind::Unsupported;
 }
 
 /// Zeroes `[start, end)` of an ephemeral disk chunk by chunk (the partial chunks of a range).
@@ -357,6 +407,7 @@ pub fn ensure_copy(src: &Path, dst: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
 
     const RAM: u64 = 0x4000_0000;
@@ -523,6 +574,23 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn a_stop_syncs_a_persistent_disk_whatever_the_cache_mode() {
+        let path = tmp("sync");
+        ensure_sparse(&path, 2 * CHUNK).expect("create");
+        let mut d = Disk::persistent(&path).expect("open");
+        d.flush().expect("flush");
+        assert_eq!(d.syncs(), 0, "a guest FLUSH under -disk-cache unsafe syncs nothing");
+        d.sync().expect("sync");
+        assert_eq!(d.syncs(), 1, "the stop's sync reaches the file under -disk-cache unsafe");
+        let mut e = Disk::ephemeral(&path).expect("open");
+        e.sync().expect("sync");
+        assert_eq!(e.syncs(), 0, "an ephemeral disk's writes are discarded: nothing to sync");
+        let _ = std::fs::remove_file(path);
+    }
+
+    // Counts `st_blocks`, and punching holes isn't implemented on Windows.
+    #[cfg(unix)]
     #[test]
     fn persistent_zero_range_punches_holes() {
         const LEN: u64 = 4 << 20;

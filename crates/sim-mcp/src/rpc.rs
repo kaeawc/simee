@@ -10,6 +10,7 @@ pub const LEGACY: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26"];
 
 pub const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
 pub const META_CLIENT_CAPS: &str = "io.modelcontextprotocol/clientCapabilities";
+pub const META_CLIENT_INFO: &str = "io.modelcontextprotocol/clientInfo";
 pub const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 pub const META_SUBSCRIPTION: &str = "io.modelcontextprotocol/subscriptionId";
 
@@ -88,6 +89,21 @@ pub fn parse(line: &str) -> Result<Incoming, RpcError> {
     }
 }
 
+/// Reads a client's response (to a request this server sent): its id, and the result or the error.
+/// `None` for anything else.
+pub fn parse_response(line: &str) -> Option<(Value, Result<Value, Value>)> {
+    let Value::Object(mut msg) = serde_json::from_str(line).ok()? else { return None };
+    if msg.get("jsonrpc").and_then(Value::as_str) != Some("2.0") || msg.contains_key("method") {
+        return None;
+    }
+    let id = msg.remove("id").filter(|id| id.is_string() || id.is_number())?;
+    match (msg.remove("result"), msg.remove("error")) {
+        (Some(result), None) => Some((id, Ok(result))),
+        (None, Some(error)) => Some((id, Err(error))),
+        _ => None,
+    }
+}
+
 /// Which protocol generation a request speaks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Era {
@@ -102,6 +118,8 @@ pub enum Era {
 #[derive(Clone, Debug)]
 pub struct Ctx {
     pub era: Era,
+    /// The revision: [`MODERN`], or the one `initialize` agreed on.
+    pub version: &'static str,
     pub caps: Value,
     pub progress_token: Option<Value>,
 }
@@ -114,6 +132,11 @@ impl Ctx {
 
     pub fn modern(&self) -> bool {
         self.era == Era::Modern
+    }
+
+    /// Whether the revision has tool output schemas (2025-06-18 on; 2025-03-26 has none).
+    pub fn output_schemas(&self) -> bool {
+        self.version != "2025-03-26"
     }
 }
 
@@ -181,7 +204,7 @@ mod tests {
         let params = json!({"_meta": {META_VERSION: MODERN, META_CLIENT_CAPS: {"extensions": {EXT_TASKS: {}}}}});
         assert_eq!(requested_version(&params), Some(MODERN));
         assert_eq!(requested_version(&json!({})), None);
-        let ctx = Ctx { era: Era::Modern, caps: meta(&params)[META_CLIENT_CAPS].clone(), progress_token: None };
+        let ctx = Ctx { era: Era::Modern, version: MODERN, caps: meta(&params)[META_CLIENT_CAPS].clone(), progress_token: None };
         assert!(ctx.has_extension(EXT_TASKS) && !ctx.has_extension(EXT_UI) && ctx.modern());
     }
 

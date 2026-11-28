@@ -1,0 +1,889 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- The mark's sketchbook: open it in a browser. The shipped mark is drawn by crates/sim-core/src/mark/; docs/design/brand.md says how its parameters map. -->
+<title>Simee Emerald Mark</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a gem-cutter's spec sheet. Hero mark with cutter's dimensions, then shape study, motion states, a workbench, and the mark in use. */
+:root {
+  --bg: #f2f6f3;
+  --surface: #ffffff;
+  --sunk: #e7eee9;
+  --fg: #0d1914;
+  --muted: #53625a;
+  --line: #d3ddd7;
+  --accent: #087449;
+  --accent-ink: #ffffff;
+  --strip-a: #e9eeeb;
+  --strip-b: #1d2622;
+  --display: "Bricolage Grotesque", "Inter", system-ui, sans-serif;
+  --body: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #09100c; --surface: #101915; --sunk: #0c1410; --fg: #e2ede7; --muted: #8b9d94;
+    --line: #1e2b25; --accent: #3dcc8a; --accent-ink: #03140c; --strip-a: #dfe6e2; --strip-b: #18201c;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #09100c; --surface: #101915; --sunk: #0c1410; --fg: #e2ede7; --muted: #8b9d94;
+  --line: #1e2b25; --accent: #3dcc8a; --accent-ink: #03140c; --strip-a: #dfe6e2; --strip-b: #18201c;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 15px; line-height: 1.55; }
+.wrap { max-width: 1180px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 40px 80px; display: flex; flex-direction: column; gap: 72px; }
+h1, h2, h3 { font-family: var(--display); font-weight: 700; letter-spacing: -0.02em; text-wrap: balance; margin: 0; }
+h1 { font-size: clamp(2.2rem, 5vw, 3.6rem); line-height: 1.02; }
+h2 { font-size: 1.75rem; line-height: 1.1; }
+h3 { font-size: 1.05rem; font-weight: 500; letter-spacing: -0.01em; }
+p { margin: 0; }
+.eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+.muted { color: var(--muted); }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+svg { display: block; overflow: visible; }
+
+/* hero */
+.hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); gap: 40px; align-items: center; }
+.hero-text { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+.hero-text p.lede { font-size: 17px; max-width: 34em; }
+.spec { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.spec div { background: var(--surface); padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; }
+.spec dt { font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.spec dd { margin: 0; font-family: var(--mono); font-size: 16px; font-variant-numeric: tabular-nums; }
+.hero-fig { display: flex; flex-direction: column; gap: 12px; align-items: stretch; min-width: 0; }
+.hero-fig svg { width: 100%; height: auto; max-height: 560px; }
+.anno line { stroke: var(--muted); stroke-width: 0.006; }
+.anno line.guide { stroke-dasharray: 0.02 0.02; opacity: 0.6; }
+.anno text { fill: var(--muted); font-family: var(--mono); font-size: 0.068px; }
+.anno text.k { fill: var(--fg); }
+.turn { display: flex; align-items: center; gap: 12px; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.turn input { flex: 1; min-width: 0; }
+
+.nav { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: -40px; }
+.nav a { color: var(--fg); text-decoration: none; font-size: 13px; padding: 6px 12px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); }
+.nav a:hover { border-color: var(--accent); }
+.nav .spacer { flex: 1; }
+button { font: inherit; font-size: 13px; color: var(--fg); background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 7px 12px; cursor: pointer; display: inline-flex; gap: 8px; align-items: center; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+section { display: flex; flex-direction: column; gap: 22px; scroll-margin-top: 20px; }
+.sec-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: end; gap: 12px; }
+.sec-head > div { display: flex; flex-direction: column; gap: 6px; max-width: 46em; }
+
+/* shape study */
+.shapes { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 14px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 10px; cursor: pointer; text-align: left; align-items: stretch; }
+.card:hover { border-color: var(--accent); }
+.card .stage { background: var(--sunk); border-radius: 8px; padding-block: 14px; display: flex; justify-content: center; }
+.card .stage svg { width: 150px; height: 150px; }
+.card .row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.card .num { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.card .meta { font-family: var(--mono); font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.card p { font-size: 13.5px; color: var(--muted); }
+.card .default-tag { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--accent-ink); background: var(--accent); padding: 2px 7px; border-radius: 999px; }
+
+/* motion */
+.states { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+.tile { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 8px; }
+.tile .stage { height: 132px; display: flex; justify-content: center; align-items: center; background: var(--sunk); border-radius: 8px; }
+.tile .stage svg { width: 112px; height: 112px; }
+.tile .what { font-size: 13px; }
+.tile .how { font-size: 12.5px; color: var(--muted); }
+
+/* workbench */
+.bench { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 20px; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
+.bench .preview { background: var(--sunk); border-radius: 10px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 20px; min-height: 420px; }
+.bench .preview svg { width: min(100%, 340px); height: auto; aspect-ratio: 1; }
+.readout { font-family: var(--mono); font-size: 12.5px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px 16px; justify-content: center; font-variant-numeric: tabular-nums; }
+.readout b { color: var(--fg); font-weight: 500; }
+.controls { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+.cgroup { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 18px; }
+.cgroup .full { grid-column: 1 / -1; }
+.ctl { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.ctl label { display: flex; justify-content: space-between; font-size: 12.5px; gap: 8px; }
+.ctl label output { font-family: var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+.ctl input[type=range] { width: 100%; accent-color: var(--accent); }
+.ctl select { font: inherit; font-size: 13px; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+.checks { display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: 13px; }
+.checks label { display: flex; gap: 6px; align-items: center; }
+.checks input { accent-color: var(--accent); }
+.gtitle { font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--line); padding-bottom: 6px; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.toast { font-size: 12.5px; color: var(--accent); }
+#copybox { width: 100%; height: 110px; font-family: var(--mono); font-size: 11px; background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 8px; }
+
+/* in use */
+.uses { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 14px; }
+.use { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.use.w3 { grid-column: span 3; } .use.w2 { grid-column: span 2; } .use.w4 { grid-column: span 4; } .use.w6 { grid-column: span 6; }
+.use .cap { font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.use .note { font-size: 12.5px; color: var(--muted); }
+.sizes { display: flex; flex-wrap: wrap; align-items: end; gap: 18px; }
+.sizes figure { margin: 0; display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.sizes figcaption { font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
+.strip { display: flex; align-items: center; gap: 18px; padding: 10px 14px; border-radius: 8px; }
+.strip.a { background: var(--strip-a); color: #111; --stripbg: var(--strip-a); }
+.strip.b { background: var(--strip-b); color: #f2f2f2; --stripbg: var(--strip-b); }
+.mono-gem polygon { fill: currentColor; stroke: none; }
+.lockups { display: flex; flex-wrap: wrap; gap: 28px 48px; align-items: center; }
+.lock-h { display: flex; align-items: center; gap: 10px; }
+.lock-h span { font-family: var(--display); font-weight: 700; font-size: 44px; letter-spacing: -0.035em; line-height: 1; }
+.lock-v { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.lock-v span { font-family: var(--display); font-weight: 700; font-size: 26px; letter-spacing: -0.03em; }
+.devlist { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.dev { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 9px 12px; font-size: 13px; border-top: 1px solid var(--line); background: var(--bg); }
+.dev:first-child { border-top: 0; }
+.dev .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dev .st { font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.palette { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }
+.sw { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.sw .bar { height: 34px; border-radius: 6px; display: flex; overflow: hidden; }
+.sw .bar i { flex: 1; }
+.sw span { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+
+@media (max-width: 900px) {
+  .hero, .bench { grid-template-columns: minmax(0, 1fr); }
+  .uses { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .use.w3, .use.w2, .use.w4, .use.w6 { grid-column: 1 / -1; }
+  .palette { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 520px) {
+  .spec { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cgroup { grid-template-columns: minmax(0, 1fr); }
+  .nav { margin-top: -48px; }
+}
+</style>
+
+<div class="wrap">
+  <header class="hero">
+    <div class="hero-text">
+      <span class="eyebrow">simee · identity study</span>
+      <h1>A cut emerald, two pyramids tall</h1>
+      <p class="lede">The mark is a bipyramid: a short crown on a longer pavilion, meeting at a ten-sided girdle, with a second, twisted ring of facets on each pyramid. It stands one and a half times taller than it is wide. In the app it is the activity indicator, and every state below is motion or colour. It has no face and never gets one.</p>
+      <dl class="spec" id="heroSpec"></dl>
+      <p class="muted" style="font-size:13px">Crown, girdle, pavilion and culet are the cutter's names for the top, the widest ring, the bottom and the tip. The workbench uses the same terms.</p>
+    </div>
+    <div class="hero-fig">
+      <svg id="heroSvg" viewBox="-1.3 -1.06 3.1 2.12" role="img" aria-label="The simee mark, a ten-sided emerald bipyramid, with its dimensions"></svg>
+      <div class="turn"><label for="heroYaw">Turn the stone</label><input id="heroYaw" type="range" min="0" max="360" value="0"><output id="heroYawOut" class="mono">0°</output></div>
+    </div>
+  </header>
+
+  <nav class="nav" aria-label="Sections">
+    <a href="#shapes">Shape study</a><a href="#motion">Motion states</a><a href="#bench">Workbench</a><a href="#inuse">In use</a>
+    <span class="spacer"></span>
+    <button id="motionBtn" type="button">Pause motion</button>
+  </nav>
+
+  <section id="shapes">
+    <div class="sec-head"><div>
+      <span class="eyebrow">01 · Shape study</span>
+      <h2>Twelve cuts, from six facets to sixty</h2>
+      <p class="muted">Every shape is two pyramids joined at a girdle. They differ in side count, crown and pavilion height, a girdle band, extra facet rings, and twist. Hover to turn one; click to open it in the workbench.</p>
+    </div></div>
+    <div class="shapes" id="shapeGrid"></div>
+  </section>
+
+  <section id="motion">
+    <div class="sec-head"><div>
+      <span class="eyebrow">02 · Motion states</span>
+      <h2>What the stone does while simee works</h2>
+      <p class="muted">Each state maps to something simee is doing. Speed, colour, position and roll carry the meaning; the shape never changes. With reduced motion turned on, these start paused.</p>
+    </div></div>
+    <div class="states" id="stateGrid"></div>
+  </section>
+
+  <section id="bench">
+    <div class="sec-head"><div>
+      <span class="eyebrow">03 · Workbench</span>
+      <h2>Cut your own</h2>
+      <p class="muted">Change the geometry and watch any state on it. The icons in the next section follow whatever is on the bench.</p>
+    </div></div>
+    <div class="bench">
+      <div class="preview">
+        <svg id="benchSvg" viewBox="-1 -1 2 2" role="img" aria-label="Workbench preview"></svg>
+        <div class="readout" id="benchReadout"></div>
+      </div>
+      <div class="controls">
+        <div class="cgroup">
+          <div class="ctl"><label for="selShape">Start from</label><select id="selShape"></select></div>
+          <div class="ctl"><label for="selState">State</label><select id="selState"></select></div>
+          <div class="ctl full"><label for="rSpeed">Speed <output id="oSpeed">1.00×</output></label><input id="rSpeed" type="range" min="0.25" max="3" step="0.05" value="1"></div>
+        </div>
+        <div class="gtitle">Outline</div>
+        <div class="cgroup" id="geomA"></div>
+        <div class="gtitle">Facets</div>
+        <div class="cgroup" id="geomB"></div>
+        <div class="gtitle">Finish</div>
+        <div class="cgroup">
+          <div class="ctl"><label for="rTilt">Tilt <output id="oTilt"></output></label><input id="rTilt" type="range" min="-0.4" max="0.6" step="0.01" value="0.22"></div>
+          <div class="ctl"><label for="selTone">Stone</label><select id="selTone"><option value="emerald">Emerald</option><option value="sapphire">Sapphire</option><option value="citrine">Citrine</option><option value="ruby">Ruby</option><option value="smoke">Smoke</option></select></div>
+          <div class="checks full">
+            <label><input type="checkbox" id="cEdges"> Facet edges</label>
+            <label><input type="checkbox" id="cGlass"> See-through</label>
+            <label><input type="checkbox" id="cFlat"> Flat tones</label>
+          </div>
+        </div>
+        <div class="actions">
+          <button type="button" class="primary" id="copySvg">Copy SVG</button>
+          <button type="button" id="copyParams">Copy parameters</button>
+          <span class="toast" id="toast" aria-live="polite"></span>
+        </div>
+        <textarea id="copybox" hidden readonly aria-label="Copied text"></textarea>
+      </div>
+    </div>
+  </section>
+
+  <section id="inuse">
+    <div class="sec-head"><div>
+      <span class="eyebrow">04 · In use</span>
+      <h2>Dock, app icon, menu bar, inline</h2>
+      <p class="muted">Drawn from the shape on the workbench. The device list rows use the motion states at 18 px; the example devices are illustrative.</p>
+    </div></div>
+    <div class="uses">
+      <div class="use w4"><span class="cap">Dock icon · macOS</span><div class="sizes" id="dockSizes"></div><p class="note">Deep green ground, the stone lit from the upper left. Below 48 px the shading drops to four flat tones.</p></div>
+      <div class="use w2"><span class="cap">App icon · light</span><div class="sizes" id="lightSizes"></div><p class="note">For the MCP App view and docs.</p></div>
+      <div class="use w3"><span class="cap">Menu bar template</span>
+        <div class="strip a" id="monoA"></div><div class="strip b" id="monoB"></div>
+        <p class="note">One colour. Facets differ only in opacity (100, 70 and 45%), which macOS template images keep. At 16 px the ridge and two or three facets survive.</p></div>
+      <div class="use w3"><span class="cap">Favicon · flat tones</span><div class="sizes" id="favSizes"></div><p class="note">Four flat tones, fully opaque.</p></div>
+      <div class="use w3"><span class="cap">Device list</span><div class="devlist" id="devList"></div></div>
+      <div class="use w3"><span class="cap">Buttons and lockups</span>
+        <div class="toolbar" id="toolbarDemo"></div>
+        <div class="lockups" id="lockups"></div>
+      </div>
+      <div class="use w6"><span class="cap">Stones · shading ramps, dark to light</span><div class="palette" id="palette"></div></div>
+    </div>
+  </section>
+</div>
+
+<script>
+(() => {
+'use strict';
+const PI = Math.PI, TAU = 2 * PI, NS = 'http://www.w3.org/2000/svg';
+const TONES = {
+  emerald:  ['#011510', '#03392a', '#076d49', '#11a466', '#56dd9b', '#dffcec'],
+  sapphire: ['#020c22', '#082660', '#124aa8', '#2c7ae3', '#88bcff', '#e3efff'],
+  citrine:  ['#1d1102', '#583605', '#a1690b', '#df9f1a', '#f7d26b', '#fff7d9'],
+  ruby:     ['#1c0307', '#560a17', '#9c1529', '#de3348', '#ff8994', '#ffe4e7'],
+  smoke:    ['#0f1312', '#252c29', '#44504a', '#6c7a73', '#a6b2ac', '#e8eeeb'],
+};
+const TONE_USE = { emerald: 'simee, Android', sapphire: 'iOS', citrine: 'warning', ruby: 'error', smoke: 'offline' };
+const RGB = {};
+for (const k in TONES) RGB[k] = TONES[k].map(h => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)]);
+const clamp = (x, a = 0, b = 1) => x < a ? a : x > b ? b : x;
+const mix = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+const css = c => `rgb(${c[0] | 0},${c[1] | 0},${c[2] | 0})`;
+function ramp(tone, x) {
+  const s = RGB[tone]; x = clamp(x) * (s.length - 1);
+  const i = Math.min(s.length - 2, Math.floor(x));
+  return mix(s[i], s[i + 1], x - i);
+}
+const norm = v => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+const LIGHT = norm([-0.55, 0.7, 0.6]);
+// The pavilion's glow: a weaker light from the lower right (sim_core::mark::Pose::GLOW).
+const GLOW = norm([0.6, -0.45, 0.65]);
+const ease = t => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+const easeOut = t => 1 - Math.pow(1 - t, 3);
+const PITCH = 0.22;
+
+const DEFAULTS = { n: 7, crown: 0.55, pav: 0.95, r: 0.5, band: 0, twist: 0, table: 0, culet: 0, crownRing: 0, crownTwist: 0, pavRing: 0, pavTwist: 0, star: 0, bulge: 1.07 };
+
+/* ---- geometry: rings from top to bottom, faces between neighbouring rings ---- */
+function buildGem(params) {
+  const p = Object.assign({}, DEFAULTS, params);
+  const n = Math.max(3, Math.round(p.n)), step = TAU / n, R = p.r;
+  const gT = p.band / 2, gB = -p.band / 2, yT = gT + p.crown, yB = gB - p.pav;
+  const rings = [];
+  const ring = (y, r, off, part, star = 0) => ({ y, r, off, part, star, pt: r < 1e-4 });
+  const offL = p.band > 0 ? p.twist * step / 2 : 0;
+  const offC = p.crownTwist * step / 2;
+  const topR = R * p.table, botR = R * p.culet;
+  if (p.crownRing > 0) {
+    rings.push(ring(yT, topR, offC, 'top'));
+    rings.push(ring(gT + p.crownRing * p.crown, (R + (topR - R) * p.crownRing) * p.bulge, offC, 'top'));
+  } else rings.push(ring(yT, topR, 0, 'top'));
+  rings.push(ring(gT, R, 0, p.band > 0 ? 'top' : 'g', p.star));
+  if (p.band > 0) rings.push(ring(gB, R, offL, 'bot', p.star));
+  const offP = offL + p.pavTwist * step / 2;
+  if (p.pavRing > 0) {
+    rings.push(ring(gB - p.pavRing * p.pav, (R + (botR - R) * p.pavRing) * p.bulge, offP, 'bot'));
+    rings.push(ring(yB, botR, offP, 'bot'));
+  } else rings.push(ring(yB, botR, offL, 'bot'));
+
+  const verts = [];
+  for (const rg of rings) {
+    rg.idx = [];
+    if (rg.pt) { rg.idx.push(verts.length); verts.push({ x: 0, y: rg.y, z: 0, part: rg.part }); continue; }
+    for (let i = 0; i < n; i++) {
+      const a = rg.off + i * step, rr = rg.r * (rg.star && i % 2 ? 1 - rg.star : 1);
+      rg.idx.push(verts.length); verts.push({ x: rr * Math.cos(a), y: rg.y, z: rr * Math.sin(a), part: rg.part });
+    }
+  }
+  const faces = [];
+  const add = (idx, part) => faces.push({ idx, part });
+  const first = rings[0], last = rings[rings.length - 1];
+  if (!first.pt) add(first.idx.slice(), 'top');
+  if (!last.pt) add(last.idx.slice(), 'bot');
+  for (let k = 0; k < rings.length - 1; k++) {
+    const A = rings[k], B = rings[k + 1];
+    const part = A.part === 'g' ? B.part : B.part === 'g' ? A.part : A.part === B.part ? A.part : 'band';
+    if (A.pt) { for (let i = 0; i < n; i++) add([A.idx[0], B.idx[i], B.idx[(i + 1) % n]], part); continue; }
+    if (B.pt) { for (let i = 0; i < n; i++) add([A.idx[i], A.idx[(i + 1) % n], B.idx[0]], part); continue; }
+    const d = ((B.off - A.off) % step + step) % step;
+    const starred = A.star || B.star;
+    for (let i = 0; i < n; i++) {
+      const a0 = A.idx[i], a1 = A.idx[(i + 1) % n], b0 = B.idx[i], b1 = B.idx[(i + 1) % n];
+      if (d < 1e-6) { if (starred) { add([a0, a1, b1], part); add([a0, b1, b0], part); } else add([a0, a1, b1, b0], part); }
+      else { add([a0, a1, b0], part); add([b0, a1, b1], part); }
+    }
+  }
+  for (const f of faces) {
+    let nx = 0, ny = 0, nz = 0, cx = 0, cy = 0, cz = 0; const m = f.idx.length;
+    for (let k = 0; k < m; k++) {
+      const a = verts[f.idx[k]], b = verts[f.idx[(k + 1) % m]];
+      nx += (a.y - b.y) * (a.z + b.z); ny += (a.z - b.z) * (a.x + b.x); nz += (a.x - b.x) * (a.y + b.y);
+      cx += a.x; cy += a.y; cz += a.z;
+    }
+    let nv = norm([nx, ny, nz]);
+    if (nv[0] * cx + nv[1] * cy + nv[2] * cz < 0) { f.idx.reverse(); nv = [-nv[0], -nv[1], -nv[2]]; }
+    f.n = nv;
+  }
+  let W = 0; for (const v of verts) W = Math.max(W, Math.hypot(v.x, v.z));
+  W *= 2;
+  const H = yT - yB;
+  return { verts, faces, n, H, W, cy: (yT + yB) / 2, yT, yB, gT, gB, V: verts.length, F: faces.length, E: verts.length + faces.length - 2 };
+}
+
+/* ---- renderer: rotate, project with mild perspective, flat-shade each facet ---- */
+class GemView {
+  constructor(g, params, cfg = {}) {
+    this.g = g;
+    this.cfg = Object.assign({ pad: 0.8, edges: false, edgeW: 0.006, seamW: 0.008, glass: 1, flat: false, mono: false, monoW: 0.1, persp: 0.12 }, cfg);
+    this.pool = [];
+    this.setGeom(params);
+  }
+  setGeom(p) {
+    this.params = Object.assign({}, DEFAULTS, p);
+    this.gem = buildGem(this.params);
+    const F = this.gem.faces.length;
+    while (this.pool.length < F) {
+      const el = document.createElementNS(NS, 'polygon');
+      el.setAttribute('stroke-linejoin', 'round');
+      this.g.appendChild(el); this.pool.push(el);
+    }
+    for (let i = F; i < this.pool.length; i++) this.pool[i].setAttribute('points', '');
+    this.fit = 2 * this.cfg.pad / Math.max(this.gem.H, this.gem.W);
+    this.step = TAU / this.gem.n;
+    this.rest = -PI / 2;
+  }
+  draw(o = {}) {
+    const c = this.cfg, gem = this.gem, fit = this.fit;
+    const yaw = o.yaw ?? this.rest, pitch = o.pitch ?? PITCH, roll = o.roll ?? 0;
+    const sep = o.sep ?? 0, sepYaw = o.sepYaw ?? 0, tx = o.tx ?? 0, ty = o.ty ?? 0;
+    const L = o.light ? norm(o.light) : LIGHT;
+    const tone = o.tone || 'emerald', tone2 = o.tone2, tT = o.toneT || 0, flash = o.flash || 0;
+    const cp = Math.cos(pitch), sp = Math.sin(pitch), cr = Math.cos(roll), sr = Math.sin(roll);
+    const mk = a => {
+      const ca = Math.cos(a), sa = Math.sin(a);
+      return (x, y, z) => {
+        const x1 = x * ca + z * sa, z1 = -x * sa + z * ca;
+        const y1 = y * cp - z1 * sp, z2 = y * sp + z1 * cp;
+        return [x1 * cr - y1 * sr, x1 * sr + y1 * cr, z2];
+      };
+    };
+    const rTop = mk(yaw + sepYaw), rBot = sep === 0 && sepYaw === 0 ? rTop : mk(yaw - sepYaw);
+    const project = (rot, dy) => gem.verts.map(v => {
+      const r = rot(v.x, v.y - gem.cy + dy, v.z), f = 1 / (1 - r[2] * c.persp);
+      return [r[0] * f * fit + tx, -r[1] * f * fit + ty, r[2]];
+    });
+    const PT = project(rTop, sep), PB = rBot === rTop && sep === 0 ? PT : project(rBot, -sep);
+    const list = [];
+    for (const f of gem.faces) {
+      const pts = f.idx.map(i => {
+        const which = f.part === 'band' ? gem.verts[i].part : f.part;
+        return (which === 'bot' ? PB : PT)[i];
+      });
+      let area = 0, z = 0;
+      for (let k = 0; k < pts.length; k++) {
+        const a = pts[k], b = pts[(k + 1) % pts.length];
+        area += a[0] * b[1] - b[0] * a[1]; z += a[2];
+      }
+      const nn = (f.part === 'bot' ? rBot : rTop)(f.n[0], f.n[1], f.n[2]);
+      list.push({ pts, front: area < 0, z: z / pts.length, nn });
+    }
+    list.sort((a, b) => (a.front - b.front) || (a.z - b.z));
+    for (let i = 0; i < list.length; i++) {
+      const it = list[i], el = this.pool[i];
+      if (!it.front && (c.mono || c.glass >= 1)) { el.setAttribute('points', ''); continue; }
+      el.setAttribute('points', it.pts.map(p => p[0].toFixed(4) + ',' + p[1].toFixed(4)).join(' '));
+      const n = it.nn;
+      if (c.mono) {
+        const dm = Math.max(0, n[0] * L[0] + n[1] * L[1] + n[2] * L[2]);
+        const vm = 0.25 + 0.6 * dm + 0.15 * (0.5 + 0.5 * n[1]);
+        el.setAttribute('fill-opacity', vm > 0.72 ? 1 : vm > 0.5 ? 0.7 : 0.45);
+        el.setAttribute('stroke', 'none');
+        continue;
+      }
+      let col;
+      if (it.front) {
+        const d = n[0] * L[0] + n[1] * L[1] + n[2] * L[2];
+        const diff = Math.max(0, d), sky = 0.5 + 0.5 * n[1];
+        const rz = 2 * d * n[2] - L[2];
+        let spec = Math.pow(Math.max(0, rz), 16);
+        const back = Math.max(0, n[0] * GLOW[0] + n[1] * GLOW[1] + n[2] * GLOW[2]);
+        let v = 0.04 + 0.66 * diff + 0.2 * sky + 0.24 * back + flash * 0.35;
+        if (c.flat) { v = Math.round(clamp(v) * 3) / 3 * 0.9 + 0.06; spec = spec > 0.45 ? 0.55 : 0; }
+        col = ramp(tone, v * 0.88);
+        if (tone2 && tT > 0) col = mix(col, ramp(tone2, v * 0.88), tT);
+        col = mix(col, [255, 255, 255], clamp(spec * 0.75 + flash * 0.12));
+        el.setAttribute('fill', css(col));
+        el.setAttribute('fill-opacity', c.glass);
+        if (c.edges) {
+          const ec = tone2 && tT > 0 ? mix(ramp(tone, 0.97), ramp(tone2, 0.97), tT) : ramp(tone, 0.97);
+          el.setAttribute('stroke', css(mix(ec, col, 0.3))); el.setAttribute('stroke-width', c.edgeW); el.setAttribute('stroke-opacity', 0.55);
+        } else {
+          // Stroke each facet in its own colour so neighbouring facets meet without an anti-aliasing seam.
+          el.setAttribute('stroke', css(col)); el.setAttribute('stroke-width', c.seamW); el.setAttribute('stroke-opacity', c.glass);
+        }
+      } else {
+        const v2 = 0.14 + 0.22 * (0.5 - 0.5 * n[1]) + flash * 0.2;
+        col = ramp(tone, v2); if (tone2 && tT > 0) col = mix(col, ramp(tone2, v2), tT);
+        el.setAttribute('fill', css(col)); el.setAttribute('fill-opacity', 1);
+        if (c.edges) { el.setAttribute('stroke', css(ramp(tone, 0.6))); el.setAttribute('stroke-width', c.edgeW * 0.7); el.setAttribute('stroke-opacity', 0.35); }
+        else el.setAttribute('stroke', 'none');
+      }
+    }
+  }
+}
+
+/* ---- motion states: each returns draw options for local time tau ---- */
+const STATES = [
+  ['idle', 'Idle', 'Device ready, nothing running', 'Holds still. A glint crosses it every five seconds.'],
+  ['spin', 'Working', 'A command is running', 'A steady turn.'],
+  ['surge', 'Heavy work', 'Provisioning an image, building the shaper', 'Turn speed swells and settles.'],
+  ['step', 'Automation step', 'One AutoMobile step', 'Turns exactly one facet per step, then stops.'],
+  ['scan', 'Inspecting', 'Reading the view hierarchy', 'The stone holds; the light sweeps across it.'],
+  ['progress', 'Progress', 'Downloading a system image', 'Fills with green from the culet up.'],
+  ['boot', 'Boot and shut down', 'Starting or stopping a device', 'The two pyramids meet, turn, and part.'],
+  ['success', 'Done', 'Boot completed, tests passed', 'Two hops, a flash, one full turn.'],
+  ['bob', 'Waiting', 'Waiting for adb or boot_completed', 'Floats and turns slowly.'],
+  ['wiggle', 'Needs you', 'A permission dialog is up', 'A short roll back and forth.'],
+  ['warn', 'Warning', 'Slow frame pacing, low disk', 'Citrine, a slow turn, a soft pulse.'],
+  ['error', 'Error', 'A command failed', 'Ruby, and a hard shake that dies out.'],
+  ['offline', 'Offline', 'Device shut down', 'Smoke grey and still.'],
+  ['orient', 'Rotate', 'Orientation change', 'Rolls 90° per change, like the device.'],
+  ['platform', 'Platform', 'Switching between Android and iOS', 'Emerald for Android, sapphire for iOS.'],
+];
+function stateFrame(s, dt, m, spd, step) {
+  m.tau += dt * spd; const t = m.tau;
+  const o = { yaw: m.rest, pitch: m.pitch ?? PITCH, tone: m.tone || 'emerald' };
+  switch (s) {
+    case 'idle': { const c = t % 5; if (c < 1.1) o.light = [-0.55 + 1.15 * Math.sin(PI * ease(c / 1.1)), 0.7, 0.6]; break; }
+    case 'spin': m.yaw += 1.5 * dt * spd; o.yaw = m.yaw; break;
+    case 'surge': m.yaw += (0.3 + 3.4 * Math.pow((Math.sin(t * 1.1) + 1) / 2, 3)) * dt * spd; o.yaw = m.yaw; break;
+    case 'step': { const per = 0.9, k = Math.floor(t / per), f = (t % per) / per; o.yaw = m.rest + (k + ease(Math.min(1, f / 0.5))) * step; break; }
+    case 'scan': { const a = Math.sin(t * 1.5) * 1.1; o.light = [Math.sin(a), 0.55, Math.cos(a) * 0.9]; break; }
+    case 'progress': { const f = (t % 5) / 5; o.progress = Math.min(1, f * 1.18); m.yaw += 0.45 * dt * spd; o.yaw = m.yaw; if (f > 0.85) o.flash = 0.4 * Math.sin(PI * (f - 0.85) / 0.15); break; }
+    case 'boot': {
+      const c = t % 4; o.yaw = m.yaw;
+      if (c < 1.1) { const e = easeOut(c / 1.1); o.sep = 0.16 * (1 - e); o.sepYaw = 2.2 * (1 - e); }
+      else if (c < 3.2) { const k = (c - 1.1) / 2.1; m.yaw += 3.2 * (1 - k) * (1 - k) * dt * spd; o.yaw = m.yaw; if (c < 1.4) o.flash = 0.6 * (1 - (c - 1.1) / 0.3); }
+      else { const e = ease((c - 3.2) / 0.8); o.sep = 0.16 * e; o.sepYaw = 2.2 * e; }
+      break;
+    }
+    case 'success': { const c = t % 2.6; if (c < 0.7) o.ty = -0.2 * Math.abs(Math.sin(PI * c / 0.35)) * (1 - c / 0.7); o.flash = Math.max(0, 1 - c / 0.5) * 0.6; o.yaw = m.rest + easeOut(Math.min(1, c / 0.9)) * TAU; break; }
+    case 'bob': o.ty = Math.sin(t * 2.4) * 0.07; m.yaw += 0.45 * dt * spd; o.yaw = m.yaw; break;
+    case 'wiggle': { const c = t % 2.2; if (c < 0.9) o.roll = 0.2 * Math.sin(c * 26) * (1 - c / 0.9); break; }
+    case 'warn': o.tone = 'citrine'; m.yaw += 0.6 * dt * spd; o.yaw = m.yaw; o.flash = 0.16 * Math.pow(0.5 + 0.5 * Math.sin(t * 3), 4); break;
+    case 'error': { const c = t % 2.4; o.tone = 'ruby'; if (c < 0.8) o.tx = 0.12 * Math.sin(c * 44) * Math.pow(1 - c / 0.8, 1.5); o.flash = Math.max(0, 0.5 * (1 - c / 0.35)); break; }
+    case 'offline': o.tone = 'smoke'; o.pitch = (m.pitch ?? PITCH) * 0.6; break;
+    case 'orient': { const per = 1.8, k = Math.floor(t / per), f = (t % per) / per; o.roll = -(k + ease(Math.min(1, f / 0.4))) * PI / 2; break; }
+    case 'platform': { m.yaw += 0.7 * dt * spd; o.yaw = m.yaw; o.tone2 = 'sapphire'; const c = t % 6; o.toneT = c < 2.5 ? 0 : c < 3 ? ease((c - 2.5) / 0.5) : c < 5.5 ? 1 : 1 - ease((c - 5.5) / 0.5); break; }
+  }
+  return o;
+}
+
+/* ---- shapes ---- */
+const SHAPES = [
+  { id: 'simee', name: 'Simee', def: true, desc: 'Ten sides and a second, twisted ring on each pyramid: 60 facets. The mark simee ships (sim_core::mark::Cut::SIMEE).', p: { n: 10, crown: 0.5, pav: 1.0, crownRing: 0.55, crownTwist: 1, pavRing: 0.5, pavTwist: 1 } },
+  { id: 'septa', name: 'Septa', desc: 'Seven sides. A ridge runs up the middle with a lit plane on one side and a shaded one on the other.', p: { n: 7, crown: 0.55, pav: 0.95 } },
+  { id: 'hexa', name: 'Hexa', desc: 'Even crown and pavilion. The plainest double pyramid.', p: { n: 6, crown: 0.78, pav: 0.82 } },
+  { id: 'needle', name: 'Needle', desc: 'Five sides and a long pavilion. Reads as a pointer at 16 px.', p: { n: 5, crown: 0.48, pav: 1.25 } },
+  { id: 'tri', name: 'Trine', desc: 'Three sides: the fewest facets and the strongest split between light and dark.', p: { n: 3, crown: 0.6, pav: 1.1, r: 0.56 } },
+  { id: 'ridge', name: 'Ridge', desc: 'Four sides, a stretched octahedron. The silhouette is a rhombus from most angles.', p: { n: 4, crown: 0.7, pav: 1.0 } },
+  { id: 'banded', name: 'Banded', desc: 'Eight sides with a thin girdle band between the pyramids that catches a line of light.', p: { n: 8, crown: 0.5, pav: 0.9, band: 0.1 } },
+  { id: 'zigzag', name: 'Zigzag', desc: 'Seven sides, the band twisted half a facet: a ring of triangles at the waist.', p: { n: 7, crown: 0.5, pav: 0.95, band: 0.16, twist: 1 } },
+  { id: 'kite', name: 'Kite', desc: 'Five sides and a deep twisted band. The faces read as kites, like a ten-sided die drawn out tall.', p: { n: 5, crown: 0.68, pav: 0.72, band: 0.24, twist: 1 } },
+  { id: 'crowned', name: 'Crowned', desc: 'A second, twisted ring on each pyramid: four times the facets, still two pyramids.', p: { n: 6, crown: 0.6, pav: 1.0, crownRing: 0.5, crownTwist: 1, pavRing: 0.45, pavTwist: 1 } },
+  { id: 'table', name: 'Table', desc: 'A flat table on top. The familiar gem outline, drawn out tall.', p: { n: 8, crown: 0.38, pav: 1.05, table: 0.5 } },
+  { id: 'star', name: 'Star', desc: 'Twelve girdle points alternating in and out: a six-pointed waist.', p: { n: 12, crown: 0.6, pav: 1.0, star: 0.3 } },
+];
+
+/* ---- animation registry ---- */
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+let playing = !reduce;
+const anims = [];
+const io = 'IntersectionObserver' in window ? new IntersectionObserver(es => {
+  for (const e of es) { const a = e.target.__anim; if (a) a.visible = e.isIntersecting; }
+}, { rootMargin: '80px' }) : null;
+function svgEl(tag, attrs = {}, parent) {
+  const el = document.createElementNS(NS, tag);
+  for (const k in attrs) el.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(el);
+  return el;
+}
+let clipSeq = 0;
+function makeStateGem(svg, state, params, cfg = {}, opts = {}) {
+  const g = svgEl('g', {}, svg);
+  const view = new GemView(g, params, cfg);
+  const a = { view, state, spd: opts.speed ?? 1, visible: !io, kind: opts.kind || 'state', m: { tau: opts.phase || 0, yaw: view.rest, rest: view.rest, tone: opts.tone, pitch: opts.pitch }, fillView: null, clip: null };
+  a.ensureProgress = () => {
+    if (a.state === 'progress' && !a.fillView) {
+      const id = 'clip' + (++clipSeq);
+      const cp = svgEl('clipPath', { id }, svgEl('defs', {}, svg));
+      a.clip = svgEl('path', {}, cp);
+      const fg = svgEl('g', { 'clip-path': `url(#${id})` }, svg);
+      a.fillView = new GemView(fg, view.params, cfg);
+      a.fillG = fg; a.defs = cp.parentNode;
+    } else if (a.state !== 'progress' && a.fillView) {
+      a.fillG.remove(); a.defs.remove(); a.fillView = null; a.clip = null;
+    }
+  };
+  a.setGeom = p => { view.setGeom(p); if (a.fillView) a.fillView.setGeom(p); a.m.rest = view.rest; };
+  a.tick = dt => {
+    a.ensureProgress();
+    const o = stateFrame(a.state, dt, a.m, a.spd, view.step);
+    if (a.state === 'progress') {
+      view.draw(Object.assign({}, o, { tone: 'smoke' }));
+      a.fillView.draw(o);
+      const h = view.gem.H * view.fit * Math.cos(o.pitch), lvl = h / 2 - o.progress * h + (o.ty || 0);
+      let d = `M-1.5 1.5 L-1.5 ${lvl.toFixed(3)}`;
+      for (let x = -1.5; x <= 1.5001; x += 0.1) d += ` L${x.toFixed(2)} ${(lvl + 0.025 * Math.sin(x * 7 + a.m.tau * 5)).toFixed(3)}`;
+      a.clip.setAttribute('d', d + ' L1.5 1.5 Z');
+    } else view.draw(o);
+  };
+  svg.__anim = a;
+  if (io) io.observe(svg);
+  anims.push(a);
+  a.tick(0);
+  return a;
+}
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  for (const a of anims) {
+    if (!a.visible) continue;
+    if (a.kind === 'hover') { a.hoverTick(dt); continue; }
+    if (playing) a.tick(dt);
+  }
+  requestAnimationFrame(loop);
+}
+
+/* ---- hero ---- */
+const hero = SHAPES[0];
+const heroSvg = document.getElementById('heroSvg');
+const heroG = svgEl('g', {}, heroSvg);
+const heroView = new GemView(heroG, hero.p, { pad: 0.82, edgeW: 0.005 });
+heroView.draw();
+(function annotate() {
+  const gem = heroView.gem, fit = heroView.fit, cp = Math.cos(PITCH), sp = Math.sin(PITCH), k = heroView.cfg.persp;
+  const Y = y => { const yy = y - gem.cy, z = yy * sp; return -(yy * cp) / (1 - z * k) * fit; };
+  const yTop = Y(gem.yT), yG = Y(0), yBot = Y(gem.yB), R = 0.5 * fit;
+  const a = svgEl('g', { class: 'anno' }, heroSvg);
+  const line = (x1, y1, x2, y2, cls) => svgEl('line', { x1, y1, x2, y2, ...(cls ? { class: cls } : {}) }, a);
+  const text = (x, y, s, anchor = 'start', cls) => { const t = svgEl('text', { x, y, 'text-anchor': anchor, 'dominant-baseline': 'middle', ...(cls ? { class: cls } : {}) }, a); t.textContent = s; return t; };
+  const X = 0.82;
+  for (const y of [yTop, yG, yBot]) { line(0.06, y, X - 0.02, y, 'guide'); line(X - 0.03, y, X + 0.03, y); }
+  line(X, yTop, X, yBot);
+  text(X + 0.07, (yTop + yG) / 2 - 0.04, 'crown', 'start', 'k'); text(X + 0.07, (yTop + yG) / 2 + 0.05, gem.yT.toFixed(2));
+  text(X + 0.07, (yG + yBot) / 2 - 0.04, 'pavilion', 'start', 'k'); text(X + 0.07, (yG + yBot) / 2 + 0.05, (-gem.yB).toFixed(2));
+  text(X + 0.07, yBot + 0.0, 'h ' + gem.H.toFixed(2));
+  const LX = -0.72;
+  line(LX + 0.03, yTop, -0.05, yTop, 'guide'); text(LX, yTop, 'apex', 'end', 'k');
+  line(LX + 0.03, yG, -R - 0.02, yG, 'guide'); text(LX, yG, 'girdle', 'end', 'k');
+  line(LX + 0.03, yBot, -0.05, yBot, 'guide'); text(LX, yBot, 'culet', 'end', 'k');
+  const wy = yBot + 0.1;
+  line(-R, wy, R, wy); line(-R, wy - 0.03, -R, wy + 0.03); line(R, wy - 0.03, R, wy + 0.03);
+  text(R + 0.05, wy, 'girdle Ø ' + (gem.W).toFixed(2));
+  const spec = document.getElementById('heroSpec');
+  const rows = [['Sides', gem.n], ['Facets', gem.F], ['Vertices', gem.V], ['Edges', gem.E], ['Height : width', (gem.H / gem.W).toFixed(2) + ' : 1'], ['Crown : pavilion', (gem.yT / -gem.yB).toFixed(2)]];
+  spec.innerHTML = rows.map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join('');
+})();
+const heroYaw = document.getElementById('heroYaw'), heroYawOut = document.getElementById('heroYawOut');
+heroYaw.addEventListener('input', () => { const d = +heroYaw.value; heroYawOut.textContent = d + '°'; heroView.draw({ yaw: heroView.rest + d * PI / 180 }); });
+
+/* ---- shape cards ---- */
+const shapeGrid = document.getElementById('shapeGrid');
+SHAPES.forEach((s, i) => {
+  const gem = buildGem(s.p);
+  const card = document.createElement('button');
+  card.type = 'button'; card.className = 'card';
+  card.setAttribute('aria-label', `Open ${s.name} in the workbench`);
+  card.innerHTML = `<div class="stage"></div>
+    <div class="row"><h3>${s.name}</h3>${s.def ? '<span class="default-tag">Default</span>' : `<span class="num">${String(i + 1).padStart(2, '0')}</span>`}</div>
+    <span class="meta">${gem.n} sides · ${gem.F} facets · h:w ${(gem.H / gem.W).toFixed(2)}</span>
+    <p>${s.desc}</p>`;
+  const svg = svgEl('svg', { viewBox: '-1 -1 2 2', 'aria-hidden': 'true' }, card.querySelector('.stage'));
+  const a = makeStateGem(svg, 'idle', s.p, { edgeW: 0.008 }, { kind: 'hover' });
+  a.hover = false;
+  a.hoverTick = dt => {
+    const m = a.m, step = a.view.step;
+    if (a.hover) { m.yaw += 1.4 * dt; a.view.draw({ yaw: m.yaw }); a.settled = false; }
+    else if (!a.settled) {
+      const target = m.rest + Math.ceil((m.yaw - m.rest) / step - 1e-6) * step;
+      m.yaw += Math.min(target - m.yaw, Math.max(0.004, (target - m.yaw) * 6 * dt));
+      if (target - m.yaw < 1e-3) { m.yaw = m.rest; a.settled = true; }
+      a.view.draw({ yaw: m.yaw });
+    }
+  };
+  a.settled = true;
+  card.addEventListener('mouseenter', () => { a.hover = true; });
+  card.addEventListener('mouseleave', () => { a.hover = false; });
+  card.addEventListener('focus', () => { a.hover = true; });
+  card.addEventListener('blur', () => { a.hover = false; });
+  card.addEventListener('click', () => { loadShape(s.id); document.getElementById('bench').scrollIntoView({ behavior: reduce ? 'auto' : 'smooth' }); });
+  shapeGrid.appendChild(card);
+});
+
+/* ---- state tiles ---- */
+const stateGrid = document.getElementById('stateGrid');
+STATES.forEach(([id, label, what, how], i) => {
+  const tile = document.createElement('div');
+  tile.className = 'tile';
+  tile.innerHTML = `<div class="stage"></div><h3>${label}</h3><p class="what">${what}</p><p class="how">${how}</p>`;
+  const svg = svgEl('svg', { viewBox: '-1 -1 2 2', role: 'img', 'aria-label': `${label}: ${how}` }, tile.querySelector('.stage'));
+  makeStateGem(svg, id, hero.p, { edgeW: 0.009 }, { phase: id === 'boot' ? 1.6 : id === 'progress' ? 2.4 : id === 'success' ? 0.35 : id === 'error' ? 0.12 : id === 'orient' ? 0.5 : 0 });
+  stateGrid.appendChild(tile);
+});
+
+/* ---- workbench ---- */
+const GEOM = [
+  ['geomA', 'n', 'Sides', 3, 12, 1, v => v],
+  ['geomA', 'crown', 'Crown height', 0.15, 1.3, 0.01, v => v.toFixed(2)],
+  ['geomA', 'pav', 'Pavilion height', 0.25, 1.7, 0.01, v => v.toFixed(2)],
+  ['geomA', 'band', 'Girdle band', 0, 0.4, 0.01, v => v.toFixed(2)],
+  ['geomA', 'table', 'Table', 0, 0.85, 0.01, v => v ? Math.round(v * 100) + '%' : 'point'],
+  ['geomA', 'culet', 'Culet', 0, 0.6, 0.01, v => v ? Math.round(v * 100) + '%' : 'point'],
+  ['geomB', 'crownRing', 'Crown ring', 0, 0.85, 0.01, v => v ? v.toFixed(2) : 'none'],
+  ['geomB', 'pavRing', 'Pavilion ring', 0, 0.85, 0.01, v => v ? v.toFixed(2) : 'none'],
+  ['geomB', 'crownTwist', 'Crown ring twist', 0, 1, 0.01, v => Math.round(v * 100) + '%'],
+  ['geomB', 'pavTwist', 'Pavilion ring twist', 0, 1, 0.01, v => Math.round(v * 100) + '%'],
+  ['geomB', 'twist', 'Band twist', 0, 1, 0.01, v => Math.round(v * 100) + '%'],
+  ['geomB', 'star', 'Star girdle', 0, 0.5, 0.01, v => v ? Math.round(v * 100) + '%' : 'off'],
+];
+let bench = Object.assign({}, DEFAULTS, hero.p);
+const inputs = {};
+for (const [grp, key, label, min, max, step, fmt] of GEOM) {
+  const d = document.createElement('div'); d.className = 'ctl';
+  d.innerHTML = `<label for="g_${key}">${label} <output id="go_${key}"></output></label><input id="g_${key}" type="range" min="${min}" max="${max}" step="${step}">`;
+  document.getElementById(grp).appendChild(d);
+  const inp = d.querySelector('input'), out = d.querySelector('output');
+  inputs[key] = { inp, out, fmt };
+  inp.addEventListener('input', () => { bench[key] = +inp.value; out.textContent = fmt(bench[key]); geomChanged(); });
+}
+const selShape = document.getElementById('selShape'), selState = document.getElementById('selState');
+selShape.innerHTML = SHAPES.map(s => `<option value="${s.id}">${s.name}${s.def ? ' (default)' : ''}</option>`).join('') + '<option value="custom" hidden>Custom</option>';
+selState.innerHTML = STATES.map(([id, label]) => `<option value="${id}">${label}</option>`).join('');
+selState.value = 'spin';
+const benchSvg = document.getElementById('benchSvg');
+const benchCfg = { edgeW: 0.005, pad: 0.78 };
+const benchAnim = makeStateGem(benchSvg, 'spin', bench, benchCfg, { kind: 'state' });
+benchAnim.visible = true; if (io) io.unobserve(benchSvg); if (io) io.observe(benchSvg);
+const rSpeed = document.getElementById('rSpeed'), oSpeed = document.getElementById('oSpeed');
+rSpeed.addEventListener('input', () => { benchAnim.spd = +rSpeed.value; oSpeed.textContent = (+rSpeed.value).toFixed(2) + '×'; });
+selState.addEventListener('change', () => { benchAnim.state = selState.value; benchAnim.m.tau = 0; benchAnim.tick(0); });
+const rTilt = document.getElementById('rTilt'), oTilt = document.getElementById('oTilt');
+const tiltOut = () => { oTilt.textContent = Math.round(+rTilt.value * 180 / PI) + '°'; };
+rTilt.addEventListener('input', () => { benchAnim.m.pitch = +rTilt.value; tiltOut(); benchAnim.tick(0); });
+tiltOut();
+const selTone = document.getElementById('selTone');
+selTone.addEventListener('change', () => { benchAnim.m.tone = selTone.value; benchAnim.tick(0); });
+const cEdges = document.getElementById('cEdges'), cGlass = document.getElementById('cGlass'), cFlat = document.getElementById('cFlat');
+const finish = () => {
+  for (const v of [benchAnim.view, benchAnim.fillView]) if (v) { v.cfg.edges = cEdges.checked; v.cfg.glass = cGlass.checked ? 0.86 : 1; v.cfg.flat = cFlat.checked; }
+  benchCfg.edges = cEdges.checked; benchCfg.glass = cGlass.checked ? 0.86 : 1; benchCfg.flat = cFlat.checked;
+  benchAnim.tick(0);
+};
+[cEdges, cGlass, cFlat].forEach(c => c.addEventListener('change', finish));
+const readout = document.getElementById('benchReadout');
+function syncInputs() { for (const k in inputs) { inputs[k].inp.value = bench[k]; inputs[k].out.textContent = inputs[k].fmt(bench[k]); } }
+function loadShape(id) {
+  const s = SHAPES.find(x => x.id === id); if (!s) return;
+  bench = Object.assign({}, DEFAULTS, s.p); selShape.value = id; syncInputs(); geomChanged(true);
+}
+selShape.addEventListener('change', () => loadShape(selShape.value));
+let pending = false;
+function geomChanged(fromPreset) {
+  if (!fromPreset) selShape.value = 'custom';
+  if (pending) return; pending = true;
+  requestAnimationFrame(() => {
+    pending = false;
+    benchAnim.setGeom(bench); benchAnim.tick(0);
+    const g = benchAnim.view.gem;
+    readout.innerHTML = `<span><b>${g.n}</b> sides</span><span><b>${g.F}</b> facets</span><span><b>${g.V}</b> vertices</span><span><b>${g.E}</b> edges</span><span>h:w <b>${(g.H / g.W).toFixed(2)}</b></span>`;
+    renderUses();
+  });
+}
+
+/* ---- copy ---- */
+const toast = document.getElementById('toast'), copybox = document.getElementById('copybox');
+function copy(text, label) {
+  const fallback = () => { copybox.hidden = false; copybox.value = text; copybox.focus(); copybox.select(); toast.textContent = 'Clipboard blocked here. The text is selected below; press ⌘C.'; };
+  try {
+    navigator.clipboard.writeText(text).then(() => { copybox.hidden = true; toast.textContent = label + ' copied.'; setTimeout(() => { toast.textContent = ''; }, 2200); }, fallback);
+  } catch (e) { fallback(); }
+}
+function staticSvg(params, cfg, o) {
+  const s = document.createElementNS(NS, 'svg');
+  s.setAttribute('xmlns', NS); s.setAttribute('viewBox', '-1 -1 2 2'); s.setAttribute('width', '512'); s.setAttribute('height', '512');
+  const v = new GemView(svgEl('g', {}, s), params, Object.assign({}, cfg));
+  v.draw(o);
+  v.pool.forEach(p => { if (!p.getAttribute('points')) p.remove(); });
+  return new XMLSerializer().serializeToString(s);
+}
+document.getElementById('copySvg').addEventListener('click', () => {
+  copy(staticSvg(bench, benchCfg, { pitch: benchAnim.m.pitch ?? PITCH, tone: benchAnim.m.tone || 'emerald' }), 'SVG');
+});
+document.getElementById('copyParams').addEventListener('click', () => {
+  const out = {}; for (const k in DEFAULTS) if (bench[k] !== DEFAULTS[k] || ['n', 'crown', 'pav'].includes(k)) out[k] = bench[k];
+  out.tilt = +(benchAnim.m.pitch ?? PITCH).toFixed(2);
+  copy(JSON.stringify(out), 'Parameters');
+});
+
+/* ---- in use ---- */
+const followers = []; // static renders: {view, o}
+function superellipse(cx, cy, r, e = 5, steps = 96) {
+  let d = '';
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps * TAU, c = Math.cos(t), s = Math.sin(t);
+    const x = cx + r * Math.sign(c) * Math.pow(Math.abs(c), 2 / e), y = cy + r * Math.sign(s) * Math.pow(Math.abs(s), 2 / e);
+    d += (i ? 'L' : 'M') + x.toFixed(2) + ' ' + y.toFixed(2);
+  }
+  return d + 'Z';
+}
+const SQUIRCLE = superellipse(50, 50, 45);
+let gradSeq = 0;
+function iconSvg(size, ground) {
+  const id = 'gr' + (++gradSeq);
+  const s = svgEl('svg', { viewBox: '0 0 100 100', width: size, height: size, role: 'img', 'aria-label': `simee icon, ${size} px` });
+  const defs = svgEl('defs', {}, s);
+  const rg = svgEl('radialGradient', { id, cx: '38%', cy: '28%', r: '85%' }, defs);
+  ground.forEach(([o, c]) => svgEl('stop', { offset: o, 'stop-color': c }, rg));
+  const hi = svgEl('linearGradient', { id: id + 'h', x1: 0, y1: 0, x2: 0, y2: 1 }, defs);
+  svgEl('stop', { offset: 0, 'stop-color': '#ffffff', 'stop-opacity': 0.14 }, hi);
+  svgEl('stop', { offset: 0.5, 'stop-color': '#ffffff', 'stop-opacity': 0 }, hi);
+  svgEl('path', { d: SQUIRCLE, fill: `url(#${id})` }, s);
+  svgEl('path', { d: SQUIRCLE, fill: `url(#${id}h)` }, s);
+  svgEl('path', { d: SQUIRCLE, fill: 'none', stroke: '#000', 'stroke-opacity': 0.12, 'stroke-width': 0.6 }, s);
+  const g = svgEl('g', { transform: 'translate(50 51) scale(37)' }, s);
+  return { s, g };
+}
+function figure(parent, el, cap) {
+  const f = document.createElement('figure'); f.appendChild(el);
+  const c = document.createElement('figcaption'); c.textContent = cap; f.appendChild(c);
+  parent.appendChild(f);
+}
+const DARK_GROUND = [[0, '#0f5a3c'], [0.55, '#06321f'], [1, '#021a10']];
+const LIGHT_GROUND = [[0, '#ffffff'], [0.6, '#e4f3ea'], [1, '#c9e6d5']];
+for (const [host, ground, sizes] of [['dockSizes', DARK_GROUND, [192, 128, 64, 32]], ['lightSizes', LIGHT_GROUND, [128, 64]]]) {
+  const el = document.getElementById(host);
+  for (const sz of sizes) {
+    const { s, g } = iconSvg(sz, ground);
+    const view = new GemView(g, bench, { pad: 0.8, seamW: 0.02, flat: sz < 48 });
+    followers.push({ view, o: {} });
+    figure(el, s, sz + ' px');
+  }
+}
+for (const host of ['monoA', 'monoB']) {
+  const el = document.getElementById(host);
+  for (const sz of [16, 18, 22, 32]) {
+    const s = svgEl('svg', { viewBox: '-1 -1 2 2', width: sz, height: sz, class: 'mono-gem', role: 'img', 'aria-label': `Template icon ${sz} px` }, el);
+    const view = new GemView(svgEl('g', {}, s), bench, { pad: 0.92, mono: true, monoW: 2 / sz * 1.1 });
+    followers.push({ view, o: { pitch: 0.12 } });
+  }
+}
+{
+  const el = document.getElementById('favSizes');
+  for (const sz of [64, 32, 16]) {
+    const s = svgEl('svg', { viewBox: '-1 -1 2 2', width: sz, height: sz, role: 'img', 'aria-label': `Favicon ${sz} px` });
+    const view = new GemView(svgEl('g', {}, s), bench, { pad: 0.94, edges: false, glass: 1, flat: true });
+    followers.push({ view, o: {} });
+    figure(el, s, sz + ' px');
+  }
+}
+const liveFollowers = [];
+{
+  const rows = [
+    ['idle', 'Pixel_8_API_35', 'Android 15 · booted'],
+    ['boot', 'iPhone 16 Pro', 'iOS 18.2 · booting'],
+    ['progress', 'Pixel_Fold_API_34', 'installing app'],
+    ['step', 'iPad Air 13-inch', 'AutoMobile · step 14'],
+    ['error', 'Apple Watch Series 10', 'runtime missing'],
+    ['offline', 'Pixel_Tablet_API_35', 'shut down'],
+  ];
+  const list = document.getElementById('devList');
+  rows.forEach(([st, nm, txt], i) => {
+    const r = document.createElement('div'); r.className = 'dev';
+    r.innerHTML = `<span></span><span class="nm">${nm}</span><span class="st">${txt}</span>`;
+    const s = svgEl('svg', { viewBox: '-1 -1 2 2', width: 20, height: 20, 'aria-hidden': 'true' }, r.firstChild);
+    liveFollowers.push(makeStateGem(s, st, bench, { pad: 0.9, edges: false, glass: 1 }, { phase: i * 0.7 }));
+    list.appendChild(r);
+  });
+}
+{
+  const tb = document.getElementById('toolbarDemo');
+  const mk = (label, state, primary) => {
+    const b = document.createElement('button'); b.type = 'button'; if (primary) b.className = 'primary';
+    const s = svgEl('svg', { viewBox: '-1 -1 2 2', width: 16, height: 16, 'aria-hidden': 'true' }, b);
+    b.appendChild(document.createTextNode(label));
+    liveFollowers.push(makeStateGem(s, state, bench, { pad: 0.92, edges: false, glass: 1 }));
+    tb.appendChild(b);
+  };
+  mk('Capturing…', 'spin', true); mk('Booting', 'boot'); mk('Retry', 'error');
+  const lk = document.getElementById('lockups');
+  const h = document.createElement('div'); h.className = 'lock-h';
+  const hs = svgEl('svg', { viewBox: '-1 -1 2 2', width: 58, height: 58, role: 'img', 'aria-label': 'simee mark' }, h);
+  followers.push({ view: new GemView(svgEl('g', {}, hs), bench, { pad: 0.98, edgeW: 0.012 }), o: {} });
+  h.insertAdjacentHTML('beforeend', '<span>simee</span>');
+  const v = document.createElement('div'); v.className = 'lock-v';
+  const vs = svgEl('svg', { viewBox: '-1 -1 2 2', width: 64, height: 64, role: 'img', 'aria-label': 'simee mark' }, v);
+  followers.push({ view: new GemView(svgEl('g', {}, vs), bench, { pad: 0.95, edgeW: 0.012 }), o: {} });
+  v.insertAdjacentHTML('beforeend', '<span>simee</span>');
+  lk.append(h, v);
+}
+{
+  const pal = document.getElementById('palette');
+  for (const k in TONES) {
+    const d = document.createElement('div'); d.className = 'sw';
+    d.innerHTML = `<div class="bar">${TONES[k].map(c => `<i style="background:${c}"></i>`).join('')}</div><span>${k[0].toUpperCase() + k.slice(1)} · ${TONE_USE[k]}</span>`;
+    pal.appendChild(d);
+  }
+}
+function renderUses() {
+  for (const f of followers) { f.view.setGeom(bench); f.view.draw(f.o); }
+  for (const a of liveFollowers) { a.setGeom(bench); a.tick(0); }
+}
+
+/* ---- motion toggle ---- */
+const motionBtn = document.getElementById('motionBtn');
+const syncBtn = () => { motionBtn.textContent = playing ? 'Pause motion' : 'Play motion'; motionBtn.setAttribute('aria-pressed', String(!playing)); };
+motionBtn.addEventListener('click', () => { playing = !playing; syncBtn(); });
+syncBtn();
+
+loadShape('simee');
+renderUses();
+requestAnimationFrame(t => { last = t; requestAnimationFrame(loop); });
+})();
+</script>

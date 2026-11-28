@@ -1,0 +1,102 @@
+name: Website
+
+# The public site (website/): a Rune app built to wasm, with every page's static HTML written by
+# the app itself, served from Fly by Caddy. A pull request builds and tests it; a push to main
+# that touches what the site reads deploys it to Fly with the FLY_API_TOKEN secret of the
+# `website` environment (a deploy token scoped to the app: website/README.md). Until that secret
+# exists the deploy job says so and passes, so merging this before Fly is set up is safe.
+on:
+  push:
+    branches: [main]
+    paths: &site
+      - website/**
+      - docs/**
+      - README.md
+      - crates/sim-core/**
+      - Cargo.toml
+      - rust-toolchain.toml
+      - .github/workflows/website.yml
+  pull_request:
+    paths: *site
+  workflow_dispatch:
+
+concurrency:
+  group: website-${{ github.ref }}
+  # A deploy in progress finishes; a newer push deploys after it.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # Canonical URLs, the sitemap and social cards name this origin. Set the repository variable
+  # SIMEE_WEB_ORIGIN when the site moves to its own domain.
+  SIMEE_WEB_ORIGIN: ${{ vars.SIMEE_WEB_ORIGIN || 'https://simee.fly.dev' }}
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The native exporter (`--html`) links Rune's window stack, as desktop-linux does.
+      - run: sudo apt-get install -y --no-install-recommends libxkbcommon-dev || (sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev)
+      - uses: ./.github/actions/rust-toolchain
+      - run: rustup target add wasm32-unknown-unknown
+      # Rune's web build needs the wasm-bindgen CLI at exactly the version in the lockfile.
+      - id: bindgen
+        run: |
+          version=$(python3 -c 'import tomllib; print(next(p["version"] for p in tomllib.load(open("website/Cargo.lock","rb"))["package"] if p["name"]=="wasm-bindgen"))')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: wasm-bindgen@${{ steps.bindgen.outputs.version }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: website
+          shared-key: website
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cd website && cargo clippy --locked --all-targets -- -D warnings
+      - run: cd website && cargo test --locked
+      - run: website/scripts/build.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: website-dist
+          path: website/dist
+          retention-days: 7
+
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: website
+      url: ${{ env.SIMEE_WEB_ORIGIN }}
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+    steps:
+      - if: env.FLY_API_TOKEN == ''
+        run: echo "::notice::FLY_API_TOKEN isn't set in the website environment, so nothing was deployed (setup in website/README.md, Hosting and deploys)."
+      - if: env.FLY_API_TOKEN != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: env.FLY_API_TOKEN != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: website-dist
+          path: website/dist
+      - if: env.FLY_API_TOKEN != ''
+        uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # 1.5
+      # The image is Caddy plus dist/: Fly's remote builder copies two things and builds nothing.
+      - if: env.FLY_API_TOKEN != ''
+        run: flyctl deploy --remote-only --config fly.toml --wait-timeout 300
+        working-directory: website

@@ -205,9 +205,11 @@ fn installs_from_a_local_archive() {
     // Manifests are fetched once, then served from the cache.
     let mf = work.join("repository2-3.xml");
     std::fs::write(&mf, REPO).expect("write manifest");
-    let url = format!("file://{}", mf.display());
+    // `file:///C:/dir/x.xml` on Windows: a URL has slashes, and an absolute path starts with one.
+    let slashed = |p: &Path| p.display().to_string().replace('\\', "/");
+    let url = format!("file://{}{}", if cfg!(windows) { "/" } else { "" }, slashed(&mf));
     let m = sdk.manifest(&url).expect("manifest");
-    assert_eq!(m.base_url, format!("file://{}/", work.display()));
+    assert_eq!(m.base_url, format!("file://{}{}/", if cfg!(windows) { "/" } else { "" }, slashed(&work)));
     std::fs::remove_file(&mf).expect("rm");
     assert_eq!(sdk.manifest(&url).expect("cached").packages.len(), m.packages.len());
     let _ = std::fs::remove_dir_all(work);
@@ -234,7 +236,7 @@ fn resolves_emulator_for_host() {
 fn the_renderer_comes_from_the_package_this_host_can_load() {
     if cfg!(target_os = "macos") {
         assert_eq!((renderer::host(), renderer::BACKEND), (Host::MACOS_ARM64, "libgfxstream_backend.dylib"));
-    } else {
+    } else if cfg!(target_os = "linux") {
         // Before: every host fetched Apple silicon's archive, whose .dylib Linux can't load.
         assert_eq!((renderer::host(), renderer::BACKEND), (Host::current(), "libgfxstream_backend.so"));
         assert_eq!(renderer::host().os, "linux");
@@ -304,7 +306,7 @@ fn renderer_lookup_preference() {
     fake_renderer(&sdk, "37.5.0", Some("37.3.9"), true);
     fake_renderer(&sdk, "38.0.0", Some("38.0.0"), false);
     fake_renderer(&sdk, "junk", Some("39"), true);
-    std::os::unix::fs::symlink("37.3.9", renderer::root(&sdk).join(renderer::CURRENT)).expect("symlink");
+    symlink_dir(Path::new("37.3.9"), &renderer::root(&sdk).join(renderer::CURRENT)).expect("symlink");
     let revs: Vec<String> = renderer::installed(&sdk).iter().map(|i| i.marker.revision.to_string()).collect();
     assert_eq!(revs, ["37.3.10", "37.3.9"]);
     assert_eq!(renderer::find_lib64(&sdk), Some(newest.join("lib64")));
@@ -323,6 +325,7 @@ fn renderer_lookup_preference() {
 /// Whether every host tool a test shells out to is present (an absolute path, or a name looked up
 /// on `PATH`). A missing tool in CI panics, since CI images have them and a broken image must not
 /// read as a pass; elsewhere it prints a `SKIP` line to stderr and returns false.
+#[cfg(unix)]
 fn have_tools(test: &str, tools: &[&str]) -> bool {
     let found = |tool: &str| {
         let path = Path::new(tool);
@@ -341,6 +344,7 @@ fn have_tools(test: &str, tools: &[&str]) -> bool {
 
 /// Zips `<work>/<src>/emulator` with `/usr/bin/zip -y` (symlinks stored as links) and returns its
 /// `Download` for revision `rev`.
+#[cfg(unix)]
 fn zip_emulator(work: &Path, src: &str, rev: &str) -> Download {
     let zip = work.join(format!("emulator-darwin_aarch64-{src}.zip"));
     let _ = std::fs::remove_file(&zip);
@@ -359,6 +363,7 @@ fn zip_emulator(work: &Path, src: &str, rev: &str) -> Download {
 }
 
 /// A tree shaped like the emulator package under `<work>/<src>/emulator`.
+#[cfg(unix)]
 fn fake_emulator_tree(work: &Path, src: &str, backend: bool) {
     let e = work.join(src).join("emulator");
     for d in ["lib64/qt/lib", "lib64/vulkan/layers", "lib64/gles_angle", "lib", "bin64"] {
@@ -384,10 +389,14 @@ fn fake_emulator_tree(work: &Path, src: &str, backend: bool) {
     if backend {
         std::fs::write(e.join("lib64").join(renderer::BACKEND), src).expect("write");
     }
+    #[cfg(unix)]
     std::os::unix::fs::symlink("libprotobuf.28.4.0.dylib", e.join("lib64/libprotobuf.dylib")).expect("symlink");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file("libprotobuf.28.4.0.dylib", e.join("lib64/libprotobuf.dylib")).expect("symlink");
 }
 
 /// Files under `dir`, relative, sorted; symlinks as `name -> target`.
+#[cfg(unix)]
 fn tree(dir: &Path) -> Vec<String> {
     fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
         for e in std::fs::read_dir(dir).expect("ls").flatten() {
@@ -411,7 +420,9 @@ fn tree(dir: &Path) -> Vec<String> {
 
 /// The renderer install path, offline: only lib64 (minus Qt) and the license files are
 /// unpacked, symlinks survive, a marker and `current` are written, the archive is deleted, and a
-/// newer revision replaces the older one.
+/// newer revision replaces the older one. Unix only: it zips with `/usr/bin/zip` and unpacks with
+/// `unzip`, neither on a Windows host.
+#[cfg(unix)]
 #[test]
 fn installs_renderer_from_a_local_archive() {
     if !have_tools("installs_renderer_from_a_local_archive", &["/usr/bin/zip", "curl", "unzip"]) {
@@ -497,6 +508,8 @@ fn the_current_host_matches_the_build_target() {
     assert_eq!(host.os, "linux");
     #[cfg(target_os = "macos")]
     assert_eq!(host.os, "macosx");
+    #[cfg(target_os = "windows")]
+    assert_eq!(host.os, "windows");
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     assert_eq!(host, Host::MACOS_ARM64);
     assert!(repo().resolve("platform-tools", Host { os: "linux", arch: "x64" }).is_ok());
@@ -513,9 +526,19 @@ fn a_missing_host_tool_says_what_to_install() {
     assert!(err.contains("`/nonexistent/curl` not found: install curl"), "{err}");
 }
 
+/// Bytes the filesystem allocated to a file (`st_blocks`); `None` where std can't tell.
+fn allocated(meta: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    return Some(std::os::unix::fs::MetadataExt::blocks(meta) * 512);
+    #[cfg(not(unix))]
+    return {
+        let _ = meta;
+        None
+    };
+}
+
 #[test]
 fn write_sparse_skips_zero_blocks_and_keeps_contents() {
-    use std::os::unix::fs::MetadataExt;
     let path = std::env::temp_dir().join(format!("emu-sdk-sparse-{}.img", std::process::id()));
     // 3 MiB: crosses the copy buffer, with data at a buffer edge and a short non-zero tail.
     let mut data = vec![0u8; 3 * (1 << 20) + 100];
@@ -527,11 +550,13 @@ fn write_sparse_skips_zero_blocks_and_keeps_contents() {
     let (len, written) = write_sparse(&data[..], &file).expect("write");
     drop(file);
     let back = std::fs::read(&path).expect("read");
-    let blocks = std::fs::metadata(&path).expect("meta").blocks();
+    let allocated = allocated(&std::fs::metadata(&path).expect("meta"));
     let _ = std::fs::remove_file(&path);
     assert_eq!(back, data, "contents unchanged");
     assert_eq!((len, written), (data.len() as u64, 3 * 4096 + 100), "only the four non-zero blocks");
-    assert!(blocks * 512 < 64 * 1024, "{blocks} sectors allocated for 3 MiB");
+    if let Some(bytes) = allocated {
+        assert!(bytes < 64 * 1024, "{bytes} bytes allocated for 3 MiB");
+    }
 
     let empty = std::env::temp_dir().join(format!("emu-sdk-sparse-empty-{}.img", std::process::id()));
     let (len, written) = write_sparse(&[][..], &std::fs::File::create(&empty).expect("create")).expect("empty");
@@ -540,6 +565,8 @@ fn write_sparse_skips_zero_blocks_and_keeps_contents() {
 }
 
 /// A system image installs with its disk images sparse and everything else as unzip leaves it.
+/// Unix only: it unpacks with `unzip`, which a Windows host doesn't have.
+#[cfg(unix)]
 #[test]
 fn installs_system_images_with_sparse_disks() {
     if !have_tools("installs_system_images_with_sparse_disks", &["unzip"]) {
@@ -572,11 +599,12 @@ fn installs_system_images_with_sparse_disks() {
     assert_eq!(std::fs::read(dest.join("system.img")).expect("system"), system);
     assert_eq!(std::fs::read(dest.join("vendor.img")).expect("vendor"), b"tiny");
     assert_eq!(std::fs::read(dest.join("data/misc/x.xml")).expect("data"), b"<x/>");
-    use std::os::unix::fs::MetadataExt;
-    let blocks = std::fs::metadata(dest.join("system.img")).expect("meta").blocks();
+    let allocated = allocated(&std::fs::metadata(dest.join("system.img")).expect("meta"));
     let leftovers: Vec<_> = std::fs::read_dir(sdk.downloads()).expect("ls").flatten().collect();
     let _ = std::fs::remove_dir_all(&work);
-    assert!(blocks * 512 < 1 << 20, "a 2 MiB image with one data block takes {blocks} sectors");
+    if let Some(bytes) = allocated {
+        assert!(bytes < 1 << 20, "a 2 MiB image with one data block takes {bytes} bytes");
+    }
     assert!(leftovers.is_empty(), "no archive or temp dirs left: {leftovers:?}");
 }
 
@@ -608,4 +636,339 @@ fn tag_variants_are_found_on_whichever_site_lists_them() {
     assert_eq!(found.expect("found"), "system-images;android-34-ext9;android-wear-signed;arm64-v8a");
     assert_eq!(listed.expect("listed"), 1, "the TV site isn't cached, so it's skipped");
     assert!(missing.is_err());
+}
+
+mod dhu_tests {
+    use super::*;
+    use crate::dhu::{self, Channel};
+
+    const AUTO: &str = include_str!("../testdata/extras-google-auto.xml");
+    const MAC_ARM: Host = Host::MACOS_ARM64;
+    const MAC_X64: Host = Host { os: "macosx", arch: "x64" };
+    const LINUX: Host = Host { os: "linux", arch: "x64" };
+    const WINDOWS: Host = Host { os: "windows", arch: "x64" };
+    const LINUX_ARM: Host = Host { os: "linux", arch: "aarch64" };
+
+    fn auto() -> Manifest {
+        Manifest::parse(AUTO, REPO_URL).expect("parse fixture")
+    }
+
+    #[test]
+    fn picks_the_archive_for_each_host() {
+        for (host, file) in [
+            (MAC_ARM, "desktop-head-unit-mac-arm_r2.0.zip"),
+            (MAC_X64, "desktop-head-unit-mac_r2.0.zip"),
+            (LINUX, "desktop-head-unit-linux_r2.0.zip"),
+            (WINDOWS, "desktop-head-unit-win_r2.0.zip"),
+        ] {
+            let plan = dhu::resolve(&auto(), host, Channel::Stable).expect("resolve");
+            assert_eq!(plan.download.url, format!("{REPO_URL}{file}"), "{host}");
+            assert_eq!(plan.download.install_dir(), PathBuf::from("extras/google/auto"));
+        }
+        let plan = dhu::resolve(&auto(), LINUX, Channel::Stable).expect("resolve");
+        assert_eq!((plan.download.size, plan.download.sha1.len()), (1_000_002, 40));
+        assert_eq!(plan.license.expect("license").id, "android-sdk-license");
+    }
+
+    #[test]
+    fn stable_is_the_default_and_beta_is_opt_in() {
+        assert_eq!(Channel::default(), Channel::Stable);
+        let stable = dhu::resolve(&auto(), LINUX, Channel::Stable).expect("stable");
+        assert_eq!(stable.download.revision.to_string(), "2");
+        let beta = dhu::resolve(&auto(), LINUX, Channel::Beta).expect("beta");
+        assert_eq!(beta.download.revision.to_string(), "2.1.0");
+        assert!(beta.download.url.ends_with("desktop-head-unit-linux_r2.1.zip"));
+
+        // With only a beta in the manifest, stable finds nothing and says so.
+        let only_beta = AUTO.replacen("channel-0\"/>", "channel-1\"/>", 1);
+        let m = Manifest::parse(&only_beta, REPO_URL).expect("parse");
+        assert!(dhu::resolve(&m, LINUX, Channel::Stable).is_err());
+        assert_eq!(dhu::resolve(&m, LINUX, Channel::Beta).expect("beta").download.revision.minor, 1);
+    }
+
+    #[test]
+    fn a_host_without_an_archive_names_the_hosts_that_have_one() {
+        let e = dhu::resolve(&auto(), LINUX_ARM, Channel::Stable).expect_err("no linux arm64 archive").to_string();
+        assert!(e.contains("linux/aarch64"), "{e}");
+        for have in ["macosx/aarch64", "macosx/x64", "linux/x64", "windows/x64"] {
+            assert!(e.contains(have), "{e}");
+        }
+        let e = dhu::resolve(&Manifest::parse(REPO, REPO_URL).expect("repo"), LINUX, Channel::Stable).expect_err("not listed");
+        assert!(matches!(e, Error::UnknownPackage(..)), "{e}");
+    }
+
+    /// A DHU download of `zip` bytes served from a file; `rev` names its file.
+    fn served(work: &Path, zip: &[u8]) -> Download {
+        let file = work.join("desktop-head-unit-linux_r2.0.zip");
+        std::fs::write(&file, zip).expect("write zip");
+        Download {
+            path: dhu::PACKAGE.into(),
+            revision: Revision { major: 2, ..Revision::default() },
+            api_level: None,
+            tags: Vec::new(),
+            url: format!("file://{}", file.display()),
+            size: zip.len() as u64,
+            sha1: sha1_hex(zip),
+        }
+    }
+
+    fn plan(download: Download) -> dhu::Plan {
+        let license = Some(License { id: "android-sdk-license".into(), text: String::new() });
+        dhu::Plan { download, channel: Channel::Stable, license }
+    }
+
+    fn sdk_in(work: &Path) -> Sdk {
+        let mut sdk = Sdk::new(work.join("sdk")).expect("sdk");
+        sdk.quiet = true;
+        sdk
+    }
+
+    fn dhu_zip() -> Vec<u8> {
+        // Stored entries carry mode 0644: the install must add the executable bit.
+        stored_zip(&[
+            ("auto/package.xml", b"<package/>"),
+            ("auto/desktop-head-unit", b"#!/bin/sh\necho fake dhu\n"),
+            ("auto/config/default.ini", b"[dhu]\n"),
+        ])
+    }
+
+    #[test]
+    fn installs_atomically_with_an_executable_program_and_is_idempotent() {
+        let work = scratch("dhu-install");
+        let bytes = dhu_zip();
+        let p = plan(served(&work, &bytes));
+        let sdk = sdk_in(&work);
+        let mut seen = Vec::new();
+
+        let dest = sdk.install_dhu(&p, &["android-sdk-license"]).expect("install");
+        assert_eq!(dest, dhu::dir(sdk.root()));
+        let exe = dhu::executable(sdk.root()).expect("installed program");
+        assert!(exe.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&exe).expect("meta").permissions().mode() & 0o111, 0o111);
+        }
+        assert!(sdk.is_installed(Path::new("extras/google/auto")));
+        assert!(dest.join("config/default.ini").is_file());
+        for e in std::fs::read_dir(sdk.downloads()).expect("ls").flatten() {
+            seen.push(e.file_name());
+        }
+        assert!(seen.is_empty(), "archive and temp dirs removed: {seen:?}");
+
+        // Installing again replaces the directory whole and leaves no set-aside copy.
+        std::fs::write(dest.join("stale"), b"x").expect("stale");
+        sdk.install_dhu(&p, &["android-sdk-license"]).expect("reinstall");
+        assert!(!dest.join("stale").exists());
+        let siblings: Vec<_> = std::fs::read_dir(dest.parent().expect("parent")).expect("ls").flatten().collect();
+        assert_eq!(siblings.len(), 1, "{siblings:?}");
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn an_archive_with_its_files_at_the_top_installs_too() {
+        let work = scratch("dhu-flat");
+        let zip = stored_zip(&[("package.xml", b"<package/>"), ("desktop-head-unit", b"#!/bin/sh\n")]);
+        let sdk = sdk_in(&work);
+        sdk.install_dhu(&plan(served(&work, &zip)), &["android-sdk-license"]).expect("install");
+        assert!(dhu::executable(sdk.root()).is_some());
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn nothing_installs_without_the_license() {
+        let work = scratch("dhu-license");
+        let p = plan(served(&work, &dhu_zip()));
+        let sdk = sdk_in(&work);
+        for accepted in [&[][..], &["some-other-license"][..]] {
+            let e = sdk.install_dhu(&p, accepted).expect_err("license refused");
+            assert!(matches!(e, Error::License(ref id) if id == "android-sdk-license"), "{e}");
+        }
+        assert!(!sdk.root().join("extras").exists() && !sdk.downloads().exists(), "refused before any download");
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn a_package_the_manifest_lists_no_license_for_still_needs_the_sdk_license_accepted() {
+        let work = scratch("dhu-nolicense");
+        let mut p = plan(served(&work, &dhu_zip()));
+        p.license = None;
+        let sdk = sdk_in(&work);
+        let e = sdk.install_dhu(&p, &[]).expect_err("refused");
+        assert!(matches!(e, Error::License(ref id) if id == dhu::SDK_LICENSE), "{e}");
+        assert!(!sdk.downloads().exists(), "refused before any download");
+        sdk.install_dhu(&p, &["android-sdk-license"]).expect("accepted");
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn a_checksum_mismatch_installs_nothing_and_keeps_the_old_install() {
+        let work = scratch("dhu-sha1");
+        let bytes = dhu_zip();
+        let good = plan(served(&work, &bytes));
+        let sdk = sdk_in(&work);
+        sdk.install_dhu(&good, &["android-sdk-license"]).expect("install");
+
+        let mut bad = good.clone();
+        bad.download.sha1 = "0".repeat(40);
+        let e = sdk.install_dhu(&bad, &["android-sdk-license"]).expect_err("sha1");
+        assert!(matches!(e, Error::Verify { what: "sha1", .. }), "{e}");
+        let mut short = good.clone();
+        short.download.size += 1;
+        let e = sdk.install_dhu(&short, &["android-sdk-license"]).expect_err("size");
+        assert!(matches!(e, Error::Verify { what: "size", .. }), "{e}");
+        assert!(dhu::executable(sdk.root()).is_some(), "the existing install is untouched");
+        assert!(std::fs::read_dir(sdk.downloads()).expect("ls").next().is_none(), "bad archives are discarded");
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn a_failed_prepare_leaves_the_existing_install_alone() {
+        let work = scratch("dhu-prepare");
+        let sdk = sdk_in(&work);
+        let old = dhu::dir(sdk.root());
+        std::fs::create_dir_all(&old).expect("mkdir");
+        std::fs::write(old.join("package.xml"), b"old").expect("write");
+        // An archive without the program: making it executable fails before the move.
+        let zip = stored_zip(&[("auto/package.xml", b"<package/>")]);
+        let e = sdk.install_dhu(&plan(served(&work, &zip)), &["android-sdk-license"]).expect_err("no program");
+        assert!(matches!(e, Error::Io(..)), "{e}");
+        assert_eq!(std::fs::read(old.join("package.xml")).expect("read"), b"old");
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn a_partial_download_resumes_and_an_oversized_one_restarts() {
+        let work = scratch("dhu-resume");
+        let bytes = dhu_zip();
+        let p = plan(served(&work, &bytes));
+        let sdk = sdk_in(&work);
+        let part = sdk.downloads().join(format!("{}.part", p.download.file_name()));
+        std::fs::create_dir_all(sdk.downloads()).expect("mkdir");
+
+        std::fs::write(&part, &bytes[..bytes.len() / 2]).expect("partial");
+        sdk.install_dhu(&p, &["android-sdk-license"]).expect("resumed");
+        assert!(dhu::executable(sdk.root()).is_some());
+
+        let _ = std::fs::remove_dir_all(dhu::dir(sdk.root()));
+        let mut junk = bytes.clone();
+        junk.extend_from_slice(b"trailing junk from another file");
+        std::fs::write(&part, &junk).expect("oversized");
+        sdk.install_dhu(&p, &["android-sdk-license"]).expect("restarted");
+        assert!(dhu::executable(sdk.root()).is_some());
+
+        // A same-size partial with the wrong bytes fails verification and is discarded.
+        let _ = std::fs::remove_dir_all(dhu::dir(sdk.root()));
+        std::fs::write(&part, vec![7u8; bytes.len()]).expect("corrupt");
+        let e = sdk.install_dhu(&p, &["android-sdk-license"]).expect_err("corrupt");
+        assert!(matches!(e, Error::Verify { what: "sha1", .. }), "{e}");
+        assert!(!part.exists());
+        sdk.install_dhu(&p, &["android-sdk-license"]).expect("clean retry");
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    fn beta_plan(mut p: dhu::Plan, minor: u32) -> dhu::Plan {
+        p.channel = Channel::Beta;
+        p.download.revision = Revision { major: 2, minor, ..Revision::default() };
+        p
+    }
+
+    #[test]
+    fn an_install_without_package_xml_is_still_detected_and_current() {
+        let work = scratch("dhu-detect");
+        // No package.xml or source.properties: only the program and simee's own record say what is there.
+        let zip = stored_zip(&[(
+            "desktop-head-unit",
+            b"#!/bin/sh
+",
+        )]);
+        let p = plan(served(&work, &zip));
+        let sdk = sdk_in(&work);
+        assert!(!p.is_installed(sdk.root()), "nothing installed yet");
+        sdk.install_dhu(&p, &["android-sdk-license"]).expect("install");
+        assert!(p.is_installed(sdk.root()));
+        let i = dhu::installed(sdk.root()).expect("installed");
+        assert_eq!((i.revision, i.channel), (Some(p.download.revision), Some(Channel::Stable)));
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn a_newer_revision_or_the_beta_channel_installs_over_what_is_there() {
+        let work = scratch("dhu-upgrade");
+        let sdk = sdk_in(&work);
+        let p = plan(served(&work, &dhu_zip()));
+        sdk.install_dhu(&p, &["android-sdk-license"]).expect("install r2.0");
+        let beta = beta_plan(plan(served(&work, &dhu_zip())), 1);
+        assert!(!beta.is_installed(sdk.root()), "r2.1 beta is not r2.0 stable");
+        sdk.install_dhu(&beta, &["android-sdk-license"]).expect("upgrade");
+        assert!(beta.is_installed(sdk.root()) && !p.is_installed(sdk.root()));
+        // The same revision under the other channel is a different request too.
+        let mut same = beta_plan(plan(served(&work, &dhu_zip())), 1);
+        same.channel = Channel::Stable;
+        assert!(!same.is_installed(sdk.root()));
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn an_sdk_manager_install_is_read_from_its_records() {
+        let work = scratch("dhu-studio");
+        let sdk = sdk_in(&work);
+        let dir = dhu::dir(sdk.root());
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("desktop-head-unit"), b"x").expect("exe");
+        let p = plan(served(&work, &dhu_zip()));
+        assert!(!p.is_installed(sdk.root()), "no readable revision: install");
+        std::fs::write(dir.join("source.properties"), "Pkg.Revision=2.0.0\n").expect("props");
+        assert!(p.is_installed(sdk.root()));
+        assert!(!beta_plan(p.clone(), 1).is_installed(sdk.root()));
+        std::fs::remove_file(dir.join("source.properties")).expect("rm");
+        std::fs::write(dir.join("package.xml"), "<p><revision><major>2</major><minor>1</minor></revision></p>").expect("xml");
+        assert!(beta_plan(p, 1).is_installed(sdk.root()), "package.xml revision, any channel");
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn a_member_that_leaves_the_install_directory_is_refused() {
+        for name in ["../evil", "auto/../../evil", "/etc/evil", "\\evil", "C:evil"] {
+            assert!(crate::unsafe_member(name), "{name}");
+        }
+        for name in ["auto/desktop-head-unit", "auto/config/a..b.ini", "auto/"] {
+            assert!(!crate::unsafe_member(name), "{name}");
+        }
+        let work = scratch("dhu-slip");
+        let zip = stored_zip(&[("../evil", b"x"), ("auto/desktop-head-unit", b"#!/bin/sh\n")]);
+        let sdk = sdk_in(&work);
+        let e = sdk.install_dhu(&plan(served(&work, &zip)), &["android-sdk-license"]).expect_err("refused");
+        assert!(e.to_string().contains("../evil"), "{e}");
+        assert!(dhu::executable(sdk.root()).is_none());
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_that_is_a_symlink_is_refused() {
+        let work = scratch("dhu-symlink");
+        // The program is a symlink (mode 0120777) to a file in the archive: a relative target,
+        // which every unzip creates, so the refusal is ours and not the extractor's.
+        let zip =
+            crate::testing::stored_zip_modes(&[("auto/real", b"#!/bin/sh\n", 0o100600), ("auto/desktop-head-unit", b"real", 0o120777)]);
+        let sdk = sdk_in(&work);
+        let e = sdk.install_dhu(&plan(served(&work, &zip)), &["android-sdk-license"]).expect_err("symlink refused");
+        assert!(e.to_string().contains("not a regular file"), "{e}");
+        assert!(dhu::executable(sdk.root()).is_none());
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn replacing_an_install_leaves_no_set_aside_copy_in_the_package_tree() {
+        let work = scratch("dhu-aside");
+        let sdk = sdk_in(&work);
+        let p = plan(served(&work, &dhu_zip()));
+        sdk.install_dhu(&p, &["android-sdk-license"]).expect("install");
+        sdk.install_dhu(&p, &["android-sdk-license"]).expect("reinstall");
+        let names: Vec<_> =
+            std::fs::read_dir(dhu::dir(sdk.root()).parent().expect("parent")).expect("ls").flatten().map(|e| e.file_name()).collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        let _ = std::fs::remove_dir_all(work);
+    }
 }

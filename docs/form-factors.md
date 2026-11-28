@@ -10,26 +10,28 @@ print it. Which iOS and tvOS runtime versions each feature works on: [ios-versio
 | --- | --- | --- |
 | `phone` | Android | iOS |
 | `tablet` | Android | iPadOS |
-| `foldable` | Android | **unsupported**: no Apple device or simulator runtime folds |
+| `foldable` | Android | iOS (the iPhone Duo, iOS 27.1 runtimes on) |
 | `watch` | Wear OS | watchOS |
 | `tv` | Android TV | tvOS |
 | `auto` | Android Automotive | CarPlay |
 | `vision` | Android XR | visionOS |
 
-A foldable iPhone is the only unsupported pair. Unsupported pairs are rejected wherever they
-appear, with the reason (the matrix predates the iPhone Duo of the iOS 27.1 and
-`iOS-27-2-iPhone19-4` runtimes: simee labels it a phone, and `fold` and `display=outer|inner`
-drive its hinge and its two screens, see [ios-versions.md](ios-versions.md#iphone-duo)):
+Every pair exists. iOS's foldable is the iPhone Duo (the iOS 27.1 and `iOS-27-2-iPhone19-4`
+runtimes): `fold` and `display=outer|inner` drive its hinge and its two screens, see
+[ios-versions.md](ios-versions.md#iphone-duo). A device type that isn't the form factor asked for
+is refused with the reason:
 
 ```text
 $ simee create x "iPhone 17" "iOS 26.5" --form-factor foldable
-Error: foldable is not supported on iOS: no Apple device or simulator runtime folds; foldables are Android-only
+Error: device type `iPhone 17` is a phone, not a foldable
 ```
 
 `auto` means different things on each side, and the labels say which: on Apple it is **CarPlay**,
 the car display an iPhone simulator projects onto; on Android it is **Android Automotive OS**, the
 OS running on the head unit itself (what the emulator's automotive images are). Android Auto, which
-projects from a phone, isn't an emulator image.
+projects from a phone, isn't an emulator image. Linking a car to a phone (Android Auto's head unit,
+Automotive over Bluetooth, CarPlay's display) is researched in
+[research/car-pairing.md](research/car-pairing.md).
 
 `vision` is a headset on both sides: **visionOS** on Apple, **Android XR** on Android. Google
 publishes arm64 Android XR images that run on Apple silicon, from the `google_xr` repository site
@@ -55,6 +57,7 @@ What a new device of each kind gets unless told otherwise. Real devices report t
 | Android XR glasses (`ai-glasses` images) | 450×450 (landscape) | 160 dpi | rectangle | — | eye tracking, hand tracking, keyboard |
 | iPhone | 1206×2622 | @3x | rounded | — | touch, keyboard, buttons |
 | iPad | 1668×2420 | @2x | rounded | — | touch, keyboard, buttons |
+| iPhone Duo (iOS foldable) | 2853×2007 unfolded (its inner screen as it lies open; the framebuffer holds it 2007×2853), folded 1398×2034 | @3x | rounded | closed at boot, 0–180° | touch, keyboard, buttons, hinge |
 | Apple Watch | 416×496 | @2x | rounded | — | touch, Digital Crown, buttons |
 | Apple TV | 1920×1080 | @1x | rectangle | — | Siri Remote, keyboard |
 | Apple Vision Pro | 2732×2048 | @2x | rectangle | — | gaze, pinch, keyboard |
@@ -79,8 +82,8 @@ Foldable postures follow the stock emulator's hinge ranges: closed below 30°, h
 
 ## How a device's form factor is found
 
-- **iOS**: from the device type identifier (`iPhone-…`, `iPad-…`, `Apple-Watch-…`, `Apple-TV-…`,
-  `Apple-Vision-…`), else the runtime (`watchOS-…`, `tvOS-…`, `xrOS-…`). An unrecognized type has
+- **iOS**: from the device type identifier (`iPhone-Duo` is a foldable; `iPhone-…`, `iPad-…`,
+  `Apple-Watch-…`, `Apple-TV-…`, `Apple-Vision-…`), else the runtime (`watchOS-…`, `tvOS-…`, `xrOS-…`). An unrecognized type has
   no form factor and is labelled by platform only. CarPlay is never inferred: it isn't a device
   type.
 - **Android**: from the AVD's `config.ini` and image. The image tag decides XR (`android-xr*`,
@@ -97,6 +100,7 @@ Foldable postures follow the stock emulator's hinge ranges: closed below 30°, h
 | --- | --- | --- |
 | iPhone | `simee create P "iPhone 17" "iOS 26.5"` | touch, `button home\|lock\|side\|action`, `type`, `rotate [--orientation …]` |
 | iPad | `simee create T "iPad Pro 11-inch (M4)" "iOS 26.5" --form-factor tablet` | as iPhone, plus `swipe --edge bottom\|top`, `pointer X Y [click\|down\|up]` or `pointer X Y --to X2 Y2`, and `stylus X Y [tap\|down\|move\|up]` or `stylus X Y --to X2 Y2` (the Apple Pencil) |
+| iPhone Duo | `simee create D "iPhone Duo" "iOS 27.1" --form-factor foldable` | as iPhone, plus `fold <fold\|unfold\|half-opened\|angle>` and `--display outer\|inner` on `screen`, `screenshot`, `tap`, `swipe` and `touch` ([iPhone Duo](ios-versions.md#iphone-duo)) |
 | CarPlay | an iPhone on an iOS 26 runtime, booted: `simee carplay P on` | `tap\|swipe\|screenshot … --display carplay`; `carplay P off` |
 | Apple Watch | `simee create W "Apple Watch Series 10 (46mm)" "watchOS 26.0" --form-factor watch` | touch, `rotary <ticks> [--delta <crown units>]`, `button home` (the crown's press) `\|side\|action`, `watch-gesture double-tap\|wrist-flick` |
 | Apple TV | `simee create TV "Apple TV 4K (3rd generation)" "tvOS 26.0" --form-factor tv` | `button select\|menu\|back\|home\|play-pause\|up\|down\|left\|right` (the Siri Remote), `remote-swipe up\|down\|left\|right` (its touch surface) |
@@ -130,6 +134,10 @@ Error: system image `system-images;android-34;android-wear;arm64-v8a` (tag `andr
 ```
 
 ## Foldables
+
+On iOS the foldable is the iPhone Duo: two built-in screens, the outer one in use folded and the
+inner one unfolded, with no hinge sensor; [ios-versions.md](ios-versions.md#iphone-duo) has how
+simee folds it. The rest of this section is Android's.
 
 A new foldable AVD follows a device definition, with the `config.ini` keys avdmanager writes for
 it: `--form-factor foldable` is the SDK's Pixel Fold (`pixel_fold`: `hw.sensor.hinge.*`,

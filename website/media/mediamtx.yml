@@ -1,0 +1,50 @@
+# The live demo's relay (Fly app simee-media): the demo Mac publishes each device over WHIP
+# (scripts/live-demo.sh) and browsers watch over WHEP (website/public/live.js). Signaling is
+# HTTPS through Fly's edge; media is WebRTC (DTLS-SRTP) on port 8189, UDP on the app's dedicated
+# IPv4 or TCP where UDP is blocked. fly.toml sets what differs on Fly through MediaMTX's MTX_*
+# environment overrides, so this file also runs as is on a laptop (README.md).
+
+logLevel: info
+logDestinations: [stdout]
+
+webrtc: true
+webrtcAddress: :8889
+# TLS ends at Fly's edge.
+webrtcEncryption: false
+webrtcAllowOrigins: ["*"]
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: :8189
+# Only the addresses below go into answers: on Fly, the app's dedicated IPv4.
+webrtcIPsFromInterfaces: false
+webrtcAdditionalHosts: [127.0.0.1]
+webrtcICEServers2: []
+# A device's encoder can take seconds to send its first IDR after the publisher connects.
+webrtcTrackGatherTimeout: 30s
+
+api: false
+metrics: false
+pprof: false
+playback: false
+rtsp: false
+rtmp: false
+hls: false
+srt: false
+moq: false
+
+# Anyone may watch; only `publisher` may publish, and only the two demo streams. Its password
+# comes from MTX_AUTHINTERNALUSERS_1_PASS (a Fly secret).
+authMethod: internal
+authInternalUsers:
+  - user: any
+    permissions:
+      - action: read
+  - user: publisher
+    pass: change-me
+    permissions:
+      - action: publish
+        path: emu
+      - action: publish
+        path: sdk
+
+paths:
+  all_others:

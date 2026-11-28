@@ -630,7 +630,9 @@ mod tests {
     }
 
     /// Allocates, fills and frees `n` blocks of `size`, then lets the clearing thread finish:
-    /// returns the area's resident bytes with the blocks full and after they were cleared.
+    /// returns the area's resident bytes with the blocks full and after they were cleared. Unix
+    /// only: `GuestRam::resident` has no Windows reading yet.
+    #[cfg(unix)]
     fn churn(clearer: bool, n: u64, size: u64) -> (u64, u64, Arc<GuestRam>) {
         let mem = Arc::new(GuestRam::new(RAM, 0x10_0000).expect("ram"));
         let area = Arc::new(GuestRam::new(AREA, n * size + (1 << 20)).expect("area"));
@@ -648,6 +650,7 @@ mod tests {
         (full, cleared, area)
     }
 
+    #[cfg(unix)]
     #[test]
     fn freed_runs_go_back_to_the_host() {
         // 16 gralloc-sized 4 MiB buffers, freed: the clearer releases their pages.
@@ -657,6 +660,7 @@ mod tests {
         assert!(reads_zero(&area, 0, 64 << 20), "and read as zero");
     }
 
+    #[cfg(unix)]
     #[test]
     fn short_runs_and_partial_pages_are_zeroed_in_place() {
         // One freed run shorter than DISCARD_MIN: zeroed with stores, so its pages stay.

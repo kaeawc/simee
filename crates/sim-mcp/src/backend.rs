@@ -10,6 +10,13 @@ use serde_json::Value;
 /// One API method call: the method's result, or its error text.
 pub trait Backend: Send + Sync + 'static {
     fn call(&self, method: &str, params: &Value) -> Result<Value, String>;
+
+    /// Whether the call `method` with `params` would be allowed now, without making it: what a
+    /// policy's backend asks again before it shows more of a result it already read (the next page
+    /// of a list). Everything is, unless a policy says otherwise.
+    fn permits(&self, _method: &str, _params: &Value) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 thread_local! {
@@ -116,6 +123,26 @@ pub mod fake {
 
     use super::Backend;
 
+    /// A scratch directory of its own, removed on drop.
+    pub struct Scratch(pub std::path::PathBuf);
+
+    impl Scratch {
+        pub fn new(tag: &str) -> Scratch {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("simee-mcp-{tag}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch");
+            Scratch(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// A latch: calls to a method named in `block` wait until it is released.
     #[derive(Default)]
     pub struct Gate {
@@ -143,6 +170,13 @@ pub mod fake {
         pub answers: Mutex<HashMap<String, Result<Value, String>>>,
         pub calls: Mutex<Vec<(String, Value)>>,
         pub gates: Mutex<HashMap<String, std::sync::Arc<Gate>>>,
+        /// What a method tells its caller it waits on (as admission does), before its gate.
+        pub says: Mutex<HashMap<String, String>>,
+        /// Whether the caller had cancelled each call once its gate opened: (method, cancelled).
+        pub saw_cancel: Mutex<Vec<(String, bool)>>,
+        /// Each call's method once it took its answer, under the answers' lock, so no later
+        /// [`Fake::answer`] can be what that call returned.
+        pub answered: Mutex<Vec<String>>,
     }
 
     impl Fake {
@@ -154,6 +188,13 @@ pub mod fake {
             let gate = std::sync::Arc::new(Gate::default());
             self.gates.lock().expect("gates").insert(method.to_owned(), gate.clone());
             gate
+        }
+
+        /// How many calls of `method` have taken their answer. [`Fake::called`] counts a call once
+        /// it starts, before a gate and its hooks: a test that changes the answer next must wait on
+        /// this instead, or the call it waited for may return the new answer.
+        pub fn answered(&self, method: &str) -> usize {
+            self.answered.lock().expect("answered").iter().filter(|m| *m == method).count()
         }
 
         pub fn called(&self, method: &str) -> Vec<Value> {
@@ -178,11 +219,18 @@ pub mod fake {
     impl Backend for Fake {
         fn call(&self, method: &str, params: &Value) -> Result<Value, String> {
             self.calls.lock().expect("calls").push((method.to_owned(), params.clone()));
+            let says = self.says.lock().expect("says").get(method).cloned();
+            if let Some(says) = says {
+                sim_api::call_progress(&says);
+            }
             let gate = self.gates.lock().expect("gates").get(method).cloned();
             if let Some(gate) = gate {
                 gate.wait();
             }
-            self.answers.lock().expect("answers").get(method).cloned().unwrap_or(Ok(Value::Null))
+            self.saw_cancel.lock().expect("saw_cancel").push((method.to_owned(), sim_api::call_cancelled()));
+            let answers = self.answers.lock().expect("answers");
+            self.answered.lock().expect("answered").push(method.to_owned());
+            answers.get(method).cloned().unwrap_or(Ok(Value::Null))
         }
     }
 }
@@ -192,6 +240,26 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn the_fake_counts_a_call_answered_only_once_it_took_its_answer() {
+        let fake = Arc::new(fake::Fake::default());
+        fake.answer("info", Ok(json!("before")));
+        let gate = fake.gate("info");
+        let caller = fake.clone();
+        let call = std::thread::spawn(move || caller.call("info", &json!({})));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while fake.called("info").is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the call never started");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Started but not answered: an answer set now is the one it returns.
+        assert_eq!(fake.answered("info"), 0);
+        fake.answer("info", Ok(json!("after")));
+        gate.release();
+        assert_eq!(call.join().expect("call"), Ok(json!("after")));
+        assert_eq!(fake.answered("info"), 1);
+    }
 
     #[test]
     fn the_api_backend_keeps_a_session_per_thread_and_runs_methods() {
@@ -218,12 +286,15 @@ mod tests {
         let (tx, rx) = channel();
         executor.submit(|| panic!("a method panicked"));
         // More jobs than workers still finish, and two of them wait for each other: they run at once.
-        let barrier = Arc::new(std::sync::Barrier::new(2));
-        for _ in 0..2 {
-            let (tx, barrier) = (tx.clone(), barrier.clone());
+        // Each signals that it is running and waits, bounded, for the other's signal (a bare
+        // `Barrier` would hang forever if they ever ran one after the other).
+        let ((a_tx, a_rx), (b_tx, b_rx)) = (channel::<()>(), channel::<()>());
+        for (mine, theirs) in [(a_tx, b_rx), (b_tx, a_rx)] {
+            let tx = tx.clone();
             executor.submit(move || {
-                barrier.wait();
-                tx.send(1).ok();
+                mine.send(()).ok();
+                let met = theirs.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+                tx.send(usize::from(met)).ok();
             });
         }
         for n in 0..Executor::WORKERS + 2 {
@@ -235,5 +306,6 @@ mod tests {
         let done: Vec<usize> =
             (0..Executor::WORKERS + 4).map(|_| rx.recv_timeout(std::time::Duration::from_secs(10)).expect("job")).collect();
         assert_eq!(done.len(), Executor::WORKERS + 4);
+        assert!(!done.contains(&0), "the two waiting jobs did not run at once: {done:?}");
     }
 }

@@ -54,7 +54,64 @@ pub struct GicInfo {
 
 /// The virtual machine. One per process; destroyed on drop.
 pub struct Vm {
-    _private: (),
+    granule_kib: u32,
+}
+
+/// This host's macOS release (`kern.osproductversion`, e.g. `26.6.2`), `None` if unreadable.
+pub fn macos_version() -> Option<(u32, u32, u32)> {
+    let mut buf = [0u8; 32];
+    let mut len = buf.len();
+    // SAFETY: a NUL-terminated name; `buf` is `len` writable bytes and `len` is updated to the
+    // bytes written; no new value is set.
+    let rc = unsafe { libc::sysctlbyname(c"kern.osproductversion".as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) };
+    if rc != 0 {
+        return None;
+    }
+    parse_version(std::str::from_utf8(&buf[..len.min(buf.len())]).ok()?.trim_end_matches('\0'))
+}
+
+/// `major[.minor[.patch]]` as numbers (`14.10` is after `14.2`).
+fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = text.trim().split('.').map(|p| p.parse::<u32>().ok());
+    let v = (parts.next()??, parts.next().unwrap_or(Some(0))?, parts.next().unwrap_or(Some(0))?);
+    parts.next().is_none().then_some(v)
+}
+
+fn show((major, minor, patch): (u32, u32, u32)) -> String {
+    match (minor, patch) {
+        (0, 0) => major.to_string(),
+        (_, 0) => format!("{major}.{minor}"),
+        _ => format!("{major}.{minor}.{patch}"),
+    }
+}
+
+/// The in-kernel GIC's functions, or why they're missing: the framework has had them since
+/// macOS 15.0 (`API_AVAILABLE(macos(15.0))` in `hv_gic.h`).
+fn gic() -> Result<&'static ffi::GicFns> {
+    let host = macos_version();
+    match (&ffi::late().gic, host) {
+        (Some(g), Some(v)) if v >= (15, 0, 0) => Ok(g),
+        (Some(g), None) => Ok(g),
+        (_, host) => Err(Error::Unsupported {
+            what: "the in-kernel GICv3 (hv_gic_create), which the Android board's interrupts need",
+            needs: "15",
+            host: host.map_or_else(|| "an unknown release".to_owned(), show),
+        }),
+    }
+}
+
+/// The GIC's functions on a hot path (an SPI, a PPI): no version read once they're there.
+fn gic_created() -> Result<&'static ffi::GicFns> {
+    match &ffi::late().gic {
+        Some(g) => Ok(g),
+        None => gic(),
+    }
+}
+
+/// Whether this host can map guest memory at 4 KiB granularity (macOS 26.0+:
+/// `hv_vm_config_set_ipa_granule`); [`Vm::granule_kib`] says what a VM got.
+pub fn granule_4k_supported() -> bool {
+    ffi::late().set_ipa_granule.is_some() && macos_version().is_none_or(|v| v >= (26, 0, 0))
 }
 
 /// VM-wide settings fixed at creation.
@@ -82,41 +139,60 @@ impl Vm {
         if VM_EXISTS.swap(true, Ordering::SeqCst) {
             return Err(Error::AlreadyCreated);
         }
-        // SAFETY: plain FFI calls on a config object we own; the framework retains it.
+        let late = ffi::late();
+        let want_4k = cfg.granule_4k && granule_4k_supported();
+        let mut granule_kib = 16;
+        // SAFETY: plain FFI calls on a config object we own; the framework retains it. Without
+        // the configuration API (before macOS 13) a null config selects the defaults.
         let rc = unsafe {
-            let config = ffi::hv_vm_config_create();
-            let mut max = 0u32;
-            if ffi::hv_vm_config_get_max_ipa_size(&mut max) == 0 {
-                let _ = ffi::hv_vm_config_set_ipa_size(config, cfg.ipa_bits.min(max));
-            }
-            if cfg.granule_4k {
-                // Unsupported before macOS 26: keep the default granule then.
-                let _ = ffi::hv_vm_config_set_ipa_granule(config, 0);
-            }
+            let config = match &late.vm_config {
+                Some(vc) => {
+                    let config = (vc.create)();
+                    let mut max = 0u32;
+                    if (vc.get_max_ipa_size)(&mut max) == 0 {
+                        let _ = (vc.set_ipa_size)(config, cfg.ipa_bits.min(max));
+                    }
+                    if let Some(set) = late.set_ipa_granule.filter(|_| want_4k)
+                        && set(config, ffi::IPA_GRANULE_4KB) == 0
+                    {
+                        granule_kib = 4;
+                    }
+                    config
+                }
+                None => std::ptr::null_mut(),
+            };
             ffi::hv_vm_create(config)
         };
         if rc != 0 {
             VM_EXISTS.store(false, Ordering::SeqCst);
             return check("hv_vm_create", rc).map(|()| unreachable!());
         }
-        Ok(Vm { _private: () })
+        Ok(Vm { granule_kib })
     }
 
-    /// Creates the in-kernel GICv3. Must run before any vCPU is created.
+    /// The granule guest memory is mapped at: 4 KiB when asked for and the host has it (macOS
+    /// 26+), else the 16 KiB default.
+    pub fn granule_kib(&self) -> u32 {
+        self.granule_kib
+    }
+
+    /// Creates the in-kernel GICv3. Must run before any vCPU is created. Before macOS 15 the
+    /// framework has none: [`Error::Unsupported`] says so, before any GIC call.
     pub fn create_gic(&self, dist_base: u64, redist_base: u64) -> Result<GicInfo> {
+        let g = gic()?;
         let mut dist_size = 0usize;
         let mut redist_region_size = 0usize;
         let (mut spi_base, mut spi_count) = (0u32, 0u32);
         // SAFETY: out-pointers reference live locals; the config object is owned by the
         // framework and intentionally leaked (one per process lifetime).
         unsafe {
-            check("hv_gic_get_distributor_size", ffi::hv_gic_get_distributor_size(&mut dist_size))?;
-            check("hv_gic_get_redistributor_region_size", ffi::hv_gic_get_redistributor_region_size(&mut redist_region_size))?;
-            check("hv_gic_get_spi_interrupt_range", ffi::hv_gic_get_spi_interrupt_range(&mut spi_base, &mut spi_count))?;
-            let cfg = ffi::hv_gic_config_create();
-            check("hv_gic_config_set_distributor_base", ffi::hv_gic_config_set_distributor_base(cfg, dist_base))?;
-            check("hv_gic_config_set_redistributor_base", ffi::hv_gic_config_set_redistributor_base(cfg, redist_base))?;
-            check("hv_gic_create", ffi::hv_gic_create(cfg))?;
+            check("hv_gic_get_distributor_size", (g.get_distributor_size)(&mut dist_size))?;
+            check("hv_gic_get_redistributor_region_size", (g.get_redistributor_region_size)(&mut redist_region_size))?;
+            check("hv_gic_get_spi_interrupt_range", (g.get_spi_interrupt_range)(&mut spi_base, &mut spi_count))?;
+            let cfg = (g.config_create)();
+            check("hv_gic_config_set_distributor_base", (g.config_set_distributor_base)(cfg, dist_base))?;
+            check("hv_gic_config_set_redistributor_base", (g.config_set_redistributor_base)(cfg, redist_base))?;
+            check("hv_gic_create", (g.create)(cfg))?;
         }
         Ok(GicInfo {
             dist_base,
@@ -156,8 +232,9 @@ impl Vm {
 
     /// Raises or lowers a shared peripheral interrupt. Callable from any thread.
     pub fn set_spi(intid: u32, level: bool) -> Result<()> {
+        let g = gic_created()?;
         // SAFETY: plain FFI call on the process-wide GIC.
-        check("hv_gic_set_spi", unsafe { ffi::hv_gic_set_spi(intid, level) })
+        check("hv_gic_set_spi", unsafe { (g.set_spi)(intid, level) })
     }
 
     /// `GICD_IROUTER<intid>`: which vCPU the guest routes SPI `intid` to. Callable from any
@@ -166,9 +243,10 @@ impl Vm {
         if !(32..1020).contains(&intid) {
             return Err(Error::Invalid("SPI INTID must be in 32..1020"));
         }
+        let g = gic_created()?;
         let mut v = 0;
         // SAFETY: plain FFI call on the process-wide GIC; out-pointer references a live local.
-        check("hv_gic_get_distributor_reg", unsafe { ffi::hv_gic_get_distributor_reg(ffi::GICD_IROUTER32 + (intid - 32) * 8, &mut v) })?;
+        check("hv_gic_get_distributor_reg", unsafe { (g.get_distributor_reg)(ffi::GICD_IROUTER32 + ((intid - 32) * 8) as u16, &mut v) })?;
         Ok(v)
     }
 }
@@ -258,8 +336,9 @@ impl Vcpu {
         if !(16..32).contains(&intid) {
             return Err(Error::Invalid("PPI INTID must be in 16..32"));
         }
+        let g = gic_created()?;
         // SAFETY: called on the owning thread; GICR_ISPENDR0 is write-1-to-set.
-        check("hv_gic_set_redistributor_reg", unsafe { ffi::hv_gic_set_redistributor_reg(self.id, ffi::GICR_ISPENDR0, 1 << intid) })
+        check("hv_gic_set_redistributor_reg", unsafe { (g.set_redistributor_reg)(self.id, ffi::GICR_ISPENDR0, 1 << intid) })
     }
 
     /// Enters the guest until it traps, its timer fires, or it is kicked.
@@ -339,4 +418,41 @@ pub fn ticks_to_nanos(ticks: u64) -> u64 {
         return ticks;
     }
     (u128::from(ticks) * u128::from(numer) / u128::from(denom)) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn versions_parse_and_compare_numerically() {
+        assert_eq!(parse_version("26.6.2"), Some((26, 6, 2)));
+        assert_eq!(parse_version("15"), Some((15, 0, 0)));
+        assert_eq!(parse_version("14.2"), Some((14, 2, 0)));
+        for bad in ["", "15.", "a", "1.2.3.4", "15.0b1"] {
+            assert_eq!(parse_version(bad), None, "{bad:?}");
+        }
+        assert!(parse_version("14.10").expect("v") > (14, 2, 0));
+        assert!(parse_version("14.6.1").expect("v") < (15, 0, 0));
+        assert_eq!((show((15, 0, 0)), show((14, 2, 0)), show((26, 0, 1))), ("15".into(), "14.2".into(), "26.0.1".into()));
+    }
+
+    #[test]
+    fn unsupported_says_what_and_which_release() {
+        let e = Error::Unsupported { what: "the in-kernel GICv3 (hv_gic_create)", needs: "15", host: "14.6.1".into() };
+        assert_eq!(e.to_string(), "the in-kernel GICv3 (hv_gic_create) needs macOS 15 or later; this Mac runs macOS 14.6.1");
+    }
+
+    /// What this host's framework has matches its release: the GIC from 15, the granule from 26.
+    #[test]
+    fn late_symbols_follow_the_release() {
+        let v = macos_version().expect("kern.osproductversion");
+        let late = ffi::late();
+        assert!(late.vm_config.is_some(), "macOS 13+ (every host simee builds on)");
+        assert_eq!(late.gic.is_some(), v >= (15, 0, 0), "{v:?}");
+        assert_eq!(late.set_ipa_granule.is_some(), v >= (26, 0, 0), "{v:?}");
+        assert_eq!(granule_4k_supported(), v >= (26, 0, 0));
+        assert_eq!(gic().is_ok(), v >= (15, 0, 0));
+        println!("macOS {}: gic {}, 4 KiB granule {}", show(v), late.gic.is_some(), granule_4k_supported());
+    }
 }

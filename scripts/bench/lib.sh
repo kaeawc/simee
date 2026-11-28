@@ -7,10 +7,17 @@
 # - `--help` prints the script's header comment; `--rounds N` (default 3) rounds, medians;
 #   `--quick` one short round (a smoke test, not a number to publish); `--out DIR` for results
 #   (default bench/results, which git ignores).
-# - The host is recorded at the start and the end (model, OS, CPUs, load average, simee's commit):
-#   scripts/bench/summarize.py host.
+# - The host is quiet before anything is measured (quiet.sh: load, foreign emulators, simulators and
+#   compilers, thermal pressure, battery power; a bounded wait, then a refusal that lists what is
+#   busy, exit status 4). `--no-quiet-gate` skips it, for a smoke run whose numbers aren't
+#   published. docs/research/bench-protocol.md.
+# - The host is recorded at the start and the end (model, chip, cores, memory, OS, load average,
+#   thermal state, power source, simee's commit): scripts/bench/summarize.py host; bench_finish
+#   writes it as <name>-<time>.host.json beside the results, with the spread of every measure.
 # - Every device a run uses it creates itself and deletes on exit (AVDs with `emu -delete-avd`,
-#   simulators with `simctl delete`, by UDID); it never touches another device, never quits
+#   simulators with `simctl delete`, by UDID), or, where a script says so (camera.sh), it is a
+#   booted device named on the command line, which the run leaves as it found it. It never touches
+#   another device, nor ever one on the protected list (bench_refuse_protected), never quits
 #   Simulator.app, never runs `adb kill-server`, and stops only the PIDs it started (SIGINT first).
 # - Samples go through bench_sample; bench_finish writes the JSON and prints a Markdown table.
 
@@ -22,11 +29,54 @@ BENCH_OUT=${BENCH_OUT:-$BENCH_REPO/bench/results}
 BENCH_ROUND=0
 BENCH_ARGS="$*"
 BENCH_PIDS=()
+# Devices the run measures but did not boot (UDIDs, AVD names, emulator-PORT serials): the gate
+# doesn't count them as foreign. Set with bench_target before bench_start.
+BENCH_TARGETS=()
 BENCH_CLEANUP=()
 BENCH_SHIFT=1
+BENCH_QUIET_GATE=${BENCH_QUIET_GATE:-1}
+# bench_start sets it ("passed", "passed after 12 s", "disabled"); summarize.py reads it.
+BENCH_GATE_STATUS=""
+BENCH_SCRIPT=$0
+export BENCH_GATE_STATUS BENCH_SCRIPT
+# shellcheck source=quiet.sh
+. "$BENCH_DIR/quiet.sh"
+
+# Devices no benchmark touches, whatever it is told: the owner's and CI's own (emulators by serial,
+# simulators by UDID). $BENCH_PROTECTED_DEVICES (space-separated) adds to them, never replaces them.
+BENCH_PROTECTED_BUILTIN="emulator-5554 emulator-5556 emulator-5558 emulator-5590 emulator-5680 8B529975-BB5F-4ED5-8309-0FF04764BAE6"
+
+# Exits (status 2) when any device named is protected. UDIDs compare in any case.
+bench_refuse_protected() {
+  local d p
+  for d in "$@"; do
+    for p in $BENCH_PROTECTED_BUILTIN ${BENCH_PROTECTED_DEVICES:-}; do
+      [ "$(printf %s "$d" | tr '[:lower:]' '[:upper:]')" = "$(printf %s "$p" | tr '[:lower:]' '[:upper:]')" ] &&
+        bench_die "$d is a protected device (built in, or in BENCH_PROTECTED_DEVICES); not touching it"
+    done
+  done
+  return 0
+}
+
+# bench_refuse_protected_port PORT: exits (status 2) unless PORT is an even number whose console
+# serial (emulator-PORT) and adb port's (emulator-PORT+1: the adb port is the next one up, and the
+# console that owns that number would collide with it) are both unprotected. It looks at the
+# number only, so a protected port is refused whether or not its device is up.
+bench_refuse_protected_port() {
+  local port=$1
+  case $port in '' | *[!0-9]*) bench_die "port '$port' is not a number" ;; *) ;; esac
+  { [ "${#port}" -le 5 ] && [ $((10#$port)) -le 65534 ]; } || bench_die "port $port is out of range"
+  port=$((10#$port))
+  [ $((port % 2)) = 0 ] || bench_die "port $port is odd: a console port is even (its adb port is the next one up)"
+  bench_refuse_protected "emulator-$port" "emulator-$((port + 1))"
+}
 
 bench_help() {
   awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+  echo
+  echo "Every benchmark waits for a quiet host first (scripts/bench/quiet.sh, docs/research/bench-protocol.md)"
+  echo "and refuses, exit status 4, when it stays busy. --no-quiet-gate skips the gate: a smoke run whose"
+  echo "numbers are not published."
 }
 
 bench_die() {
@@ -58,6 +108,7 @@ bench_opt() {
       BENCH_OUT=$2
       BENCH_SHIFT=2
       ;;
+    --no-quiet-gate) BENCH_QUIET_GATE=0 ;;
     *) bench_die "unknown option $1 (--help lists them)" ;;
   esac
 }
@@ -78,9 +129,31 @@ median() {
   grep -E '^-?[0-9.]+$' | sort -n | awk '{ v[NR] = $1 } END { if (NR % 2) print v[(NR + 1) / 2]; else if (NR) printf "%.3f\n", (v[NR / 2] + v[NR / 2 + 1]) / 2 }'
 }
 
-# Starts the run: a work directory, the samples file, the host at the start, the exit trap.
+# bench_target ID...: devices this run measures that were already running.
+bench_target() { BENCH_TARGETS+=("$@"); }
+
+# bench_gate: waits for a quiet host (quiet.sh) and sets BENCH_GATE_STATUS, or refuses with what is
+# busy and exits 4 (run-all.sh stops the run on it: the next benchmark would wait for the same busy
+# host). Processes this run tracks are its own, not foreign (BENCH_PIDS entries: a PID, or
+# "PID|lstart|command", one per line to quiet.sh), and so are the devices it measures that the user
+# booted (bench_target). BENCH_QUIET_GATE=0 (--no-quiet-gate) skips the gate.
+bench_gate() {
+  if [ "$BENCH_QUIET_GATE" = 0 ]; then
+    BENCH_GATE_STATUS="disabled (--no-quiet-gate)"
+    return 0
+  fi
+  bench_log "waiting for a quiet host (up to ${BENCH_QUIET_WAIT:-300} s)"
+  local allow=""
+  [ ${#BENCH_PIDS[@]} -gt 0 ] && allow=$(printf '%s\n' "${BENCH_PIDS[@]}")
+  BENCH_GATE_STATUS=$(BENCH_QUIET_WHO=$(basename "$0") BENCH_QUIET_ALLOW_PIDS="$allow" BENCH_QUIET_TARGETS="${BENCH_TARGETS[*]:-}" quiet_gate) || exit 4
+  bench_log "host is quiet: $BENCH_GATE_STATUS"
+}
+
+# Starts the run: the quiet gate, a work directory, the samples file, the host at the start, the
+# exit trap.
 bench_start() {
   BENCH_NAME=$1
+  bench_gate
   BENCH_WORK=$(mktemp -d "${TMPDIR:-/tmp}/bench-$BENCH_NAME.XXXXXX")
   BENCH_SAMPLES="$BENCH_WORK/samples.tsv"
   : >"$BENCH_SAMPLES"
@@ -110,28 +183,88 @@ bench_finish() {
 
 # Cleanup runs in reverse order of registration, after every tracked PID has stopped.
 bench_on_exit() { BENCH_CLEANUP+=("$*"); }
-bench_track() { BENCH_PIDS+=("$1"); }
+
+# A PID alone is not an identity: hours into a run macOS can hand a finished process's PID to an
+# unrelated one. A process this run started is its PID and its start time (ps lstart, which an
+# exec doesn't change) and, where the caller gives the command it will run and it was seen, that
+# command. A tracked PID is signalled only while all of these still match. BENCH_PIDS holds the entries,
+# "PID|lstart|command" (command empty when none was recorded); an identity is the part after the
+# PID, "lstart|command".
+bench_pid_start() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'; }
+bench_pid_cmd() { ps -o command= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'; }
+# bench_pid_is PID IDENTITY: PID is still the process IDENTITY ("lstart|command") describes.
+bench_pid_is() {
+  local want_start=${2%%|*} want_cmd=${2#*|}
+  [ -n "$1" ] && [ -n "$want_start" ] && [ "$(bench_pid_start "$1")" = "$want_start" ] || return 1
+  [ -z "$want_cmd" ] || [ "$(bench_pid_cmd "$1")" = "$want_cmd" ]
+}
+# bench_track PID [COMMAND]: records PID's start time now, at launch, and tracks it at once (an
+# interrupt from here on still stops it). With COMMAND (a path), it then adds the command line
+# once the process has exec'd it (a launch is a fork, then exec's, and the command shows the
+# launching shell's until then), polled for BENCH_TRACK_WAIT/10 s (5 s). A command that was never
+# seen is not recorded at all: the entry keeps the start time alone, which still identifies the
+# process, where the launcher's command would fail every later check on the real one. A process
+# already gone is recorded with no start time, so it is never signalled.
+bench_track() {
+  local pid=$1 expect=${2:-} start cmd i e keep=()
+  start=$(bench_pid_start "$pid")
+  BENCH_PIDS+=("$pid|$start|")
+  [ -n "$expect" ] && [ -n "$start" ] || return 0
+  for i in $(seq 1 "${BENCH_TRACK_WAIT:-50}"); do
+    cmd=$(bench_pid_cmd "$pid")
+    case $cmd in
+      "$expect"*)
+        for e in "${BENCH_PIDS[@]}"; do
+          if [ "$e" = "$pid|$start|" ]; then keep+=("$pid|$start|$cmd"); else keep+=("$e"); fi
+        done
+        BENCH_PIDS=("${keep[@]}")
+        return 0
+        ;;
+      *) ;;
+    esac
+    sleep 0.1
+  done
+  return 0
+}
+# bench_identity PID: the identity recorded for a tracked PID ("lstart|command"); status 1 when
+# PID isn't tracked.
+bench_identity() {
+  local e
+  for e in ${BENCH_PIDS[@]+"${BENCH_PIDS[@]}"}; do
+    [ "${e%%|*}" = "$1" ] && {
+      printf '%s\n' "${e#*|}"
+      return 0
+    }
+  done
+  return 1
+}
 bench_untrack() {
   local keep=() p
-  for p in ${BENCH_PIDS[@]+"${BENCH_PIDS[@]}"}; do [ "$p" = "$1" ] || keep+=("$p"); done
+  for p in ${BENCH_PIDS[@]+"${BENCH_PIDS[@]}"}; do [ "${p%%|*}" = "$1" ] || keep+=("$p"); done
   BENCH_PIDS=(${keep[@]+"${keep[@]}"})
 }
-# Stops a PID this run started: SIGINT, then SIGTERM after $2 s (30), then waits.
+# bench_pid_live PID [IDENTITY]: PID is running and, when it has a tracked IDENTITY, is that process.
+bench_pid_live() { if [ -n "${2:-}" ]; then bench_pid_is "$1" "$2"; else kill -0 "$1" 2>/dev/null; fi; }
+# Stops a PID this run started: SIGINT, then SIGTERM after $2 s (30), then waits. A PID with an
+# identity (the one bench_track recorded, or $3, an IDENTITY of the caller's own) that is no longer
+# the process that was started (it exited and the number was reused) is dropped and never
+# signalled; a PID with none is signalled as before.
 bench_stop_pid() {
-  local pid=$1 grace=${2:-30} i
-  kill -0 "$pid" 2>/dev/null || {
+  local pid=$1 grace=${2:-30} i ident=${3:-}
+  [ -n "$ident" ] || ! bench_identity "$pid" >/dev/null || ident=$(bench_identity "$pid")
+  bench_pid_live "$pid" "$ident" || {
     bench_untrack "$pid"
     return 0
   }
   kill -INT "$pid" 2>/dev/null
   for i in $(seq 1 $((grace * 10))); do
-    kill -0 "$pid" 2>/dev/null || break
+    bench_pid_live "$pid" "$ident" || break
     sleep 0.1
   done
-  if kill -0 "$pid" 2>/dev/null; then
+  if bench_pid_live "$pid" "$ident"; then
     kill -TERM "$pid" 2>/dev/null
     for i in $(seq 1 100); do
-      kill -0 "$pid" 2>/dev/null || break
+      bench_pid_live "$pid" "$ident" || break
       sleep 0.1
     done
   fi
@@ -141,7 +274,7 @@ bench_stop_pid() {
 bench_cleanup() {
   local rc=$? p i
   trap - EXIT INT TERM
-  for p in ${BENCH_PIDS[@]+"${BENCH_PIDS[@]}"}; do bench_stop_pid "$p"; done
+  for p in ${BENCH_PIDS[@]+"${BENCH_PIDS[@]}"}; do bench_stop_pid "${p%%|*}"; done
   for ((i = ${#BENCH_CLEANUP[@]} - 1; i >= 0; i--)); do eval "${BENCH_CLEANUP[i]}" || true; done
   [ -n "${BENCH_KEEP_WORK:-}" ] || rm -rf "${BENCH_WORK:-/nonexistent}"
   exit "$rc"
@@ -267,17 +400,20 @@ android_port() {
 # android_boot ARM AVD PORT LOG [emulator args]: starts emu or the SDK emulator and waits for
 # sys.boot_completed (BOOT_TIMEOUT s, default 600). ARM is emu, stock, or emu:K=V,K=V (env for an
 # A/B arm). Always -no-window -no-audio -no-boot-anim, and -no-snapshot-save unless SNAPSHOT_SAVE=1.
-# Sets BOOT_PID, BOOT_S (launch to sys.boot_completed), ADB_S (launch to adb listing the
-# device), PEAK_RSS_MB; returns 1 when it didn't boot. The environment is stripped as
-# scripts/android-bench.sh strips it (no Java on PATH).
+# Sets BOOT_PID, BOOT_IDENT (its identity, recorded at launch: bench_pid_is), BOOT_S (launch to
+# sys.boot_completed), ADB_S (launch to adb listing the device), PEAK_RSS_MB; returns 1 when it
+# didn't boot. The identity is the start time and, for emu (which never re-execs), its command;
+# the stock launcher may exec the real emulator, so it is identified by start time alone. The
+# environment is stripped as scripts/android-bench.sh strips it (no Java on PATH).
 android_boot() {
-  local arm=$1 avd=$2 port=$3 log=$4 bin t0 deadline serial="emulator-$3" tick=0 r
+  local arm=$1 avd=$2 port=$3 log=$4 bin t0 deadline serial="emulator-$3" tick=0 r track_cmd=""
   shift 4
   local envs=() own=()
   case $arm in
     stock*) bin=$BENCH_STOCK ;;
     emu*)
       bin=$BENCH_EMU
+      track_cmd=$bin
       own=(-verbose)
       ;;
     *) bench_die "arm $arm: expected emu, stock or emu:K=V" ;;
@@ -291,7 +427,8 @@ android_boot() {
     ${envs[@]+"${envs[@]}"} "$bin" -avd "$avd" -port "$port" -no-window -no-audio -no-boot-anim \
     ${own[@]+"${own[@]}"} "$@" >"$log" 2>&1 &
   BOOT_PID=$!
-  bench_track "$BOOT_PID"
+  bench_track "$BOOT_PID" "$track_cmd"
+  BOOT_IDENT=$(bench_identity "$BOOT_PID")
   BOOT_S=""
   ADB_S=""
   PEAK_RSS_MB=0
@@ -317,9 +454,15 @@ android_boot() {
   bench_log "$arm: no sys.boot_completed in ${BOOT_TIMEOUT:-600} s"
   return 1
 }
-# Stops the device android_boot started: the console's kill, then SIGINT/SIGTERM by PID.
+# Stops the device android_boot started: the console's kill, then SIGINT/SIGTERM by PID. The
+# kill goes out only while PID is still the process android_boot started (a tracked PID that has
+# exited and been reused gets neither the kill nor a signal).
 android_stop() {
-  local pid=$1 port=$2 i
+  local pid=$1 port=$2 i ident
+  if ident=$(bench_identity "$pid") && ! bench_pid_is "$pid" "$ident"; then
+    bench_untrack "$pid"
+    return 0
+  fi
   "$BENCH_ADB" -s "emulator-$port" emu kill >/dev/null 2>&1
   for i in $(seq 1 150); do
     kill -0 "$pid" 2>/dev/null || break

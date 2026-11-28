@@ -10,13 +10,26 @@
 //! an AVD home, and Android has no other stable id for a device that isn't running.
 
 pub mod apps;
+pub mod audio;
 pub mod console;
+pub mod dhu;
 pub mod display;
-#[cfg(any(test, feature = "testing"))]
+pub mod files;
+pub mod host;
+pub mod listing;
+pub mod net;
+pub mod notify;
+pub mod procs;
+pub mod profile;
+pub mod settle;
+pub mod state;
+/// A fake emulator and adb for tests (a Unix socket per device and `/bin/sh` scripts): unix only.
+#[cfg(all(unix, any(test, feature = "testing")))]
 pub mod testing;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -25,7 +38,7 @@ pub use emu_avd::Env;
 /// AVD export and import results ([`Android::export_avd`], [`Android::import_avd`]).
 pub use emu_avd::bundle;
 use emu_avd::{Avd, NewAvd, Running};
-use sim_core::device::{DeviceInfo, DeviceState, RuntimeInfo, Selection, select};
+use sim_core::device::{DeviceInfo, DeviceState, DeviceTypeInfo, RuntimeInfo, Selection, select};
 use sim_core::form_factor::{FormFactor, InputMethod, Kind, Profile, android_profile};
 use sim_core::frame::Frame;
 use sim_core::gesture::{Phase, Sample, pace, pace_samples};
@@ -42,6 +55,8 @@ pub struct Android {
     pub env: Env,
     /// Where running emulators advertise themselves (default: [`emu_avd::running_dir`]).
     pub running_dir: Option<PathBuf>,
+    /// Stock emulators found by earlier lookups, so a listing asks the host only about new ones.
+    stock: std::sync::Arc<listing::StockCache>,
 }
 
 impl Default for Android {
@@ -112,6 +127,55 @@ impl LogTail {
     }
 }
 
+/// The hardware a new AVD can follow, as device types in the iOS backend's shape: simee's phone
+/// and tablet (no SDK definition: its own small screens, which boot faster), the foldables
+/// ([`sim_core::fold::devices`]), and the SDK definitions emu writes for the other form factors
+/// (`emu_avd::sdk_device`: Wear OS, TV, Automotive, the XR headset and the AI glasses). The
+/// identifier is the definition's `hw.device.name` (`pixel_fold`), or the form factor where there
+/// is none (`phone`); `create` takes the form factor, and a foldable's identifier as `device`. The
+/// XR pair is chosen by the system image (`ai-glasses` images get the glasses). The scale is the
+/// density over 160 dpi.
+pub fn device_types() -> Vec<DeviceTypeInfo> {
+    use emu_avd::sdk_device as sdk;
+    use sim_core::form_factor::{ANDROID_GLASSES_SCREEN, Density};
+    let kind = |form_factor: FormFactor| Kind::new(Platform::Android, form_factor).expect("every form factor is an Android one");
+    let entry = |form_factor: FormFactor, id: &str, name: &str, model: &str, (width, height, dpi): (u32, u32, u32)| DeviceTypeInfo {
+        identifier: id.to_owned(),
+        name: name.to_owned(),
+        model: model.to_owned(),
+        product_family: kind(form_factor).sub_platform.label().to_owned(),
+        screen_width: f64::from(width),
+        screen_height: f64::from(height),
+        screen_scale: f64::from(dpi) / 160.0,
+        platform: Platform::Android,
+        form_factor: Some(form_factor),
+    };
+    // The reference profile's screen (Android's are all in dpi).
+    let screen = |form_factor: FormFactor| {
+        let p = kind(form_factor).profile();
+        let dpi = match p.density {
+            Density::Dpi(d) => d,
+            Density::Scale(s) => s * 160,
+        };
+        (p.width, p.height, dpi)
+    };
+    let defined =
+        |form_factor: FormFactor, device: &sdk::SdkDevice, name: &str| entry(form_factor, device.id, name, device.id, screen(form_factor));
+    let mut out = vec![
+        entry(FormFactor::Phone, "phone", "Phone", "", screen(FormFactor::Phone)),
+        entry(FormFactor::Tablet, "tablet", "Tablet", "", screen(FormFactor::Tablet)),
+    ];
+    out.extend(sim_core::fold::devices().iter().map(|d| entry(FormFactor::Foldable, d.id, d.name, d.id, d.lcd)));
+    out.extend([
+        defined(FormFactor::Watch, &sdk::WEAR_LARGE_ROUND, "Wear OS Large Round"),
+        defined(FormFactor::Tv, &sdk::TV_1080P, "Television (1080p)"),
+        defined(FormFactor::Auto, &sdk::AUTOMOTIVE_1024P_LANDSCAPE, "Automotive (1024p landscape)"),
+        defined(FormFactor::Vision, &sdk::XR_HEADSET, "XR Headset"),
+        entry(FormFactor::Vision, sdk::AI_GLASSES.id, "AI Glasses", sdk::AI_GLASSES.id, ANDROID_GLASSES_SCREEN),
+    ]);
+    out
+}
+
 impl Android {
     /// The SDK and AVD home from the environment, resolved like the SDK tools do.
     pub fn from_env() -> Self {
@@ -119,14 +183,38 @@ impl Android {
     }
 
     pub fn new(env: Env) -> Self {
-        Android { env, running_dir: emu_avd::running_dir() }
+        Android::with_host(env, std::sync::Arc::new(host::Native))
+    }
+
+    /// [`Android::new`] asking `host` about processes instead of the kernel.
+    pub fn with_host(env: Env, host: std::sync::Arc<dyn listing::Host>) -> Self {
+        Android { env, running_dir: emu_avd::running_dir(), stock: std::sync::Arc::new(listing::StockCache::new(host)) }
     }
 
     /// Every running emulator: simee's (their advertisements), then the stock emulator's
-    /// ([`Env::stock_instances`]) for AVDs simee doesn't run.
+    /// ([`StockCache::instances`](listing::StockCache::instances)) for AVDs simee doesn't run.
     fn running(&self) -> Vec<Running> {
+        self.running_among(&self.listed())
+    }
+
+    /// Every AVD with its directory resolved once ([`Env::content_dir`], `None` where its pointer
+    /// can't be read), for a listing to look at each AVD's lock and config without resolving it
+    /// twice.
+    fn listed(&self) -> Vec<(String, Option<PathBuf>)> {
+        self.env
+            .list_avds()
+            .into_iter()
+            .map(|name| {
+                let dir = self.env.content_dir(&name).ok();
+                (name, dir)
+            })
+            .collect()
+    }
+
+    /// [`Android::running`] for the AVDs `avds` ([`Android::listed`]).
+    fn running_among(&self, avds: &[(String, Option<PathBuf>)]) -> Vec<Running> {
         let mut all = self.simee_running();
-        let stock = self.env.stock_instances(&all);
+        let stock = self.stock.instances(avds.iter().filter_map(|(n, d)| Some((n.as_str(), d.as_deref()?))), &all);
         all.extend(stock);
         all
     }
@@ -141,14 +229,26 @@ impl Android {
         let simee = self.simee_running();
         match simee.iter().find(|r| r.avd_name == name) {
             Some(r) => Some(r.clone()),
-            None => self.env.stock_instance(name, &simee),
+            None => self.stock.instance(&self.env, name, &simee),
         }
     }
 
     /// Every AVD, labelled with its form factor; running ones (simee or stock) are `Booted`.
     pub fn devices(&self) -> Vec<DeviceInfo> {
-        let running = self.running();
-        self.env.list_avds().into_iter().map(|name| self.describe(&name, &running).info).collect()
+        let avds = self.listed();
+        let running = self.running_among(&avds);
+        avds.iter().map(|(name, dir)| self.describe_in(name, dir.as_deref(), &running).info).collect()
+    }
+
+    /// AVD `name` as a booted device, from its config alone (no emulator lookup: the caller saw
+    /// its process); `None` when no AVD has that name.
+    pub fn running_info(&self, name: &str) -> Option<DeviceInfo> {
+        if !self.env.has_avd(name) {
+            return None;
+        }
+        let mut info = self.describe(name, &[]).info;
+        info.state = DeviceState::Booted;
+        Some(info)
     }
 
     /// Whether an AVD is named exactly `name` (its UDID), without loading or listing any: one
@@ -160,20 +260,12 @@ impl Android {
     /// Resolves a UDID-or-name query (`booted` is the only running device) to a device. An exact
     /// AVD name loads just that AVD.
     pub fn device(&self, query: &str) -> Result<Device, String> {
-        // One directory scan, not one for the exact-name check and another for the list.
-        let names = self.env.list_avds();
-        // An exact AVD name (what every API call passes) probes that AVD alone.
-        if !query.is_empty() && names.iter().any(|n| n == query) {
+        // An exact AVD name (what every API call passes) is one stat of its pointer, and probes
+        // that AVD alone: nothing lists the home.
+        if self.env.has_avd(query) {
             return Ok(self.describe(query, &self.running_of(query).into_iter().collect::<Vec<_>>()));
         }
-        let running = self.running();
-        // `booted` is decided by what is running alone: load only those AVDs, not every config.
-        let only_running = query.eq_ignore_ascii_case("booted");
-        let devices: Vec<Device> = names
-            .into_iter()
-            .filter(|name| !only_running || name.eq_ignore_ascii_case(query) || running.iter().any(|r| r.avd_name == *name))
-            .map(|name| self.describe(&name, &running))
-            .collect();
+        let (devices, _) = self.candidates(query);
         let infos: Vec<DeviceInfo> = devices.iter().map(|d| d.info.clone()).collect();
         match select(&infos, query) {
             Selection::One(i) => devices.into_iter().nth(i).ok_or_else(|| format!("no device matches `{query}`")),
@@ -182,7 +274,27 @@ impl Android {
         }
     }
 
+    /// The AVDs `query` could select among, and whether the home has any AVD at all. Every AVD,
+    /// except that `booted` is decided by what is running alone: it loads only the running ones
+    /// and one named like it, not every config.
+    pub fn candidates(&self, query: &str) -> (Vec<Device>, bool) {
+        let avds = self.listed();
+        let running = self.running_among(&avds);
+        let only_running = query.eq_ignore_ascii_case("booted");
+        let devices = avds
+            .iter()
+            .filter(|(name, _)| !only_running || name.eq_ignore_ascii_case(query) || running.iter().any(|r| r.avd_name == *name))
+            .map(|(name, dir)| self.describe_in(name, dir.as_deref(), &running))
+            .collect();
+        (devices, !avds.is_empty())
+    }
+
     fn describe(&self, name: &str, running: &[Running]) -> Device {
+        self.describe_in(name, self.env.content_dir(name).ok().as_deref(), running)
+    }
+
+    /// [`Android::describe`] for an AVD whose directory is resolved already.
+    fn describe_in(&self, name: &str, dir: Option<&Path>, running: &[Running]) -> Device {
         let running = running.iter().find(|r| r.avd_name == name).cloned();
         let state = if running.is_some() { DeviceState::Booted } else { DeviceState::Shutdown };
         let mut info = DeviceInfo {
@@ -196,7 +308,7 @@ impl Android {
             form_factor: None,
             sub_platform: None,
         };
-        let avd = self.env.load(name).ok();
+        let avd = dir.and_then(|dir| self.env.load_in(name, dir.to_path_buf()).ok());
         if let Some(avd) = &avd {
             let profile = avd.profile();
             info = info.with_kind(Some(profile.kind));
@@ -320,12 +432,27 @@ impl Android {
     /// launch to booted, or why it didn't. A device that fails doesn't stop the others; the next
     /// one starts as soon as any finishes.
     pub fn boot_many(&self, avds: &[String], concurrency: usize, timeout: Duration, first_port: u16) -> Result<Vec<BootOutcome>, String> {
+        self.boot_many_hooked(avds, concurrency, timeout, first_port, &Unhooked)
+    }
+
+    /// [`Android::boot_many`] with `hook` asked before each AVD starts and told as each finishes
+    /// (see [`BootHook`]); the window, ports and timeouts are the same. An AVD the hook stopped
+    /// is in the result with the hook's reason as its error.
+    pub fn boot_many_hooked(
+        &self,
+        avds: &[String],
+        concurrency: usize,
+        timeout: Duration,
+        first_port: u16,
+        hook: &dyn BootHook,
+    ) -> Result<Vec<BootOutcome>, String> {
         let locks = emu_avd::port_lock_dir();
         let free = |p: u16| port_usable(locks.as_deref(), p, port_free);
         // A farm stays silent: N devices would open N host audio streams.
-        self.boot_many_with(avds, concurrency, timeout, first_port, free, |d, port| d.launch_command(Some(port), false))
+        self.boot_window(avds, concurrency, timeout, first_port, free, |d, port| d.launch_command(Some(port), false), hook)
     }
 
+    #[cfg(all(test, unix))]
     fn boot_many_with(
         &self,
         avds: &[String],
@@ -334,6 +461,20 @@ impl Android {
         first_port: u16,
         free: impl Fn(u16) -> bool + Sync,
         launch: impl Fn(&Device, u16) -> Command + Sync,
+    ) -> Result<Vec<BootOutcome>, String> {
+        self.boot_window(avds, concurrency, timeout, first_port, free, launch, &Unhooked)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn boot_window(
+        &self,
+        avds: &[String],
+        concurrency: usize,
+        timeout: Duration,
+        first_port: u16,
+        free: impl Fn(u16) -> bool + Sync,
+        launch: impl Fn(&Device, u16) -> Command + Sync,
+        hook: &dyn BootHook,
     ) -> Result<Vec<BootOutcome>, String> {
         let running = self.running();
         let devices: Vec<Device> = avds.iter().map(|a| self.device(a)).collect::<Result<_, _>>()?;
@@ -369,10 +510,20 @@ impl Android {
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let Some((d, port)) = jobs.get(i) else { break };
+                        if let Err(why) = hook.start(i) {
+                            let outcome = BootOutcome { avd: d.info.udid.clone(), console_port: *port, result: Err(why) };
+                            results.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(outcome);
+                            continue;
+                        }
+                        // Live, not the snapshot above: another caller may have started it since,
+                        // and then the window waits on that emulator instead of launching one.
+                        let now = d.live(self);
+                        let d = now.as_ref().unwrap_or(d);
+                        let port = d.running.as_ref().map_or(port, |r| &r.console_port);
                         let (mut port, mut tries) = (*port, 0);
                         let started = Instant::now();
                         let result = loop {
-                            let r = d.boot_with(self, timeout, launch(d, port)).map(|()| started.elapsed());
+                            let r = d.boot_launching(self, timeout, || launch(d, port), &|| hook.launching(i)).map(|()| started.elapsed());
                             match r {
                                 Err(e) if e.contains(emu_avd::PORT_TAKEN) && tries < PORT_RETRIES => {
                                     tries += 1;
@@ -386,6 +537,7 @@ impl Android {
                             }
                         };
                         let outcome = BootOutcome { avd: d.info.udid.clone(), console_port: port, result };
+                        hook.finished(i, &outcome);
                         results.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(outcome);
                     }
                 });
@@ -394,13 +546,23 @@ impl Android {
         Ok(results.into_inner().unwrap_or_else(|e| e.into_inner()).into_iter().flatten().collect())
     }
 
-    /// Deletes a stopped AVD (its directory and pointer file).
+    /// Deletes a stopped AVD (its directory and pointer file). A head unit still running for it
+    /// (`car_start`) is stopped first: its record goes with the directory, and nothing could find
+    /// it afterwards.
     pub fn delete(&self, device: &Device) -> Result<(), String> {
         if device.running.is_some() {
             return Err(format!("{} is running; shut it down first", device.info.name));
         }
+        device.stop_head_unit(self).map_err(|e| format!("{}'s head unit: {e}; not deleting it", device.info.name))?;
         // Also refuses one a stock emulator holds that hasn't advertised itself (its lock files).
         self.env.delete_avd_in(&device.info.udid, self.running_dir.as_deref()).map_err(|e| e.to_string())
+    }
+
+    /// Shuts `device` down ([`Device::shutdown`]), stopping its head unit (`car_start`) and that
+    /// forward first, best effort: one that can't be stopped doesn't keep the device up.
+    pub fn shutdown(&self, device: &Device) -> Result<(), String> {
+        let _ = device.stop_head_unit(self);
+        device.shutdown()
     }
 
     /// `adb`, from the SDK's platform-tools or the PATH.
@@ -408,6 +570,36 @@ impl Android {
         let sdk = self.env.sdk_root.as_ref().map(|r| r.join("platform-tools/adb")).filter(|p| p.is_file());
         sdk.or_else(|| Command::new("adb").arg("version").output().ok().filter(|o| o.status.success()).map(|_| PathBuf::from("adb")))
     }
+}
+
+/// What [`Android::boot_many_hooked`]'s window tells and asks its caller about each AVD, from the
+/// window's threads; `i` is the AVD's place in `avds`.
+pub trait BootHook: Sync {
+    /// Asked before AVD `i` starts: `Err(why)` starts no more (each AVD not started fails with
+    /// `why`).
+    fn start(&self, i: usize) -> Result<(), String>;
+    /// Asked just before the window launches an emulator for AVD `i`, which no emulator runs at
+    /// that instant: `Err(why)` launches none (`why` is its error). Never asked for an AVD that
+    /// was running (or starting under another caller) when its turn came: the window only waits
+    /// on that one, so only an AVD this says yes to is the caller's own.
+    fn launching(&self, i: usize) -> Result<(), String>;
+    /// AVD `i` finished, booted or not.
+    fn finished(&self, i: usize, outcome: &BootOutcome);
+}
+
+/// The hook of a plain [`Android::boot_many`]: every AVD starts, nothing is told.
+struct Unhooked;
+
+impl BootHook for Unhooked {
+    fn start(&self, _: usize) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn launching(&self, _: usize) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn finished(&self, _: usize, _: &BootOutcome) {}
 }
 
 /// One device's result in [`Android::boot_many`].
@@ -559,6 +751,23 @@ fn stale_note(emu: &Path, checkout: &Path) -> Option<String> {
     })
 }
 
+/// How long [`Device::rotate`] waits for the guest to follow the turn before it says it stayed:
+/// the guest's orientation listener settles on the new gravity first (a fraction of a second),
+/// slower on a busy host.
+pub const ROTATE_SETTLE: Duration = Duration::from_secs(3);
+const ROTATE_POLL: Duration = Duration::from_millis(200);
+
+/// What a [`Device::rotate`] did to the guest's display.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Rotated {
+    /// The guest's display rotation after it (as screenshots and touches follow it); None when
+    /// it couldn't be read (no adb).
+    pub rotation: Option<Rotation>,
+    /// Why the guest didn't turn: "the guest stayed upright: the app in front (`<package>`)
+    /// doesn't rotate". None when it turned or couldn't be read.
+    pub note: Option<String>,
+}
+
 /// One AVD, running or not.
 #[derive(Clone, Debug)]
 pub struct Device {
@@ -571,6 +780,17 @@ pub struct Device {
 impl Device {
     fn running(&self) -> Result<&Running, String> {
         self.running.as_ref().ok_or_else(|| format!("{} isn't running; boot it first", self.info.name))
+    }
+
+    /// simee's state directory beside the AVD (`<avd>/simee/`), where its camera and device links
+    /// live; `None` when its config can't be read.
+    pub fn state_dir(&self) -> Option<PathBuf> {
+        self.avd.as_ref().map(|a| emu_avd::state_dir(&a.dir))
+    }
+
+    /// Whether it is a pair of Android XR glasses (an `ai-glasses` system image), not a headset.
+    pub fn is_glasses(&self) -> bool {
+        self.avd.as_ref().is_some_and(|a| a.image_tags().split(',').any(|t| sim_core::form_factor::is_glasses_tag(t.trim())))
     }
 
     /// The running instance, for what only simee's `emu` offers (`what`: the display socket,
@@ -660,7 +880,30 @@ impl Device {
     /// on the host's default output; without it (what tools and farms want) it is silent
     /// (`-no-audio`) and opens no host audio device.
     pub fn boot(&self, android: &Android, timeout: Duration, audio: bool) -> Result<(), String> {
-        self.boot_with(android, timeout, self.launch_command(None, audio))
+        self.boot_asking(android, timeout, audio, &|| Ok(()))
+    }
+
+    /// [`boot`](Self::boot), with `launching` asked just before it launches an emulator for this
+    /// AVD, which none runs at that instant (read then, not when this `Device` was read): `Err`
+    /// launches none and is the boot's error. An AVD running or starting already (another
+    /// caller's) is waited on without asking, so a yes means this boot started it.
+    pub fn boot_asking(
+        &self,
+        android: &Android,
+        timeout: Duration,
+        audio: bool,
+        launching: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let now = self.live(android);
+        let d = now.as_ref().unwrap_or(self);
+        d.boot_launching(android, timeout, || d.launch_command(None, audio), launching)
+    }
+
+    /// This AVD as it runs now, when this `Device` (read earlier) says it isn't running but an
+    /// emulator, another caller's, has started it since; `None` otherwise.
+    fn live(&self, android: &Android) -> Option<Device> {
+        let r = self.running.is_none().then(|| android.running_of(&self.info.udid)).flatten()?;
+        Some(Device { running: Some(r), ..self.clone() })
     }
 
     /// The command that starts `emu` for this AVD, on console port `port` if given (else emu
@@ -687,16 +930,38 @@ impl Device {
         if let Some(port) = port {
             cmd.args(["-port", &port.to_string()]);
         }
+        // The cameras simee linked (`camera_link`, `boot` with `camera_back`): they win over
+        // config.ini, so they come back on every boot.
+        if let Some(avd) = &self.avd {
+            for warning in saved_cameras_warnings(&avd.dir) {
+                eprintln!("{warning}");
+            }
+            for (facing, source) in saved_cameras(&avd.dir) {
+                cmd.arg(format!("-camera-{facing}")).arg(camera_arg(&avd.dir, &facing, &source));
+            }
+        }
         cmd
     }
 
-    /// [`boot`](Self::boot) with the launch command given (its stdout and stderr are replaced by
-    /// the log). Boot is detected from emu's own `emu: boot completed in X s` line, tailed in the
-    /// log from where this launch began: no process per poll, and the lag is one poll (50 ms).
-    /// adb is the fallback for an emulator that never prints it (the stock one, an older emu),
-    /// consulted every [`ADB_FALLBACK`] and once more to confirm after the line appears. A child
-    /// that exits fails the wait at once instead of at the timeout.
-    fn boot_with(&self, android: &Android, timeout: Duration, mut cmd: Command) -> Result<(), String> {
+    /// [`boot_launching`](Self::boot_launching) asking nothing.
+    #[cfg(all(test, unix))]
+    fn boot_with(&self, android: &Android, timeout: Duration, cmd: Command) -> Result<(), String> {
+        self.boot_launching(android, timeout, || cmd, &|| Ok(()))
+    }
+
+    /// [`boot_asking`](Self::boot_asking) with the launch command given, built only for a launch
+    /// (its stdout and stderr are replaced by the log). Boot is detected from emu's own `emu: boot
+    /// completed in X s` line, tailed in the log from where this launch began: no process per
+    /// poll, and the lag is one poll (50 ms). adb is the fallback for an emulator that never prints
+    /// it (the stock one, an older emu), consulted every [`ADB_FALLBACK`] and once more to confirm
+    /// after the line appears. A child that exits fails the wait at once instead of at the timeout.
+    fn boot_launching(
+        &self,
+        android: &Android,
+        timeout: Duration,
+        cmd: impl FnOnce() -> Command,
+        launching: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
         let avd = self.avd()?;
         let deadline = Instant::now() + timeout;
         let log_dir = emu_avd::state_dir(&avd.dir);
@@ -704,11 +969,13 @@ impl Device {
         let mut child = None;
         let mut tail = None;
         if self.running.is_none() {
+            launching()?;
             std::fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
             let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
             // Truncated just now: this launch's output starts at offset 0.
             tail = Some(LogTail::new(&log_path));
             let err = log.try_clone().map_err(|e| e.to_string())?;
+            let mut cmd = cmd();
             let spawned = cmd.stdin(Stdio::null()).stdout(log).stderr(err).spawn();
             child = Some(spawned.map_err(|e| format!("starting {}: {e}", cmd.get_program().to_string_lossy()))?);
         }
@@ -788,10 +1055,19 @@ impl Device {
     /// The current screen as the emulator encodes it: width, height and PNG bytes, with no
     /// decode and re-encode on the way.
     pub fn screenshot_png(&self) -> Result<(u32, u32, Vec<u8>), String> {
-        let path = std::env::temp_dir().join(format!("sim-android-{}-{}.png", std::process::id(), self.info.udid));
-        let size = self.screenshot_png_to(&path);
-        let png = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()));
-        let _ = std::fs::remove_file(&path);
+        // Removes the file on every path out, a panic included.
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        // Unique per call: calls can run at once on one device.
+        static SHOTS: AtomicU64 = AtomicU64::new(0);
+        let n = SHOTS.fetch_add(1, Ordering::Relaxed);
+        let scratch = Scratch(std::env::temp_dir().join(format!("sim-android-{}-{}-{n}.png", std::process::id(), self.info.udid)));
+        let size = self.screenshot_png_to(&scratch.0);
+        let png = std::fs::read(&scratch.0).map_err(|e| format!("{}: {e}", scratch.0.display()));
         let (w, h) = size?;
         Ok((w, h, png?))
     }
@@ -1009,9 +1285,37 @@ impl Device {
         self.console(&[format!("geo fix {longitude} {latitude}")]).map(drop)
     }
 
-    /// Rotates the device 90° clockwise.
-    pub fn rotate(&self) -> Result<(), String> {
-        self.console(&["rotate".into()]).map(drop)
+    /// Rotates the device 90° clockwise (the virtual accelerometer) and reports what the guest
+    /// did: its display's rotation once it turned, or after [`ROTATE_SETTLE`] without turning,
+    /// with why it stayed (the app in front fixes its orientation, auto-rotate is off, or the
+    /// turn is upside down). Read with `dumpsys window displays` over adb: without adb, or when
+    /// the guest's window manager doesn't answer, the rotate is sent and nothing is reported.
+    pub fn rotate(&self, android: &Android) -> Result<Rotated, String> {
+        self.rotate_within(android, ROTATE_SETTLE)
+    }
+
+    fn rotate_within(&self, android: &Android, settle: Duration) -> Result<Rotated, String> {
+        self.running()?;
+        let adb = self.adb(android).ok();
+        let read = |adb: &apps::Adb| {
+            let text = adb.shell("dumpsys window displays", adb.deadlines.query).ok()?;
+            Some(sim_core::window::WindowState::parse(&text)).filter(|s| s.rotation.is_some())
+        };
+        let before = adb.as_ref().and_then(read);
+        self.console(&["rotate".into()])?;
+        let (Some(adb), Some(before)) = (adb, before) else { return Ok(Rotated::default()) };
+        let deadline = Instant::now() + settle;
+        let mut last = before.clone();
+        loop {
+            sleep(ROTATE_POLL.min(settle));
+            if let Some(now) = read(&adb) {
+                last = now;
+            }
+            if last.rotation != before.rotation || Instant::now() >= deadline {
+                break;
+            }
+        }
+        Ok(Rotated { rotation: last.rotation, note: sim_core::window::stayed_note(&before, &last) })
     }
 
     fn require(&self, input: InputMethod, what: &str) -> Result<(), String> {
@@ -1129,6 +1433,220 @@ fn booted(r: &Running, adb: Option<&Path>) -> bool {
     }
 }
 
+/// The camera links simee keeps for an AVD, in its state directory ([`emu_avd::state_dir`]): one
+/// `back=<source id>` / `front=<source id>` line each (`sim-api`'s `camera_link` writes it). Every
+/// boot from here passes them to emu as `-camera-back` / `-camera-front`, so they come back after
+/// a reboot or a server restart.
+pub const CAMERAS_FILE: &str = "cameras.ini";
+
+/// The cameras emu has, in the order [`saved_cameras`] returns them.
+pub const CAMERA_FACINGS: [&str; 2] = ["back", "front"];
+
+/// The saved camera links of the AVD in `avd_dir` ([`CAMERAS_FILE`]): (facing, source id), back
+/// first. A missing file is no links; a line that isn't a valid link is skipped (see
+/// [`saved_cameras_warnings`]).
+pub fn saved_cameras(avd_dir: &Path) -> Vec<(String, String)> {
+    read_cameras(avd_dir).0
+}
+
+/// A warning for each line of the AVD's [`CAMERAS_FILE`] that [`saved_cameras`] skips, naming
+/// the file and the line. A boot prints them and goes on with the valid links.
+pub fn saved_cameras_warnings(avd_dir: &Path) -> Vec<String> {
+    read_cameras(avd_dir).1
+}
+
+/// What a boot passes emu for a saved link: the link itself, except another device's screen
+/// (`device:`), which emu never captures: the simee server does, and serves it to this camera on
+/// [`camera_feed_socket`], which emu reads as `feed:<socket>` (the test card stands in until the
+/// server serves it).
+fn camera_arg(avd_dir: &Path, facing: &str, source: &str) -> String {
+    match source.split_once(':') {
+        Some((kind, _)) if kind.eq_ignore_ascii_case("device") => format!("feed:{}", camera_feed_socket(avd_dir, facing).display()),
+        _ => source.to_owned(),
+    }
+}
+
+/// The longest path a Unix socket takes (`sun_path` is 104 bytes on macOS, NUL included).
+const MAX_SOCKET_PATH: usize = 103;
+
+/// The socket the simee server serves camera `facing` of the AVD in `avd_dir` on when it is linked
+/// to another device's screen: `cam-<facing>.sock` in the AVD's state directory, or, when that is
+/// too long for a Unix socket, `<hash of the state directory>-cam-<facing>.sock` in
+/// `/tmp/simee-<uid>` (named by the user id, never `$USER` or `$TMPDIR`, so a boot run with another
+/// environment than the server's agrees with it; short enough for any AVD home). The same path as
+/// `sim_camera::feed::socket_path_in` gives (which also makes that directory private): the server
+/// serves it, the boot hands it to emu.
+pub fn camera_feed_socket(avd_dir: &Path, facing: &str) -> PathBuf {
+    let dir = emu_avd::state_dir(avd_dir);
+    let name = format!("cam-{facing}.sock");
+    let path = dir.join(&name);
+    if path.as_os_str().len() <= MAX_SOCKET_PATH {
+        return path;
+    }
+    let hash = dir
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3));
+    // No user id (no writable /tmp): a directory nothing serves, so the camera shows the test card;
+    // the server can't serve there either, and its link says why.
+    let uid = own_uid().map_or_else(|| "unknown".to_owned(), |u| u.to_string());
+    Path::new("/tmp").join(format!("simee-{uid}")).join(format!("{hash:016x}-{name}"))
+}
+
+/// This process's user id, read once off a file it creates (exclusively) in `/tmp`, as
+/// `sim_camera::feed` does: no `libc` call (unsafe) and no environment variable.
+#[cfg(unix)]
+fn own_uid() -> Option<u32> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    static UID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *UID.get_or_init(|| {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let probe = Path::new("/tmp").join(format!(".simee-uid-{}-{nanos}", std::process::id()));
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&probe).ok()?;
+        let uid = file.metadata().map(|m| m.uid()).ok();
+        drop(file);
+        let _ = std::fs::remove_file(&probe);
+        uid
+    })
+}
+
+#[cfg(not(unix))]
+fn own_uid() -> Option<u32> {
+    None
+}
+
+/// Whether `v` is a camera source emu takes (`-camera-back`): none, a stock value, `webcamN`, or
+/// `<kind>:<rest>` of a simee source kind (`device:` is passed as its feed, [`camera_arg`]). emu
+/// checks the rest (a colour, a path) itself.
+fn camera_source_ok(v: &str) -> bool {
+    if matches!(v, "none" | "emulated" | "virtualscene") {
+        return true;
+    }
+    if v.strip_prefix("webcam").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+        return true;
+    }
+    v.split_once(':').is_some_and(|(kind, rest)| {
+        ["webcam", "pattern", "qr", "text", "image", "video", "solid", "device"].contains(&kind) && !rest.trim().is_empty()
+    })
+}
+
+fn read_cameras(avd_dir: &Path) -> (Vec<(String, String)>, Vec<String>) {
+    let path = emu_avd::state_dir(avd_dir).join(CAMERAS_FILE);
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let (mut links, mut warnings) = (Vec::new(), Vec::new());
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let skip = |why: &str| format!("{}: line {}: {why} ({line:?}); skipped", path.display(), n + 1);
+        match line.split_once('=').map(|(k, v)| (k.trim(), v.trim())) {
+            None => warnings.push(skip("not `back=<source>` or `front=<source>`")),
+            Some((k, _)) if !CAMERA_FACINGS.contains(&k) => warnings.push(skip("a camera is back or front")),
+            Some((_, v)) if !camera_source_ok(v) => warnings.push(skip("not a camera source")),
+            Some((k, v)) => links.push((k.to_owned(), v.to_owned())),
+        }
+    }
+    links.sort_by_key(|(k, _)| CAMERA_FACINGS.iter().position(|f| f == k));
+    links.dedup_by(|a, b| a.0 == b.0);
+    (links, warnings)
+}
+
+/// Holds the lock of one of simee's files in a state directory (an advisory lock file next to it:
+/// `<file>.lock`) until dropped, so two saves of it run one after the other. A lock file older
+/// than [`LOCK_STALE`] is a dead holder's and is taken over. Camera links (`cameras.ini`) and
+/// device links (`links.json`, on both platforms) take it.
+pub struct StateLock(PathBuf);
+
+const LOCK_STALE: Duration = Duration::from_secs(30);
+
+impl StateLock {
+    /// Takes `dir`'s lock for `file`, creating `dir`; waits up to 10 s for another holder.
+    pub fn take(dir: &Path, file: &str) -> Result<StateLock, String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let path = dir.join(format!("{file}.lock"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => return Ok(StateLock(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale =
+                        std::fs::metadata(&path).and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age > LOCK_STALE));
+                    if stale {
+                        let _ = std::fs::remove_file(&path);
+                    } else if Instant::now() > deadline {
+                        return Err(format!("{}: another save holds the lock", path.display()));
+                    } else {
+                        sleep(Duration::from_millis(2));
+                    }
+                }
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            }
+        }
+    }
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Writes `text` to `dir/file` through a temporary file of this call's own, renamed into place, so
+/// a reader never sees half of it (`None`: removes the file). Take the file's [`StateLock`] first.
+pub fn write_state_file(dir: &Path, file: &str, text: Option<&str>) -> Result<(), String> {
+    let path = dir.join(file);
+    let Some(text) = text else {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("{}: {e}", path.display())),
+            _ => Ok(()),
+        };
+    };
+    static SAVES: AtomicU64 = AtomicU64::new(0);
+    let tmp = dir.join(format!("{file}.{}.{}.tmp", std::process::id(), SAVES.fetch_add(1, Ordering::Relaxed)));
+    std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })
+}
+
+/// Replaces the saved camera links of the AVD in `avd_dir` (none: removes the file). Written to a
+/// temporary file of its own and renamed, under the AVD's lock, so a boot never reads half a file
+/// and concurrent saves don't collide.
+pub fn save_cameras(avd_dir: &Path, links: &[(String, String)]) -> Result<(), String> {
+    let dir = emu_avd::state_dir(avd_dir);
+    let _lock = StateLock::take(&dir, CAMERAS_FILE)?;
+    write_cameras(&dir, links)
+}
+
+/// Reads the saved links, applies `change` and saves them, all under the AVD's lock: concurrent
+/// updates each see the other's, so none is lost. Returns what was saved.
+pub fn update_cameras(avd_dir: &Path, change: impl FnOnce(&mut Vec<(String, String)>)) -> Result<Vec<(String, String)>, String> {
+    let dir = emu_avd::state_dir(avd_dir);
+    let _lock = StateLock::take(&dir, CAMERAS_FILE)?;
+    let mut links = saved_cameras(avd_dir);
+    change(&mut links);
+    links.sort_by_key(|(f, _)| CAMERA_FACINGS.iter().position(|c| c == f));
+    write_cameras(&dir, &links)?;
+    Ok(links)
+}
+
+fn write_cameras(dir: &Path, links: &[(String, String)]) -> Result<(), String> {
+    if links.is_empty() {
+        return write_state_file(dir, CAMERAS_FILE, None);
+    }
+    let mut text = String::new();
+    for (facing, source) in links {
+        if !CAMERA_FACINGS.contains(&facing.as_str()) || source.contains(['\n', '\r']) || source.trim().is_empty() {
+            return Err(format!("can't save camera link {facing}={source:?}: a camera is back or front, its source one line"));
+        }
+        text.push_str(&format!("{facing}={}\n", source.trim()));
+    }
+    write_state_file(dir, CAMERAS_FILE, Some(&text))
+}
+
 /// The last `n` lines of a device's guest console (`<avd>/simee/console.log`). Without
 /// `-show-kernel` (or `EMU_CONSOLE=full`) emu keeps the console quiet: only critical kernel
 /// messages and panics, so for a normal boot it's empty.
@@ -1222,10 +1740,51 @@ fn decode_png(bytes: &[u8]) -> Result<Frame, String> {
     Ok(Frame { width: info.width, height: info.height, rgba })
 }
 
-#[cfg(test)]
+/// These run against `testing`'s fake emulator (a Unix socket per device, `/bin/sh` scripts for
+/// adb), which Windows can't host until it has a transport.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::testing::{fake_emulator, fake_stock_emulator, wait_for};
+
+    #[test]
+    fn device_types_are_the_hardware_new_avds_follow() {
+        let types = device_types();
+        let ids: Vec<&str> = types.iter().map(|t| t.identifier.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "phone",
+                "tablet",
+                "pixel_fold",
+                "surface_duo",
+                "wearos_large_round",
+                "tv_1080p",
+                "automotive_1024p_landscape",
+                "xr_headset_device",
+                "ai_glasses_device"
+            ]
+        );
+        // Every supported Android form factor has one, and every one is Android's.
+        for (f, p, kind) in sim_core::form_factor::matrix() {
+            if p == Platform::Android && kind.is_ok() {
+                assert!(types.iter().any(|t| t.form_factor == Some(f)), "{f:?}");
+            }
+        }
+        assert!(types.iter().all(|t| t.platform == Platform::Android));
+        let fold = &types[2];
+        assert_eq!((fold.name.as_str(), fold.model.as_str(), fold.product_family.as_str()), ("Pixel Fold", "pixel_fold", "Android"));
+        assert_eq!((fold.screen_width, fold.screen_height, fold.screen_scale), (2208.0, 1840.0, 2.625));
+        let phone = &types[0];
+        assert_eq!((phone.screen_width, phone.screen_height, phone.screen_scale), (720.0, 1280.0, 2.0));
+        assert_eq!((types[4].product_family.as_str(), types[5].product_family.as_str()), ("Wear OS", "Android TV"));
+        let glasses = types.last().expect("glasses");
+        assert_eq!((glasses.screen_width, glasses.screen_height, glasses.screen_scale), (450.0, 450.0, 1.0));
+        // A foldable's identifier is what `create` takes as `device`.
+        for t in types.iter().filter(|t| t.form_factor == Some(FormFactor::Foldable)) {
+            assert_eq!(sim_core::fold::device(&t.identifier).map(|d| d.id), Some(t.identifier.as_str()));
+        }
+    }
 
     struct Fixture {
         root: PathBuf,
@@ -1341,6 +1900,35 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_and_delete_stop_the_head_unit_and_its_forward() {
+        let f = fixture("dhugone");
+        let fake = crate::testing::fake_adb(&f.android);
+        let program = f.root.join("sdk").join(dhu::EXECUTABLE);
+        std::fs::create_dir_all(program.parent().expect("auto dir")).expect("auto dir");
+        crate::testing::write_script(&program, "cat > /dev/null\n");
+        let adb = apps::Adb::bound(f.android.adb().expect("adb"), "emulator-5556".into());
+        let options = dhu::Options { startup: Duration::from_millis(200), ..dhu::Options::default() };
+        let gone = |pid: u32| !Command::new("kill").args(["-0", &pid.to_string()]).status().expect("kill").success();
+        for (name, deleted) in [("down", false), ("gone", true)] {
+            f.android.create(name, "system-images;android-36;google_apis;arm64-v8a", None).expect("avd");
+            let d = f.android.device(name).expect("device");
+            let p = dhu::start(&program, &adb, &d.avd.as_ref().expect("avd").dir.join("simee"), &options).expect("head unit");
+            assert_eq!(fake.forwards().len(), 1);
+            if deleted {
+                f.android.delete(&d).expect("delete");
+                assert!(f.android.device(name).is_err(), "the AVD is gone");
+            } else {
+                // The emulator was already down: its part refuses, and the head unit still goes.
+                assert!(f.android.shutdown(&d).expect_err("not running").contains("isn't running"));
+                assert_eq!(d.head_unit(), Ok(None));
+            }
+            assert!(gone(p.pid), "{name}: the DHU (PID {}) was stopped", p.pid);
+            assert!(fake.forwards().is_empty(), "{name}: its forward was removed: {:?}", fake.forwards());
+        }
+        std::fs::remove_dir_all(&f.root).ok();
+    }
+
+    #[test]
     fn the_stale_check_sees_a_release_emu_through_a_dotdot_target() {
         let root = PathBuf::from("/tmp").join(format!("sa-canon-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1421,7 +2009,7 @@ mod tests {
         let f = fixture("stopped");
         f.android.create("watch", "system-images;android-34;android-wear;arm64-v8a", None).expect("watch");
         let d = f.android.device("watch").expect("watch");
-        assert_eq!(d.rotate(), Err("watch isn't running; boot it first".into()));
+        assert_eq!(d.rotate(&f.android), Err("watch isn't running; boot it first".into()));
         assert_eq!(d.touch(1.0, 1.0, Phase::Down), Err("watch isn't running; boot it first".into()), "not a socket error");
         assert_eq!(d.rotary(1), Err("watch isn't running; boot it first".into()));
         assert!(d.fold(90.0).expect_err("not a foldable").starts_with("folding needs a device with Hinge; watch is Wear OS · Watch"));
@@ -1445,7 +2033,7 @@ mod tests {
         d.button(Button::Back, Direction::Up).expect("back up");
         d.key(0x28, Direction::Down).expect("return");
         d.set_location(37.5, -122.25).expect("geo");
-        d.rotate().expect("rotate");
+        assert_eq!(d.rotate_within(&f.android, Duration::ZERO), Ok(Rotated::default()), "no adb: nothing to report");
         d.fold(90.0).expect("fold");
         assert_eq!(
             wait_for(&fake.console, 10)[2..],
@@ -1472,6 +2060,70 @@ mod tests {
         assert_eq!(wait_for(&fake.display, 2), ["touch 100 200 down", "touch 100 200 up"]);
         assert!(d.rotary(1).expect_err("not a watch").starts_with("rotary input needs a device with Rotary input"));
         assert!(f.android.delete(&d).expect_err("running").contains("is running"));
+    }
+
+    #[test]
+    fn concurrent_screenshots_of_one_device_each_get_their_own_file() {
+        let f = fixture("shots");
+        f.android.create("shots", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        let _fake = fake_emulator(&f.android, "shots");
+        let d = f.android.device("booted").expect("running");
+        let results: Vec<_> = std::thread::scope(|s| {
+            let jobs: Vec<_> = (0..2).map(|_| s.spawn(|| d.screenshot_png())).collect();
+            jobs.into_iter().map(|j| j.join().expect("thread")).collect()
+        });
+        for r in results {
+            let (w, h, png) = r.expect("each screenshot succeeds");
+            assert_eq!((w, h, sim_core::frame::png_size(&png)), (2, 1, Some((2, 1))));
+        }
+    }
+
+    /// A fake `adb` whose `dumpsys window displays` answers `before` the first time and `after`
+    /// from then on (each with the focused app and its orientation, as an API 35 guest dumps them).
+    fn fake_dumpsys(f: &Fixture, before: (&str, &str, i32, u32), after: (&str, &str, i32, u32)) {
+        let dir = f.root.join("sdk/platform-tools");
+        std::fs::create_dir_all(&dir).expect("platform-tools");
+        let dump = |(package, activity, orientation, rotation): (&str, &str, i32, u32)| {
+            format!(
+                "  mFocusedApp=ActivityRecord{{9a3b2c1 u0 {package}/{activity} t3}}\n  DisplayRotation\n    mLastOrientation={orientation}\n    mRotation={rotation} mDeferredRotationPauseCount=0\n    mUserRotationMode=USER_ROTATION_FREE mUserRotation=ROTATION_0\n"
+            )
+        };
+        std::fs::write(dir.join("before.txt"), dump(before)).expect("before");
+        std::fs::write(dir.join("after.txt"), dump(after)).expect("after");
+        let script = r#"d="$(dirname "$0")"
+case "$*" in
+  *"shell dumpsys window displays")
+    if [ -e "$d/asked" ]; then cat "$d/after.txt"; else touch "$d/asked"; cat "$d/before.txt"; fi;;
+  *) echo 1;;
+esac
+"#;
+        crate::testing::write_script(&dir.join("adb"), script);
+    }
+
+    #[test]
+    fn rotate_says_when_the_guest_stayed_upright_and_where_it_turned_to() {
+        const LAUNCHER: (&str, &str, i32, u32) = ("com.google.android.apps.nexuslauncher", ".NexusLauncherActivity", 5, 0);
+        let f = fixture("rotlauncher");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("phone");
+        let fake = fake_emulator(&f.android, "phone");
+        fake_dumpsys(&f, LAUNCHER, LAUNCHER);
+        let d = f.android.device("phone").expect("phone");
+        let r = d.rotate_within(&f.android, Duration::from_millis(300)).expect("rotate");
+        assert_eq!(r.rotation, Some(Rotation::Deg0));
+        assert_eq!(
+            r.note.as_deref(),
+            Some("the guest stayed upright: the app in front (`com.google.android.apps.nexuslauncher`) doesn't rotate")
+        );
+        assert_eq!(wait_for(&fake.console, 1), ["rotate"]);
+
+        let f = fixture("rotsettings");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("phone");
+        let _fake = fake_emulator(&f.android, "phone");
+        // The guest turns with its top to the right: ROTATION_270, a quarter turn clockwise.
+        fake_dumpsys(&f, ("com.android.settings", ".Settings", -1, 0), ("com.android.settings", ".Settings", -1, 3));
+        let d = f.android.device("phone").expect("phone");
+        let r = d.rotate_within(&f.android, Duration::from_secs(5)).expect("rotate");
+        assert_eq!(r, Rotated { rotation: Some(Rotation::Deg90), note: None });
     }
 
     /// Adds an installed system image under the fixture's SDK.
@@ -1653,6 +2305,121 @@ mod tests {
     }
 
     #[test]
+    fn launches_pass_the_saved_camera_links() {
+        let f = fixture("camera-arg");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        let d = f.android.device("phone").expect("device");
+        let dir = d.avd.as_ref().expect("avd").dir.clone();
+        let args =
+            |d: &Device| -> Vec<String> { d.launch_command(None, false).get_args().map(|a| a.to_string_lossy().into_owned()).collect() };
+        assert!(!args(&d).iter().any(|a| a.starts_with("-camera")), "nothing saved, nothing passed");
+        save_cameras(&dir, &[("front".into(), "solid:orange".into()), ("back".into(), "qr:hello world".into())]).expect("save");
+        let saved = [("back".to_owned(), "qr:hello world".to_owned()), ("front".to_owned(), "solid:orange".to_owned())];
+        assert_eq!(saved_cameras(&dir), saved);
+        let a = args(&d);
+        let at = a.iter().position(|x| x == "-camera-back").expect("-camera-back");
+        assert_eq!(a[at + 1], "qr:hello world");
+        let at = a.iter().position(|x| x == "-camera-front").expect("-camera-front");
+        assert_eq!(a[at + 1], "solid:orange");
+        // Another device's screen is saved as it was linked, and emu gets the feed the server
+        // serves it on.
+        save_cameras(&dir, &[("back".into(), "device:tablet:0,0,540,960".into())]).expect("save");
+        assert_eq!(saved_cameras(&dir), [("back".to_owned(), "device:tablet:0,0,540,960".to_owned())]);
+        let a = args(&d);
+        let at = a.iter().position(|x| x == "-camera-back").expect("-camera-back");
+        let feed = camera_feed_socket(&dir, "back");
+        assert_eq!(a[at + 1], format!("feed:{}", feed.display()));
+        assert_eq!(feed, emu_avd::state_dir(&dir).join("cam-back.sock"), "a short AVD path: in its state directory");
+        assert_ne!(camera_feed_socket(&dir, "front"), feed);
+        save_cameras(&dir, &[("back".into(), "qr:hello world".into()), ("front".into(), "solid:orange".into())]).expect("save");
+        assert!(save_cameras(&dir, &[("side".into(), "qr:x".into())]).is_err());
+        assert!(save_cameras(&dir, &[("back".into(), "qr:a\nfront=x".into())]).is_err(), "one line per link");
+        assert_eq!(saved_cameras(&dir), saved, "a refused save keeps what was there");
+        save_cameras(&dir, &[]).expect("clear");
+        assert!(saved_cameras(&dir).is_empty() && !emu_avd::state_dir(&dir).join(CAMERAS_FILE).exists());
+    }
+
+    #[test]
+    fn a_bad_cameras_ini_line_is_skipped_with_a_warning_and_the_boot_goes_on() {
+        let f = fixture("camera-bad-line");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        let d = f.android.device("phone").expect("device");
+        let dir = d.avd.as_ref().expect("avd").dir.clone();
+        let state = emu_avd::state_dir(&dir);
+        std::fs::create_dir_all(&state).expect("state dir");
+        std::fs::write(state.join(CAMERAS_FILE), "back=foo:bar\n# a comment\nfront=qr:hello\nside=qr:x\nnonsense\n").expect("write");
+        assert_eq!(saved_cameras(&dir), [("front".to_owned(), "qr:hello".to_owned())], "only the valid link");
+        let warnings = saved_cameras_warnings(&dir);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings[0].contains(CAMERAS_FILE) && warnings[0].contains("line 1") && warnings[0].contains("foo:bar"), "{warnings:?}");
+        assert!(warnings[1].contains("line 4") && warnings[2].contains("line 5"), "{warnings:?}");
+        let args: Vec<String> = d.launch_command(None, false).get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(!args.iter().any(|a| a == "-camera-back"), "the bad link isn't passed to emu");
+        let at = args.iter().position(|a| a == "-camera-front").expect("-camera-front");
+        assert_eq!(args[at + 1], "qr:hello");
+        // Every kind of source emu takes stays valid.
+        for ok in [
+            "none",
+            "emulated",
+            "virtualscene",
+            "webcam0",
+            "webcam:OBS-1",
+            "pattern:testcard",
+            "text:a b",
+            "image:/x.png",
+            "solid:red",
+            "device:A",
+        ] {
+            std::fs::write(state.join(CAMERAS_FILE), format!("back={ok}\n")).expect("write");
+            assert!(saved_cameras_warnings(&dir).is_empty(), "{ok}");
+            assert_eq!(saved_cameras(&dir).len(), 1, "{ok}");
+        }
+    }
+
+    #[test]
+    fn concurrent_saves_neither_collide_nor_lose_an_update() {
+        let f = fixture("camera-concurrent");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        let dir = f.android.device("phone").expect("device").avd.as_ref().expect("avd").dir.clone();
+        for round in 0..20 {
+            save_cameras(&dir, &[]).expect("clear");
+            let threads: Vec<_> = ["back", "front"]
+                .into_iter()
+                .map(|facing| {
+                    let dir = dir.clone();
+                    std::thread::spawn(move || {
+                        update_cameras(&dir, |links| {
+                            links.retain(|(f, _)| f != facing);
+                            links.push((facing.to_owned(), format!("qr:{facing}")));
+                        })
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().expect("thread").unwrap_or_else(|e| panic!("round {round}: {e}"));
+            }
+            assert_eq!(
+                saved_cameras(&dir),
+                [("back".to_owned(), "qr:back".to_owned()), ("front".to_owned(), "qr:front".to_owned())],
+                "round {round}: both updates kept"
+            );
+        }
+        // Plain saves from many threads at once never fail on a shared temporary file.
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let dir = dir.clone();
+                std::thread::spawn(move || save_cameras(&dir, &[("back".into(), format!("qr:{i}"))]))
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("thread").expect("save");
+        }
+        let state = emu_avd::state_dir(&dir);
+        let leftovers: Vec<_> = std::fs::read_dir(&state).expect("dir").flatten().map(|e| e.file_name()).collect();
+        assert!(!leftovers.iter().any(|n| n.to_string_lossy().ends_with(".tmp")), "{leftovers:?}");
+    }
+
+    #[test]
     fn launches_are_silent_unless_audio_is_asked_for() {
         let f = fixture("audio-arg");
         f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
@@ -1729,6 +2496,128 @@ mod tests {
         ports.dedup();
         assert_eq!(ports.len(), 4, "one port each");
         assert!(f.android.boot_many(&["nope".to_string()], 1, Duration::from_secs(1), 5600).is_err(), "unknown AVDs fail up front");
+    }
+
+    /// Records when each AVD started and finished; after `stop_after` have finished it starts no more.
+    struct Watch {
+        t0: Instant,
+        stop_after: usize,
+        started: std::sync::Mutex<Vec<(usize, Duration)>>,
+        launched: std::sync::Mutex<Vec<usize>>,
+        finished: std::sync::Mutex<Vec<(usize, Duration, bool)>>,
+    }
+
+    impl BootHook for Watch {
+        fn start(&self, i: usize) -> Result<(), String> {
+            if self.finished.lock().expect("finished").len() >= self.stop_after {
+                return Err("not started: stopped".into());
+            }
+            self.started.lock().expect("started").push((i, self.t0.elapsed()));
+            Ok(())
+        }
+
+        fn launching(&self, i: usize) -> Result<(), String> {
+            self.launched.lock().expect("launched").push(i);
+            Ok(())
+        }
+
+        fn finished(&self, i: usize, outcome: &BootOutcome) {
+            self.finished.lock().expect("finished").push((i, self.t0.elapsed(), outcome.result.is_ok()));
+        }
+    }
+
+    /// `slow`, `f1`, `f2` and `f3` booted two at a time by a fresh fixture `tag` with `hook`:
+    /// `slow` takes 1.5 s, the others 0.2 s each.
+    fn boot_hooked(tag: &str, hook: &Watch) -> Vec<BootOutcome> {
+        let f = fixture(tag);
+        let names: Vec<String> = ["slow", "f1", "f2", "f3"].iter().map(|s| s.to_string()).collect();
+        for n in &names {
+            f.android.create(n, "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        }
+        fake_adb(&f);
+        let _console = fake_emulator(&f.android, "console-only");
+        let me = f.android.running_dir.clone().expect("running").join(format!("pid_{}.ini", std::process::id()));
+        let ad = std::fs::read_to_string(&me).expect("fake ad");
+        let console = Running::parse(&format!("pid_{}.ini", std::process::id()), &ad).expect("parse").console_port;
+        let run = f.android.running_dir.clone().expect("running");
+        let launch = |d: &Device, _port: u16| {
+            let took = if d.info.udid == "slow" { 1.5 } else { 0.2 };
+            sh(&format!(
+                "printf 'port.serial={console}\\navd.name={}\\nemulator=simee\\n' > {}/pid_$$.ini; sleep {took}; \
+                 echo 'emu: boot completed in {took}s'; sleep 3",
+                d.info.udid,
+                run.display()
+            ))
+        };
+        f.android.boot_window(&names, 2, Duration::from_secs(20), 5600, |_| true, launch, hook).expect("boot_many")
+    }
+
+    fn watch(stop_after: usize) -> Watch {
+        Watch { t0: Instant::now(), stop_after, started: Default::default(), launched: Default::default(), finished: Default::default() }
+    }
+
+    #[test]
+    fn a_hooked_boot_many_refills_its_window_as_each_device_finishes() {
+        let all = watch(usize::MAX);
+        let out = boot_hooked("hooked", &all);
+        assert!(out.iter().all(|o| o.result.is_ok()), "{out:?}");
+        let started = all.started.into_inner().expect("started");
+        let finished = all.finished.into_inner().expect("finished");
+        let at = |i: usize| started.iter().find(|s| s.0 == i).expect("started").1;
+        let slow_done = finished.iter().find(|f| f.0 == 0).expect("slow finished").1;
+        // f1, f2 and f3 boot one after another beside `slow`, not after it.
+        assert!(at(3) < slow_done, "f3 started as f2 finished, not after slow: {started:?} {finished:?}");
+        // Every device finished. Which one finishes last depends on the fake's polling, not the
+        // window (a loaded CI runner finished `slow` before f3), so the order isn't asserted.
+        assert_eq!(finished.len(), 4, "{finished:?}");
+    }
+
+    #[test]
+    fn a_hooked_boot_many_waits_on_an_avd_another_caller_started_without_launching_it() {
+        // `a` and `b` are stopped when the window reads them; while `a` boots, another caller
+        // starts `b` (its advertisement, with a live pid). On `b`'s turn the window waits on that
+        // emulator: it launches none and doesn't ask `launching`, so `b` is never the caller's.
+        let f = fixture("hookedtaken");
+        let names: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        for n in &names {
+            f.android.create(n, "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        }
+        fake_adb(&f);
+        let _console = fake_emulator(&f.android, "console-only");
+        let me = f.android.running_dir.clone().expect("running").join(format!("pid_{}.ini", std::process::id()));
+        let ad = std::fs::read_to_string(&me).expect("fake ad");
+        let console = Running::parse(&format!("pid_{}.ini", std::process::id()), &ad).expect("parse").console_port;
+        let run = f.android.running_dir.clone().expect("running");
+        let launches = std::sync::Mutex::new(Vec::new());
+        let launch = |d: &Device, _port: u16| {
+            launches.lock().expect("launches").push(d.info.udid.clone());
+            sh(&format!(
+                "printf 'port.serial={console}\\navd.name={avd}\\nemulator=simee\\n' > {run}/pid_$$.ini; \
+                 sleep 2 & printf 'port.serial={console}\\navd.name=b\\nemulator=simee\\n' > {run}/pid_$!.ini; \
+                 sleep 0.2; echo 'emu: boot completed in 0.2s'; sleep 2",
+                avd = d.info.udid,
+                run = run.display()
+            ))
+        };
+        let hook = watch(usize::MAX);
+        let out = f.android.boot_window(&names, 1, Duration::from_secs(20), 5600, |_| true, launch, &hook).expect("boot_many");
+        assert!(out.iter().all(|o| o.result.is_ok()), "{out:?}");
+        assert_eq!(*launches.lock().expect("launches"), ["a"], "no emulator launched for b");
+        assert_eq!(*hook.launched.lock().expect("launched"), [0], "only a is the caller's");
+        assert_eq!(out[1].console_port, console, "b's port is the one its emulator advertises");
+    }
+
+    #[test]
+    fn a_hooked_boot_many_starts_no_more_once_told_to_stop() {
+        // Stopped once one has finished: f1 is done, `slow` (in flight) finishes, f2 and f3 never start.
+        let one = watch(1);
+        let out = boot_hooked("hookstop", &one);
+        let mut started: Vec<usize> = one.started.into_inner().expect("started").iter().map(|s| s.0).collect();
+        started.sort_unstable();
+        assert_eq!(started, [0, 1]);
+        assert!(out[..2].iter().all(|o| o.result.is_ok()), "{out:?}");
+        assert!(out[2..].iter().all(|o| o.result == Err("not started: stopped".into())), "{out:?}");
+        assert_eq!(one.finished.into_inner().expect("finished").len(), 2, "only the two started are told they finished");
     }
 
     #[test]
@@ -1934,6 +2823,86 @@ mod tests {
         assert_eq!(f.android.device("Pixel").map(|d| d.info.udid), Ok("pixel".into()), "the scan still matches names loosely");
     }
 
+    /// Where a listing's time goes, in this process: `scripts/bench/android-resolve.py --make-home`
+    /// says how to run it (docs/benchmarks.md "Android device resolution").
+    #[test]
+    #[ignore = "a benchmark: needs SIMEE_BENCH_SDK and SIMEE_BENCH_AVD_HOME"]
+    fn listing_cost() {
+        let (Some(sdk), Some(home)) = (std::env::var_os("SIMEE_BENCH_SDK"), std::env::var_os("SIMEE_BENCH_AVD_HOME")) else {
+            panic!("set SIMEE_BENCH_SDK and SIMEE_BENCH_AVD_HOME (scripts/bench/android-resolve.py --make-home DIR)");
+        };
+        let android = Android::new(Env { sdk_root: Some(sdk.into()), avd_home: home.into() });
+        let measure = |label: &str, f: &dyn Fn()| {
+            f();
+            let mut ms: Vec<f64> = (0..1000)
+                .map(|_| {
+                    let start = Instant::now();
+                    f();
+                    start.elapsed().as_secs_f64() * 1000.0
+                })
+                .collect();
+            ms.sort_by(f64::total_cmp);
+            println!("{label}: p50 {:.3} ms, p95 {:.3} ms", ms[500], ms[950]);
+        };
+        let avds = android.listed();
+        let running = android.running_among(&avds);
+        println!("{} AVDs", avds.len());
+        measure("list the home", &|| drop(android.env.list_avds()));
+        measure("resolve each AVD's directory", &|| drop(android.listed()));
+        measure("look at each AVD's lock", &|| drop(android.running_among(&avds)));
+        measure("describe each AVD", &|| {
+            for (name, dir) in &avds {
+                drop(android.describe_in(name, dir.as_deref(), &running));
+            }
+        });
+        measure("devices (all of it)", &|| drop(android.devices()));
+        measure("candidates of booted", &|| drop(android.candidates("booted")));
+    }
+
+    #[test]
+    fn booted_loads_only_the_running_avds_and_any_named_like_it() {
+        let f = fixture("candidates");
+        assert!(!f.android.candidates("booted").1, "an empty home has no AVDs");
+        for n in ["a", "b", "c"] {
+            f.android.create(n, "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        }
+        let udids = |query: &str| f.android.candidates(query).0.iter().map(|d| d.info.udid.clone()).collect::<Vec<_>>();
+        assert_eq!((udids("booted"), f.android.candidates("booted").1), (Vec::<String>::new(), true), "none running, AVDs exist");
+        assert_eq!(udids("a"), ["a", "b", "c"], "a name is matched against every AVD");
+        let _fake = fake_emulator(&f.android, "b");
+        assert_eq!(udids("booted"), ["b"], "the other configs aren't loaded");
+        assert_eq!(udids("BOOTED"), ["b"]);
+        // An AVD that is named `booted` is still selectable by that name, as `device` always did.
+        f.android.create("booted", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        assert_eq!(udids("booted"), ["b", "booted"]);
+        assert_eq!(f.android.device("booted").map(|d| d.info.udid), Ok("booted".into()));
+    }
+
+    /// An exact name is settled by one stat of its pointer: it works where the home can't be listed.
+    #[test]
+    fn an_exact_avd_name_resolves_without_listing_the_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fixture("nolist");
+        f.android.create("pixel", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        let home = f.android.env.avd_home.clone();
+        // Searchable but not readable: a path inside is reachable, the directory can't be listed.
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o311)).expect("chmod");
+        // (root lists it anyway: only then is there nothing to show)
+        let listable = std::fs::read_dir(&home).is_ok();
+        let found = f.android.device("pixel").map(|d| d.info.udid);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
+        assert_eq!(found, Ok("pixel".into()), "listable: {listable}");
+    }
+
+    #[test]
+    fn a_running_avds_info_comes_from_its_config_alone() {
+        let f = fixture("runinfo");
+        f.android.create("pixel", "system-images;android-36;google_apis;arm64-v8a", Some(FormFactor::Phone)).expect("create");
+        let info = f.android.running_info("pixel").expect("info");
+        assert_eq!((info.state, info.platform, info.form_factor), (DeviceState::Booted, Platform::Android, Some(FormFactor::Phone)));
+        assert_eq!(f.android.running_info("no-such-avd"), None);
+    }
+
     #[test]
     fn tvs_have_no_touch_screen() {
         let f = fixture("tv");
@@ -1960,6 +2929,8 @@ mod tests {
             f.android.create("glasses", "system-images;android-36;ai-glasses;arm64-v8a", Some(FormFactor::Vision)).expect("glasses");
         assert_eq!(glasses.sub_platform.map(|s| s.as_str()), Some("androidxr"));
         assert_eq!(f.android.device("glasses").expect("glasses").screen_size(), Ok((450, 450)));
+        assert!(f.android.device("glasses").expect("glasses").is_glasses() && !d.is_glasses(), "a headset isn't glasses");
+        assert!(d.state_dir().is_some_and(|dir| dir.ends_with("headset.avd/simee")), "{:?}", d.state_dir());
         let err = f.android.create("p", "system-images;android-34;google-xr;arm64-v8a", Some(FormFactor::Phone)).expect_err("phone");
         assert!(err.ends_with("boots Android XR · Vision devices, not phone"), "{err}");
 

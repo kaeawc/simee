@@ -7,6 +7,11 @@
 //! otherwise (and always for `boot`, see `sim_api::IN_CALLER`) they run in this process. The
 //! output is the same either way.
 
+mod doctor;
+mod mcp_install;
+mod mcp_safety;
+mod stream_cli;
+
 use std::io::Write;
 use std::time::Duration;
 
@@ -27,6 +32,12 @@ struct Cli {
     /// server fail instead of running here.
     #[arg(long, global = true)]
     verbose: bool,
+    /// The iOS device set to work in: a directory of simulators, as `simctl --set` takes (`create`
+    /// makes it). Its devices boot with no Simulator.app window. Default: `$SIMEE_IOS_DEVICE_SET`,
+    /// else the default set; `--set ''` is the default set. For `serve` and `mcp`, set
+    /// `SIMEE_IOS_DEVICE_SET` instead.
+    #[arg(long, global = true, value_name = "DIR")]
+    set: Option<String>,
     #[command(subcommand)]
     command: Cmd,
 }
@@ -54,6 +65,13 @@ enum Cmd {
         /// Only this form factor: phone, tablet, foldable, watch, tv, auto, vision.
         #[arg(long)]
         form_factor: Option<String>,
+    },
+    /// This host against the support matrix: chip, macOS, Xcode, Hypervisor.framework, the host's
+    /// health, and which features are on or off and why (docs/development.md "Support matrix").
+    Doctor {
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Every form factor on every platform: sub-platform and inputs, or why it's unsupported.
     FormFactors {
@@ -129,6 +147,13 @@ enum Cmd {
         /// Android: play the device's audio on the host's default output (silent otherwise).
         #[arg(long)]
         audio: bool,
+        /// Android: link the back camera to this source first, as `camera link --back` does (and
+        /// keep it for later boots).
+        #[arg(long, value_name = "SOURCE")]
+        camera_back: Option<String>,
+        /// Android: link the front camera to this source first, as `camera link --front` does.
+        #[arg(long, value_name = "SOURCE")]
+        camera_front: Option<String>,
     },
     /// Boot several devices of one platform, a few at a time, and print each one's timings.
     /// Exits non-zero only when a device failed to boot (one that booted but didn't settle in
@@ -164,7 +189,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// iOS: wait until a booted simulator is quiet; prints how long that took.
+    /// Wait until a booted device is quiet (an Android guest: its own processes, over adb); prints how long that took.
     Settle {
         device: String,
         #[arg(long, default_value_t = 600)]
@@ -173,22 +198,25 @@ enum Cmd {
         #[arg(long, value_enum)]
         settle_cpu: Option<SettleCpu>,
     },
-    /// iOS: turn a named set of daemons off on a booted simulator (`slim`), or back on with --undo.
+    /// Turn a named set of daemons off on a booted device (`slim`; Android: packages, `pm disable-user`), or back on with --undo.
     Profile {
         device: String,
         name: String,
-        /// Re-enable the profile's daemons (they run again from the next boot).
+        /// Re-enable the profile's daemons (iOS: they run again from the next boot; Android: at once).
         #[arg(long)]
         undo: bool,
     },
     /// Create a device as a copy of a shut-down one (iOS: a simulator; Android: an AVD from a
     /// golden booted once under simee); prints its UDID (an AVD's name).
     Clone { template: String, name: String },
-    /// Android: pack a shut-down AVD into a portable bundle (a .tar file, else a new directory)
-    /// with no host path in it; prints its sizes. iOS: not yet.
+    /// Pack a shut-down device into a portable bundle (a .tar file, else a new directory) with no
+    /// host path in it; prints its sizes. Android: an AVD's simee disks; iOS: a simulator's data
+    /// directory, without its caches.
     Export { device: String, to: String },
-    /// Android: create AVD `name` from a bundle, its system image found by content; prints its
-    /// name. The import keeps the exported device's guest identity (ro.serialno, android_id).
+    /// Create device `name` from a bundle, on the platform the bundle names; prints its UDID (an
+    /// AVD's name). Android: its system image found by content; iOS: its runtime by identifier
+    /// and build. Its apps see the exported device (Android: ro.serialno, android_id; iOS: the
+    /// keychain and app data).
     Import {
         from: String,
         name: String,
@@ -390,6 +418,18 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Device cameras: the host's camera sources, and which one feeds each device camera (saved
+    /// with the device, so links come back on every boot). Android now; iOS with #322.
+    Camera {
+        #[command(subcommand)]
+        command: CameraCmd,
+    },
+    /// Publish device screens over WHIP (WebRTC): start, inspect, keep alive and stop streams.
+    /// Streams live in a running `simee serve` (never in this process).
+    Stream {
+        #[command(subcommand)]
+        command: stream_cli::StreamCmd,
+    },
     /// Send commands to an Android device's emulator console (`adb emu`'s protocol).
     Console {
         device: String,
@@ -412,8 +452,41 @@ enum Cmd {
     },
     /// Serve MCP on stdin and stdout, so an agent can do everything simee can: every API method as
     /// a tool, devices as resources, long operations as tasks, a device view as an app. Configure
-    /// it in the agent's MCP settings as the command `simee mcp` (see docs/mcp.md).
-    Mcp,
+    /// it in the agent's MCP settings as the command `simee mcp` (see docs/mcp.md). With `--http`,
+    /// serve MCP's Streamable HTTP transport instead, at `http://ADDR/mcp`.
+    #[command(args_conflicts_with_subcommands = true)]
+    Mcp {
+        /// `install` writes a client's MCP config; `config` prints it (docs/mcp-clients.md).
+        #[command(subcommand)]
+        action: Option<mcp_install::McpAction>,
+        /// Serve Streamable HTTP on ADDR (default 127.0.0.1:8377). Every request needs a bearer
+        /// token (see `--token-file`); a non-loopback ADDR also needs TLS (`--tls-cert` and
+        /// `--tls-key`, or `--tls-self-signed`) or `--insecure-remote`.
+        #[arg(long, value_name = "ADDR", num_args = 0..=1, default_missing_value = sim_mcp::http::DEFAULT_ADDR)]
+        http: Option<String>,
+        /// Bearer tokens, one per line, in a file of your own that only you can read, in a
+        /// directory others can't write; created with a random token if missing (default:
+        /// `mcp-token` in simee's state directory, reused on later runs). Rotate a token by
+        /// rewriting the file.
+        #[arg(long, value_name = "PATH", requires = "http")]
+        token_file: Option<std::path::PathBuf>,
+        /// Serve without a token, on a loopback ADDR only. Any local user or process, and anything
+        /// a reverse proxy on this host forwards, can then drive the devices.
+        #[arg(long, requires = "http", conflicts_with = "token_file")]
+        no_auth: bool,
+        /// Serve a non-loopback ADDR over plain HTTP: the token crosses the network in the clear,
+        /// so use a trusted network or a TLS proxy. Not needed with TLS.
+        #[arg(long, alias = "insecure", requires = "http")]
+        insecure_remote: bool,
+        #[command(flatten)]
+        // Boxed: these two make `mcp` the enum's one large variant (more so where a path is wider, as on Windows).
+        safety: Box<mcp_safety::McpSafety>,
+        #[command(flatten)]
+        tls: Box<McpTls>,
+    },
+    /// Read the audit log `simee mcp` keeps of every tool call: client, tool, arguments (secrets
+    /// removed), how it ended and how long it took (docs/mcp-safety.md).
+    McpAudit(mcp_safety::McpAudit),
     /// Run a program inside the device (e.g. `defaults`, `log`, `launchctl`, `notifyutil`, `heap`).
     #[command(disable_help_flag = true)]
     Exec {
@@ -427,25 +500,150 @@ enum Cmd {
     },
 }
 
+/// `simee camera`'s commands.
+#[derive(Subcommand)]
+enum CameraCmd {
+    /// The host's cameras (built-in, external, Continuity Camera, virtual ones such as OBS) and
+    /// the synthetic sources, with the host's camera permission (read, never prompted for).
+    Sources {
+        /// Only these: host (the host's cameras), virtual (its virtual cameras) or synthetic.
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Feed a device camera from a source: an id (qr:hello, pattern:testcard, text:Hi,
+    /// image:PATH, video:PATH (macOS), solid:red, webcam:ID, none) or part of a host camera's name (`obs` finds "OBS
+    /// Virtual Camera"; a name that matches several fails, listing them). The back camera unless
+    /// --front or --both.
+    Link {
+        device: String,
+        source: String,
+        /// The back camera (the default).
+        #[arg(long, conflicts_with_all = ["front", "both"])]
+        back: bool,
+        #[arg(long, conflicts_with = "both")]
+        front: bool,
+        #[arg(long)]
+        both: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a device camera's link (both unless --back or --front): it goes back to the AVD's
+    /// own camera.
+    Unlink {
+        device: String,
+        #[arg(long, conflicts_with = "front")]
+        back: bool,
+        #[arg(long)]
+        front: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Each linked device camera (of one device, or of every device) and its state.
+    Links {
+        device: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `simee mcp --http`'s TLS flags. They need a build with the `tls` feature (`cargo build -p simee
+/// --features tls`); without it the server says so and doesn't start.
+#[derive(clap::Args, Clone, Debug, Default, PartialEq, Eq)]
+struct McpTls {
+    /// Serve HTTPS (TLS 1.3) with this PEM certificate chain, leaf first.
+    #[arg(long, value_name = "PATH", requires_all = ["tls_key", "http"], conflicts_with = "tls_self_signed")]
+    tls_cert: Option<std::path::PathBuf>,
+    /// The PEM private key of `--tls-cert`.
+    #[arg(long, value_name = "PATH", requires = "tls_cert")]
+    tls_key: Option<std::path::PathBuf>,
+    /// For development: serve HTTPS with a self-signed certificate, made on first use and kept in
+    /// simee's state directory (a file only you can read). The server prints the certificate's
+    /// SHA-256 fingerprint: pin that in the client.
+    #[arg(long, requires = "http")]
+    tls_self_signed: bool,
+    /// A host name or address the self-signed certificate must also name (repeatable), besides
+    /// `localhost`, the loopback addresses and the address bound.
+    #[arg(long, value_name = "NAME", requires = "tls_self_signed")]
+    tls_name: Vec<String>,
+}
+
+/// `simee mcp --http`'s settings: the address (`host:port`, a name resolved to its first address),
+/// the token file (or none, `--no-auth`), TLS, the toolsets `SIMEE_MCP_TOOLSETS` names and the screen
+/// subscription pace `SIMEE_MCP_SCREEN_FPS` sets.
+fn mcp_http_config(
+    addr: &str,
+    token_file: Option<std::path::PathBuf>,
+    no_auth: bool,
+    insecure_remote: bool,
+    tls: &McpTls,
+) -> Result<sim_mcp::http::Config> {
+    use std::net::ToSocketAddrs as _;
+    let addr = addr
+        .to_socket_addrs()
+        .with_context(|| format!("--http {addr}: expected HOST:PORT"))?
+        .next()
+        .with_context(|| format!("--http {addr}: no address"))?;
+    let mut config = sim_mcp::http::Config::new(addr);
+    config.token_file = token_file;
+    config.no_auth = no_auth;
+    config.insecure_remote = insecure_remote;
+    config.tls = match (&tls.tls_cert, &tls.tls_key) {
+        (Some(cert), Some(key)) => Some(sim_mcp::http::Tls::Files { cert: cert.clone(), key: key.clone() }),
+        _ if tls.tls_self_signed => Some(sim_mcp::http::Tls::SelfSigned { dir: None, names: tls.tls_name.clone() }),
+        _ => None,
+    };
+    config.toolsets = sim_mcp::Toolsets::from_env().map_err(anyhow::Error::msg)?;
+    config.timing = sim_mcp::server::Timing::from_env().map_err(anyhow::Error::msg)?;
+    Ok(config)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let set = command_set(cli.set.as_deref(), std::env::var(sim_core::device::DEVICE_SET_ENV).ok().as_deref());
+    if cli.set.is_some() && matches!(cli.command, Cmd::Serve { .. } | Cmd::Mcp { .. }) {
+        anyhow::bail!("--set names the device set of one command; start a server on a set with SIMEE_IOS_DEVICE_SET=<dir>");
+    }
     match &cli.command {
         Cmd::Serve { socket } => {
             let path = socket.clone().unwrap_or_else(sim_api::default_socket);
             eprintln!("simee API on {}", path.display());
-            sim_api::serve(&path)?;
+            // Until SIGINT or SIGTERM, then a shutdown in order: 130 or 143.
+            let code = sim_api::serve(&path)?;
+            std::process::exit(code);
+        }
+        Cmd::McpAudit(audit) => {
+            audit.run(&mut std::io::stdout().lock())?;
             return Ok(());
         }
-        Cmd::Mcp => {
+        Cmd::Mcp { action: Some(action), .. } => {
+            let stdout = std::io::stdout();
+            return mcp_install::run(action, &mcp_install::Host::current()?, &mut stdout.lock());
+        }
+        Cmd::Mcp { http: None, safety, .. } => {
+            safety.install()?;
+            mcp_shutdown_on_signal()?;
             // Methods run in this process, on the server's own threads: nothing but protocol
             // messages may reach stdout.
-            sim_mcp::serve_stdio(std::sync::Arc::new(sim_mcp::ApiBackend::new()))?;
+            let served = sim_mcp::serve_stdio(std::sync::Arc::new(sim_mcp::ApiBackend::new()));
+            sim_api::stop_streams();
+            served?;
+            return Ok(());
+        }
+        Cmd::Mcp { http: Some(addr), token_file, no_auth, insecure_remote, tls, safety, .. } => {
+            safety.install()?;
+            let config = mcp_http_config(addr, token_file.clone(), *no_auth, *insecure_remote, tls)?;
+            mcp_shutdown_on_signal()?;
+            let served = sim_mcp::http::serve(std::sync::Arc::new(sim_mcp::ApiBackend::new()), config);
+            sim_api::stop_streams();
+            served?;
             return Ok(());
         }
         Cmd::Call { method, params, socket } => {
             let path = socket.clone().unwrap_or_else(sim_api::default_socket);
             let params: Value = serde_json::from_str(params).context("params must be JSON")?;
-            let result = sim_api::call(&path, method, params).map_err(anyhow::Error::msg)?;
+            let result = sim_api::call(&path, method, with_set(params, set.as_deref())).map_err(anyhow::Error::msg)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             return Ok(());
         }
@@ -455,8 +653,52 @@ fn main() -> Result<()> {
     let mut transport = if in_process { Transport::local() } else { Transport::open(&sim_api::default_socket()) };
     transport.verbose = cli.verbose || flag("SIMEE_VERBOSE");
     transport.require = flag("SIMEE_REQUIRE_SERVER");
+    transport.set = set;
     let (stdout, stderr) = (std::io::stdout(), std::io::stderr());
     run(cli.command, &mut transport, &mut stdout.lock(), &mut stderr.lock())
+}
+
+/// `simee mcp` on SIGINT or SIGTERM: the servers stop taking tool calls (each is answered
+/// `cancelled: server shutting down`), the calls in flight stop at their next safe point and get up
+/// to `sim_mcp::drain::DRAIN`, the streams stop with their WHIP DELETE, and the process exits with 130 or
+/// 143 (a second signal exits at once). The transports answer until then, so every reply reaches
+/// the client first.
+fn mcp_shutdown_on_signal() -> Result<()> {
+    sim_api::shutdown::watch(|sig| {
+        if !sim_mcp::Drain::shared().finish(sim_mcp::drain::DRAIN) {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "simee: calls still running after {} s: stopping anyway", sim_mcp::drain::DRAIN.as_secs());
+        }
+        sim_api::stop_streams();
+        sim_api::shutdown::exit(sig);
+    })
+    .context("watching SIGINT and SIGTERM")
+}
+
+/// `--set`'s directory as it is sent: absolute (the process that runs the method may be a server
+/// elsewhere), or empty for the default set.
+fn set_arg(dir: &str) -> String {
+    match dir {
+        "" => String::new(),
+        dir => std::path::absolute(dir).map_or_else(|_| dir.to_owned(), |p| p.display().to_string()),
+    }
+}
+
+/// The iOS device set this command works in, sent with every call (#409): `--set`, else this
+/// process's `SIMEE_IOS_DEVICE_SET` (`env`), else `""`, the default set. It is always said, so a
+/// server never fills it in from its own environment.
+fn command_set(flag: Option<&str>, env: Option<&str>) -> Option<String> {
+    Some(set_arg(flag.or(env).unwrap_or("")))
+}
+
+/// `params` with the command's `set` added when they have none (#409).
+fn with_set(params: Value, set: Option<&str>) -> Value {
+    let Some(set) = set else { return params };
+    let mut params = if params.is_null() { json!({}) } else { params };
+    if let Some(p) = params.as_object_mut() {
+        p.entry("set").or_insert_with(|| json!(set));
+    }
+    params
 }
 
 /// Whether an on/off environment variable is on (set, not empty, not `0`).
@@ -486,6 +728,8 @@ struct Transport {
     local: Option<Box<sim_api::Session>>,
     verbose: bool,
     require: bool,
+    /// The command's iOS device set ([`command_set`]), sent with every method.
+    set: Option<String>,
 }
 
 impl Transport {
@@ -497,6 +741,7 @@ impl Transport {
             local: None,
             verbose: false,
             require: false,
+            set: None,
         }
     }
 
@@ -527,6 +772,7 @@ impl Transport {
     }
 
     fn route(&mut self, method: &str, params: Value, binary: bool) -> Result<(Value, Option<Vec<u8>>)> {
+        let params = with_set(params, self.set.as_deref());
         let forwards = sim_api::forwards(method);
         let forward = forwards && self.connected();
         if forwards && !forward {
@@ -565,6 +811,24 @@ impl Transport {
     }
 }
 
+/// The stream commands' view of the transport: only a server answers. A stream dies with the
+/// process that holds it and sends its WHIP DELETE only if that process stops it, so one started
+/// here would be gone when this command exits.
+struct ServerOnly<'a>(&'a mut Transport);
+
+impl stream_cli::Api for ServerOnly<'_> {
+    fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        if !self.0.connected() {
+            let why = self.0.unused.as_deref().unwrap_or("no server answered");
+            anyhow::bail!(
+                "`simee stream` needs a running server of this build (`simee serve`): a stream lives in the process that started it and \
+                 would die with this command without sending its WHIP DELETE ({why})"
+            );
+        }
+        self.0.call(method, params)
+    }
+}
+
 /// A path parameter made absolute here, so a server with another working directory reads and
 /// writes the same file this process would.
 fn absolute(path: &str) -> String {
@@ -583,6 +847,14 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
                 writeln!(out, "{}", serde_json::to_string_pretty(&devices)?)?;
             } else {
                 write!(out, "{}", list_text(&serde_json::from_value::<Vec<DeviceInfo>>(devices)?))?;
+            }
+        }
+        Cmd::Doctor { json } => {
+            let r = doctor::report(call("host", json!({})).ok().as_ref());
+            if json {
+                writeln!(out, "{}", serde_json::to_string_pretty(&r)?)?;
+            } else {
+                write!(out, "{}", doctor::text(&r))?;
             }
         }
         Cmd::FormFactors { json, platform } => {
@@ -633,7 +905,7 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             writeln!(out, "{}", text(&d["udid"]))?;
         }
         Cmd::Delete { device } => drop(call("delete", json!({"device": device}))?),
-        Cmd::Boot { device, timeout, env, shaped, settle, settle_timeout, settle_cpu, profile, audio } => {
+        Cmd::Boot { device, timeout, env, shaped, settle, settle_timeout, settle_cpu, profile, audio, camera_back, camera_front } => {
             let env: serde_json::Map<String, Value> =
                 env.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), Value::from(v))).collect();
             let mut params = json!({"device": device, "timeout_s": timeout, "env": env, "shaped": shaped});
@@ -654,8 +926,14 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             if audio {
                 params["audio"] = json!(true);
             }
+            for (key, source) in [("camera_back", camera_back), ("camera_front", camera_front)] {
+                if let Some(source) = source {
+                    params[key] = json!(camera_source(&source));
+                }
+            }
             let timed = call("boot", params)?;
-            if !timed.is_null() {
+            // Without settle or a profile there are no timings, only the admission (#275).
+            if timed.get("device").is_some() {
                 writeln!(out, "{}", boot_line(&timed))?;
                 if timed["settled"] == json!(false) {
                     writeln!(err, "{}", not_settled_line(&timed))?;
@@ -724,6 +1002,10 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             )?;
             for d in items(&r["dropped"]) {
                 writeln!(err, "simee: left out {}", text(d))?;
+            }
+            let caches = items(&r["left_out"]).len();
+            if caches > 0 {
+                writeln!(err, "simee: left out the contents of {caches} cache and tmp directories")?;
             }
         }
         Cmd::Import { from, name, allow_mismatch } => {
@@ -795,6 +1077,12 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             let r = call("rotate", json!({"device": device, "orientation": orientation}))?;
             if let Some(o) = r["orientation"].as_str() {
                 writeln!(out, "{o}")?;
+            }
+            // Android: why the guest didn't follow the turn, else where it turned to.
+            if let Some(note) = r["note"].as_str() {
+                writeln!(out, "{note}")?;
+            } else if let Some(degrees) = r["rotation"].as_u64() {
+                writeln!(out, "rotation: {degrees}")?;
             }
         }
         Cmd::Fold { device, posture } => {
@@ -870,8 +1158,16 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
                 }
             }
         }
+        Cmd::Camera { command } => camera(command, &mut call, out, err)?,
+        Cmd::Stream { command } => {
+            let mut api = ServerOnly(transport);
+            let mut stop = stream_cli::enter_to_stop();
+            stream_cli::run(command, &mut api, &mut stop, out)?;
+        }
         Cmd::Console { device, command } => lines(out, &call("console", json!({"device": device, "command": command.join(" ")}))?)?,
-        Cmd::Serve { .. } | Cmd::Call { .. } | Cmd::Mcp => anyhow::bail!("`serve`, `call` and `mcp` don't run through a transport"),
+        Cmd::Serve { .. } | Cmd::Call { .. } | Cmd::Mcp { .. } | Cmd::McpAudit(_) => {
+            anyhow::bail!("`serve`, `call`, `mcp` and `mcp-audit` don't run through a transport")
+        }
         Cmd::Exec { device, env, program, args } => {
             let env: serde_json::Map<String, Value> =
                 env.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), Value::from(v))).collect();
@@ -882,6 +1178,108 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
     }
     if input {
         transport.flush();
+    }
+    Ok(())
+}
+
+/// A camera source as the server should read it: an `image:` or `video:` path made absolute.
+fn camera_source(source: &str) -> String {
+    for kind in ["image:", "video:"] {
+        if let Some(path) = source.strip_prefix(kind) {
+            return format!("{kind}{}", absolute(path));
+        }
+    }
+    source.to_owned()
+}
+
+/// `simee camera ...`: the camera methods, printed one line per source or link (or as JSON).
+fn camera(command: CameraCmd, call: &mut dyn FnMut(&str, Value) -> Result<Value>, out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
+    let print_json = |out: &mut dyn Write, v: &Value| -> Result<()> { Ok(writeln!(out, "{}", serde_json::to_string_pretty(v)?)?) };
+    match command {
+        CameraCmd::Sources { kind, json } => {
+            let r = call("camera_sources", json!({"kind": kind}))?;
+            if json {
+                return print_json(out, &r);
+            }
+            let permission = &r["permission"];
+            writeln!(out, "camera permission: {}", text(&permission["status"]))?;
+            if let Some(fix) = permission["fix"].as_str() {
+                writeln!(err, "simee: {fix}")?;
+            }
+            if let Some(e) = r["cameras_error"].as_str() {
+                writeln!(err, "simee: the host's cameras can't be listed: {e}")?;
+            }
+            for s in items(&r["sources"]) {
+                let what = if s["kind"] == "synthetic" {
+                    let note = if s["supported"] == false { " (not yet)" } else { "" };
+                    format!("{}{note}", text(&s["description"]))
+                } else {
+                    let flag = if s["virtual"] == true && s["kind"] != "virtual" { ", virtual" } else { "" };
+                    format!("{} ({}{flag})", text(&s["name"]), text(&s["kind"]))
+                };
+                writeln!(out, "{:<32} {what}", text(&s["source"]))?;
+            }
+        }
+        CameraCmd::Link { device, source, back: _, front, both, json } => {
+            let facing = if both {
+                "both"
+            } else if front {
+                "front"
+            } else {
+                "back"
+            };
+            let r = call("camera_link", json!({"device": device, "facing": facing, "source": camera_source(&source)}))?;
+            if json {
+                return print_json(out, &r);
+            }
+            link_lines(out, &r["links"])?;
+            if let Some(note) = r["note"].as_str() {
+                writeln!(err, "simee: {note}")?;
+            }
+        }
+        CameraCmd::Unlink { device, back, front, json } => {
+            let facing = if back {
+                "back"
+            } else if front {
+                "front"
+            } else {
+                "both"
+            };
+            let r = call("camera_unlink", json!({"device": device, "facing": facing}))?;
+            if json {
+                return print_json(out, &r);
+            }
+            for n in items(&r["now"]) {
+                writeln!(out, "{} {}: {} (unlinked)", text(&r["device"]), text(&n["facing"]), text(&n["source"]))?;
+            }
+        }
+        CameraCmd::Links { device, json } => {
+            let r = call("camera_links", json!({"device": device}))?;
+            if json {
+                return print_json(out, &r);
+            }
+            link_lines(out, &r)?;
+        }
+    }
+    Ok(())
+}
+
+/// One line per camera link: `device facing: source [name] (state)`, the live source when it
+/// differs, and the fix when there is one.
+fn link_lines(out: &mut dyn Write, rows: &Value) -> Result<()> {
+    for l in items(rows) {
+        let mut line = format!("{} {}: {}", text(&l["device"]), text(&l["facing"]), text(&l["source"]));
+        if let Some(name) = l["name"].as_str() {
+            line.push_str(&format!(" [{name}]"));
+        }
+        line.push_str(&format!(" ({})", text(&l["state"])));
+        if let Some(live) = l["live"].as_str().filter(|live| *live != text(&l["source"])) {
+            line.push_str(&format!(", live: {live}"));
+        }
+        if let Some(fix) = l["fix"].as_str() {
+            line.push_str(&format!(": {fix}"));
+        }
+        writeln!(out, "{line}")?;
     }
     Ok(())
 }
@@ -1040,6 +1438,40 @@ fn xr_params(device: &str, words: &[String]) -> Result<Value> {
 mod tests {
     use super::*;
 
+    /// #409: `--set` goes with every method a command calls, as an absolute path, before or after
+    /// the subcommand; a `set` the params already have stays; with no set at all (a test's
+    /// transport) nothing is added.
+    // Unix paths; device sets are iOS (macOS) only.
+    #[cfg(unix)]
+    #[test]
+    fn the_set_flag_goes_with_every_call_as_an_absolute_path() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).expect("arguments");
+        assert_eq!(parse(&["--set", "/farm/set", "list"]).set.as_deref(), Some("/farm/set"));
+        assert_eq!(parse(&["list", "--set", "/farm/set"]).set.as_deref(), Some("/farm/set"));
+        assert_eq!(parse(&["list"]).set, None);
+        let cwd = std::env::current_dir().expect("cwd");
+        assert_eq!(set_arg("sets/a"), cwd.join("sets/a").display().to_string());
+        assert_eq!(set_arg("/farm/set"), "/farm/set");
+        assert_eq!(set_arg(""), "", "the default set, over the environment's");
+        assert_eq!(with_set(json!({"device": "booted"}), Some("/s")), json!({"device": "booted", "set": "/s"}));
+        assert_eq!(with_set(json!({"set": "/mine"}), Some("/s")), json!({"set": "/mine"}));
+        assert_eq!(with_set(json!({"device": "booted"}), None), json!({"device": "booted"}));
+        assert_eq!(with_set(Value::Null, Some("/s")), json!({"set": "/s"}));
+    }
+
+    #[test]
+    fn camera_file_sources_are_sent_as_absolute_paths() {
+        let cwd = std::env::current_dir().expect("cwd");
+        // `/abs/clip.mov` has no drive on Windows, so it isn't absolute there.
+        let abs = std::env::temp_dir().join("clip.mov").display().to_string();
+        for kind in ["image", "video"] {
+            assert_eq!(camera_source(&format!("{kind}:clip.mov")), format!("{kind}:{}", cwd.join("clip.mov").display()));
+            assert_eq!(camera_source(&format!("{kind}:{abs}")), format!("{kind}:{abs}"));
+        }
+        assert_eq!(camera_source("qr:hello"), "qr:hello");
+        assert_eq!(camera_source("webcam:0"), "webcam:0");
+    }
+
     #[test]
     fn list_groups_devices_by_runtime_with_labels() {
         let devices: Vec<DeviceInfo> = serde_json::from_value(json!([
@@ -1064,8 +1496,20 @@ mod tests {
         let rows = sim_api::call_method(&mut s, "form_factors", &json!({"platform": "ios"})).expect("rows");
         let out = form_factors_text(&rows);
         assert!(out.contains("watch     ios      watchOS · Watch (inputs: Touch, Digital Crown, Hardware buttons)"), "{out}");
-        assert!(out.contains("foldable  ios      unsupported: no Apple device"), "{out}");
+        assert!(out.contains("foldable  ios      iOS · Foldable (inputs: Touch, Keyboard, Hardware buttons, Hinge)"), "{out}");
+        assert!(!out.contains("unsupported"), "{out}");
         assert_eq!(out.lines().count(), 7);
+    }
+
+    #[test]
+    fn stream_commands_refuse_to_run_without_a_server() {
+        use stream_cli::Api as _;
+        let missing = std::env::temp_dir().join(format!("simee-no-server-{}.sock", std::process::id()));
+        for mut transport in [Transport::local(), Transport::open(&missing)] {
+            let e = ServerOnly(&mut transport).call("streams", json!({})).expect_err("refused").to_string();
+            assert!(e.contains("needs a running server") && e.contains("simee serve") && e.contains("WHIP DELETE"), "{e}");
+            assert!(transport.local.is_none(), "nothing ran in this process");
+        }
     }
 
     #[test]
@@ -1161,6 +1605,7 @@ mod tests {
         (String::from_utf8(out).expect("utf-8"), String::from_utf8(err).expect("utf-8"), result.err().map(|e| e.to_string()))
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_server_and_this_process_print_the_same_bytes() {
         let root = android_root("forward");
@@ -1200,6 +1645,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     /// A command's stdout as bytes (a PNG isn't UTF-8) and its error, run through `transport`.
     fn output_bytes(transport: &mut Transport, args: &[&str]) -> (Vec<u8>, Option<String>) {
         let cli = Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).expect("arguments");
@@ -1208,6 +1654,7 @@ mod tests {
         (out, result.err().map(|e| e.to_string()))
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_screenshot_to_stdout_is_the_png_here_and_on_a_server() {
         let root = android_root("stdout");
@@ -1236,6 +1683,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_stale_socket_falls_back_to_this_process() {
         let root = android_root("stale");
@@ -1248,6 +1696,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_required_server_that_cant_be_used_fails_the_command_with_why() {
         let root = android_root("require");
@@ -1324,11 +1773,80 @@ mod tests {
     #[test]
     fn mcp_is_a_subcommand_that_runs_no_device_command() {
         let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
-        assert!(matches!(parse(&["mcp"]), Ok(Cmd::Mcp)));
-        assert!(parse(&["mcp", "--http"]).is_err(), "stdio only");
+        assert!(matches!(parse(&["mcp"]), Ok(Cmd::Mcp { http: None, token_file: None, no_auth: false, insecure_remote: false, .. })));
         let mut transport = Transport::local();
-        let e = run(Cmd::Mcp, &mut transport, &mut Vec::new(), &mut Vec::new()).expect_err("served by main, not run");
-        assert!(e.to_string().contains("`mcp` don't run through a transport"));
+        let stdio = Cmd::Mcp {
+            action: None,
+            http: None,
+            token_file: None,
+            no_auth: false,
+            insecure_remote: false,
+            tls: Box::default(),
+            safety: Default::default(),
+        };
+        let e = run(stdio, &mut transport, &mut Vec::new(), &mut Vec::new()).expect_err("served by main, not run");
+        assert!(e.to_string().contains("`mcp` and `mcp-audit` don't run through a transport"));
+    }
+
+    #[test]
+    fn mcp_install_and_config_are_subcommands_that_do_not_mix_with_serving_flags() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
+        assert!(matches!(parse(&["mcp", "install", "cursor", "--dry-run"]), Ok(Cmd::Mcp { action: Some(_), http: None, .. })));
+        assert!(matches!(parse(&["mcp", "config", "claude-desktop"]), Ok(Cmd::Mcp { action: Some(_), .. })));
+        assert!(parse(&["mcp", "--http", "install", "cursor"]).is_err());
+        assert!(parse(&["mcp", "install", "nonsense"]).is_err());
+    }
+
+    #[test]
+    fn mcp_http_takes_an_address_a_token_file_and_an_acknowledgement() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
+        let Ok(Cmd::Mcp { http: Some(addr), token_file: None, no_auth: false, insecure_remote: false, .. }) = parse(&["mcp", "--http"])
+        else {
+            panic!("--http alone")
+        };
+        assert_eq!(addr, sim_mcp::http::DEFAULT_ADDR);
+        let Ok(Cmd::Mcp { http: Some(addr), token_file: Some(path), no_auth: false, insecure_remote: true, .. }) =
+            parse(&["mcp", "--http", "0.0.0.0:9000", "--token-file", "/tmp/t", "--insecure-remote"])
+        else {
+            panic!("every flag")
+        };
+        assert_eq!((addr.as_str(), path.to_str()), ("0.0.0.0:9000", Some("/tmp/t")));
+        assert!(matches!(parse(&["mcp", "--http", "--no-auth"]), Ok(Cmd::Mcp { no_auth: true, token_file: None, .. })));
+        assert!(parse(&["mcp", "--http", "--no-auth", "--token-file", "/tmp/t"]).is_err(), "no token, or a token file: not both");
+        assert!(parse(&["mcp", "--token-file", "/tmp/t"]).is_err(), "a token file needs --http");
+        assert!(parse(&["mcp", "--insecure-remote"]).is_err(), "so does the acknowledgement");
+        assert!(parse(&["mcp", "--no-auth"]).is_err(), "and --no-auth");
+        // With no flag, authentication is on (the state directory's token file).
+        let plain = McpTls::default();
+        let config = mcp_http_config("127.0.0.1:0", None, false, false, &plain).expect("config");
+        assert!(config.addr.ip().is_loopback() && config.token_file.is_none() && !config.no_auth && config.tls.is_none());
+        assert!(mcp_http_config("127.0.0.1:0", None, true, false, &plain).expect("config").no_auth);
+        assert!(mcp_http_config("localhost:8377", None, false, false, &plain).expect("a name resolves").addr.ip().is_loopback());
+        assert!(mcp_http_config("nonsense", None, false, false, &plain).is_err());
+        // The acknowledgement is also spelled `--insecure`.
+        assert!(matches!(parse(&["mcp", "--http", "0.0.0.0:9000", "--insecure"]), Ok(Cmd::Mcp { insecure_remote: true, .. })));
+    }
+
+    #[test]
+    fn mcp_http_takes_a_certificate_and_key_or_a_self_signed_one() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
+        let Ok(Cmd::Mcp { tls, .. }) = parse(&["mcp", "--http", "0.0.0.0:9000", "--tls-cert", "c.pem", "--tls-key", "k.pem"]) else {
+            panic!("a certificate and key")
+        };
+        let config = mcp_http_config("127.0.0.1:0", None, false, false, &tls).expect("config");
+        assert!(matches!(&config.tls, Some(sim_mcp::http::Tls::Files { cert, key }) if cert.ends_with("c.pem") && key.ends_with("k.pem")));
+        let Ok(Cmd::Mcp { tls, .. }) = parse(&["mcp", "--http", "--tls-self-signed", "--tls-name", "box.lan", "--tls-name", "10.0.0.5"])
+        else {
+            panic!("self-signed")
+        };
+        let config = mcp_http_config("127.0.0.1:0", None, false, false, &tls).expect("config");
+        assert!(matches!(&config.tls, Some(sim_mcp::http::Tls::SelfSigned { dir: None, names }) if names == &["box.lan", "10.0.0.5"]));
+        assert!(parse(&["mcp", "--http", "--tls-cert", "c.pem"]).is_err(), "a certificate needs its key");
+        assert!(parse(&["mcp", "--http", "--tls-key", "k.pem"]).is_err(), "and a key its certificate");
+        assert!(parse(&["mcp", "--http", "--tls-self-signed", "--tls-cert", "c.pem", "--tls-key", "k.pem"]).is_err(), "not both");
+        assert!(parse(&["mcp", "--http", "--tls-name", "box.lan"]).is_err(), "a name is for the self-signed certificate");
+        assert!(parse(&["mcp", "--tls-self-signed"]).is_err(), "TLS needs --http");
+        assert!(parse(&["mcp", "--tls-cert", "c.pem", "--tls-key", "k.pem"]).is_err(), "so does a certificate");
     }
 
     #[test]
@@ -1362,24 +1880,34 @@ mod tests {
     }
 
     /// A fake server's reply to a method: its result or its error.
+    #[cfg(unix)]
     type Answer = fn(&str) -> std::result::Result<Value, String>;
 
+    #[cfg(unix)]
     /// A server on `socket` that records each method it is sent and answers with `answer`; `None`
     /// never answers (a wedged server).
     fn fake_server(socket: &std::path::Path, answer: Option<Answer>) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        fake_server_params(socket, answer).0
+    }
+
+    /// [`fake_server`], recording each request's params too.
+    #[cfg(unix)]
+    fn fake_server_params(socket: &std::path::Path, answer: Option<Answer>) -> (Seen<String>, Seen<Value>) {
         use std::io::BufRead;
         let listener = std::os::unix::net::UnixListener::bind(socket).expect("bind");
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let record = seen.clone();
+        let params = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (record, record_params) = (seen.clone(), params.clone());
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let record = record.clone();
+                let (record, record_params) = (record.clone(), record_params.clone());
                 std::thread::spawn(move || {
                     let mut writer = stream.try_clone().expect("clone");
                     for line in std::io::BufReader::new(stream).lines().map_while(Result::ok) {
                         let req: Value = serde_json::from_str(&line).expect("request");
                         let method = req["method"].as_str().unwrap_or("").to_owned();
                         record.lock().expect("lock").push(method.clone());
+                        record_params.lock().expect("lock").push(req["params"].clone());
                         match answer {
                             Some(answer) => {
                                 let reply = match answer(&method) {
@@ -1394,9 +1922,43 @@ mod tests {
                 });
             }
         });
-        seen
+        (seen, params)
     }
 
+    /// What a fake server has been sent, as it arrives.
+    #[cfg(unix)]
+    type Seen<T> = std::sync::Arc<std::sync::Mutex<Vec<T>>>;
+
+    /// #409: the device set is this command's, said on every call: `--set`, else this process's
+    /// `SIMEE_IOS_DEVICE_SET` (made absolute), else the default set (`""`). A server with another
+    /// set in its environment never picks the set (it would be the owner's default set).
+    #[cfg(unix)]
+    #[test]
+    fn the_commands_own_device_set_reaches_a_server_on_every_call() {
+        let root = android_root("set-forward");
+        let cwd = std::env::current_dir().expect("cwd");
+        for (i, (flag, env, sent)) in [
+            (None, Some("/farm/sims"), "/farm/sims".to_owned()),
+            (None, Some("farm/sims"), cwd.join("farm/sims").display().to_string()),
+            (Some("/mine"), Some("/farm/sims"), "/mine".to_owned()),
+            (Some(""), Some("/farm/sims"), String::new()),
+            (None, None, String::new()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let socket = root.join(format!("{i}.sock"));
+            let (seen, params) =
+                fake_server_params(&socket, Some(|m| Ok(if m == "identity" { sim_api::identity().clone() } else { Value::Null })));
+            let mut transport = Transport { set: command_set(flag, env), ..Transport::open(&socket) };
+            assert_eq!(outputs(&mut transport, &["shutdown", "booted"]).2, None, "{flag:?} {env:?}");
+            assert_eq!(*seen.lock().expect("lock"), ["identity", "shutdown"], "{flag:?} {env:?}: forwarded");
+            assert_eq!(params.lock().expect("lock")[1], json!({"device": "booted", "set": sent}), "{flag:?} {env:?}");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
     #[test]
     fn a_server_that_never_answers_runs_the_command_here() {
         let root = android_root("wedged");
@@ -1413,6 +1975,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn another_build_or_an_old_server_runs_the_command_here() {
         let root = android_root("skew");
@@ -1446,6 +2009,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn boot_runs_here_even_with_a_matching_server() {
         let root = android_root("boot");
@@ -1479,11 +2043,79 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn camera_commands_link_swap_and_unlink_through_the_api() {
+        let root = android_root("camera");
+        let cameras = [("OBS-1", "OBS Virtual Camera", true), ("CAMO-1", "Camo Camera", true), ("FT-1", "FaceTime HD Camera", false)];
+        let session = android_session(&root).with_cameras(&cameras, true);
+        let mut local = Transport { local: Some(Box::new(session)), ..Transport::local() };
+        let image = "system-images;android-36;google_apis;arm64-v8a";
+        assert_eq!(outputs(&mut local, &["create", "pixel", "--platform", "android", "--system-image", image]).0, "pixel\n");
+        let saved = || std::fs::read_to_string(root.join("avd/pixel.avd/simee/cameras.ini")).unwrap_or_default();
+        // Shut down: saved for its boot.
+        assert_eq!(
+            outputs(&mut local, &["camera", "link", "pixel", "--back", "qr:hello"]),
+            ("pixel back: qr:hello (saved)\n".into(), String::new(), None)
+        );
+        // Part of a name finds the camera; it is saved by its id.
+        let (out, _, e) = outputs(&mut local, &["camera", "link", "pixel", "--front", "obs"]);
+        assert_eq!(e, None);
+        assert_eq!(out, "pixel back: qr:hello (saved)\npixel front: webcam:OBS-1 [OBS Virtual Camera] (saved)\n");
+        let (_, _, e) = outputs(&mut local, &["camera", "link", "pixel", "camera"]);
+        let e = e.expect("ambiguous");
+        assert!(
+            e.contains("matches more than one camera: OBS Virtual Camera (OBS-1), Camo Camera (CAMO-1), FaceTime HD Camera (FT-1)"),
+            "{e}"
+        );
+        assert_eq!(saved(), "back=qr:hello\nfront=webcam:OBS-1\n", "the failed link changed nothing");
+        assert_eq!(outputs(&mut local, &["camera", "links"]).0, out, "every device's links");
+        // Running: relinked live through the console, then unlinked back to the AVD's own (none).
+        let emulator = sim_android::testing::fake_emulator(&android_backend(&root), "pixel");
+        let (out, _, e) = outputs(&mut local, &["camera", "link", "pixel", "--both", "emulated"]);
+        assert_eq!(e, None);
+        assert_eq!(out, "pixel back: pattern:testcard (linked)\npixel front: pattern:testcard (linked)\n");
+        assert_eq!(outputs(&mut local, &["camera", "unlink", "pixel", "--back"]).0, "pixel back: none (unlinked)\n");
+        // The boot links first (stopped after that by an iOS-only flag: no boot wait on the fake).
+        let (_, _, e) = outputs(&mut local, &["boot", "pixel", "--camera-front", "solid:orange", "--settle"]);
+        assert!(e.expect("settle is iOS's").contains("for iOS devices only"));
+        let console: Vec<String> =
+            emulator.console.lock().expect("console").iter().filter(|c| c.starts_with("camera link")).cloned().collect();
+        assert_eq!(
+            console,
+            [
+                "camera link back pattern:testcard",
+                "camera link front pattern:testcard",
+                "camera link back none",
+                "camera link front solid:orange"
+            ]
+        );
+        assert_eq!(saved(), "front=solid:orange\n");
+        let (out, _, _) = outputs(&mut local, &["camera", "sources", "--kind", "virtual"]);
+        assert_eq!(
+            out,
+            "camera permission: authorized\nwebcam:OBS-1                     OBS Virtual Camera (virtual)\nwebcam:CAMO-1                    Camo Camera (virtual)\n"
+        );
+        assert!(outputs(&mut local, &["camera", "sources", "--kind", "synthetic"]).0.contains("qr:hello"));
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
+        assert!(parse(&["camera", "link", "pixel", "--back", "--front", "qr:x"]).is_err(), "one facing");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    fn android_backend(root: &std::path::Path) -> sim_android::Android {
+        let env = emu_avd::Env { sdk_root: Some(root.join("sdk")), avd_home: root.join("avd") };
+        let mut android = sim_android::Android::new(env);
+        android.running_dir = Some(root.join("running"));
+        android
+    }
+
     #[test]
     fn path_parameters_are_made_absolute() {
         let here = std::env::current_dir().expect("cwd");
         assert_eq!(absolute("shot.png"), here.join("shot.png").display().to_string());
-        assert_eq!(absolute("/tmp/x.png"), "/tmp/x.png");
+        let abs = std::env::temp_dir().join("x.png").display().to_string();
+        assert_eq!(absolute(&abs), abs);
     }
 
     #[test]

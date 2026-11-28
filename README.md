@@ -1,5 +1,7 @@
 # simee
 
+<img src="assets/brand/simee-mark.svg" alt="The simee mark: a cut emerald" align="right" height="96">
+
 iOS simulators and Android emulators without Simulator.app or the SDK emulator: one Rust core, one
 CLI, one JSON socket API and one desktop window for both platforms. Your existing tools keep
 working, because each device looks like the stock one: `adb`, `adb emu`, `simctl` and test
@@ -9,28 +11,38 @@ harnesses drive it unchanged.
 
 ## Performance
 
-Measured against the stock tools on the same host and day, medians of 3 or more; each links its
-row and the script that reruns it (it creates and deletes its own devices).
+Against the stock tools on the same host and day, medians of 3 or more. Each simee cell reads
+Android / iOS: Android against the SDK emulator (QEMU), iOS against Simulator.app. ↗ opens a
+row's benchmark, Android's first; its tooltip names the host, date and script, which creates and
+deletes its own devices.
 
-- **Android boots 4.9× faster warm, 2.4× cold:** 3.5 s against the SDK emulator's 17.1 s to
-  `sys.boot_completed`, 9.5 s against 22.9 s for a new AVD, with 45% less peak memory warm (2.09 against
-  3.78 GB; 25% cold). M3 Max, 2026-11-24. [Row](docs/benchmarks.md#android-emu-against-the-sdk-emulator),
-  `scripts/bench/android-boot.sh`.
-- **Fewer janky frames:** 0% of the frames swiping a Pixel Tablet's launcher against 5.6%, though
-  emu drew about 530 frames to stock's 1350 there; 0.25% against 6.2% on a phone, where both drew
-  about 790. M3 Max, 2026-11-25. [Row](docs/benchmarks.md#frame-pacing),
-  `scripts/bench/android-frames.sh`.
-- **Cheaper idle devices:** an idle API 29 device costs 2.9% of a host core against 5.4%; API 30
-  2.1% against 3.7%. M3 Max, 2026-11-26.
-  [Row](docs/benchmarks.md#api-29-and-30-first-boots-and-idle-host-cpu), `scripts/bench/android-idle.sh`.
-- **Android on Linux without KVM:** a warm boot in 168 s against `-accel off`'s 2302 s (one of its
-  3 boots never finished in 40 minutes). 4-vCPU Xeon VM, 2026-11-26.
-  [Row](docs/benchmarks.md#boot-to-sysboot_completed-with-emus-devices), `scripts/bench/software-mode.sh`.
-- **iOS screenshots 17× faster as a command:** 36 ms through `simee serve` against 601 ms for
-  `simctl io screenshot` (a loaded host, 1-minute load 13-69). M3 Max, 2026-11-26.
-  [Row](docs/benchmarks.md#ios-simee-against-simctl), `scripts/bench/ios-command.sh`.
+| Measure | simee, Android / iOS | Android emulator (QEMU) | Simulator.app | Source |
+| --- | --- | --- | --- | --- |
+| Cold boot, a new device | **9.5 s** / 18.6 s | 22.9 s | 18.5 s | [↗](docs/benchmarks.md#android-emu-against-the-sdk-emulator "Android: M3 Max, 2026-11-24, scripts/bench/android-boot.sh") [↗](docs/research/ios-site-measures.md#results "iOS: M3 Max, 2026-11-27, loaded host, no script yet") |
+| Warm boot | **3.5 s** / 6.6 s | 17.1 s | 6.6 s | [↗](docs/benchmarks.md#android-emu-against-the-sdk-emulator "Android: M3 Max, 2026-11-24, scripts/bench/android-boot.sh") [↗](docs/research/ios-site-measures.md#results "iOS: M3 Max, 2026-11-27, loaded host, no script yet") |
+| Peak memory, warm | **2.09 GB** / 2.99 GB | 3.78 GB | 3.11 GB | [↗](docs/benchmarks.md#android-emu-against-the-sdk-emulator "Android: M3 Max, 2026-11-24, scripts/bench/android-boot.sh") [↗](docs/research/ios-site-measures.md#results "iOS: M3 Max, 2026-11-27, loaded host, no script yet") |
+| Screenshot as a command, median | n/m / **23 ms** | n/m | 565 ms | [↗](docs/research/ios-site-measures.md#results "iOS: M3 Max, 2026-11-27, loaded host, no script yet") |
+| Janky frames swiping the launcher, phone | **0.25%** / n/m | 6.2% | n/m | [↗](docs/benchmarks.md#frame-pacing "Android: M3 Max, 2026-11-25, scripts/bench/android-frames.sh") |
+| Idle host CPU, of a core | **2.1%** / 13.6% (noisy) | 3.7% | **12.5%** (noisy) | [↗](docs/benchmarks.md#api-29-and-30-first-boots-and-idle-host-cpu "Android: M3 Max, 2026-11-26, scripts/bench/android-idle.sh") [↗](docs/research/ios-site-measures.md#results "iOS: M3 Max, 2026-11-27, loaded host, no script yet") |
+| Warm boot, Linux without KVM | **168 s** / n/a | 2302 s | n/a | [↗](docs/benchmarks.md#boot-to-sysboot_completed-with-emus-devices "Android: 4-vCPU Xeon VM, 2026-11-26, scripts/bench/software-mode.sh") |
 
-`scripts/bench/run-all.sh --list` names every benchmark behind the numbers on this page.
+n/m: not measured. n/a: nothing to compare; iOS devices need a Mac. Bold marks the better of a
+pair; a pair within 5% has none. A boot ends at `sys.boot_completed` on Android and when the boot
+command returns on iOS.
+
+On iOS simee is level with Simulator.app, not ahead. Its 6.6 s warm boot matches Simulator.app
+with its window open, but a headless `simctl` boot on a device set of its own takes 2.6 s, and
+simee can't boot a device in a custom device set yet, so it couldn't be timed that way. The iOS
+idle CPU was measured under high host load (1-minute load 28-60): read it as indicative only. The
+iOS screenshot is `simee screenshot` forwarded to `simee serve`; in its own process it takes
+148 ms, and the p95s are 47 ms against 585 ms.
+
+Android's idle CPU is API 30's; on API 29 it is 2.9% against 5.4%. On the Pixel Tablet 0% of
+frames were janky against 5.6%: emu drew about 530 frames to stock's 1350, and on the phone both
+drew about 790. The Linux row ran on a 4-vCPU Xeon VM with the stock emulator under `-accel off`,
+where 1 of 3 boots never finished in 40 minutes. Every other row ran on an M3 Max: Android
+2026-11-24 to 26, iOS 2026-11-27. `scripts/bench/run-all.sh --list` names every benchmark behind
+the numbers on this page.
 
 ## Compared with the stock tools
 
@@ -54,6 +66,13 @@ within a second of that restore.
 Guest code runs natively under both. The gap is the emulator itself: an
 in-kernel interrupt controller, zero-copy disk and adb paths, and memory that is committed only
 when the guest touches it.
+
+### Android on Linux with KVM
+
+On an x86_64 Linux host with a usable `/dev/kvm`, software mode runs the guest on KVM. On a GitHub
+`ubuntu-latest` runner, 2026-11-27, the API 36 x86_64 image reached `sys.boot_completed` in **28.8 s**
+cold and **16.6 s** warm, against the SDK emulator's 30.3 s and 19.2 s, with a 2.27 GB peak RSS
+against 3.00 GB cold ([benchmarks](docs/benchmarks.md#android-software-mode-on-kvm-githubs-x86_64-runner)).
 
 ### Android on Linux without KVM
 
@@ -94,7 +113,15 @@ measured yet: [docs/benchmarks.md](docs/benchmarks.md). The full comparison:
 ## Quick start
 
 Needs macOS on Apple silicon, Rust (pinned in `rust-toolchain.toml`) and, for iOS, Xcode with a
-simulator runtime.
+simulator runtime. `simee doctor` says what this Mac can run and why.
+
+| | Apple silicon (M1 and later) | Intel |
+| --- | --- | --- |
+| iOS devices | Xcode 26 or 27 (macOS 15.6+) | planned ([#241](https://github.com/kaeawc/simee/issues/241)) |
+| iOS audio capture and mute | macOS 14.2+ | planned |
+| Android devices (`emu`) | macOS 15+; 4 KiB guest memory pages on macOS 26+ | planned ([#242](https://github.com/kaeawc/simee/issues/242)) |
+
+Tested on macOS 26; the floors and their sources: [docs/development.md](docs/development.md#support-matrix).
 
 ```bash
 cargo build && alias simee=target/debug/simee
@@ -121,12 +148,13 @@ To put emu behind tools that launch `emulator` themselves: `make shim`, then
 
 Phones, tablets, foldables, watches, TVs, cars and headsets on both platforms, each with its own
 inputs (hinge, rotary, D-pad, Digital Crown, Siri Remote, vehicle properties, XR head pose).
-Unsupported combinations are refused with the reason. The matrix and its gaps:
+iOS's foldable is the iPhone Duo. The matrix and its gaps:
 [docs/form-factors.md](docs/form-factors.md).
 
 ## Not yet
 
-- iOS needs an Apple silicon Mac. Android runs on Apple silicon, and on x86_64 Linux in software
+- iOS needs an Apple silicon Mac (Intel: [#241](https://github.com/kaeawc/simee/issues/241)). Android
+  runs on Apple silicon (Intel: [#242](https://github.com/kaeawc/simee/issues/242)), and on x86_64 Linux in software
   mode (x86_64 images; slow frames, see above). KVM on Linux is in progress
   ([#54](https://github.com/kaeawc/simee/issues/54)).
 - No Android snapshots, so every boot is a full boot.

@@ -177,6 +177,28 @@ static void test_match(void) {
 
 static int udp_socket(int family) { return my_socket(family, SOCK_DGRAM, 0); }
 
+/// Whether this host can open an IPv6 socket and bind it to ::1. A container without IPv6 can't: the
+/// IPv6 cases are skipped there, with the reason printed, and the IPv4 cases still run.
+static int ipv6_usable(const char *what) {
+    int fd = socket(AF_INET6, SOCK_DGRAM, 0);
+    int err = fd < 0 ? errno : 0;
+    if (fd >= 0) {
+        struct sockaddr_in6 lo = {0};
+        lo.sin6_family = AF_INET6;
+        lo.sin6_addr = in6addr_loopback;
+        if (bind(fd, (struct sockaddr *)&lo, sizeof lo) != 0) err = errno;
+        close(fd);
+    }
+    if (err == 0) return 1;
+    if (err != EAFNOSUPPORT && err != EADDRNOTAVAIL && err != EPROTONOSUPPORT) {
+        errno = err;
+        CHECK(!"IPv6 probe failed for a reason other than missing IPv6 support");
+        return 0;
+    }
+    fprintf(stderr, "SKIPPED: %s: IPv6 is not available on this host (%s)\n", what, strerror(err));
+    return 0;
+}
+
 static void test_fd_state(void) {
     set_conf("loss_pct=0\nrule 198.51.100.0/24 latency_ms=40\n");
     struct sockaddr_storage remote = addr("198.51.100.7", 53), other = addr("203.0.113.9", 53), local = addr("127.0.0.1", 53);
@@ -264,13 +286,15 @@ static void test_datagram_gate_and_cache(void) {
     set_conf("rule 192.0.2.0/24 latency_ms=1\n");
     CHECK(send_gate(u, (struct sockaddr *)&plain, "x", 1) == 0 && fd_rule(fd_get(u)) == 1);
     // IPv6 destinations are cached by their whole address.
-    int u6 = udp_socket(AF_INET6);
-    set_conf("rule 2001:db8::1 latency_ms=1\n");
-    struct sockaddr_storage v6b = addr("2001:db8::2", 53);
-    CHECK(send_gate(u6, (struct sockaddr *)&v6, "x", 1) == 0 && fd_rule(fd_get(u6)) == 1);
-    CHECK(send_gate(u6, (struct sockaddr *)&v6b, "x", 1) == 0 && fd_rule(fd_get(u6)) == 0);
-    CHECK(send_gate(u6, (struct sockaddr *)&v6, "x", 1) == 0 && fd_rule(fd_get(u6)) == 1);
-    my_close(u6);
+    if (ipv6_usable("IPv6 destination cache cases")) {
+        int u6 = udp_socket(AF_INET6);
+        set_conf("rule 2001:db8::1 latency_ms=1\n");
+        struct sockaddr_storage v6b = addr("2001:db8::2", 53);
+        CHECK(send_gate(u6, (struct sockaddr *)&v6, "x", 1) == 0 && fd_rule(fd_get(u6)) == 1);
+        CHECK(send_gate(u6, (struct sockaddr *)&v6b, "x", 1) == 0 && fd_rule(fd_get(u6)) == 0);
+        CHECK(send_gate(u6, (struct sockaddr *)&v6, "x", 1) == 0 && fd_rule(fd_get(u6)) == 1);
+        my_close(u6);
+    }
     my_close(u);
     set_conf("");
 }

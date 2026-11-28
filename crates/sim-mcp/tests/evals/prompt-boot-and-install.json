@@ -1,0 +1,32 @@
+{
+  "name": "prompt-boot-and-install",
+  "goal": "Follow the boot-and-install prompt: an Android tablet running /fixtures/Notes.apk.",
+  "toolsets": "core,lifecycle",
+  "prompt": {"name": "boot-and-install", "arguments": {"platform": "android", "form_factor": "tablet", "app_path": "/fixtures/Notes.apk"}},
+  "world": {
+    "devices": [
+      {"udid": "pixel-9", "name": "Pixel 9", "platform": "android", "form_factor": "phone", "state": "Shutdown"}
+    ],
+    "packages": {"/fixtures/Notes.apk": "com.example.notes"}
+  },
+  "plan": [
+    {"tool": "devices", "args": {"platform": "android", "form_factor": "tablet"}, "expect": {"contains": ["[]"]}},
+    {"tool": "form_factors", "args": {"platform": "android", "form_factor": "tablet"}, "expect": {"contains": ["\"supported\":true"]}},
+    {"tool": "runtimes", "args": {"platform": "android"}, "expect": {"contains": ["android-36"]}},
+    {"tool": "device_types", "args": {}},
+    {"tool": "create", "args": {"name": "Pixel Tablet", "platform": "android", "form_factor": "tablet",
+                                "system_image": "system-images;android-36;google_apis;arm64-v8a"},
+     "expect": {"contains": ["created-pixel-tablet"]}},
+    {"tool": "boot", "args": {"device": "created-pixel-tablet", "admission": "wait"}},
+    {"tool": "install", "args": {"device": "created-pixel-tablet", "path": "/fixtures/Notes.apk"}},
+    {"tool": "apps", "args": {"device": "created-pixel-tablet"}, "expect": {"contains": ["com.example.notes"]}},
+    {"tool": "launch", "args": {"device": "created-pixel-tablet", "bundle_id": "com.example.notes"}},
+    {"tool": "screenshot", "args": {"device": "created-pixel-tablet"}}
+  ],
+  "end": {
+    "booted": ["created-pixel-tablet"],
+    "shutdown": ["pixel-9"],
+    "foreground": {"created-pixel-tablet": "com.example.notes"},
+    "screenshot_shows": {"created-pixel-tablet": ["app=com.example.notes"]}
+  }
+}

@@ -15,16 +15,34 @@ include = ["/Cargo.toml", "/LICENSE", "/examples", "/native", "/src", "/tests"]
 [lib]
 doctest = false
 
+[features]
+# The Linux H.264 encoder for `stream_start` (`simee-encode`'s `openh264`: OpenH264 built from its
+# C++ source, which needs a C++ compiler). Off by default; macOS has VideoToolbox without it.
+openh264 = ["sim-encode/openh264"]
+
 [dependencies]
 base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sim-core.workspace = true
 sim-android.workspace = true
+# `import` reads a bundle's manifest to route it to its platform; iOS export and import.
+sim-bundle.workspace = true
+# `device:` camera sources are read here (`src/camera_device.rs`), not in sim-camera, which emu
+# links: emu reads them from this crate's server as a `feed:`.
+sim-camera.workspace = true
 sim-coresim.workspace = true
 sim-debug.workspace = true
 sim-netshape.workspace = true
 sim-audio.workspace = true
+sim-host.workspace = true
+# Streams (`stream_*`): the encoder and the WHIP publisher.
+sim-encode.workspace = true
+sim-rtc.workspace = true
+# SIGINT/SIGTERM: the servers shut down in order (`src/shutdown.rs`).
+signal-hook.workspace = true
+# `serve`'s accept loop waits on its listener and its shutdown's own fd at once (`poll`).
+rustix.workspace = true
 
 [dev-dependencies]
 emu-avd.workspace = true

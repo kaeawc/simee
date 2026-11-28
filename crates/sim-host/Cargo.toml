@@ -1,0 +1,30 @@
+[package]
+name = "simee-host"
+description = "Host health for simulator farms: load, memory pressure, swap, disk, an admit/hold/backoff verdict and per-device CPU, memory and I/O, sampled without forking."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["host", "load", "memory", "pressure", "macos"]
+categories = ["development-tools::testing", "os"]
+include = ["/Cargo.toml", "/LICENSE", "/src"]
+
+[lib]
+doctest = false
+
+[dependencies]
+serde.workspace = true
+sim-core.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+# macOS reads the kernel's sysctls through sim-coresim, the one crate here that allows `unsafe`.
+[target.'cfg(target_os = "macos")'.dependencies]
+sim-coresim.workspace = true
+
+[lints]
+workspace = true

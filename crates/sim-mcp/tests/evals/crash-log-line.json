@@ -1,0 +1,27 @@
+{
+  "name": "crash-log-line",
+  "goal": "Launch com.example.crashy on the booted iPhone, tap its Save button (at 600, 2400) to make it crash, and return the log line that says why it crashed.",
+  "toolsets": "core",
+  "world": {
+    "devices": [
+      {"udid": "iphone-17", "name": "iPhone 17", "platform": "ios", "form_factor": "phone", "state": "Booted",
+       "apps": ["com.example.crashy"]}
+    ],
+    "crash": {
+      "bundle_id": "com.example.crashy",
+      "region": [500, 2300, 200, 200],
+      "log": "crashy[4242:9b0] *** Terminating app due to uncaught exception 'NSRangeException', reason: 'index 3 beyond bounds [0 .. 2]'",
+      "report": "crashy-2026-11-27-101500.ips"
+    }
+  },
+  "plan": [
+    {"tool": "launch", "args": {"device": "iphone-17", "bundle_id": "com.example.crashy"}},
+    {"tool": "screenshot", "args": {"device": "iphone-17"}},
+    {"tool": "tap", "args": {"device": "iphone-17", "x": 600, "y": 2400}},
+    {"tool": "logs", "args": {"device": "iphone-17", "last": "30s"}, "expect": {"contains": ["Terminating app"]}}
+  ],
+  "end": {
+    "foreground": {"iphone-17": null},
+    "seen": ["*** Terminating app due to uncaught exception 'NSRangeException'"]
+  }
+}
