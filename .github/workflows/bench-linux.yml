@@ -1,0 +1,136 @@
+name: Bench Linux KVM
+
+# Linux with KVM numbers from GitHub's x86_64 Ubuntu runner: boot (cold and warm), memory, idle
+# CPU, screenshot latency and frame pacing, scripts/bench/linux-kvm.sh. Weekly and on demand, never
+# on a push or a pull request: a run takes about 45 minutes. A hosted runner is a shared VM, so the
+# run records its profile and load, passes --no-quiet-gate, and its numbers are labelled "GitHub
+# runner" (docs/research/linux-kvm-bench.md). The result is one JSON file, an artifact, and a table
+# in the job summary.
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: Rounds (boots) per measure
+        default: "5"
+        type: string
+
+concurrency:
+  group: bench-linux
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  QEMU_VERSION: 11.1.3
+  # sha256 of download.qemu.org's qemu-11.1.3.tar.xz.
+  QEMU_SHA256: 5a8289c7940dc77d3873c81a6c29ba3afe1446fc9d36e77fa1658cdbecb84b22
+
+jobs:
+  bench:
+    name: bench (kvm)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      # Everything outside the checkout lives under the runner's temp dir. The runner exports
+      # ANDROID_SDK_ROOT for its preinstalled SDK, and emu prefers it, so both point at ours.
+      - name: Paths
+        run: |
+          {
+            echo "ANDROID_HOME=$RUNNER_TEMP/sdk"
+            echo "ANDROID_SDK_ROOT=$RUNNER_TEMP/sdk"
+            echo "ANDROID_AVD_HOME=$RUNNER_TEMP/avd"
+            echo "QEMU_PREFIX=$RUNNER_TEMP/qemu"
+            echo "EMU_QEMU=$RUNNER_TEMP/qemu/bin/qemu-system-x86_64"
+          } >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/enable-kvm
+      - uses: ./.github/actions/rust-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: software-mode
+          cache-on-failure: true
+          save-if: false
+      - name: Packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends ninja-build libglib2.0-dev libpixman-1-dev libslirp-dev \
+            libfdt-dev flex bison python3-venv libx11-6 libxcb1 libpulse0 libasound2t64 libgl1 libnss3 libxkbfile1 libx11-xcb1
+      # The same QEMU and SDK cache keys as software-mode.yml, so a warm cache from there is reused.
+      - id: qemu-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/qemu
+          key: qemu-${{ env.QEMU_VERSION }}-x86_64-${{ runner.os }}-v1
+      - name: Build QEMU
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl -sSfLo qemu.tar.xz "https://download.qemu.org/qemu-$QEMU_VERSION.tar.xz"
+          echo "$QEMU_SHA256  qemu.tar.xz" | sha256sum -c
+          tar xf qemu.tar.xz
+          cd "qemu-$QEMU_VERSION"
+          ./configure --prefix="$QEMU_PREFIX" --target-list=x86_64-softmmu --disable-docs --disable-werror \
+            --enable-slirp --enable-fdt=system --disable-gtk --disable-sdl --disable-opengl --disable-spice --disable-vnc \
+            --disable-xen --disable-debug-info
+          make -j"$(nproc)"
+          make install
+      - run: $EMU_QEMU -version
+      - run: cargo build --locked --release -p simee-emu -p simee
+      - id: sdk-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/sdk
+          key: sdk-android-36-default-x86_64-${{ runner.os }}-v1
+      - name: Provision
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: target/release/emu -provision 36 -tag default -abi x86_64
+      # The renderer is fetched on demand: fetch it now, so the first cold boot doesn't pay for it.
+      - run: target/release/emu -provision-renderer
+      - run: target/release/emu -accel-check
+      # The build, the downloads and the apt installs above have just loaded the runner. Let the
+      # 1-minute load fall, and record what is left in the run's own record.
+      - name: Let the runner settle
+        run: |
+          for _ in $(seq 1 24); do
+            read -r l _ < /proc/loadavg
+            echo "load1 $l"
+            awk -v l="$l" -v n="$(nproc)" 'BEGIN { exit !(l < n * 0.5) }' && break
+            sleep 5
+          done
+          ps -eo pcpu,comm --sort=-pcpu | head -6
+      - name: Benchmark
+        env:
+          ROUNDS: ${{ github.event.inputs.rounds || '5' }}
+        run: |
+          case "$ROUNDS" in '' | *[!0-9]*) echo "rounds must be a number"; exit 2 ;; *) ;; esac
+          scripts/bench/linux-kvm.sh --rounds "$ROUNDS" --port 5700 --no-quiet-gate --out bench/results
+          cat bench/results/linux-kvm-summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Runner profile in the summary
+        if: always()
+        run: |
+          shopt -s nullglob
+          files=(bench/results/linux-kvm-*.json)
+          [ "${#files[@]}" -gt 0 ] || exit 0
+          python3 -I - "${files[0]}" >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          import json, sys
+          r = json.load(open(sys.argv[1]))["runner"]
+          print("\n| Runner | |\n| --- | --- |")
+          for k in ("cpu_model", "cpus", "mem_total_gb", "kvm_device", "hypervisor_vendor", "kernel", "load_avg", "runner_image"):
+              print(f"| {k} | {r.get(k, '')} |")
+          EOF
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bench-linux-kvm
+          path: |
+            bench/results/
+            ${{ runner.temp }}/avd/*/simee/console.log
+          if-no-files-found: ignore
