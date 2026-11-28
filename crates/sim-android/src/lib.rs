@@ -20,6 +20,7 @@ pub mod net;
 pub mod procs;
 pub mod profile;
 pub mod settle;
+pub mod state;
 /// A fake emulator and adb for tests (a Unix socket per device and `/bin/sh` scripts): unix only.
 #[cfg(all(unix, any(test, feature = "testing")))]
 pub mod testing;

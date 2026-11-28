@@ -145,7 +145,14 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          exported device's guest identity (ro.serialno, android_id). iOS: not yet",
     ),
     ("shutdown", "device; iOS: set?", "Shut down"),
-    ("erase", "device, set?", "Erase content and settings (shut down first)"),
+    (
+        "erase",
+        "device; iOS: set?",
+        "Erase content and settings (shut down first). Android: simee's user data (the userdata, cache and metadata disks in \
+         `<avd>/simee/`) is removed and cloned again from the image's golden when one has the AVD's shape, so the next boot is \
+         warm; without one the next boot is a first boot. The AVD keeps its name and config, and the stock emulator's own files \
+         are left alone (its `-wipe-data` clears them)",
+    ),
     (
         "screen",
         "device, display?(main|outer|inner|carplay); iOS: set?",
@@ -246,20 +253,43 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("push", "device, bundle_id, payload, set?", "Deliver an APNs payload (object)"),
     (
         "status_bar",
-        "device, time?, data_network?, wifi_mode?, wifi_bars?, cellular_mode?, cellular_bars?, operator?, battery_state?, battery_level?, set?",
-        "Override status bar",
+        "device, time?, data_network?, wifi_mode?, wifi_bars?, cellular_mode?, cellular_bars?, operator?, battery_state?, battery_level?; iOS: set?",
+        "Override status bar. Android: SystemUI's demo mode, which replaces the whole status bar: time as a time of day (HH:MM); \
+         data_network lte-a shows LTE+, 5g-uwb and 5g-uc 5G+, hide no type, wifi the Wi-Fi icon; Wi-Fi's 0-3 bars scale to \
+         Android's 0-4; searching and failed show no bars; charging and charged show the battery plugged in; no operator (the \
+         demo status bar has no carrier name)",
     ),
-    ("clear_status_bar", "device, set?", "Remove status bar overrides"),
+    ("clear_status_bar", "device; iOS: set?", "Remove status bar overrides (Android: leaves demo mode)"),
     ("content_size", "device, size, set?", "Dynamic Type size (name or 0-11)"),
-    ("increase_contrast", "device, on, set?", "Increase Contrast"),
+    (
+        "increase_contrast",
+        "device, on; iOS: set?",
+        "Increase Contrast (Android: high-contrast text, `high_text_contrast_enabled`, and from API 34 the color contrast, \
+         `contrast_level` 1.0 or 0.0)",
+    ),
     ("dynamic_island", "device, suppressed, set?", "Hide the Dynamic Island"),
     ("backlight", "device, on, set?", "Display backlight"),
-    ("keyboard_language", "device, language, set?", "Software keyboard language"),
-    ("hardware_keyboard", "device, on, set?", "Connect the hardware keyboard"),
+    (
+        "keyboard_language",
+        "device, language, set?",
+        "Software keyboard language (not on Android: a keyboard's language is its input method's subtype, which only that \
+         input method's settings choose; no host command sets it)",
+    ),
+    (
+        "hardware_keyboard",
+        "device, on; iOS: set?",
+        "Connect the hardware keyboard (Android: the emulator's keyboard stays attached; off shows the on-screen keyboard \
+         beside it and on hides it, `show_ime_with_hard_keyboard`)",
+    ),
     ("ca_debug", "device, option, on, set?", "Render overlay (see ca_debug_state for names)"),
     ("ca_debug_state", "device, set?", "Every render overlay and whether it is on"),
     ("reset_keychain", "device, set?", "Delete every keychain item"),
-    ("memory_warning", "device, set?", "Simulate a memory warning"),
+    (
+        "memory_warning",
+        "device; iOS: set?; Android: bundle_id?",
+        "Simulate a memory warning (Android: `am send-trim-memory` RUNNING_CRITICAL to bundle_id's process, by default the \
+         foreground app's)",
+    ),
     ("notify", "device, name, state?, set?", "Post a Darwin notification (optionally setting its state)"),
     ("biometric", "device, action(match|nomatch|enroll|unenroll), face?, set?", "Touch ID / Face ID"),
     (
@@ -609,6 +639,13 @@ const ALL_PLATFORMS: &[&str] = &[
     "admission_check",
     "clone",
     "shutdown",
+    // Device state, on Android over adb and the AVD's disks (#418).
+    "erase",
+    "status_bar",
+    "clear_status_bar",
+    "increase_contrast",
+    "hardware_keyboard",
+    "memory_warning",
     "screen",
     "screenshot",
     "stream_start",
@@ -1685,7 +1722,7 @@ pub(crate) mod tests {
         let help = call(&mut Session::default(), "help", &Value::Null).expect("help");
         let find = |m: &str| help.as_array().and_then(|a| a.iter().find(|x| x["method"] == m)).cloned().expect(m);
         assert_eq!(find("devices")["platforms"], json!(["android", "ios"]));
-        assert_eq!(find("status_bar")["platforms"], json!(["ios"]));
+        assert_eq!(find("appearance")["platforms"], json!(["ios"]));
         assert_eq!(find("tap")["platforms"], json!(["android", "ios"]));
         assert_eq!(find("fold")["platforms"], json!(["android", "ios"]));
         assert_eq!(find("xr")["platforms"], json!(["android"]));
@@ -1764,8 +1801,8 @@ pub(crate) mod tests {
         assert_eq!(call(&mut s, "screen", &json!({"device": "watch"})).expect("screen"), json!({"width": 454, "height": 454}));
         let info = call(&mut s, "info", &json!({"device": "fold"})).expect("info");
         assert_eq!(info["profile"]["fold"]["angle"], 180.0);
-        let err = call(&mut s, "status_bar", &json!({"device": "watch"})).expect_err("iOS-only");
-        assert_eq!(err, "`status_bar` isn't available on Android devices (it works on iOS)");
+        let err = call(&mut s, "appearance", &json!({"device": "watch"})).expect_err("iOS-only");
+        assert_eq!(err, "`appearance` isn't available on Android devices (it works on iOS)");
         let err = call(&mut s, "fold", &json!({"device": "watch", "posture": "closed"})).expect_err("not a foldable");
         assert!(err.starts_with("folding needs a device with Hinge; watch is Wear OS · Watch"), "{err}");
         assert_eq!(
@@ -3097,6 +3134,7 @@ pub(crate) mod tests {
 
     /// Methods the Android dispatcher serves that this test must not run, and why.
     const NOT_RUN_ON_ANDROID: &[(&str, &str)] = &[
+        ("erase", "refuses a running device, and reads no parameters"),
         ("boot", "starts or stops emulators: the fake's advertisement names this process"),
         ("boot_many", "starts emulators"),
         ("shutdown", "signals the advertised process, which is this one"),
