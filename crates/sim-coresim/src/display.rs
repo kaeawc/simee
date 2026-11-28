@@ -213,26 +213,27 @@ impl Display {
         self.read(frame).map(|(frame, _)| frame)
     }
 
-    /// The contents' [`hash_rows`] (of the BGRA rows, read in place: no copy) and the seed they
-    /// were read at, from one lock.
-    pub fn content_hash(&self) -> Result<(u32, u64)> {
-        self.read(|bgra, width, height, stride| hash_rows(bgra, width * 4, height, stride)).map(|(hash, seed)| (seed, hash))
+    /// The contents' [`hash_rows`] (of the BGRA rows, read in place: no copy) and the [`Stamp`] of
+    /// the surface they were read from (its seed is the lock's), from one fetch and one lock.
+    pub fn content_hash(&self) -> Result<(Stamp, u64)> {
+        self.read(|bgra, width, height, stride| hash_rows(bgra, width * 4, height, stride)).map(|(hash, stamp)| (stamp, hash))
     }
 
-    /// [`Display::capture`] with the seed the pixels were read at and their hash (as
-    /// [`Display::content_hash`] gives it), from one lock.
-    pub fn capture_hashed(&self) -> Result<(Frame, u32, u64)> {
+    /// [`Display::capture`] with the [`Stamp`] of the surface the pixels were read from and their
+    /// hash (as [`Display::content_hash`] gives it), from one fetch and one lock.
+    pub fn capture_hashed(&self) -> Result<(Frame, Stamp, u64)> {
         let both = |bgra: &[u8], width: usize, height: usize, stride: usize| {
             let hash = hash_rows(bgra, width * 4, height, stride)?;
             Some((Frame { width: width as u32, height: height as u32, rgba: bgra_to_rgba(bgra, width, height, stride)? }, hash))
         };
-        self.read(both).map(|((frame, hash), seed)| (frame, seed, hash))
+        self.read(both).map(|((frame, hash), stamp)| (frame, stamp, hash))
     }
 
     /// Runs `with` on the current surface's BGRA bytes (and its width, height and bytes per row)
-    /// while it is locked for reading, with the seed the lock reported. `None` from `with` means
-    /// the geometry is inconsistent.
-    fn read<R>(&self, with: impl FnOnce(&[u8], usize, usize, usize) -> Option<R>) -> Result<(R, u32)> {
+    /// while it is locked for reading, with the [`Stamp`] of that same surface (the seed the lock
+    /// reported, the ID and size read under it): one surface fetch makes the whole stamp. `None`
+    /// from `with` means the geometry is inconsistent.
+    fn read<R>(&self, with: impl FnOnce(&[u8], usize, usize, usize) -> Option<R>) -> Result<(R, Stamp)> {
         let surface = self.surface().ok_or_else(|| Error::NoDisplay("no framebuffer surface yet".into()))?;
         let s: *const AnyObject = &*surface;
         // SAFETY: `s` is a live IOSurface (retained by `surface`) for all calls below.
@@ -249,6 +250,8 @@ impl Display {
         let (width, height, stride, len, base) = unsafe {
             (IOSurfaceGetWidth(s), IOSurfaceGetHeight(s), IOSurfaceGetBytesPerRow(s), IOSurfaceGetAllocSize(s), IOSurfaceGetBaseAddress(s))
         };
+        // SAFETY: as above, the surface is still locked.
+        let id = unsafe { IOSurfaceGetID(s) };
         let result = if base.is_null() {
             None
         } else {
@@ -258,7 +261,8 @@ impl Display {
         };
         // SAFETY: balances the successful lock above.
         unsafe { IOSurfaceUnlock(s, LOCK_READ_ONLY, std::ptr::null_mut()) };
-        result.map(|r| (r, seed)).ok_or_else(|| Error::NoDisplay("framebuffer geometry is inconsistent".into()))
+        let stamp = Stamp { surface: id, seed, width: width as u32, height: height as u32 };
+        result.map(|r| (r, stamp)).ok_or_else(|| Error::NoDisplay("framebuffer geometry is inconsistent".into()))
     }
 }
 

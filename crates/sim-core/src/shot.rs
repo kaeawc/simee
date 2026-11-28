@@ -27,10 +27,12 @@ pub struct Stamp {
 pub trait Source {
     /// The surface's identity and seed now. Cheap: no pixels are read.
     fn stamp(&mut self) -> Result<Stamp, String>;
-    /// The contents' [`hash_rows`] and the seed they were read at (one lock).
-    fn hash(&mut self) -> Result<(u32, u64), String>;
-    /// The contents as a frame, with the seed they were read at and their [`hash_rows`] (one lock).
-    fn capture(&mut self) -> Result<(Frame, u32, u64), String>;
+    /// The contents' [`hash_rows`] and the [`Stamp`] of the surface they were read from: one
+    /// fetch of the surface, one lock, so the stamp describes exactly those pixels.
+    fn hash(&mut self) -> Result<(Stamp, u64), String>;
+    /// The contents as a frame, with the [`Stamp`] of the surface they were read from and their
+    /// [`hash_rows`] (one fetch, one lock).
+    fn capture(&mut self) -> Result<(Frame, Stamp, u64), String>;
 }
 
 /// An encoded screenshot.
@@ -93,16 +95,19 @@ impl<K: PartialEq + Clone> ShotCache<K> {
             } else {
                 // The seed moved: the picture may not have. The hash and its seed come from one
                 // read, so a later change moves the seed past the one kept here.
-                let (seed, hash) = source.hash()?;
-                if hash == kept.ticket.hash {
-                    kept.ticket.stamp.seed = seed;
+                // The surface read may not be the one stamped: it counts only if it is the kept one.
+                let (read, hash) = source.hash()?;
+                if same(&kept.ticket.stamp, &read) && hash == kept.ticket.hash {
+                    kept.ticket.stamp.seed = read.seed;
                     return Ok(Lookup::Hit(Shot { cached: true, ..kept.shot.clone() }));
                 }
             }
         }
-        // The seed is the one the pixels were read at: never newer than they are.
-        let (frame, seed, hash) = source.capture()?;
-        Ok(Lookup::Miss(frame, Ticket { key, stamp: Stamp { seed, ..stamp }, turns, hash }))
+        // The whole stamp is the surface the pixels were read from, not the one fetched above: a
+        // device that swapped its surface in between can't pair one's identity with the other's
+        // picture.
+        let (frame, stamp, hash) = source.capture()?;
+        Ok(Lookup::Miss(frame, Ticket { key, stamp, turns, hash }))
     }
 
     /// Keeps `bytes`, encoded from a missed lookup's frame, for its key (replacing what it had).
@@ -202,11 +207,21 @@ mod tests {
         frame: Frame,
         captures: u32,
         hashes: u32,
+        /// A surface the device switches to after the next `stamp`, before the next read.
+        swap: Option<(Stamp, Frame)>,
     }
 
     impl Fake {
         fn new() -> Self {
-            Self { stamp: Stamp { surface: 7, seed: 1, width: 2, height: 1 }, frame: frame(0), captures: 0, hashes: 0 }
+            Self { stamp: Stamp { surface: 7, seed: 1, width: 2, height: 1 }, frame: frame(0), captures: 0, hashes: 0, swap: None }
+        }
+
+        /// The surface a read gets: the one `stamp` reports, unless the device swaps it first.
+        fn read(&mut self) -> Stamp {
+            if let Some((stamp, frame)) = self.swap.take() {
+                (self.stamp, self.frame) = (stamp, frame);
+            }
+            self.stamp
         }
 
         /// The device renders a new picture.
@@ -228,13 +243,15 @@ mod tests {
         fn stamp(&mut self) -> Result<Stamp, String> {
             Ok(self.stamp)
         }
-        fn hash(&mut self) -> Result<(u32, u64), String> {
+        fn hash(&mut self) -> Result<(Stamp, u64), String> {
             self.hashes += 1;
-            Ok((self.stamp.seed, hash_of(&self.frame)))
+            let read = self.read();
+            Ok((read, hash_of(&self.frame)))
         }
-        fn capture(&mut self) -> Result<(Frame, u32, u64), String> {
+        fn capture(&mut self) -> Result<(Frame, Stamp, u64), String> {
             self.captures += 1;
-            Ok((self.frame.clone(), self.stamp.seed, hash_of(&self.frame)))
+            let read = self.read();
+            Ok((self.frame.clone(), read, hash_of(&self.frame)))
         }
     }
 
@@ -287,6 +304,36 @@ mod tests {
     }
 
     #[test]
+    fn a_surface_swapped_between_the_stamp_and_the_read_is_kept_as_the_surface_read() {
+        let (mut cache, mut d, encodes) = (ShotCache::default(), Fake::new(), Cell::new(0));
+        // The stamp says surface 7; by the time of the read the device shows surface 8 (seed 1 too).
+        d.swap = Some((Stamp { surface: 8, seed: 1, width: 2, height: 1 }, frame(9)));
+        let first = cache.get(MAIN, 0, &mut d, counting(&encodes)).expect("first");
+        assert_eq!(*first.bytes, encode_png(&frame(9)).expect("png"));
+        // A lookup on surface 8 at that seed is answered with surface 8's picture. Were the key
+        // surface 7's, it would be dropped (and re-encoded); were it 7's with 8's seed, a later
+        // surface 7 at seed 1 would be served surface 8's picture.
+        let again = cache.get(MAIN, 0, &mut d, counting(&encodes)).expect("again");
+        assert!(again.cached, "the kept image is keyed by the surface it was read from");
+        assert_eq!(encodes.get(), 1);
+        d.stamp.surface = 7;
+        assert!(!cache.get(MAIN, 0, &mut d, counting(&encodes)).expect("surface 7").cached, "another surface's seed is no proof");
+    }
+
+    #[test]
+    fn a_surface_swapped_before_the_hash_is_not_a_match_for_the_kept_image() {
+        let (mut cache, mut d, encodes) = (ShotCache::default(), Fake::new(), Cell::new(0));
+        cache.get(MAIN, 0, &mut d, counting(&encodes)).expect("first");
+        // The seed moves; before the hash is read the device swaps to surface 8 showing the same pixels.
+        d.stamp.seed += 1;
+        d.swap = Some((Stamp { surface: 8, seed: 5, width: 2, height: 1 }, frame(0)));
+        let after = cache.get(MAIN, 0, &mut d, counting(&encodes)).expect("after");
+        assert!(!after.cached, "equal pixels on another surface don't vouch for the kept image");
+        assert_eq!(encodes.get(), 2);
+        assert!(cache.get(MAIN, 0, &mut d, counting(&encodes)).expect("kept").cached);
+    }
+
+    #[test]
     fn a_rotation_drops_the_kept_image() {
         let (mut cache, mut d, encodes) = (ShotCache::default(), Fake::new(), Cell::new(0));
         cache.get(MAIN, 0, &mut d, counting(&encodes)).expect("before");
@@ -312,8 +359,9 @@ mod tests {
     }
 
     #[test]
-    fn a_reboot_starts_with_an_empty_cache() {
-        // The iOS worker keeps the cache with the displays it reuses for one boot.
+    fn a_cache_kept_in_a_reuse_is_dropped_with_the_boot() {
+        // A property of `Reuse`, which `ios::Screens` keeps its cache in (made in `Screens::open`,
+        // so a new boot starts empty). The wiring itself needs a device: reboot, then screenshot.
         let mut kept: Reuse<BootKey, Cell<ShotCache<(usize, &str)>>> = Reuse::default();
         let (mut d, encodes) = (Fake::new(), Cell::new(0));
         let shoot = |kept: &mut Reuse<_, Cell<ShotCache<_>>>, key: Option<BootKey>, d: &mut Fake| {

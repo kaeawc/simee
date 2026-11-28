@@ -25,6 +25,9 @@ pub trait Probe {
     fn wait(&mut self, at_most: Duration);
     /// The time now.
     fn now(&self) -> Instant;
+    /// Why the wait should end now, if it should: the call was cancelled, or the device went
+    /// away (its frozen surface would read as a still screen).
+    fn stop(&mut self) -> Option<String>;
 }
 
 /// A wait that ended on a still screen.
@@ -75,6 +78,9 @@ pub fn wait_idle(probe: &mut impl Probe, quiet: Duration, timeout: Duration, has
         // would end, unless a frame comes first.
         let until = if dirty { hashed_at + hash_every } else { still_since + quiet }.min(start + timeout);
         probe.wait(until.saturating_duration_since(now));
+        if let Some(why) = probe.stop() {
+            return Err(why);
+        }
         let at = probe.seed()?;
         if at != seed {
             (seed, moved_at, dirty, frames) = (at, probe.now(), true, frames + 1);
@@ -101,11 +107,13 @@ mod tests {
         at: Duration,
         events: Vec<(Duration, bool)>,
         seed_reads: u64,
+        /// The time (from the start) from which `stop` says why.
+        stop_at: Option<Duration>,
     }
 
     impl Fake {
         fn new(events: Vec<(Duration, bool)>) -> Self {
-            Self { start: Instant::now(), at: Duration::ZERO, events, seed_reads: 0 }
+            Self { start: Instant::now(), at: Duration::ZERO, events, seed_reads: 0, stop_at: None }
         }
 
         /// Frames every `every` from `from` until `until`, changing the picture or not.
@@ -132,6 +140,9 @@ mod tests {
         }
         fn now(&self) -> Instant {
             self.start + self.at
+        }
+        fn stop(&mut self) -> Option<String> {
+            self.stop_at.filter(|t| self.at >= *t).map(|_| "cancelled".to_owned())
         }
     }
 
@@ -186,6 +197,15 @@ mod tests {
         // A change at 250 ms, then seed-only ticks: still since 250 ms, not since the last tick.
         let mut fake = Fake::new(vec![(ms(250), true), (ms(260), false), (ms(270), false)]);
         let still = wait(&mut fake).expect("idle");
-        assert!(still.waited >= ms(250) + QUIET && still.waited <= ms(270) + QUIET, "{still:?}");
+        assert_eq!(still.waited, ms(250) + QUIET, "still since the change at 250 ms, not the last tick at 270 ms: {still:?}");
+    }
+
+    #[test]
+    fn a_cancelled_or_stopped_wait_ends_with_why_not_at_the_timeout() {
+        let mut fake = Fake::new(Fake::frames(ms(0), ms(10_000), FRAME, true));
+        fake.stop_at = Some(ms(100));
+        let e = wait(&mut fake).expect_err("stopped");
+        assert_eq!(e, "cancelled");
+        assert!(fake.now() - fake.start < ms(200), "stops at the first look after the signal, not at the timeout");
     }
 }

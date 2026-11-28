@@ -816,23 +816,29 @@ impl sim_core::shot::Source for Surfaced<'_> {
     fn stamp(&mut self) -> Result<sim_core::shot::Stamp, String> {
         self.0.stamp().map_err(err)
     }
-    fn hash(&mut self) -> Result<(u32, u64), String> {
+    fn hash(&mut self) -> Result<(sim_core::shot::Stamp, u64), String> {
         self.0.content_hash().map_err(err)
     }
-    fn capture(&mut self) -> Result<(sim_core::frame::Frame, u32, u64), String> {
+    fn capture(&mut self) -> Result<(sim_core::frame::Frame, sim_core::shot::Stamp, u64), String> {
         self.0.capture_hashed().map_err(err)
     }
 }
 
 /// `wait_idle`'s quiet period (`quiet_ms`, default 300), its limit (`timeout_ms`, default 10 s) and
 /// whether it answers with the still screen (`screenshot`, default false).
+///
 pub(crate) fn wait_idle_options(p: &Value) -> Result<(Duration, Duration, bool), String> {
-    Ok((
-        Duration::from_millis(opt_u64(p, "quiet_ms").unwrap_or(300)),
-        Duration::from_millis(opt_u64(p, "timeout_ms").unwrap_or(10_000)),
-        opt_bool(p, "screenshot")?.unwrap_or(false),
-    ))
+    let (quiet_ms, timeout_ms) = (opt_u64(p, "quiet_ms").unwrap_or(300), opt_u64(p, "timeout_ms").unwrap_or(10_000));
+    if timeout_ms < quiet_ms {
+        return Err(format!(
+            "timeout_ms ({timeout_ms}) is shorter than quiet_ms ({quiet_ms}): the screen can't be still for the quiet period within it"
+        ));
+    }
+    Ok((Duration::from_millis(quiet_ms), Duration::from_millis(timeout_ms), opt_bool(p, "screenshot")?.unwrap_or(false)))
 }
+
+/// The least time between two looks at the device's state while `wait_idle` waits.
+const DEVICE_CHECK: Duration = Duration::from_millis(100);
 
 /// How often `wait_idle` reads the seed of a display that has no frame callback.
 const IDLE_POLL: Duration = Duration::from_millis(16);
@@ -858,7 +864,7 @@ fn wait_idle(s: &mut Session, p: &Value) -> Result<Value, String> {
                 screens.pick(which)?.0
             }
         };
-        sim_core::idle::wait_idle(&mut Watched::new(display), quiet, timeout, sim_core::idle::HASH_EVERY)
+        sim_core::idle::wait_idle(&mut Watched::new(display, &device), quiet, timeout, sim_core::idle::HASH_EVERY)
     })?;
     let mut result = json!({"waited_ms": still.waited.as_millis() as u64, "frames": still.frames});
     if with_shot && let Value::Object(shot) = screenshot(s, p)? {
@@ -871,12 +877,14 @@ fn wait_idle(s: &mut Session, p: &Value) -> Result<Value, String> {
 /// polled every [`IDLE_POLL`].
 struct Watched<'a> {
     display: &'a Display,
+    device: &'a Device,
+    checked_at: Option<Instant>,
     presented: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     watch: Option<sim_coresim::FrameWatch>,
 }
 
 impl<'a> Watched<'a> {
-    fn new(display: &'a Display) -> Self {
+    fn new(display: &'a Display, device: &'a Device) -> Self {
         let presented = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let posted = presented.clone();
         let watch = display
@@ -885,7 +893,7 @@ impl<'a> Watched<'a> {
                 posted.1.notify_all();
             })
             .ok();
-        Self { display, presented, watch }
+        Self { display, device, checked_at: None, presented, watch }
     }
 }
 
@@ -894,7 +902,7 @@ impl sim_core::idle::Probe for Watched<'_> {
         sim_coresim::autoreleasepool(|| self.display.stamp()).map(|s| s.seed).map_err(err)
     }
     fn hash(&mut self) -> Result<(u32, u64), String> {
-        sim_coresim::autoreleasepool(|| self.display.content_hash()).map_err(err)
+        sim_coresim::autoreleasepool(|| self.display.content_hash()).map(|(stamp, hash)| (stamp.seed, hash)).map_err(err)
     }
     fn wait(&mut self, at_most: Duration) {
         if self.watch.is_none() {
@@ -907,6 +915,19 @@ impl sim_core::idle::Probe for Watched<'_> {
     }
     fn now(&self) -> Instant {
         Instant::now()
+    }
+    fn stop(&mut self) -> Option<String> {
+        if crate::call_cancelled() {
+            return Some("cancelled: wait_idle was cancelled".to_owned());
+        }
+        // A device that shuts down freezes its surface, which would read as a still screen: look at
+        // its state, at most every `DEVICE_CHECK`.
+        let now = Instant::now();
+        if self.checked_at.is_some_and(|at| now.duration_since(at) < DEVICE_CHECK) {
+            return None;
+        }
+        self.checked_at = Some(now);
+        (self.device.state() != DeviceState::Booted).then(|| format!("{} stopped being booted during wait_idle", self.device.info().name))
     }
 }
 
@@ -2701,6 +2722,15 @@ fn read_log(reader: Box<dyn std::io::Read + Send>, tail: &SharedTail, clock: &dy
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    #[test]
+    fn a_wait_idle_timeout_under_its_quiet_period_is_refused_up_front() {
+        let e = super::wait_idle_options(&serde_json::json!({"quiet_ms": 300, "timeout_ms": 100})).expect_err("refused");
+        assert!(e.contains("timeout_ms") && e.contains("quiet_ms"), "{e}");
+        // Neighbours: equal is fine, and so are the defaults.
+        assert!(super::wait_idle_options(&serde_json::json!({"quiet_ms": 300, "timeout_ms": 300})).is_ok());
+        assert!(super::wait_idle_options(&serde_json::json!({})).is_ok());
+    }
 
     #[test]
     fn keys_go_a_gap_apart_and_twenty_characters_type_in_under_a_fifth_of_a_second() {
