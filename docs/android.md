@@ -473,8 +473,12 @@ so far, and what it doesn't:
   `slirp4netns` (`--disable-host-loopback`; the forward is added through its API socket), then,
   for root, a veth pair (a /30 per container from the first of 10.233.0.0/16, 10.234.0.0/16,
   10.235.0.0/16, 172.29.0.0/16 and 192.168.233.0/24 that the host has no route into, read from
-  `/proc/net/route`: not Tailscale's 100.64.0.0/10, behind which a tailnet peer could be hidden;
-  refused with the list when every candidate is routed; a proxy thread on the loopback port). Root prefers pasta to the veth pair because it gives the guest an uplink without changing
+  `/proc/net/route` and from every policy-routing table (`ip -4 route show table all`, and the
+  ranges `ip -4 rule` selects on), so Tailscale's table 52 counts: not Tailscale's 100.64.0.0/10,
+  behind which a tailnet peer could be hidden. Each /30 is held in a file under `/run/simee/veth`
+  while its plan or container lives, claimed under a host-wide `flock`, so containers planned at
+  once never share a subnet; a claim whose process is gone is taken over. Refused with the list
+  when every candidate is routed or held; a proxy thread on the loopback port). Root prefers pasta to the veth pair because it gives the guest an uplink without changing
   the host's routing or firewall. The veth pair has no uplink (the guest reaches the host's end of
   the pair and nothing further; services the host binds on all addresses are reachable from it
   there). Authentication: `AdbAuth::Keys` sets `ro.adb.secure=1` as an init argument and writes the

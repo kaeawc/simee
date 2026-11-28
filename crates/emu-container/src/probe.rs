@@ -28,6 +28,15 @@ pub trait HostView {
     /// The device names a binderfs mount holds once mounted (in a throwaway user namespace, so no
     /// privilege is needed): `binder-control` is not one. `None` when that couldn't be tried.
     fn binderfs_devices(&self) -> Option<Vec<String>>;
+    /// The standard output of `ip <args>` (iproute2); `None` when it isn't installed or fails.
+    fn ip(&self, _args: &[&str]) -> Option<String> {
+        None
+    }
+    /// The directory veth address reservations live in ([`crate::net::Reservations`]): one for
+    /// the whole host, so every launcher on it sees every other's claims.
+    fn reservations_dir(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from("/run/simee/veth")
+    }
 }
 
 /// One thing a container needs from the host.
@@ -527,6 +536,11 @@ impl HostView for FsView {
         std::env::consts::ARCH.to_string()
     }
 
+    fn ip(&self, args: &[&str]) -> Option<String> {
+        let out = std::process::Command::new("ip").args(args).stdin(std::process::Stdio::null()).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
     /// Mounts binderfs in a throwaway user namespace (`unshare`) and lists it.
     fn binderfs_devices(&self) -> Option<Vec<String>> {
         let dir = std::env::temp_dir().join(format!("simee-binderfs-probe-{}", std::process::id()));
@@ -568,6 +582,10 @@ pub(crate) mod fake {
         pub arch: String,
         /// What a test mount of binderfs holds; `None` is "couldn't be tried".
         pub binderfs: Option<Vec<String>>,
+        /// Canned `ip` output, keyed by its arguments joined with spaces.
+        pub ip_outputs: BTreeMap<String, String>,
+        /// Where reservations go; a per-process temp directory when unset.
+        pub reservations: Option<std::path::PathBuf>,
     }
 
     impl FakeView {
@@ -581,6 +599,10 @@ pub(crate) mod fake {
         }
         pub fn tool(mut self, name: &str) -> Self {
             self.tools.insert(name.into());
+            self
+        }
+        pub fn ip_output(mut self, args: &str, body: &str) -> Self {
+            self.ip_outputs.insert(args.into(), body.into());
             self
         }
         pub fn euid(mut self, euid: u32) -> Self {
@@ -634,6 +656,12 @@ pub(crate) mod fake {
         }
         fn on_path(&self, name: &str) -> bool {
             self.tools.contains(name)
+        }
+        fn ip(&self, args: &[&str]) -> Option<String> {
+            self.ip_outputs.get(&args.join(" ")).cloned()
+        }
+        fn reservations_dir(&self) -> std::path::PathBuf {
+            self.reservations.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("simee-fake-veth-{}", std::process::id())))
         }
         fn memfd_create(&self) -> bool {
             self.memfd
