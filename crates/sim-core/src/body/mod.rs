@@ -366,6 +366,18 @@ impl Body {
     }
 }
 
+/// Whether the generic body of a form factor is drawn at the dpi simee reports (`SIZES_BY_DPI` of
+/// its module); the shared reference-body test consults it.
+pub(super) fn sizes_by_dpi(form_factor: FormFactor) -> bool {
+    match form_factor {
+        FormFactor::Phone | FormFactor::Tablet | FormFactor::Foldable => true,
+        FormFactor::Watch => watch::SIZES_BY_DPI,
+        FormFactor::Tv => tv::SIZES_BY_DPI,
+        FormFactor::Auto => car::SIZES_BY_DPI,
+        FormFactor::Vision => headset::SIZES_BY_DPI,
+    }
+}
+
 /// Whether a form factor has a body: phones, tablets and foldables always; each other form factor
 /// once its module says so (watches do; TVs, car head units and headsets don't yet).
 pub fn has_body(form_factor: FormFactor) -> bool {
@@ -403,7 +415,7 @@ pub fn for_apple_type(info: &DeviceTypeInfo) -> Option<Arc<Body>> {
     let form_factor = info.form_factor.filter(|f| has_body(*f))?;
     let density = Density::Scale(info.screen_scale.round().max(1.0) as u32);
     let shape = table::reference_shape(Platform::Ios, form_factor);
-    generic(Platform::Ios, form_factor, px, density, shape, None, table::HingeSpec::default())
+    generic(Platform::Ios, form_factor, px, density, shape, None, table::HingeSpec::default(), "")
 }
 
 /// The body for an Android virtual device: the table's row for its hardware definition
@@ -415,10 +427,17 @@ pub fn for_android(device_name: &str, profile: &Profile) -> Option<Arc<Body>> {
 /// [`for_android`] with the AVD's own hinge (`fold::Hinge::from_config` on its `config.ini`): a
 /// foldable the table doesn't list folds the way that hinge says.
 pub fn for_android_hinge(device_name: &str, profile: &Profile, hinge: Option<&Hinge>) -> Option<Arc<Body>> {
+    for_android_image(device_name, profile, hinge, "")
+}
+
+/// [`for_android_hinge`] for a device booting the system image tagged `image_tag` (`ai-glasses`,
+/// `google_apis`, ...): the tag reaches a form factor's module as `Spec::image_tag`, and a
+/// TV, head unit or headset body is keyed by it (a phone, tablet, foldable or watch ignores it).
+pub fn for_android_image(device_name: &str, profile: &Profile, hinge: Option<&Hinge>, image_tag: &str) -> Option<Arc<Body>> {
     let known = get(device_name).filter(|b| {
         b.platform == Platform::Android && b.form_factor == profile.kind.form_factor && b.shows((profile.width, profile.height))
     });
-    known.or_else(|| for_profile_hinge(profile, hinge))
+    known.or_else(|| generic_for(profile, hinge, image_tag))
 }
 
 /// A generic body for a profile's screen (its density, shape and fold), cached by its key; the
@@ -434,11 +453,25 @@ pub fn for_profile(profile: &Profile) -> Option<Arc<Body>> {
 /// profile that isn't a foldable ignores it, and `None` is a vertical hinge over 0-180° with one
 /// flexible screen.
 pub fn for_profile_hinge(profile: &Profile, hinge: Option<&Hinge>) -> Option<Arc<Body>> {
-    let folded = profile.fold.map(|f| (f.folded_width, f.folded_height));
-    let hinge = hinge.map(table::HingeSpec::from_hinge).unwrap_or_default();
-    generic(profile.kind.platform, profile.kind.form_factor, (profile.width, profile.height), profile.density, profile.shape, folded, hinge)
+    generic_for(profile, hinge, "")
 }
 
+fn generic_for(profile: &Profile, hinge: Option<&Hinge>, image_tag: &str) -> Option<Arc<Body>> {
+    let folded = profile.fold.map(|f| (f.folded_width, f.folded_height));
+    let hinge = hinge.map(table::HingeSpec::from_hinge).unwrap_or_default();
+    generic(
+        profile.kind.platform,
+        profile.kind.form_factor,
+        (profile.width, profile.height),
+        profile.density,
+        profile.shape,
+        folded,
+        hinge,
+        image_tag,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn generic(
     platform: Platform,
     form_factor: FormFactor,
@@ -447,12 +480,18 @@ fn generic(
     shape: Shape,
     folded: Option<(u32, u32)>,
     hinge: table::HingeSpec,
+    image_tag: &str,
 ) -> Option<Arc<Body>> {
     if !has_body(form_factor) || px.0 == 0 || px.1 == 0 {
         return None;
     }
     let hinge = if form_factor == FormFactor::Foldable { hinge } else { table::HingeSpec::default() };
-    let id = table::generic_id(platform, form_factor, px, density, shape, folded, hinge);
+    let mut id = table::generic_id(platform, form_factor, px, density, shape, folded, hinge);
+    // Only the modules that read the tag key their bodies by it; the rest stay one body per screen.
+    let image_tag = if matches!(form_factor, FormFactor::Tv | FormFactor::Auto | FormFactor::Vision) { image_tag } else { "" };
+    if !image_tag.is_empty() {
+        id = format!("{id}@{image_tag}");
+    }
     if let Some(b) = get(&id) {
         return Some(b);
     }
@@ -461,7 +500,7 @@ fn generic(
     if let Some(b) = map.get(&id) {
         return Some(Arc::clone(b));
     }
-    let body = Arc::new(table::generic(&id, platform, form_factor, px, density, shape, folded, hinge)?);
+    let body = Arc::new(table::generic(&id, platform, form_factor, px, density, shape, folded, hinge, image_tag)?);
     map.insert(id, Arc::clone(&body));
     Some(body)
 }

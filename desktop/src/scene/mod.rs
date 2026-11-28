@@ -376,7 +376,7 @@ pub fn body_for(s: &State) -> Option<Arc<Body>> {
             // An unlisted foldable folds the way its AVD's hinge says (a flip, its angles).
             let config = device.and_then(|a| a.avd.as_ref());
             let hinge = config.and_then(|c| sim_core::fold::Hinge::from_config(|k| c.get(k).map(str::to_owned)));
-            body::for_android_hinge(&d.device_type_id, &profile, hinge.as_ref())
+            body::for_android_image(&d.device_type_id, &profile, hinge.as_ref(), tag)
         }
     }
 }
