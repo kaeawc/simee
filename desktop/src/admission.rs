@@ -623,21 +623,20 @@ mod tests {
         let woken = std::sync::Arc::new(AtomicUsize::new(0));
         let w = woken.clone();
         g.connect(std::sync::Arc::new(move || {
-            w.fetch_add(1, Ordering::Relaxed);
+            w.fetch_add(1, Ordering::Release);
         }));
         assert_eq!(g.ask(pixels(1)), None, "in flight");
         assert!(g.busy());
         assert_eq!(g.ask(pixels(2)), None, "a second request while one waits is dropped");
+        // The thread publishes the result, then wakes the window: so a wake means the result has
+        // landed, but the result can be taken before the wake arrives. Wait for the wake.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let d = loop {
-            if let Some(d) = g.take() {
-                break d;
-            }
-            assert!(std::time::Instant::now() < deadline, "the check lands");
+        while woken.load(Ordering::Acquire) == 0 {
+            assert!(std::time::Instant::now() < deadline, "the window is woken");
             std::thread::yield_now();
-        };
+        }
+        let d = g.take().expect("a wake follows the result, so it has landed");
         assert_eq!(sheet(d).request, pixels(1));
-        assert!(woken.load(Ordering::Relaxed) >= 1, "the window is woken");
         assert!(!g.busy());
     }
 

@@ -75,8 +75,13 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         "hold_ms" | "duration_ms" | "timeout_s" | "settle_timeout_s" | "concurrency" | "first_port" | "usage" | "pid" | "signal"
         | "ticks" | "pressure" | "level" | "wifi_bars" | "cellular_bars" | "battery_level" | "state" | "port_base" | "port_count"
         | "settle_ms" => Int,
+        // wait_idle (#114)
+        "quiet_ms" | "timeout_ms" => Int,
+        "screenshot" => Bool,
         "booted" | "on" | "suppressed" | "undo" | "shaped" | "settle" | "settle_foreground" | "audio" | "mute" | "sizes" | "offline"
         | "proxy" | "face" | "foreground" | "eraser" | "folded" | "restart" | "stream" | "all" | "allow_mismatch" | "fresh" => Bool,
+        // The Android file methods' opt-ins: `adb root` and `pm clear`.
+        "root" | "pm_clear" => Bool,
         "env" => StrMap,
         "payload" | "region" => Obj,
         "rules" => Objects,
@@ -438,8 +443,9 @@ mod tests {
         assert_eq!(rotary["properties"]["delta"]["description"], "Digital Crown units; iOS; give one of `ticks`, `delta`");
         assert_eq!(one_of("fold"), [["folded", "angle", "posture"]]);
         assert_eq!(one_of("console"), [["command", "commands"]]);
+        assert_eq!(one_of("write"), [["text", "base64"]]);
         // `text? | base64?` are both optional, and a lone name or a quoted word is no group.
-        assert!(one_of("write").is_empty() && one_of("audio_route").is_empty() && one_of("tap").is_empty());
+        assert!(parse("device, text? | base64?").1.is_empty() && one_of("audio_route").is_empty() && one_of("tap").is_empty());
     }
 
     #[test]
@@ -494,6 +500,8 @@ mod tests {
             (Platform::Android, "boot") => text(crate::android::boot_options(p)),
             (Platform::Android, "boot_many") => text(crate::android::boot_many_options(p)),
             (Platform::Android, "import") => text(crate::android::import_allows_mismatch(p)),
+            // Android's `settle` reads what iOS's does.
+            (Platform::Android, "settle") => text(crate::settle::options(p)),
             // It needs a platform to read the rest.
             (_, "admission_check") => text(crate::methods::check_params(&{
                 let mut p = p.clone();
@@ -510,6 +518,8 @@ mod tests {
             (Platform::Ios, "settle") => text(crate::ios::settle_options(p)),
             #[cfg(target_os = "macos")]
             (Platform::Ios, "logs") => text(crate::ios::log_options(p)),
+            #[cfg(target_os = "macos")]
+            (Platform::Ios, "wait_idle") => text(crate::ios::wait_idle_options(p)),
             #[cfg(target_os = "macos")]
             (Platform::Ios, "mem_leaks" | "mem_heap" | "mem_vmmap" | "mem_history") => text(Ok(crate::ios::mem_deadline(p))),
             _ => None,

@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use sim_core::device::{DeviceInfo, DeviceState, RuntimeInfo, Selection, select};
+use sim_core::device::{DeviceInfo, DeviceState, DeviceTypeInfo, RuntimeInfo, Selection, select};
 use sim_core::form_factor::{FormFactor, Kind, matrix};
 use sim_core::platform::Platform;
 use sim_host::Verdict;
@@ -50,7 +50,13 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "List devices with their platform, form factor and sub-platform",
     ),
     ("runtimes", "platform?; iOS: set?", "List installed runtimes (Android: system images)"),
-    ("device_types", "set?", "List device types"),
+    (
+        "device_types",
+        "platform?; iOS: set?",
+        "List device types. Android: the hardware a new AVD follows (phone and tablet, the foldables pixel_fold and surface_duo, \
+         and the SDK definitions for Wear OS, TV, Automotive and Android XR's headset and glasses), each with its screen, the scale \
+         its dpi over 160; `create` takes its form factor, and a foldable's identifier as `device`",
+    ),
     (
         "create",
         "name, platform?(ios|android), form_factor?, admission?(ignore|refuse); iOS: device_type, runtime, set?; Android: system_image, device?(pixel_fold|surface_duo)",
@@ -98,15 +104,20 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "settle",
-        "device, cpu_pct?, window_s?, foreground?(true), timeout_s?(600), set?",
-        "Wait until a booted simulator is quiet: its processes under cpu_pct (10) % of a core for window_s (10) s (foreground, the default: \
-         only foreground-QoS CPU counts), SpringBoard running; returns settle_s, cpu_pct, foreground_cpu_pct and background_cpu_pct, and cpu_s and background_cpu_s (CPU-seconds used since the first sample)",
+        "device, cpu_pct?, window_s?, foreground?(true), timeout_s?(600); iOS: set?",
+        "Wait until a booted device is quiet: its processes under cpu_pct (10) % of a core for window_s (10) s (foreground, the default: \
+         only foreground-QoS CPU counts), SpringBoard running; returns settle_s, cpu_pct, foreground_cpu_pct and background_cpu_pct, and cpu_s and background_cpu_s (CPU-seconds used since the first sample). \
+         Android: the guest's processes and kernel threads from /proc over adb, once a second on the guest's clock (the probe's own \
+         shell left out), all of it foreground (no QoS split: background_cpu_pct is 0), with sys.boot_completed and system_server \
+         running in place of SpringBoard",
     ),
     (
         "profile",
-        "device, name(slim), undo?, set?",
-        "Turn a named set of daemons off on a booted simulator (disabled in its launchd database and stopped: stays off across reboots), \
-         or with undo back on (from the next boot); returns how many changed, those that failed and those that weren't loaded",
+        "device, name(slim), undo?; iOS: set?",
+        "Turn a named set of daemons off on a booted device (iOS: disabled in its launchd database and stopped; Android: packages \
+         disabled for user 0, `pm disable-user`; both stay off across reboots), or with undo back on (iOS: from the next boot; \
+         Android: at once); returns how many changed, those that failed and those that weren't loaded (Android: not on this image). \
+         Android's slim: Device Health Services, Digital Wellbeing, Data Restore Tool and Google Partner Setup (savings not yet measured)",
     ),
     (
         "clone",
@@ -146,6 +157,14 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "device, path?, display?(main|outer|inner|carplay); iOS: set?",
         "PNG to path, else base64 in `png` (a folded Android foldable: its outer screen as the scanout shows it, a Pixel Fold's 949x1840; \
          an iPhone Duo's inner screen as its framebuffer holds it, 2007x2853)",
+    ),
+    (
+        "wait_idle",
+        "device, quiet_ms?(300), timeout_ms?(10000), screenshot?(false), path?, display?(main|outer|inner|carplay), set?",
+        "Wait until the screen is still: no frame has changed it for quiet_ms, at most timeout_ms (fails if it kept changing). \
+         Follows the display's frame callback and surface seed, reading no pixels while nothing is presented; where the seed \
+         ticks on a still screen (iOS 26.5, 10 times a second) a content hash decides. Returns waited_ms and frames (seed \
+         changes seen), and with screenshot the still screen as screenshot returns it (path, else base64 in `png`)",
     ),
     (
         "stream_start",
@@ -274,8 +293,20 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          zygote64, system_server, surfaceflinger, servicemanager, hwservicemanager, vndservicemanager, vold, lmkd, logd, adbd, netd, \
          installd, ueventd, keystore2 and statsd are refused unless force",
     ),
-    ("connections", "device, set?", "Open sockets of device processes"),
-    ("traffic", "device, set?", "Bytes in/out per device process"),
+    (
+        "connections",
+        "device; iOS: set?",
+        "Open sockets of device processes (Android: the guest kernel's /proc/net/tcp, tcp6, udp and udp6, matched to processes by \
+         the socket inodes in /proc/<pid>/fd, as root where the image has su; each row has the socket's uid, and pid is null for \
+         one no process could be matched to, as another user's is without root)",
+    ),
+    (
+        "traffic",
+        "device; iOS: set?",
+        "Bytes in/out per device process (Android: per app uid since boot, from the kernel's eBPF mAppUidStatsMap as dumpsys \
+         prints it, or /proc/net/xt_qtaguid/stats on Android 9 and older; each row has the uid, and pid is the app's own \
+         process, null when it isn't running or the uid is shared)",
+    ),
     // Memory tools on one app (#183): the host's leaks, heap, vmmap and malloc_history on its pid.
     (
         "mem_leaks",
@@ -304,13 +335,27 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          needs the app launched with malloc_stack_logging (MallocStackLogging=1 logs live allocations only). raw adds \
          the report as printed",
     ),
-    ("containers", "device, sizes?, set?", "App data and bundle containers"),
-    ("ls", "device, path?, set?", "List a directory under the device data dir"),
-    ("read", "device, path, set?", "Read a file (base64)"),
-    ("write", "device, path, text? | base64?, set?", "Write a file"),
-    ("rm", "device, path, set?", "Remove a file or directory"),
-    ("du", "device, path?, set?", "Size in bytes"),
-    ("clear_container", "device, path, set?", "Empty a container (an app's data) without deleting it"),
+    (
+        "containers",
+        "device, sizes?; iOS: set?; Android: root?",
+        "App data and bundle containers. Android: each third-party app's data dir (`data/user/0/<package>`) and APK dir; the \
+         file methods take paths in one app's container (`data/data/<package>`, `data/user/<n>/<package>`, \
+         `sdcard/Android/data/<package>`, the APK dir read only) and reach it through run-as for a debuggable app, otherwise \
+         as root when adbd is root or `su 0` works. None of them runs `adb root` unless given root: true, since it restarts \
+         adbd and drops the device's adb forwards and open shells",
+    ),
+    ("ls", "device, path?; iOS: set?; Android: root?", "List a directory under the device data dir (Android: in an app's container)"),
+    ("read", "device, path; iOS: set?; Android: root?", "Read a file (base64; Android: at most 128 MiB)"),
+    ("write", "device, path, text | base64; iOS: set?; Android: root?", "Write a file"),
+    ("rm", "device, path; iOS: set?; Android: root?", "Remove a file or directory"),
+    ("du", "device, path?; iOS: set?; Android: root?", "Size in bytes (Android: of a path in an app's container)"),
+    (
+        "clear_container",
+        "device, path; iOS: set?; Android: root?, pm_clear?",
+        "Empty a container (an app's data) without deleting it (Android: or a directory in one. pm_clear: true clears an app's \
+         whole data dir with `pm clear --user <n>` instead, which reaches a release app without root but also stops the app, \
+         wipes its external dir and resets its runtime permissions)",
+    ),
     ("defaults_read", "device, domain, set?", "Read a preferences domain"),
     ("defaults_write", "device, domain, key, value, type?, set?", "Write a preference (type: string|int|float|bool)"),
     (
@@ -355,12 +400,30 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("info", "device; iOS: set?", "Paths and identity"),
     (
         "network_shape",
-        "device, preset?(offline|3g|edge|lte|lossy|very-bad|none), offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?, port_base?, port_count?, rules?([{pattern, offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?}]), proxy?(default true), inject?(false|true|\"launchd\"|\"boot\"), set?",
-        "Shape the device's network without root. proxy: a shaping HTTP/SOCKS proxy set in the device's configd_sim. inject: an in-process socket shaper; \"boot\" reboots the device with it in launchd's environment so every process, WebKit included, is shaped live by the profile",
+        "device, preset?(offline|3g|edge|lte|lossy|very-bad|none), offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?; iOS: port_base?, port_count?, rules?([{pattern, offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?}]), proxy?(default true), inject?(false|true|\"launchd\"|\"boot\"), set?",
+        "Shape the device's network without root. proxy: a shaping HTTP/SOCKS proxy set in the device's configd_sim. inject: an in-process socket shaper; \"boot\" reboots the device with it in launchd's environment so every process, WebKit included, is shaped live by the profile. \
+         Android: the emulator's NAT through its console (`network speed <up>:<down>` kbit/s, `network delay <ms>`, and simee's `network loss <pct>`; what isn't given keeps the device's value, and only what changes is sent) and offline as airplane mode (`cmd connectivity airplane-mode`), returning the commands sent; \
+         loss_pct means different things per platform: on iOS the percent of new connections that time out, on Android the percent of the guest's TCP, UDP and ICMP packets dropped in each direction. On Android it (so lossy and very-bad) is refused on the stock emulator, whose console has no loss command, and rules, port ranges, proxy and inject are refused on Android",
     ),
-    ("network_state", "device, set?", "Current profile, proxy port and injection state"),
-    ("network_flows", "device, set?", "Connections through the device's shaping proxy (host, bytes, duration, outcome)"),
-    ("network_clear", "device, set?", "Remove shaping: clear the device proxy, stop the proxy, remove injection"),
+    (
+        "network_state",
+        "device; iOS: set?",
+        "Current profile, proxy port and injection state (Android: the console's `network status`, as network_status, and airplane \
+         mode as offline; a latency range set from the console reads as its mean, as does a loss that differs each way; proxy_port \
+         null, injected false)",
+    ),
+    (
+        "network_flows",
+        "device, set?",
+        "Connections through the device's shaping proxy: host, bytes, duration, outcome (not on Android: the emulator's NAT keeps \
+         only its live flows, with no history or byte counts per flow; connections lists the open sockets)",
+    ),
+    (
+        "network_clear",
+        "device; iOS: set?",
+        "Remove shaping: clear the device proxy, stop the proxy, remove injection (Android: `network speed full`, `network delay none`, \
+         `network loss none` under simee's emu, and airplane mode off)",
+    ),
     ("audio_state", "device, set?", "Device audio settings (routed host UIDs, volume) and every host audio device"),
     ("audio_volume", "device, level(0-100), set?", "Device output volume (100 = unity); applies to audio clients started afterwards"),
     (
@@ -408,7 +471,12 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          restores the saved link), unsaved (linked from the console only), off, source missing (the host no longer lists the camera: \
          the device shows the test card until it is back) or permission missing, with the fix",
     ),
-    ("network_env", "device, set?", "Environment that makes one app launch shaped (for simctl: prefix each key with SIMCTL_CHILD_)"),
+    (
+        "network_env",
+        "device, set?",
+        "Environment that makes one app launch shaped; for simctl, prefix each key with SIMCTL_CHILD_ (not on Android: an app starts \
+         from an intent with zygote's environment, and the emulator's NAT shapes the whole device, not one app)",
+    ),
     (
         "console",
         "device, command | commands",
@@ -541,6 +609,16 @@ const ALL_PLATFORMS: &[&str] = &[
     "processes",
     "kill",
     "exec",
+    // Over the emulator's console and adb on Android (#416).
+    "connections",
+    "traffic",
+    "network_shape",
+    "network_state",
+    "network_clear",
+    // Android: the guest's /proc and package manager over adb; emu's hardware definitions (#420).
+    "settle",
+    "profile",
+    "device_types",
     "location",
     "info",
     "rotate",
@@ -553,6 +631,14 @@ const ALL_PLATFORMS: &[&str] = &[
     "prefs_delete",
     "prefs_batch",
     "prefs_watch",
+    // App files: Android through run-as or root (`android_files.rs`).
+    "containers",
+    "ls",
+    "read",
+    "write",
+    "rm",
+    "du",
+    "clear_container",
     // Needs no device: the host's camera sources.
     "camera_sources",
     // Camera links: Android through emu, iOS through the device-wide camera shim.
@@ -1447,7 +1533,15 @@ fn dispatch(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             }
         }
         // Need no device: resolving the default `booted` would fail with two simulators booted.
-        "device_types" | "audio_capture_stop" => crate::ios::call(&mut s.ios, method, p),
+        "device_types" => {
+            let platform = opt_platform(p)?;
+            let mut list: Vec<DeviceTypeInfo> = if platform == Some(Platform::Android) { Vec::new() } else { ios_list(s, method)? };
+            if platform != Some(Platform::Ios) {
+                list.extend(sim_android::device_types());
+            }
+            serde_json::to_value(list).map_err(|e| e.to_string())
+        }
+        "audio_capture_stop" => crate::ios::call(&mut s.ios, method, p),
         // Streams outlive the call: the process's own registry, which resolves `device` itself.
         m if crate::stream::is_method(m) => crate::stream::call(s, m, p),
         // Makes a device from a bundle; the bundle's manifest says whose.
@@ -1876,24 +1970,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn boot_many_and_clone_work_on_both_platforms_and_settle_on_ios() {
+    fn boot_many_clone_settle_and_profile_work_on_both_platforms() {
         let (mut s, root) = android_session("boot-many");
         let mobile = "system-images;android-36;google_apis;arm64-v8a";
         call(&mut s, "create", &json!({"platform": "android", "name": "pixel", "system_image": mobile})).expect("pixel");
         // A listing resolves no device (it resolved the default `booted`, which fails with two booted).
         assert!(call(&mut s, "device_types", &Value::Null).is_ok_and(|t| t.is_array()));
+        // Android's hardware is listed with or without a platform; asked for iOS, none.
+        let android = call(&mut s, "device_types", &json!({"platform": "android"})).expect("android types");
+        assert!(android.as_array().is_some_and(|a| !a.is_empty() && a.iter().all(|t| t["platform"] == "android")), "{android}");
+        let ios = call(&mut s, "device_types", &json!({"platform": "ios"})).expect("ios types");
+        assert!(ios.as_array().is_some_and(|a| a.iter().all(|t| t["platform"] == "ios")), "{ios}");
         let help = call(&mut s, "help", &Value::Null).expect("help");
         let row = |m: &str| help.as_array().and_then(|a| a.iter().find(|x| x["method"] == m)).cloned().expect(m);
-        for m in ["boot_many", "clone"] {
+        for m in ["boot_many", "clone", "settle", "profile", "device_types"] {
             assert_eq!(row(m)["platforms"], json!(["android", "ios"]), "{m}");
         }
-        for m in ["settle", "profile"] {
-            assert_eq!(row(m)["platforms"], json!(["ios"]), "{m}");
-        }
-        let err = call(&mut s, "settle", &json!({"device": "pixel"})).expect_err("iOS-only");
-        assert_eq!(err, "`settle` isn't available on Android devices (it works on iOS)");
-        let err = call(&mut s, "profile", &json!({"device": "pixel", "name": "slim"})).expect_err("iOS-only");
-        assert_eq!(err, "`profile` isn't available on Android devices (it works on iOS)");
+        // Both need a running device.
+        let err = call(&mut s, "settle", &json!({"device": "pixel"})).expect_err("not booted");
+        assert_eq!(err, "pixel isn't booted");
+        let err = call(&mut s, "profile", &json!({"device": "pixel", "name": "slim"})).expect_err("not booted");
+        assert_eq!(err, "pixel isn't booted");
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -1908,8 +2005,14 @@ pub(crate) mod tests {
             p
         };
         for (extra, want) in [
-            (json!({"settle": true}), "`boot_many` takes `settle` for iOS devices only (a settle wait reads a simulator's process tree"),
-            (json!({"profile": "slim"}), "`boot_many` takes `profile` for iOS devices only"),
+            (
+                json!({"settle": true}),
+                "`boot_many` takes `settle` for iOS devices only (an Android boot waits for sys.boot_completed; call `settle` after it",
+            ),
+            (
+                json!({"profile": "slim"}),
+                "`boot_many` takes `profile` for iOS devices only (on Android, call `profile` on the booted device)",
+            ),
             (json!({"env": {"A": "1"}}), "`boot_many` takes `env` for iOS devices only"),
             (json!({"concurrency": 0}), "concurrency must be at least 1"),
             (json!({"first_port": 80}), "first_port must be a console port from 5554 to 5682"),
@@ -1970,6 +2073,7 @@ pub(crate) mod tests {
             memory_available_bytes: None,
             memory_free_pct: Some(59.0),
             now: decide(&reading, &Thresholds::default()),
+            basis: None,
         }
     }
 
@@ -2972,6 +3076,8 @@ pub(crate) mod tests {
         ("delete", "refuses a running device before it reads parameters"),
         ("create", "its required parameters depend on `platform`, and it creates a device"),
         ("clone", "creates a device from a golden that has booted"),
+        ("ls", "without a path it lists the device's `/`, in no app's container; android_files.rs runs it on the files fake"),
+        ("du", "without a path it sizes the device's `/`, in no app's container; android_files.rs runs it on the files fake"),
         ("kill", "the probe's pid is 1, init, which kill refuses without force (its own tests read its parameters)"),
     ];
 

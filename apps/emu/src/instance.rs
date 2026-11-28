@@ -1016,6 +1016,7 @@ const KOSMICKRISP_NOTICE: &str = "emu: API 35 draws its UI with Skia GL on the g
 /// is by API level as well as by the missing `VulkanVirtualQueue` tag: an API 36 image without
 /// it (Wear OS 36) stays on MoltenVK until a device check shows KosmicKrisp draws it. See
 /// docs/research/api34-moltenvk.md.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
 fn host_gpu_icd(avd: &Avd, egl: &str, kosmickrisp: bool, asked: Option<&str>) -> emu_gfxstream::Icd {
     let api_35 = avd.api_level() == Some(35);
@@ -1398,6 +1399,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn the_host_gpu_driver_per_api_is_kosmickrisp_only_on_api_35_where_the_ui_is_skia_gl_on_angle() {
         use emu_gfxstream::Icd::{KosmicKrisp, MoltenVk};

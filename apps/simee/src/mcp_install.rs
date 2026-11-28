@@ -666,6 +666,51 @@ mod tests {
         assert_eq!(p(Client::Gemini, Scope::Project, Os::Linux).expect("ok"), "/work/.gemini/settings.json");
     }
 
+    /// A Windows host as `Host::current` builds it: home is `%USERPROFILE%`, app config `%APPDATA%`.
+    fn windows_host() -> Host {
+        Host {
+            os: Os::Windows,
+            home: PathBuf::from("C:/Users/u"),
+            appdata: Some(PathBuf::from("C:/Users/u/AppData/Roaming")),
+            xdg_config_home: None,
+            codex_home: None,
+            cwd: PathBuf::from("C:/work"),
+        }
+    }
+
+    #[test]
+    fn windows_paths_for_every_client() {
+        let norm = |p: PathBuf| p.to_string_lossy().replace('\\', "/");
+        let h = windows_host();
+        let p = |c: Client, s| norm(c.config_path(s, &h).expect("ok"));
+        // %USERPROFILE%-rooted user files.
+        assert_eq!(p(Client::ClaudeCode, Scope::User), "C:/Users/u/.claude.json");
+        assert_eq!(p(Client::Cursor, Scope::User), "C:/Users/u/.cursor/mcp.json");
+        assert_eq!(p(Client::Windsurf, Scope::User), "C:/Users/u/.codeium/windsurf/mcp_config.json");
+        assert_eq!(p(Client::Codex, Scope::User), "C:/Users/u/.codex/config.toml");
+        assert_eq!(p(Client::Gemini, Scope::User), "C:/Users/u/.gemini/settings.json");
+        // %APPDATA%-rooted user files.
+        assert_eq!(p(Client::ClaudeDesktop, Scope::User), "C:/Users/u/AppData/Roaming/Claude/claude_desktop_config.json");
+        assert_eq!(p(Client::Vscode, Scope::User), "C:/Users/u/AppData/Roaming/Code/User/mcp.json");
+        // Project files under the working directory.
+        assert_eq!(p(Client::ClaudeCode, Scope::Project), "C:/work/.mcp.json");
+        assert_eq!(p(Client::Cursor, Scope::Project), "C:/work/.cursor/mcp.json");
+        assert_eq!(p(Client::Vscode, Scope::Project), "C:/work/.vscode/mcp.json");
+        assert_eq!(p(Client::Codex, Scope::Project), "C:/work/.codex/config.toml");
+        assert_eq!(p(Client::Gemini, Scope::Project), "C:/work/.gemini/settings.json");
+        // XDG_CONFIG_HOME is a Linux notion; CODEX_HOME still applies.
+        let mut h = windows_host();
+        h.xdg_config_home = Some(PathBuf::from("C:/xdg"));
+        h.codex_home = Some(PathBuf::from("D:/codex"));
+        assert_eq!(norm(Client::Vscode.config_path(Scope::User, &h).expect("ok")), "C:/Users/u/AppData/Roaming/Code/User/mcp.json");
+        assert_eq!(norm(Client::Codex.config_path(Scope::User, &h).expect("ok")), "D:/codex/config.toml");
+        // Cursor, Claude Code and Codex need only the home directory, not %APPDATA%.
+        h.appdata = None;
+        for c in [Client::Cursor, Client::ClaudeCode, Client::Codex] {
+            assert!(c.config_path(Scope::User, &h).is_ok());
+        }
+    }
+
     #[test]
     fn xdg_config_home_moves_linux_app_config_and_windows_needs_appdata() {
         let mut h = host(Os::Linux);
@@ -799,20 +844,26 @@ mod tests {
         assert!(merge(Client::Codex, Some("[mcp_servers"), "simee", &entry(), true).is_err());
     }
 
+    /// What `--command /bin/simee` becomes: absolute, so a drive path (`D:\bin\simee`) on Windows.
+    fn absolute_command() -> String {
+        std::path::absolute("/bin/simee").expect("ok").to_string_lossy().into_owned()
+    }
+
     #[test]
     fn install_writes_and_dry_run_does_not() {
+        let command = absolute_command();
         let dir = Dir::new();
         let host = host_in(&dir);
         let path = Client::Cursor.config_path(Scope::User, &host).expect("ok");
         let mut out = Vec::new();
         run(&args("cursor", &["--dry-run"]), &host, &mut out).expect("ok");
         let shown = String::from_utf8(out).expect("ok");
-        assert!(shown.starts_with("would create") && shown.contains("\"/bin/simee\""), "{shown}");
+        assert!(shown.starts_with("would create") && shown.contains(&serde_json::to_string(&command).expect("ok")), "{shown}");
         assert!(!path.exists() && !path.parent().expect("ok").exists(), "dry run wrote nothing");
 
         run(&args("cursor", &[]), &host, &mut Vec::new()).expect("ok");
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).expect("ok")).expect("ok");
-        assert_eq!(v["mcpServers"]["simee"]["command"], "/bin/simee");
+        assert_eq!(v["mcpServers"]["simee"]["command"], command.as_str());
         let leftovers: Vec<_> = std::fs::read_dir(path.parent().expect("ok")).expect("ok").collect();
         assert_eq!(leftovers.len(), 1, "no temp file left");
 

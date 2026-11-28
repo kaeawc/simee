@@ -9,6 +9,7 @@
 
 mod doctor;
 mod mcp_install;
+mod mcp_safety;
 mod stream_cli;
 
 use std::io::Write;
@@ -188,7 +189,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// iOS: wait until a booted simulator is quiet; prints how long that took.
+    /// Wait until a booted device is quiet (an Android guest: its own processes, over adb); prints how long that took.
     Settle {
         device: String,
         #[arg(long, default_value_t = 600)]
@@ -197,11 +198,11 @@ enum Cmd {
         #[arg(long, value_enum)]
         settle_cpu: Option<SettleCpu>,
     },
-    /// iOS: turn a named set of daemons off on a booted simulator (`slim`), or back on with --undo.
+    /// Turn a named set of daemons off on a booted device (`slim`; Android: packages, `pm disable-user`), or back on with --undo.
     Profile {
         device: String,
         name: String,
-        /// Re-enable the profile's daemons (they run again from the next boot).
+        /// Re-enable the profile's daemons (iOS: they run again from the next boot; Android: at once).
         #[arg(long)]
         undo: bool,
     },
@@ -475,8 +476,14 @@ enum Cmd {
         #[arg(long, alias = "insecure", requires = "http")]
         insecure_remote: bool,
         #[command(flatten)]
-        tls: McpTls,
+        // Boxed: these two make `mcp` the enum's one large variant (more so where a path is wider, as on Windows).
+        safety: Box<mcp_safety::McpSafety>,
+        #[command(flatten)]
+        tls: Box<McpTls>,
     },
+    /// Read the audit log `simee mcp` keeps of every tool call: client, tool, arguments (secrets
+    /// removed), how it ended and how long it took (docs/mcp-safety.md).
+    McpAudit(mcp_safety::McpAudit),
     /// Run a program inside the device (e.g. `defaults`, `log`, `launchctl`, `notifyutil`, `heap`).
     #[command(disable_help_flag = true)]
     Exec {
@@ -603,11 +610,16 @@ fn main() -> Result<()> {
             let code = sim_api::serve(&path)?;
             std::process::exit(code);
         }
+        Cmd::McpAudit(audit) => {
+            audit.run(&mut std::io::stdout().lock())?;
+            return Ok(());
+        }
         Cmd::Mcp { action: Some(action), .. } => {
             let stdout = std::io::stdout();
             return mcp_install::run(action, &mcp_install::Host::current()?, &mut stdout.lock());
         }
-        Cmd::Mcp { http: None, .. } => {
+        Cmd::Mcp { http: None, safety, .. } => {
+            safety.install()?;
             mcp_shutdown_on_signal()?;
             // Methods run in this process, on the server's own threads: nothing but protocol
             // messages may reach stdout.
@@ -616,7 +628,8 @@ fn main() -> Result<()> {
             served?;
             return Ok(());
         }
-        Cmd::Mcp { http: Some(addr), token_file, no_auth, insecure_remote, tls, .. } => {
+        Cmd::Mcp { http: Some(addr), token_file, no_auth, insecure_remote, tls, safety, .. } => {
+            safety.install()?;
             let config = mcp_http_config(addr, token_file.clone(), *no_auth, *insecure_remote, tls)?;
             mcp_shutdown_on_signal()?;
             let served = sim_mcp::http::serve(std::sync::Arc::new(sim_mcp::ApiBackend::new()), config);
@@ -642,12 +655,17 @@ fn main() -> Result<()> {
     run(cli.command, &mut transport, &mut stdout.lock(), &mut stderr.lock())
 }
 
-/// `simee mcp` on SIGINT or SIGTERM: calls in flight see the cancel at their next safe point, the
-/// streams stop with their WHIP DELETE, any socket it serves on is removed, and the process exits
-/// with 130 or 143 (a second signal exits at once). The MCP servers have no way to stop accepting
-/// or to wait for their calls yet.
+/// `simee mcp` on SIGINT or SIGTERM: the servers stop taking tool calls (each is answered
+/// `cancelled: server shutting down`), the calls in flight stop at their next safe point and get up
+/// to `sim_mcp::drain::DRAIN`, the streams stop with their WHIP DELETE, and the process exits with 130 or
+/// 143 (a second signal exits at once). The transports answer until then, so every reply reaches
+/// the client first.
 fn mcp_shutdown_on_signal() -> Result<()> {
     sim_api::shutdown::watch(|sig| {
+        if !sim_mcp::Drain::shared().finish(sim_mcp::drain::DRAIN) {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "simee: calls still running after {} s: stopping anyway", sim_mcp::drain::DRAIN.as_secs());
+        }
         sim_api::stop_streams();
         sim_api::shutdown::exit(sig);
     })
@@ -1134,7 +1152,9 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             stream_cli::run(command, &mut api, &mut stop, out)?;
         }
         Cmd::Console { device, command } => lines(out, &call("console", json!({"device": device, "command": command.join(" ")}))?)?,
-        Cmd::Serve { .. } | Cmd::Call { .. } | Cmd::Mcp { .. } => anyhow::bail!("`serve`, `call` and `mcp` don't run through a transport"),
+        Cmd::Serve { .. } | Cmd::Call { .. } | Cmd::Mcp { .. } | Cmd::McpAudit(_) => {
+            anyhow::bail!("`serve`, `call`, `mcp` and `mcp-audit` don't run through a transport")
+        }
         Cmd::Exec { device, env, program, args } => {
             let env: serde_json::Map<String, Value> =
                 env.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), Value::from(v))).collect();
@@ -1408,6 +1428,8 @@ mod tests {
     /// #409: `--set` goes with every method a command calls, as an absolute path, before or after
     /// the subcommand; a `set` the params already have stays; with no set at all (a test's
     /// transport) nothing is added.
+    // Unix paths; device sets are iOS (macOS) only.
+    #[cfg(unix)]
     #[test]
     fn the_set_flag_goes_with_every_call_as_an_absolute_path() {
         let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).expect("arguments");
@@ -1740,9 +1762,17 @@ mod tests {
         let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
         assert!(matches!(parse(&["mcp"]), Ok(Cmd::Mcp { http: None, token_file: None, no_auth: false, insecure_remote: false, .. })));
         let mut transport = Transport::local();
-        let stdio = Cmd::Mcp { action: None, http: None, token_file: None, no_auth: false, insecure_remote: false, tls: McpTls::default() };
+        let stdio = Cmd::Mcp {
+            action: None,
+            http: None,
+            token_file: None,
+            no_auth: false,
+            insecure_remote: false,
+            tls: Box::default(),
+            safety: Default::default(),
+        };
         let e = run(stdio, &mut transport, &mut Vec::new(), &mut Vec::new()).expect_err("served by main, not run");
-        assert!(e.to_string().contains("`mcp` don't run through a transport"));
+        assert!(e.to_string().contains("`mcp` and `mcp-audit` don't run through a transport"));
     }
 
     #[test]
@@ -1848,6 +1878,7 @@ mod tests {
     }
 
     /// [`fake_server`], recording each request's params too.
+    #[cfg(unix)]
     fn fake_server_params(socket: &std::path::Path, answer: Option<Answer>) -> (Seen<String>, Seen<Value>) {
         use std::io::BufRead;
         let listener = std::os::unix::net::UnixListener::bind(socket).expect("bind");
@@ -1882,11 +1913,13 @@ mod tests {
     }
 
     /// What a fake server has been sent, as it arrives.
+    #[cfg(unix)]
     type Seen<T> = std::sync::Arc<std::sync::Mutex<Vec<T>>>;
 
     /// #409: the device set is this command's, said on every call: `--set`, else this process's
     /// `SIMEE_IOS_DEVICE_SET` (made absolute), else the default set (`""`). A server with another
     /// set in its environment never picks the set (it would be the owner's default set).
+    #[cfg(unix)]
     #[test]
     fn the_commands_own_device_set_reaches_a_server_on_every_call() {
         let root = android_root("set-forward");

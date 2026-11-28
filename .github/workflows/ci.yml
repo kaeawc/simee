@@ -136,6 +136,10 @@ jobs:
         with:
           tool: cargo-llvm-cov,cargo-nextest
       - run: cargo nextest run --locked -p simee-encode -p simee-api -p simee --features openh264 --cargo-profile ci --hide-progress-bar
+      # The MCP server's HTTPS transport, `simee-mcp`'s `tls` feature: off by default, so nothing
+      # else here compiles or tests it (#481).
+      - run: cargo clippy --locked -p simee-mcp --all-targets --features tls --profile ci -- -D warnings
+      - run: cargo nextest run --locked -p simee-mcp --features tls --cargo-profile ci --hide-progress-bar
       # The tests run once, instrumented. Per-file coverage goes to the job summary, and the job
       # fails when line coverage drops under the floor: raise it as coverage grows, never lower it
       # to get green.
@@ -233,10 +237,13 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --locked --all-targets --profile ci -- -D warnings
+      # simee-mcp's off-by-default `tls` feature (#481); macOS is where the TLS code runs for users.
+      - run: cargo clippy --locked -p simee-mcp --all-targets --features tls --profile ci -- -D warnings
       # Prebuilt nextest runs the test binaries in parallel (doctests are disabled in this repo).
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-nextest
+      - run: cargo nextest run --locked -p simee-mcp --features tls --cargo-profile ci --hide-progress-bar
       - name: Wait for the simulator service
         timeout-minutes: 5
         run: time xcrun simctl list devices > /dev/null

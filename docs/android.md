@@ -24,7 +24,7 @@ to use fewer resources.
 | Boot | Full Android boot to `sys.boot_completed`: 9.5 s cold, 3.5 s warm (stock: 22.9 s and 17.1 s; [benchmarks](benchmarks.md)); first boot formats and encrypts `/data`. System images from API 29 on; emu refuses older ones up front with the reason (`EMU_ALLOW_OLD_IMAGES=1` boots them anyway, to work on them). API 29 and 30 draw with the GLES encoder over the goldfish `opengles` pipe: each pipe gets a render channel of its own in the renderer, as stock gives it ([performance notes](#performance-notes)); API 30 `google_apis` first-boots in 18.0 s (stock 17.0 s), and both idle at 2.1–2.9% of a host core (stock 3.7–5.4%; [benchmarks](benchmarks.md#api-29-and-30-first-boots-and-idle-host-cpu)); the board has no virtio-gpu for them (their kernels oops on it, and stock gives them none). They also get adb over `qemud:adb` (a client that connects first waits for adbd's `accept`), the reference RIL's `qemud:gsm` modem, and `logcat -Q`'s `logcat` stream from stock's `qemu.cmdline` and `qemu.logcat` properties. API 29 `default` warm-boots in 4.8 s (stock 6.4 s) and first-boots in 3.7 s (stock 4.8 s); its first boot runs the host GLES on SwiftShader, since ANGLE on Metal faults there ([performance notes](#performance-notes)); API 29 `default` and API 30 `google_apis` pass the AutoMobile harness (40 of 41 on API 30, 35 of 41 on API 29; device snapshots and video recording fail, and rotation and dark theme on API 29 fail on stock too; since the touch screen became stock's `virtio_input_multi_touch_1` (#69), AutoMobile's injected taps, multi-touch and pinch are cancelled on API 30, 2026-11-26). API 31 and 32 draw over the same pipe with no virtio-gpu (bootconfig `gltransport=pipe`, as stock gives every image): the gralloc mapper inside their `media.swcodec` opens the GLES transport to read color buffers, and their SELinux policy denies `mediaswcodec` the render node (`avc: denied { read write } ... name="renderD128" scontext=u:r:mediaswcodec:s0 tcontext=u:object_r:gpu_device:s0`) but not the goldfish pipe, so over virtio-gpu `screenrecord`'s encoder crashed ([#64](https://github.com/kaeawc/simee/issues/64)). API 33 guests set up address-space graphics with the protocol before the renderer's; the GPU translates it (`virtio/legacy_asg.rs`, [#39](https://github.com/kaeawc/simee/issues/39)). API 31 to 33's GLES is the encoder on a renderer with GL, as stock runs them, since their ANGLE finds SurfaceFlinger no EGL config. Images without `AndroidbootProps2` (API 30 and older, kernels without bootconfig) get stock's legacy kernel command line (`qemu.*` names) instead of bootconfig |
 | adb | virtio-vsock with a host bridge on `console port + 1`, announced to the adb server. `adb shell`/`root`/`push` work, and the device shows up about 8 s after launch on a warm boot |
 | Apps | The API's `install`, `uninstall`, `launch`, `terminate`, `apps` and `open_url` run on Android devices through the host's `adb` (the SDK's platform-tools, else the PATH), so they work on a stock emulator's AVD too, with iOS's parameters and result shapes. `install` is `adb install -r` for an `.apk` (an `.aab` through `bundletool` when it is on the PATH, else an error that says so); `uninstall` is `pm uninstall`; `launch` starts the package's own first launcher activity (`cmd package query-activities --brief --components`, so an app with two, as a debug build with LeakCanary's "Leaks" alias has, never gets the system's chooser), runs `am start -W` (`-S` when `restart` is true, the default, as iOS terminates first) and returns the app's `pid` from `pidof`, polled for up to 3 s (null when no process is named for the package), with the `activity` it started; `terminate` is `am force-stop`; `apps` lists third-party packages (`all` adds the system's) as bare package names, without labels, which need `aapt` or a `dumpsys` per package; `open_url` is `am start -a android.intent.action.VIEW -d`. Package names and URLs are validated and quoted before they reach the guest's shell. Every adb call has a deadline (an install or `pm uninstall` 300 s, `am start` 30 s, the rest 10 s); one past it is killed and reported by its command line, and each `.aab` install builds in a scratch directory of its own. `launch`'s `args`, `env` and `shaped` are refused on Android. Tested against a fake adb; not yet timed on a booted device |
-| Console | `adb emu` / telnet console with token auth: `avd name`, `ping`, `kill`, `sensor set\|get\|status`, `event send\|text`, `geo fix`, `finger touch\|remove`, `power`, `rotate`, `sms send`, `gsm call\|accept\|busy\|cancel\|hold\|list\|voice\|data\|status\|signal`, `screenshot` turned upright as the guest rotated its display (as `adb screencap` is), `network speed|delay|status` (stock's presets, numbers and report, seeded by `-netspeed`/`-netdelay`; applied live in the NAT, `crates/emu-vmm/src/net/shape.rs`: a token bucket per direction, 0 = unlimited, each direction holds about a second of its rate and drops past that, as a bottleneck does (except small control frames, ARP replies and payload-free TCP segments, which take a bounded reserve of 16 frames past it), with TCP held back by the download queue's room; unshaped devices take the plain path with no shaper; inbound frames are delayed by a latency between min and max, in order. Verified in unit tests over loopback only: not yet measured in a guest under `network speed edge`, and `network speed` doesn't change the radio's reported data type), `avd snapshot` (answers as stock does without snapshot support: `save`/`load` are a `KO`, `list` is empty, `del` succeeds), plus simee's `touch`, `clipboard`, `frames`, `sms list`, `xr` (Android XR), `car` (Automotive) |
+| Console | `adb emu` / telnet console with token auth: `avd name`, `ping`, `kill`, `sensor set\|get\|status`, `event send\|text`, `geo fix`, `finger touch\|remove`, `power`, `rotate`, `sms send`, `gsm call\|accept\|busy\|cancel\|hold\|list\|voice\|data\|status\|signal`, `screenshot` turned upright as the guest rotated its display (as `adb screencap` is), `network speed|delay|status` (stock's presets, numbers and report, seeded by `-netspeed`/`-netdelay`; applied live in the NAT, `crates/emu-vmm/src/net/shape.rs`: a token bucket per direction, 0 = unlimited, each direction holds about a second of its rate and drops past that, as a bottleneck does (except small control frames, ARP replies and payload-free TCP segments, which take a bounded reserve of 16 frames past it), with TCP held back by the download queue's room; unshaped devices take the plain path with no shaper; inbound frames are delayed by a latency between min and max, in order. Verified in unit tests over loopback only: not yet measured in a guest under `network speed edge`, and `network speed` doesn't change the radio's reported data type), simee's `network loss <percent>|<up>:<down>|none` (stock has no loss command: each direction drops that percent of the guest's TCP, UDP and ICMP packets at the NAT, never ARP and never adb, which doesn't cross the NAT; drawn from a random stream per direction seeded once per boot; `network status` adds a download and an upload loss line while either is set; unit-tested with fixed seeds, not yet measured in a guest), `avd snapshot` (answers as stock does without snapshot support: `save`/`load` are a `KO`, `list` is empty, `del` succeeds), plus simee's `touch`, `clipboard`, `frames`, `sms list`, `xr` (Android XR), `car` (Automotive) |
 | Discovery | `-list-avds`, `pid_<pid>.ini` running-instance file, `emulator-<port>` serial on stdout |
 | Graphics | Home screen and apps render. virtio-gpu with gfxstream contexts on the host GPU: the guest's GLES through ANGLE on its Vulkan and, on images that map it (API 36 and newer, `VulkanVirtualQueue`), its UI and SurfaceFlinger drawn with Skia on that Vulkan, as stock's `GuestAngle` mode does, so the renderer runs without a GL backend (see "Vulkan-only renderer" below); Vulkan on MoltenVK (lavapipe fallback), Vulkan composition. Host-visible memory via blob mapping; goldfish address space (PCIe, shared-slot allocator) and goldfish pipe (refcounted color buffers) for the ranchu gralloc; guest `screencap` and host screenshots both work |
 | Input & sensors | virtio-input touchscreen, keyboard and rotary, plus stock's dual-mode mouse on XR images. The keyboard is stock's `qwerty2` (0627:0001, stock's key set), so goldfish's `qwerty2.kl` applies: HOME, D-pad centre (`KEY_CENTER`), Recents (580), media and stem keys arrive. The console takes every stock `KEY_*` name and numeric codes. `qemud:sensors` lists the AVD's sensors by stock's rules (`hw.sensor*` flags; heart rate and wrist tilt on Wear OS API 28+; the hinge on foldables) with live values; GNSS over `qemud:gps`; goldfish battery; fingerprint; clipboard |
@@ -425,16 +425,27 @@ so far, and what it doesn't:
   binder_linux` gives an empty one), memfd, the unified cgroup hierarchy, user namespaces (also for
   root: the container's process runs unprivileged), and, for an unprivileged user, `newuidmap` and
   `newgidmap` with a 65,536-id range in `/etc/subuid` and `/etc/subgid`; overlayfs on Linux 5.11
-  or newer (`userxattr`). Reported but not blocking: cgroup memory/cpu/pids controllers, DMA-BUF
+  or newer (`userxattr`); and a way to give the container a network namespace of its own: `ip`,
+  plus `pasta` or `slirp4netns` with `/dev/net/tun`, or root for a veth pair. Reported but not blocking: cgroup memory/cpu/pids controllers, DMA-BUF
   heaps. Each missing piece prints its fix.
 - **Image.** One pinned image: `redroid/redroid:15.0.0_64only-250627`, by per-architecture
   manifest digest and layer digest (`image.rs`). It is downloaded only when asked (`skopeo copy` of
   the manifest by digest) and every blob is hashed against the pin before it is unpacked.
-- **Launcher.** `unshare` into new user, mount, pid, uts, ipc and cgroup namespaces (not network).
-  Container root is never host root: an unprivileged user is their own container root with their
-  `/etc/subuid` range above it (`newuidmap`); run as host root, the container's process drops to a
+- **Launcher.** `unshare` into new user, mount, pid, uts, ipc, cgroup and network namespaces.
+  Container root is never host root and never the launching user: an unprivileged user's container
+  ids are their `/etc/subuid` range (`newuidmap`), so container root is its first subordinate id
+  and the user's own uid is not in the map; run as host root, the container's process drops to a
   range of its own (root's `/etc/subuid` range, else 2,000,000,000 + 65,536) before it creates the
-  namespace, and the state directory is handed to that range. The script mounts an overlay of the
+  namespace. Either way the state directory is handed to that range. The unprivileged process has
+  an uid the map doesn't contain, so `unshare --keep-caps` keeps its capabilities across `exec`
+  and the helper's `become-root` waits for the maps, clears the supplementary groups and becomes
+  uid and gid 0, in a first `unshare` that makes every namespace but the pid one; a second
+  `unshare --pid --fork` then runs the script. A subordinate range must have 65,536 ids and must
+  not contain the user's own uid or gid (all of the user's `/etc/subuid` and `/etc/subgid` lines
+  are read, and the first range that qualifies is used); when none does, the fix names a range
+  after the highest one in the file. `chown` and `rm` on the container's files run in a short
+  admin namespace where the user is root and container id `n` is id `n + 1` (no guest code runs
+  there; the user's uid appears in that map only). The script mounts an overlay of the
   unpacked image over a per-device writable layer, a `/dev` tmpfs with the nodes Redroid's init
   expects, binderfs (checked for the three devices, linked at `/dev/*`), `/proc` with runc's masked
   and read-only paths (`kcore`, `/proc/sys`, `sysrq-trigger`...), and the host's `/sys` with every
@@ -443,21 +454,55 @@ so far, and what it doesn't:
   (`androidboot.redroid_width|height|dpi|gpu_mode`, `androidboot.use_memfd=true`). The helper is
   `emu` itself under a hidden subcommand (`helper::main`) or the crate's `simee-container-helper`
   binary, and it also sets `PR_SET_PDEATHSIG` so a crashed `emu` takes the container down with it
-  (start containers from a thread that outlives them: the kernel ties the signal to the thread);
-  dropping a `Container` kills it. Removing a rootfs the container made runs `rm` inside the
+  (start containers from a thread that outlives them: the kernel ties the signal to the thread).
+  The kernel clears that signal on a credential change and on any `exec` that gains capabilities,
+  so it is set again in `become-root` (checking the launcher is still the parent) and in `pivot`
+  just before `/init` (checking that the launcher's control pipe, which stays open, isn't hung up);
+  the launcher-death test runs the whole chain. Dropping a `Container` kills it. Removing a rootfs the container made runs `rm` in the admin
   namespace.
+- **Network and adb (`net.rs`).** The pinned image's adbd listens on port 5555 on every address and
+  the image ships with adb authentication off (`ro.adb.secure=0`, in
+  `/system_ext/etc/build.prop`: "GSI always disables adb authentication"; `ro.secure=1`,
+  `ro.debuggable=1`; read from the pinned layer, 2026-11-28), and Redroid's own docs say never to
+  expose the port on a public network. So the container's namespace is its own and the host
+  reaches adb through `127.0.0.1:<port>` only, with nothing in the host's namespace listening on a
+  non-loopback address. Uplink, in order: `pasta` (attached to the container's namespaces by pid,
+  `eth0` named as Redroid's init expects, one `-t 127.0.0.1/<port>:5555` rule and every other
+  direction off: `-T none -U none -u none --no-map-gw`, because pasta's defaults forward every port the
+  guest binds on every host address and splice the guest's loopback to the host's), then
+  `slirp4netns` (`--disable-host-loopback`; the forward is added through its API socket), then,
+  for root, a veth pair (a /30 per container from the first of 10.233.0.0/16, 10.234.0.0/16,
+  10.235.0.0/16, 172.29.0.0/16 and 192.168.233.0/24 that the host has no route into, read from
+  `/proc/net/route`: not Tailscale's 100.64.0.0/10, behind which a tailnet peer could be hidden;
+  refused with the list when every candidate is routed; a proxy thread on the loopback port). Root prefers pasta to the veth pair because it gives the guest an uplink without changing
+  the host's routing or firewall. The veth pair has no uplink (the guest reaches the host's end of
+  the pair and nothing further; services the host binds on all addresses are reachable from it
+  there). Authentication: `AdbAuth::Keys` sets `ro.adb.secure=1` as an init argument and writes the
+  host's `adbkey.pub` lines to `/data/misc/adb/adb_keys` before the container starts;
+  `AdbAuth::Disabled` keeps the image's setting, which leaves the loopback port open to every
+  local user. The caller chooses; there is no default.
 - **Verified:** the plan, the script, the probe and the selection against fake hosts; and on a Linux
   VM without binder, as root and as an unprivileged user, a real user namespace with the id maps,
   the overlay, `/dev`, devpts, `/proc` and its masks, `/sys` read-only throughout, and the pivot:
   the container's mount table has the overlay as its only root, no host device, no path to the
   host's files, and uid 0 maps to a non-zero host id; setup stops at binderfs with its message
   there. Also that a helper's child dies when its parent is killed, and that a tree owned by
-  subordinate ids is removed from inside the namespace.
+  subordinate ids is removed from inside the namespace. Unprivileged, container root maps to the
+  first subordinate id (`0 165536 65536`, not the user's uid), the process is uid 0, gid 0 with no
+  groups, and the unpack and removal go through the admin namespace. As root, with the veth pair
+  (this VM has no `/dev/net/tun`): the guest's namespace differs from the host's, it has only `lo`
+  and `eth0`, the host listens on the adb port on `127.0.0.1` and nowhere else, a connection from
+  the host reaches a listener in the guest over the pair, and the listener is gone when the
+  container stops. Killing the launcher takes the whole container tree with it, as root and as an
+  unprivileged user (it failed before `pivot` set the signal again: `/init` outlived `unshare`).
 - **Not verified:** a boot. No binder host has run this launcher, so whether Redroid's `/init`
-  starts unprivileged in this namespace set, and how long it takes, are open. It is not wired into
-  `emu` yet, so nothing boots through it; there is no display, input or console for it, no
-  network namespace (adbd listens on the host's port 5555, so one container per host), no cgroup
-  limits, and no `docs/benchmarks.md` row (nothing measured). `SIMEE_E2E_CONTAINER=1 cargo
+  starts unprivileged in this namespace set (as a subordinate id, with `eth0` configured by the
+  uplink), and how long it takes, are open; so is whether `ro.adb.secure=1` as an init argument
+  overrides the image's `ro.adb.secure=0` and whether adbd reads the seeded key under the image's
+  SELinux labels. pasta and slirp4netns were not run end to end (no `/dev/net/tun` on the VM):
+  their command lines are asserted as data and pasta's accepted the flags and printed the one
+  loopback rule. It is not wired into `emu` yet, so nothing boots through it; there is no display,
+  input or console for it, no cgroup limits, and no `docs/benchmarks.md` row (nothing measured). `SIMEE_E2E_CONTAINER=1 cargo
   nextest run -p simee-emu-container` runs the namespace tests against the host's kernel;
   `cargo run -p simee-emu-container --example probe` prints what a host offers.
 

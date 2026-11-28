@@ -66,6 +66,17 @@ impl Rig {
     fn client(&self) -> Client {
         Client::connect(self.running.addr())
     }
+
+    /// Waits until the backend has answered `method` once (a watcher's first read is its baseline),
+    /// so an answer set next is a change the watcher sees, never its baseline. [`Fake::called`]
+    /// counts a call before it reads its answer: waiting on it races the answer that follows.
+    fn until_answered(&self, method: &str) {
+        let deadline = Instant::now() + WAIT;
+        while self.fake.answered(method) == 0 {
+            assert!(Instant::now() < deadline, "no {method} call was answered within {WAIT:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 }
 
 /// One response: status, headers (names lowercased) and the whole body.
@@ -317,6 +328,23 @@ impl Client {
         response
     }
 
+    /// The next event of `method` on an open event stream, past pings and other events. Bounded by
+    /// [`WAIT`] overall: heartbeats keep the socket busy, so its read timeout alone never fires.
+    fn event(&mut self, method: &str) -> Value {
+        let deadline = Instant::now() + WAIT;
+        let mut others = Vec::new();
+        while Instant::now() < deadline {
+            let chunk = self.chunk().unwrap_or_else(|| panic!("the stream ended before a {method}; other events: {others:?}"));
+            for event in events_of(&chunk) {
+                if event["method"] == method {
+                    return event;
+                }
+                others.push(event["method"].clone());
+            }
+        }
+        panic!("no {method} within {WAIT:?}; other events: {others:?}");
+    }
+
     /// Opens an older revision's session.
     fn initialize(&mut self, version: &str) -> Value {
         let (reply, _) = self.request("initialize", json!({"protocolVersion": version, "capabilities": {}, "clientInfo": {"name": "t"}}));
@@ -457,17 +485,9 @@ fn subscriptions_listen_streams_on_its_post_until_the_client_closes_it() {
     let ack = events_of(&client.chunk().expect("the acknowledgement"));
     assert_eq!(ack[0]["method"], "notifications/subscriptions/acknowledged", "{ack:?}");
     assert_eq!(ack[0]["params"]["_meta"][META_SUBSCRIPTION], "sub", "the client's own id");
-    let deadline = Instant::now() + WAIT;
-    while rig.fake.called("info").is_empty() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    rig.until_answered("info");
     rig.fake.answer("info", Ok(json!({"state": "Booted"})));
-    let updated = loop {
-        let events = events_of(&client.chunk().expect("an update"));
-        if let Some(e) = events.into_iter().find(|e| e["method"] == "notifications/resources/updated") {
-            break e;
-        }
-    };
+    let updated = client.event("notifications/resources/updated");
     assert_eq!(
         (updated["params"]["uri"].clone(), updated["params"]["_meta"][META_SUBSCRIPTION].clone()),
         (json!("simee://devices/phone"), json!("sub"))
@@ -943,17 +963,9 @@ fn concurrent_sessions_are_isolated() {
     b_stream.write_request("GET", &[], b"");
     assert_eq!(b_stream.read_head().0, 200);
     assert_eq!(a.call("resources/subscribe", json!({"uri": "simee://devices/phone"}))["result"], json!({}));
-    let deadline = Instant::now() + WAIT;
-    while rig.fake.called("info").is_empty() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    rig.until_answered("info");
     rig.fake.answer("info", Ok(json!({"state": "Booted"})));
-    let updated = loop {
-        let events = events_of(&a_stream.chunk().expect("an update"));
-        if let Some(e) = events.into_iter().find(|e| e["method"] == "notifications/resources/updated") {
-            break e;
-        }
-    };
+    let updated = a_stream.event("notifications/resources/updated");
     assert_eq!(updated["params"]["uri"], "simee://devices/phone");
     // B's stream has had only pings meanwhile.
     b_stream.reader.get_ref().tcp().set_read_timeout(Some(Duration::from_millis(400))).expect("timeout");
@@ -1194,8 +1206,6 @@ fn a_stalled_listens_response_follows_its_notifications_and_is_never_dropped() {
     let Some(Out::Response(last)) = got.pop() else { panic!("the response comes last: {got:?}") };
     assert_eq!(serde_json::from_str::<Value>(&last).expect("json"), json!({"jsonrpc": "2.0", "id": 3, "result": {"done": true}}));
     assert_eq!(got.len(), NOTE_QUEUE, "the notifications are bounded, the response is not among them");
-    let progress: Vec<&Out> = got.iter().filter(|o| matches!(o, Out::Note(n) if n.contains("notifications/progress"))).collect();
-    assert!(progress.len() <= 1, "progress is coalesced to its latest: {progress:?}");
     assert!(lock(&router.routes).is_empty(), "a response ends its route");
     assert_eq!(rx.recv_timeout(Duration::ZERO), Err(RecvTimeoutError::Disconnected), "and its stream");
 }

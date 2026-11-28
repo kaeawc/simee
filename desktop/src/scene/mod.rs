@@ -11,9 +11,10 @@
 //! with no CPU copy of any pixel: the copy is one GPU texture copy per drawn frame. Rune can't
 //! hand a compositor a `NativeSurface`'s texture yet (anomalyco/rune#2546, simee#192).
 //!
-//! Depth attachments and MSAA resolves need Rune's wgpu backend (`SIMEE_GPU_BACKEND=wgpu`):
-//! the native Metal backend panics on them (anomalyco/rune#2547, simee#193), so on it the toggle
-//! says why it does nothing. With the view off the window draws exactly as without it.
+//! Both of Rune's backends draw it: its native Metal backend (macOS's default) has depth
+//! attachments and MSAA resolves since anomalyco/rune#2563 (simee#193), and wgpu's
+//! (`SIMEE_GPU_BACKEND=wgpu`) always had them. With the view off the window draws exactly as
+//! without it.
 //!
 //! The user moves the camera (#155, [`View`]): a drag beside the drawn screen orbits, ⇧-drag or a
 //! two-finger trackpad drag pans, a mouse wheel, ⌘-scroll or a pinch zooms. A drag that starts on
@@ -32,11 +33,12 @@ mod gpu;
 mod layout;
 mod motion;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use rune::{Color, Cursor, Drag, El, GesturePhase, Key, KeyEvent, MagnifyEvent, Mods, Phase, PointerEvent, RotateEvent, Tx, WheelEvent};
 use sim_core::body::{self, Body, Display, Face};
+use sim_core::form_factor::FormFactor;
 use sim_core::platform::Platform;
 use sim_core::rotation::Rotation;
 
@@ -49,45 +51,55 @@ use crate::State;
 /// The slot's `El::effect` mark.
 const MARK: u32 = 152;
 
-/// What ⌘3 says on a backend that can't draw the scene.
-pub const UNAVAILABLE: &str = "The 3D view needs SIMEE_GPU_BACKEND=wgpu: Rune's native Metal backend can't draw a depth buffer \
-                               or MSAA yet (anomalyco/rune#2547)";
+/// What ⌘3 says where no compositor draws the scene (live Rust editing runs without one).
+pub const UNAVAILABLE: &str = "The 3D view needs the scene's compositor, which live Rust editing (the hot feature) runs without";
 /// What ⌘3 says once the view is on.
 pub const ON: &str = "3D view on: drag beside the device to orbit, ⇧-drag to pan, scroll or pinch to zoom; ⌘0 face on, \
                       ⌘1 ⌘2 ⌘4 ⌘5 3/4, front, side, back, ⌘F flip, ⌘[ ⌘] turn. Touches on its screen come with #156";
 /// What a drag on the drawn screen says.
 pub const SCREEN_DRAG: &str = "Touches on the 3D screen come with #156: drag beside the device, or hold ⌥, to move the camera";
-/// What ⌘3 says for a device with no body.
-pub const NO_BODY: &str = "The 3D view has bodies for phones, tablets, foldables and watches";
+/// The body row of an iPhone's CarPlay display (a car head unit, `sim_core::body`'s car rows):
+/// drawn while the display shows ([`body_for`]). Without that row the view stays flat.
+pub const CARPLAY_BODY: &str = "CarPlay-800x480";
+/// What ⌘3 says for a device with no body: the form factors that have one ([`body::has_body`]).
+pub static NO_BODY: LazyLock<String> = LazyLock::new(|| no_body(body::has_body));
 
-/// Whether this process draws with a backend the scene can use, set once in `main` before the
-/// window opens (headless scenes and tests leave it false unless they set it).
+/// "The 3D view has bodies for …", listing the form factors `has` says have one.
+fn no_body(has: impl Fn(FormFactor) -> bool) -> String {
+    let names: Vec<&str> = FormFactor::ALL
+        .into_iter()
+        .filter(|f| has(*f))
+        .map(|f| match f {
+            FormFactor::Phone => "phones",
+            FormFactor::Tablet => "tablets",
+            FormFactor::Foldable => "foldables",
+            FormFactor::Watch => "watches",
+            FormFactor::Tv => "TVs",
+            FormFactor::Auto => "car head units",
+            FormFactor::Vision => "XR headsets and glasses",
+        })
+        .collect();
+    match names.split_last() {
+        Some((last, [])) => format!("The 3D view has bodies for {last}"),
+        Some((last, rest)) => format!("The 3D view has bodies for {} and {last}", rest.join(", ")),
+        None => "The 3D view has no device bodies".into(),
+    }
+}
+
+/// Whether this process has the scene's compositor, set once in `main` before the window opens
+/// (live Rust editing has none; tests leave it false unless they set it).
 static SUPPORTED: AtomicBool = AtomicBool::new(false);
 
 pub fn set_supported(on: bool) {
     SUPPORTED.store(on, Ordering::Relaxed);
 }
 
-/// Whether the backend `RUNE_GPU_BACKEND` (which wins) and `SIMEE_GPU_BACKEND` choose can draw
-/// the scene: wgpu's. macOS draws with Rune's native Metal backend when neither says; other
-/// hosts always draw with wgpu. Rune matches its variable exactly (`wgpu` or `metal`; anything
-/// else is ignored), while simee's is trimmed and lowercased (`crate::gpu_backend`): each is read
-/// the way its owner reads it, so this agrees with the backend Rune draws with.
-pub fn wgpu_backend(rune: Option<&str>, simee: Option<&str>, macos: bool) -> bool {
-    let rune = rune.filter(|s| matches!(*s, "wgpu" | "metal"));
-    let simee = simee.map(|s| s.trim().to_ascii_lowercase()).filter(|s| s == "wgpu" || s == "metal");
-    match rune.or(simee.as_deref()) {
-        Some(b) => b == "wgpu" || !macos,
-        None => !macos,
-    }
-}
-
 /// The 3D view's switch, and the view itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Toggle {
-    /// Asked for (⌘3, `SIMEE_VIEW=3d`) on a backend that can draw it.
+    /// Asked for (⌘3, `SIMEE_VIEW=3d`) where the compositor can draw it.
     pub on: bool,
-    /// The backend can draw it.
+    /// The compositor is there to draw it.
     pub supported: bool,
     /// The view it started in (`SIMEE_SCENE_CAMERA`).
     pub preset: Preset,
@@ -353,18 +365,26 @@ impl View {
 }
 
 /// The selected device's body: the table's row for its device type (an Apple identifier, an
-/// AVD's `hw.device.name`) when it has one, else a generic body for its screen.
+/// AVD's `hw.device.name`) when it has one, else a generic body for its screen. An Android
+/// device not running here gets the reference screen of its system image (AI glasses' own). While
+/// an iPhone's CarPlay display shows in its place, the car head unit's ([`CARPLAY_BODY`]), never
+/// the iPhone's.
 pub fn body_for(s: &State) -> Option<Arc<Body>> {
     let d = s.selected_info()?;
+    if s.carplay_shown() {
+        return body::get(CARPLAY_BODY);
+    }
     match d.platform {
         Platform::Ios => body::get(&d.device_type_id).or_else(|| body::for_profile(&d.kind()?.profile())),
         Platform::Android => {
             let device = s.android.as_ref().filter(|a| a.info.udid == d.udid);
-            let profile = device.and_then(|a| a.profile().ok()).or_else(|| d.kind().map(|k| k.profile()))?;
+            // `system-images;android-36;ai-glasses;arm64-v8a`: the image's tag.
+            let tag = d.runtime_id.split(';').nth(2).unwrap_or_default();
+            let profile = device.and_then(|a| a.profile().ok()).or_else(|| d.kind().map(|k| k.image_profile(tag)))?;
             // An unlisted foldable folds the way its AVD's hinge says (a flip, its angles).
             let config = device.and_then(|a| a.avd.as_ref());
             let hinge = config.and_then(|c| sim_core::fold::Hinge::from_config(|k| c.get(k).map(str::to_owned)));
-            body::for_android_hinge(&d.device_type_id, &profile, hinge.as_ref())
+            body::for_android_image(&d.device_type_id, &profile, hinge.as_ref(), tag)
         }
     }
 }
@@ -527,27 +547,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_wgpu_draws_the_scene_on_macos() {
-        assert!(!wgpu_backend(None, None, true));
-        assert!(wgpu_backend(None, Some("wgpu"), true));
-        assert!(wgpu_backend(None, Some(" WGPU "), true));
-        assert!(!wgpu_backend(None, Some("metal"), true));
-        assert!(!wgpu_backend(None, Some("vulkan"), true));
-        // Rune's own variable wins over simee's.
-        assert!(!wgpu_backend(Some("metal"), Some("wgpu"), true));
-        assert!(wgpu_backend(Some("wgpu"), Some("metal"), true));
-        // Rune matches its variable exactly: `WGPU` or ` wgpu` is no choice, so Rune draws with
-        // simee's setting (else the default).
-        assert!(!wgpu_backend(Some("WGPU"), None, true));
-        assert!(!wgpu_backend(Some(" wgpu"), Some("metal"), true));
-        assert!(wgpu_backend(Some("WGPU"), Some("wgpu"), true));
-        // Elsewhere there's only wgpu.
-        assert!(wgpu_backend(None, None, false));
-        assert!(wgpu_backend(Some("metal"), None, false));
-    }
-
-    #[test]
-    fn toggle_starts_from_the_environment_and_explains_metal() {
+    fn toggle_starts_from_the_environment_and_explains_a_missing_compositor() {
         let still = |p| View::new(p);
         assert_eq!(
             Toggle::from_env(None, None, true),
@@ -566,15 +566,30 @@ mod tests {
     }
 
     #[test]
+    fn no_body_lists_the_form_factors_with_bodies() {
+        let before = |f: FormFactor| matches!(f, FormFactor::Phone | FormFactor::Tablet | FormFactor::Foldable | FormFactor::Watch);
+        assert_eq!(no_body(before), "The 3D view has bodies for phones, tablets, foldables and watches");
+        assert_eq!(
+            no_body(|_| true),
+            "The 3D view has bodies for phones, tablets, foldables, watches, TVs, car head units and XR headsets and glasses"
+        );
+        assert_eq!(no_body(|f| f == FormFactor::Phone), "The 3D view has bodies for phones");
+        assert_eq!(*NO_BODY, no_body(body::has_body));
+        for f in FormFactor::ALL {
+            assert!(NO_BODY.contains(no_body(|g| g == f).trim_start_matches("The 3D view has bodies for ")) == body::has_body(f), "{f:?}");
+        }
+    }
+
+    #[test]
     fn flip_turns_it_on_and_off_only_where_it_can_draw() {
         let mut t = Toggle { supported: true, ..Toggle::default() };
         assert_eq!(t.flip(), None);
         assert!(t.on);
         assert_eq!(t.flip(), None);
         assert!(!t.on);
-        let mut metal = Toggle::default();
-        assert_eq!(metal.flip().as_deref(), Some(UNAVAILABLE));
-        assert!(!metal.on);
+        let mut hot = Toggle::default();
+        assert_eq!(hot.flip().as_deref(), Some(UNAVAILABLE));
+        assert!(!hot.on);
     }
 
     #[test]

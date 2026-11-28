@@ -155,7 +155,8 @@ device's own launchd database) and stops 74 daemons no AutoMobile tool and no si
 suggestions, photo and media analysis, Health, Home, fitness, the Store, iCloud sync, Mail, News,
 Weather, Wallet, Game Center, Screen Time, watch and Find My companions, experiments and ML hosts,
 App Intents (linkd), account sync, Focus status, Memoji and Apple Intelligence's model catalog.
-The list and what was kept on purpose is `SLIM` in `crates/sim-api/src/ios.rs`.
+The list, each job's rationale and safety note, and what was kept on purpose are a table, `SLIM`
+and `KEPT` in `crates/sim-core/src/launchd_profiles.rs` ([ios.md](ios.md#launchd-job-profiles)).
 
 | per device | fresh | clone | slim clone |
 | --- | --- | --- | --- |

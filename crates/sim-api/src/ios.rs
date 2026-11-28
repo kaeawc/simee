@@ -12,20 +12,25 @@ use sim_core::debug;
 use sim_core::device::{DeviceState, privacy_service};
 use sim_core::duo;
 use sim_core::form_factor::FormFactor;
+use sim_core::frame::encode_png;
 use sim_core::geometry::{Point, Size};
 use sim_core::gesture::{Sample, ScreenEdge, pace, pace_samples};
 use sim_core::hid::{Button, KeyEvent, key_events};
 use sim_core::indigo::PointerButton;
 use sim_core::pointer::{self, Held, HeldPointer, PointerAction};
 use sim_core::reuse::{BootKey, Reuse};
+use sim_core::shot::{Lookup, ShotCache};
 use sim_core::worker::Workers;
 use sim_coresim::{Appearance, Context, Device, Direction, Display, Hid, Orientation, StateWatch, StatusBar, WatchGesture};
 
 use crate::params::{
     PointerRequest, button, crown_delta, display, err, need_bool, need_f64, need_str, opt_bool, opt_edge, opt_form_factor, opt_orientation,
-    opt_u64, pairs, pencil_samples, pointer_request, remote_swipe_samples, screenshot_result, str_param, strings, swipe_samples,
-    tap_samples, touch_sample,
+    opt_u64, pairs, pencil_samples, png_result, pointer_request, remote_swipe_samples, screenshot_result, str_param, strings,
+    swipe_samples, tap_samples, touch_sample,
 };
+// The settle rule, its options and a result's load figures: shared with Android's `settle`.
+pub(crate) use crate::settle::options as settle_options;
+use crate::settle::{not_settled, put_load, round, rule as settle_rule};
 
 /// Shaping proxies, one per device, owned by this (long-running) process.
 static PROXIES: std::sync::Mutex<Option<std::collections::HashMap<String, sim_netshape::proxy::Proxy>>> = std::sync::Mutex::new(None);
@@ -33,39 +38,6 @@ static PROXIES: std::sync::Mutex<Option<std::collections::HashMap<String, sim_ne
 fn with_proxies<T>(f: impl FnOnce(&mut std::collections::HashMap<String, sim_netshape::proxy::Proxy>) -> T) -> T {
     let mut guard = PROXIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     f(guard.get_or_insert_with(Default::default))
-}
-
-fn profile_from(p: &Value, base: sim_netshape::Profile) -> Result<sim_netshape::Profile, String> {
-    let mut profile = match str_param(p, "preset") {
-        Some(name) => sim_netshape::Profile::preset(name).ok_or_else(|| format!("unknown preset `{name}`"))?,
-        None => base,
-    };
-    let num = |key: &str| p.get(key).and_then(Value::as_u64);
-    if let Some(v) = p.get("offline").and_then(Value::as_bool) {
-        profile.offline = v;
-    }
-    if let Some(v) = num("latency_ms") {
-        profile.latency_ms = v as u32;
-    }
-    if let Some(v) = num("down_kbps") {
-        profile.down_kbps = v as u32;
-    }
-    if let Some(v) = num("up_kbps") {
-        profile.up_kbps = v as u32;
-    }
-    if let Some(v) = num("loss_pct") {
-        profile.loss_pct = (v as u32).min(100);
-    }
-    if let Some(v) = num("port_base") {
-        profile.port_base = u16::try_from(v).map_err(err)?;
-    }
-    if let Some(v) = num("port_count") {
-        profile.port_count = u16::try_from(v).map_err(err)?;
-    }
-    if let Some(rules) = p.get("rules") {
-        profile.rules = serde_json::from_value(rules.clone()).map_err(|e| format!("bad rules: {e}"))?;
-    }
-    Ok(profile)
 }
 
 /// A local port nothing listens on.
@@ -526,7 +498,16 @@ struct Screens {
     /// 1206x2622 in all four orientations on an iPhone 17 Pro, iOS 27.2), and these displays are
     /// found again, `updateIOPorts` and all, in every new boot.
     sizes: [std::cell::Cell<Option<SizeAt>>; 2],
+    /// The last screenshot of each (#114): answered again while the surface's seed (or, where the
+    /// seed ticks on a still screen, its contents' hash) stays the same. Kept for this boot only,
+    /// beside the displays, and dropped with them; shared with the caller, which encodes a miss off
+    /// the worker and stores it.
+    shots: Shots,
 }
+
+/// The screenshot cache's key: which built-in screen (0 main, 1 inner) and the format.
+type ShotKey = (usize, &'static str);
+type Shots = Arc<std::sync::Mutex<ShotCache<ShotKey>>>;
 
 /// A framebuffer size (width, height) and the [`TURNS`] it was read at.
 type SizeAt = (u64, (u32, u32));
@@ -548,7 +529,16 @@ fn inner_for<T>(device_type_id: &str, second: Option<T>) -> Option<T> {
 impl Screens {
     fn open(device: &Device) -> Result<Self, String> {
         let (main, inner) = device.builtin_displays().map_err(err)?;
-        Ok(Self { main, inner: inner_for(&device.info().device_type_id, inner), sizes: Default::default() })
+        Ok(Self { main, inner: inner_for(&device.info().device_type_id, inner), sizes: Default::default(), shots: Shots::default() })
+    }
+
+    /// The PNG screenshot of `display`, one of these: the kept one while its surface still shows
+    /// it, else the frame to encode, with the cache to store the encoded bytes in.
+    fn shot(&self, display: &Display) -> Result<(Lookup<ShotKey>, Shots), String> {
+        let key = (usize::from(!std::ptr::eq(display, &self.main)), "png");
+        let turns = TURNS.load(Ordering::Acquire);
+        let found = self.shots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).lookup(key, turns, &mut Surfaced(display))?;
+        Ok((found, self.shots.clone()))
     }
 
     /// The framebuffer size of `display`, one of these: read once, then kept until a rotation or
@@ -767,6 +757,147 @@ fn capture(s: &mut Session, p: &Value) -> Result<sim_core::frame::Frame, String>
     match display(p)? {
         duo::Display::CarPlay => s.device(p)?.external_display().and_then(|d| d.capture()).map_err(err),
         which => on_display(s, p, which, |_, d| d.capture().map_err(err)),
+    }
+}
+
+/// `screenshot`. A built-in screen is looked up in its worker's cache (#114): an unchanged surface
+/// answers with the bytes encoded before; a miss is captured on the worker and encoded here, so the
+/// worker is free for input meanwhile, then kept. The CarPlay screen is captured and encoded per
+/// call, as before.
+fn screenshot(s: &mut Session, p: &Value) -> Result<Value, String> {
+    let which = display(p)?;
+    if which == duo::Display::CarPlay {
+        return screenshot_result(&capture(s, p)?, p);
+    }
+    let shot = match on_display(s, p, which, |screens, d| screens.shot(d))? {
+        (Lookup::Hit(shot), _) => shot,
+        (Lookup::Miss(frame, ticket), shots) => {
+            let png = encode_png(&frame)?;
+            shots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).store(ticket, frame.width, frame.height, png)
+        }
+    };
+    png_result(shot.width, shot.height, shot.bytes.as_slice(), p)
+}
+
+/// A display as the screenshot cache reads it.
+struct Surfaced<'a>(&'a Display);
+
+impl sim_core::shot::Source for Surfaced<'_> {
+    fn stamp(&mut self) -> Result<sim_core::shot::Stamp, String> {
+        self.0.stamp().map_err(err)
+    }
+    fn hash(&mut self) -> Result<(sim_core::shot::Stamp, u64), String> {
+        self.0.content_hash().map_err(err)
+    }
+    fn capture(&mut self) -> Result<(sim_core::frame::Frame, sim_core::shot::Stamp, u64), String> {
+        self.0.capture_hashed().map_err(err)
+    }
+}
+
+/// `wait_idle`'s quiet period (`quiet_ms`, default 300), its limit (`timeout_ms`, default 10 s) and
+/// whether it answers with the still screen (`screenshot`, default false).
+///
+pub(crate) fn wait_idle_options(p: &Value) -> Result<(Duration, Duration, bool), String> {
+    let (quiet_ms, timeout_ms) = (opt_u64(p, "quiet_ms").unwrap_or(300), opt_u64(p, "timeout_ms").unwrap_or(10_000));
+    if timeout_ms < quiet_ms {
+        return Err(format!(
+            "timeout_ms ({timeout_ms}) is shorter than quiet_ms ({quiet_ms}): the screen can't be still for the quiet period within it"
+        ));
+    }
+    Ok((Duration::from_millis(quiet_ms), Duration::from_millis(timeout_ms), opt_bool(p, "screenshot")?.unwrap_or(false)))
+}
+
+/// The least time between two looks at the device's state while `wait_idle` waits.
+const DEVICE_CHECK: Duration = Duration::from_millis(100);
+
+/// How often `wait_idle` reads the seed of a display that has no frame callback.
+const IDLE_POLL: Duration = Duration::from_millis(16);
+
+/// `wait_idle` (#114): waits on this thread, not the device's worker, so input keeps flowing; the
+/// screenshot after it goes through the worker's cache like any other.
+fn wait_idle(s: &mut Session, p: &Value) -> Result<Value, String> {
+    let (quiet, timeout, with_shot) = wait_idle_options(p)?;
+    let which = display(p)?;
+    let device = s.device(p)?;
+    if device.state() != DeviceState::Booted {
+        return Err(format!("{} isn't booted", device.info().name));
+    }
+    let still = sim_coresim::autoreleasepool(|| {
+        let (screens, external);
+        let display = match which {
+            duo::Display::CarPlay => {
+                external = device.external_display().map_err(err)?;
+                &external
+            }
+            which => {
+                screens = Screens::open(&device)?;
+                screens.pick(which)?.0
+            }
+        };
+        sim_core::idle::wait_idle(&mut Watched::new(display, &device), quiet, timeout, sim_core::idle::HASH_EVERY)
+    })?;
+    let mut result = json!({"waited_ms": still.waited.as_millis() as u64, "frames": still.frames});
+    if with_shot && let Value::Object(shot) = screenshot(s, p)? {
+        result.as_object_mut().expect("an object").extend(shot);
+    }
+    Ok(result)
+}
+
+/// A display `wait_idle` watches: its frame callback wakes the wait, and a display without one is
+/// polled every [`IDLE_POLL`].
+struct Watched<'a> {
+    display: &'a Display,
+    device: &'a Device,
+    checked_at: Option<Instant>,
+    presented: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    watch: Option<sim_coresim::FrameWatch>,
+}
+
+impl<'a> Watched<'a> {
+    fn new(display: &'a Display, device: &'a Device) -> Self {
+        let presented = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let posted = presented.clone();
+        let watch = display
+            .watch_frames(move || {
+                *posted.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                posted.1.notify_all();
+            })
+            .ok();
+        Self { display, device, checked_at: None, presented, watch }
+    }
+}
+
+impl sim_core::idle::Probe for Watched<'_> {
+    fn seed(&mut self) -> Result<u32, String> {
+        sim_coresim::autoreleasepool(|| self.display.stamp()).map(|s| s.seed).map_err(err)
+    }
+    fn hash(&mut self) -> Result<(u32, u64), String> {
+        sim_coresim::autoreleasepool(|| self.display.content_hash()).map(|(stamp, hash)| (stamp.seed, hash)).map_err(err)
+    }
+    fn wait(&mut self, at_most: Duration) {
+        if self.watch.is_none() {
+            return sleep(at_most.min(IDLE_POLL));
+        }
+        let (flag, cv) = &*self.presented;
+        let flag = flag.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut flag, _) = cv.wait_timeout_while(flag, at_most, |f| !*f).unwrap_or_else(std::sync::PoisonError::into_inner);
+        *flag = false;
+    }
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn stop(&mut self) -> Option<String> {
+        if crate::call_cancelled() {
+            return Some("cancelled: wait_idle was cancelled".to_owned());
+        }
+        // A device that shuts down freezes its surface, which would read as a still screen: look at
+        // its state, at most every `DEVICE_CHECK`.
+        let now = Instant::now();
+        if self.checked_at.is_some_and(|at| now.duration_since(at) < DEVICE_CHECK) {
+            return None;
+        }
+        self.checked_at = Some(now);
+        (self.device.state() != DeviceState::Booted).then(|| format!("{} stopped being booted during wait_idle", self.device.info().name))
     }
 }
 
@@ -1098,7 +1229,8 @@ struct BootPlan {
 #[derive(Debug)]
 pub struct Profile {
     pub name: &'static str,
-    /// launchd labels (in the device's `system` domain) disabled and stopped.
+    /// launchd labels (in the device's `system` domain) disabled and stopped: the labels of the
+    /// profile's table in `sim_core::launchd_profiles`, in order.
     pub disabled: &'static [&'static str],
 }
 
@@ -1118,150 +1250,20 @@ pub struct Profile {
 /// `Disabled` in their own plists; nanoregistrylaunchd enables all 17 each time it runs (one to
 /// three minutes after a boot, measured on iOS 27.2), which is why they came back on every boot.
 /// The profile disables nanoregistrylaunchd itself, and the ones that run once enabled.
-pub const PROFILES: &[Profile] = &[Profile { name: "slim", disabled: SLIM }];
-
-/// The `slim` profile: daemons that burn CPU or memory on an idle booted device and that no
-/// AutoMobile tool needs (measured on iOS 27.2, iPhone 17; see docs/farm.md).
 ///
-/// Kept on purpose: SpringBoard, backboardd, InputUI (the keyboard), AccessibilityUIServer and
-/// the accessibility daemons (AutoMobile reads the screen through accessibility), installd,
-/// lsd and runningboardd (install, launch), tccd (privacy), usernotificationsd, locationd
-/// (`location`), sharingd, webbookmarksd (Safari, `open_url`), assetsd (the photo library),
-/// syslogd/logd (`logs`), configd_sim and nsurlsessiond (networking), and what simee's own
-/// methods reach in the device: carkitd (`carplay`), biometrickitd (`biometric`), apsd (`push`),
-/// securityd (`reset_keychain`), cfprefsd (`defaults_*`, `keyboard_language`), notifyd (`notify`,
-/// `memory_warning`), mediaserverd (audio). Also kept though a slim clone spends 1-6 CPU-s on each
-/// in its first two minutes: donotdisturbd and liveactivitiesd (notification delivery, Live
-/// Activities), AuthenticationServicesAgent (password AutoFill, passkeys), callservicesd
-/// (CallKit), calaccessd (EventKit), mobileassetd (keyboard and font assets), identityservicesd
-/// and diagnosticd (the log stream).
-const SLIM: &[&str] = &[
-    // Lock and home screen wallpapers: PosterBoard and the ~15 poster extensions it keeps alive.
-    "com.apple.PosterBoard",
-    // Widgets.
-    "com.apple.chronod",
-    // Siri, dictation and suggestions.
-    "com.apple.assistantd",
-    "com.apple.assistant_cdmd",
-    "com.apple.siriactionsd",
-    "com.apple.siriinferenced",
-    "com.apple.siriknowledged",
-    "com.apple.sirittsd",
-    "com.apple.siri.context.service",
-    "com.apple.corespeechd",
-    "com.apple.voicebankingd",
-    "com.apple.suggestd",
-    "com.apple.textunderstandingd",
-    "com.apple.generativeexperiencesd",
-    "com.apple.spotlightknowledged.updater",
-    "com.apple.parsecd",
-    // Photo and media analysis.
-    "com.apple.photoanalysisd",
-    "com.apple.mediaanalysisd",
-    // Health, home, fitness. Not sleepd: without it SpringBoard and mobiletimerd retry
-    // `com.apple.sleepd.sleepserver` in a tight loop on every later boot (~350 % of a core, and
-    // the device never settles; measured on iOS 27.2).
-    "com.apple.healthd",
-    "com.apple.homed",
-    "com.apple.homeeventsd",
-    "com.apple.fitnesscoachingd",
-    "com.apple.fitnessintelligenced",
-    // Store, iCloud sync, mail, news, weather, wallet, games, finance.
-    "com.apple.appstored",
-    "com.apple.itunesstored",
-    "com.apple.itunescloudd",
-    "com.apple.amsengagementd",
-    "com.apple.ap.adprivacyd",
-    "com.apple.ap.promotedcontentd",
-    "com.apple.cloudd",
-    "com.apple.email.maild",
-    "com.apple.icloudmailagent",
-    "com.apple.newsd",
-    "com.apple.weatherd",
-    "com.apple.passd",
-    "com.apple.financed",
-    "com.apple.gamed",
-    "com.apple.SafariBookmarksSyncAgent",
-    "com.apple.followupd",
-    "com.apple.remindd",
-    // Location history, maps analytics, people and social. Not carkitd: `carplay` needs it.
-    "com.apple.routined",
-    "com.apple.geoanalyticsd",
-    "com.apple.navd",
-    "com.apple.peopled",
-    "com.apple.sociallayerd",
-    // Screen Time.
-    "com.apple.ScreenTimeAgent",
-    "com.apple.UsageTrackingAgent",
-    "com.apple.FamilyControlsAgent",
-    // Paired-watch and Find My companions: nanoregistrylaunchd enables the paired-watch daemons
-    // (see `PROFILES`); the rest are those that then run on an idle phone.
-    "com.apple.nanoregistrylaunchd",
-    "com.apple.addressbooksyncd",
-    "com.apple.bulletindistributord",
-    "com.apple.pairedsyncd",
-    "com.apple.NPKCompanionAgent",
-    "com.apple.companionappd",
-    "com.apple.wcd",
-    "com.apple.brook.brookcompaniond",
-    "com.apple.findmy.findmylocated",
-    // Experiments, ML hosting and asset prefetch.
-    "com.apple.triald",
-    "com.apple.mlhostd",
-    "com.apple.jetpackassetd",
-    "com.apple.replicatord",
-    "com.apple.diagnosticextensionsd",
-    // What a slim clone still spent its first two minutes on (measured per job, iOS 27.2 and
-    // 18.6; docs/farm.md). App Intents: linkd runs donotdisturbd's Focus-filter first-launch task,
-    // which starts the Calendar, Safari and Messages intents extensions and Calendar itself
-    // 13-38 s after the boot (~8 CPU-s, the burst that held the settle window open).
-    "com.apple.linkd",
-    // Watch faces and settings sync, with no watch paired.
-    "com.apple.nanotimekitcompaniond",
-    "com.apple.nanoprefsyncd.2",
-    // Exchange/CalDAV/CardDAV account sync (no accounts) and Safari's breached-password lookups.
-    "com.apple.dataaccess.dataaccessd",
-    "com.apple.Safari.passwordbreachd",
-    // Fitness: activity sharing, awards, Fitness+ (healthd is off already).
-    "com.apple.activitysharingd",
-    "com.apple.activityawardsd",
-    "com.apple.fitcore",
-    // Focus status sharing, Memoji, Apple Intelligence's model catalog, Family Sharing alerts.
-    "com.apple.StatusKitAgent",
-    "com.apple.avatarsd",
-    "com.apple.modelcatalogd",
-    "com.apple.familynotification",
-];
+/// What each profile turns off, why, what it was measured to save and what breaks without it, and
+/// what is kept on purpose, is data: `sim_core::launchd_profiles` (docs/ios.md, "Launchd job
+/// profiles").
+pub const PROFILES: &[Profile] = &[Profile { name: "slim", disabled: &SLIM }];
+
+/// The `slim` profile's labels, from its table.
+const SLIM: [&str; sim_core::launchd_profiles::SLIM.len()] = sim_core::launchd_profiles::labels(sim_core::launchd_profiles::SLIM);
 
 fn profile(name: &str) -> Result<&'static Profile, String> {
     PROFILES.iter().find(|p| p.name == name).ok_or_else(|| {
         let names: Vec<&str> = PROFILES.iter().map(|p| p.name).collect();
         format!("unknown profile `{name}` ({})", names.join(", "))
     })
-}
-
-/// The settle rule from `prefix` + `cpu_pct`, `window_s` and `foreground` (the defaults where
-/// absent): `settle_` for `boot` and `boot_many`, none for `settle`.
-fn settle_rule(p: &Value, prefix: &str) -> Result<crate::settle::Rule, String> {
-    let mut rule = crate::settle::Rule::default();
-    let key = |name: &str| format!("{prefix}{name}");
-    match p.get(key("cpu_pct")) {
-        None | Some(Value::Null) => {}
-        Some(v) => {
-            rule.cpu_pct =
-                v.as_f64().filter(|x| *x >= 0.0).ok_or_else(|| format!("{} must be a number of % of a core, not {v}", key("cpu_pct")))?
-        }
-    }
-    match p.get(key("window_s")) {
-        None | Some(Value::Null) => {}
-        Some(v) => {
-            rule.window = Duration::from_secs(v.as_u64().ok_or_else(|| format!("{} must be whole seconds, not {v}", key("window_s")))?)
-        }
-    }
-    if let Some(fg) = opt_bool(p, &key("foreground"))? {
-        rule.foreground = fg;
-    }
-    Ok(rule)
 }
 
 /// `launch`'s `restart`: true (the default) terminates a running instance and cold-starts the
@@ -1359,12 +1361,6 @@ pub(crate) fn boot_plan_text(p: &Value, many: bool) -> Result<String, String> {
     boot_plan(p, 1, many, || Ok(Vec::new())).map(|plan| format!("{plan:?}"))
 }
 
-/// `settle`'s rule and how long it waits (`timeout_s`, default 600 s).
-pub(crate) fn settle_options(p: &Value) -> Result<(crate::settle::Rule, Duration), String> {
-    let rule = settle_rule(p, "")?;
-    Ok((rule, opt_u64(p, "timeout_s").map_or_else(|| crate::settle::default_settle_timeout(1), Duration::from_secs)))
-}
-
 /// `logs`' window, predicate and whether it answers from the device's stream (`stream`, default false).
 pub(crate) fn log_options(p: &Value) -> Result<(&str, Option<&str>, bool), String> {
     Ok((str_param(p, "last").unwrap_or("1m"), str_param(p, "predicate"), opt_bool(p, "stream")?.unwrap_or(false)))
@@ -1441,31 +1437,6 @@ fn boot_device(device: &Device, plan: &BootPlan, launching: &dyn Fn() -> Result<
         put_load(&mut result, &settler);
     }
     Ok(result)
-}
-
-/// Why a wait that ran out of time didn't settle.
-fn not_settled(settler: &crate::settle::Settler, rule: crate::settle::Rule, timeout: Duration) -> String {
-    let what = if rule.foreground { " in the foreground" } else { "" };
-    let pct = settler.load().map_or_else(|| "no process tree".to_owned(), |l| format!("{:.0} % of a core{what}", l.judged_pct(&rule)));
-    format!("device did not settle within {}s ({pct} over the last {}s)", timeout.as_secs(), rule.window.as_secs())
-}
-
-/// A settle wait's last figures: processes, and CPU over the window (all of it, and the
-/// background-QoS and foreground parts); and the CPU seconds the tree used over the whole wait
-/// (from the boot when the wait followed one).
-fn put_load(result: &mut Value, settler: &crate::settle::Settler) {
-    let load = settler.load();
-    let used = settler.used();
-    result["cpu_s"] = json!(round(used.total_s));
-    result["background_cpu_s"] = json!(round(used.background_s));
-    result["procs"] = json!(settler.procs());
-    result["cpu_pct"] = json!(load.map(|l| round(l.total_pct)));
-    result["background_cpu_pct"] = json!(load.map(|l| round(l.background_pct)));
-    result["foreground_cpu_pct"] = json!(load.map(|l| round(l.foreground_pct())));
-}
-
-fn round(x: f64) -> f64 {
-    (x * 10.0).round() / 10.0
 }
 
 /// What applying (or undoing) a profile did: the labels now in the wanted state, those that
@@ -1583,11 +1554,21 @@ fn apply_profile(device: &Device, profile: &Profile, undo: bool) -> Result<Appli
     // has no shell, so each call is its own spawn (~0.1-0.4 s), and `exec` reports no exit
     // status: a failed call is one that printed an error, and the effect is read back from
     // launchd's own lists.
-    let run = |args: &[&str]| device.exec("launchctl", &args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>(), &[]);
+    apply_jobs(profile.disabled, undo, |args| {
+        device.exec("launchctl", &args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>(), &[]).map_err(err)
+    })
+}
+
+/// [`apply_profile`] for `labels` over `run`, one launchctl call (its arguments) at a time.
+fn apply_jobs(
+    labels: &[&str],
+    undo: bool,
+    mut run: impl FnMut(&[&str]) -> Result<sim_coresim::ExecOutput, String>,
+) -> Result<Applied, String> {
     let loaded = if undo { String::new() } else { run(&["list"]).map(|o| o.stdout).unwrap_or_default() };
     let before = if undo { String::new() } else { run(&["print-disabled", "system"]).map(|o| o.stdout).unwrap_or_default() };
-    let todo = if undo { profile.disabled.to_vec() } else { still_on(profile.disabled, &loaded, &before) };
-    let already: Vec<&str> = profile.disabled.iter().copied().filter(|l| !todo.contains(l)).collect();
+    let todo = if undo { labels.to_vec() } else { still_on(labels, &loaded, &before) };
+    let already: Vec<&str> = labels.iter().copied().filter(|l| !todo.contains(l)).collect();
     let mut refused = Vec::new();
     for label in &todo {
         let target = format!("system/{label}");
@@ -1602,8 +1583,8 @@ fn apply_profile(device: &Device, profile: &Profile, undo: bool) -> Result<Appli
     }
     // Nothing changed (a device whose disables were preset before its boot): the listing read
     // before is the one after.
-    let disabled = if todo.is_empty() { before } else { run(&["print-disabled", "system"]).map_err(err)?.stdout };
-    Ok(profile_outcome(profile.disabled, &loaded, &already, &refused, &disabled, undo))
+    let disabled = if todo.is_empty() { before } else { run(&["print-disabled", "system"])?.stdout };
+    Ok(profile_outcome(labels, &loaded, &already, &refused, &disabled, undo))
 }
 
 /// Writes `profile`'s disables into the shut-down device `udid`'s launchd overrides file (see
@@ -1928,8 +1909,8 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             let (w, h) = screen_size(s, p)?;
             Ok(json!({"width": w, "height": h}))
         }
-        // Captured on the device's worker, encoded here: the worker is free for input meanwhile.
-        "screenshot" => screenshot_result(&capture(s, p)?, p),
+        "screenshot" => screenshot(s, p),
+        "wait_idle" => wait_idle(s, p),
         "contrast_check" => crate::contrast::run(&mut ContrastTarget { s, p }, p),
         m if INPUT_METHODS.contains(&m) => input(s, m, p),
         "rotate" => rotate(&s.device(p)?, opt_orientation(p)?),
@@ -2146,7 +2127,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "network_shape" => {
             let d = s.device(p)?;
             let udid = d.info().udid;
-            let profile = profile_from(p, sim_netshape::read_profile(&udid))?;
+            let profile = crate::params::shape_profile(p, sim_netshape::read_profile(&udid))?;
             let use_proxy = p.get("proxy").and_then(Value::as_bool).unwrap_or(true);
             // inject: false | true (launchd setenv: new processes) | "boot" (reboot: every process).
             let inject_mode = match p.get("inject") {
@@ -2561,6 +2542,15 @@ fn read_log(reader: Box<dyn std::io::Read + Send>, tail: &SharedTail, clock: &dy
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    #[test]
+    fn a_wait_idle_timeout_under_its_quiet_period_is_refused_up_front() {
+        let e = super::wait_idle_options(&serde_json::json!({"quiet_ms": 300, "timeout_ms": 100})).expect_err("refused");
+        assert!(e.contains("timeout_ms") && e.contains("quiet_ms"), "{e}");
+        // Neighbours: equal is fine, and so are the defaults.
+        assert!(super::wait_idle_options(&serde_json::json!({"quiet_ms": 300, "timeout_ms": 300})).is_ok());
+        assert!(super::wait_idle_options(&serde_json::json!({})).is_ok());
+    }
 
     #[test]
     fn keys_go_a_gap_apart_and_twenty_characters_type_in_under_a_fifth_of_a_second() {
@@ -3927,6 +3917,138 @@ mod tests {
         assert_eq!(still_on(&labels, idle, enabled), labels, "not disabled yet: disabled");
         let r = profile_outcome(&labels, idle, &["com.apple.siri.context.service"], &[], disabled, false);
         assert_eq!(r, Applied { changed: 2, failed: vec![], not_loaded: vec![], already: 1 });
+    }
+
+    /// `boot {profile: "slim"}` as it was when the profile became a table (#199): the same 74
+    /// labels in the same order, each written disabled before the boot. A change to the profile
+    /// changes this pin on purpose, with its evidence in the table.
+    const SLIM_AT_199: &str = "com.apple.PosterBoard com.apple.chronod com.apple.assistantd com.apple.assistant_cdmd \
+        com.apple.siriactionsd com.apple.siriinferenced com.apple.siriknowledged com.apple.sirittsd com.apple.siri.context.service \
+        com.apple.corespeechd com.apple.voicebankingd com.apple.suggestd com.apple.textunderstandingd com.apple.generativeexperiencesd \
+        com.apple.spotlightknowledged.updater com.apple.parsecd com.apple.photoanalysisd com.apple.mediaanalysisd com.apple.healthd \
+        com.apple.homed com.apple.homeeventsd com.apple.fitnesscoachingd com.apple.fitnessintelligenced com.apple.appstored \
+        com.apple.itunesstored com.apple.itunescloudd com.apple.amsengagementd com.apple.ap.adprivacyd com.apple.ap.promotedcontentd \
+        com.apple.cloudd com.apple.email.maild com.apple.icloudmailagent com.apple.newsd com.apple.weatherd com.apple.passd \
+        com.apple.financed com.apple.gamed com.apple.SafariBookmarksSyncAgent com.apple.followupd com.apple.remindd com.apple.routined \
+        com.apple.geoanalyticsd com.apple.navd com.apple.peopled com.apple.sociallayerd com.apple.ScreenTimeAgent \
+        com.apple.UsageTrackingAgent com.apple.FamilyControlsAgent com.apple.nanoregistrylaunchd com.apple.addressbooksyncd \
+        com.apple.bulletindistributord com.apple.pairedsyncd com.apple.NPKCompanionAgent com.apple.companionappd com.apple.wcd \
+        com.apple.brook.brookcompaniond com.apple.findmy.findmylocated com.apple.triald com.apple.mlhostd com.apple.jetpackassetd \
+        com.apple.replicatord com.apple.diagnosticextensionsd com.apple.linkd com.apple.nanotimekitcompaniond com.apple.nanoprefsyncd.2 \
+        com.apple.dataaccess.dataaccessd com.apple.Safari.passwordbreachd com.apple.activitysharingd com.apple.activityawardsd \
+        com.apple.fitcore com.apple.StatusKitAgent com.apple.avatarsd com.apple.modelcatalogd com.apple.familynotification";
+
+    #[test]
+    fn boot_with_the_slim_profile_is_unchanged() {
+        let none = || -> Result<Shapers, String> { Err("unused".into()) };
+        let plan = boot_plan(&json!({"profile": "slim"}), 1, false, none).expect("boot");
+        let slim = plan.profile.expect("a profile");
+        assert_eq!((slim.name, slim.disabled.join(" ")), ("slim", SLIM_AT_199.to_owned()));
+        // What the boot of a shut-down device hands CoreSimulator (no earlier overrides): each disabled.
+        let missing = std::env::temp_dir().join(format!("simee-no-such-{}/disabled.plist", std::process::id()));
+        let jobs = boot_jobs_from(&missing, slim.disabled);
+        assert_eq!(jobs.len(), 74);
+        assert!(jobs.iter().zip(SLIM_AT_199.split(' ')).all(|((label, off), want)| label == want && *off));
+        assert!(boot_plan(&json!({}), 1, false, none).expect("boot").profile.is_none(), "no profile unless named");
+        assert_eq!(boot_plan(&json!({"profile": "lean"}), 1, false, none).expect_err("unknown"), "unknown profile `lean` (slim)");
+    }
+
+    #[test]
+    fn the_table_drives_the_slim_profile() {
+        let slim = profile("slim").expect("slim");
+        let table: Vec<&str> = sim_core::launchd_profiles::SLIM.iter().map(|j| j.label).collect();
+        assert_eq!(slim.disabled, table, "the table's labels, in its order");
+        // Every job a simee method reaches is on the keep list the table is checked against.
+        for (method, jobs) in NEEDED_BY_METHODS {
+            for job in *jobs {
+                assert!(sim_core::launchd_profiles::KEPT.iter().any(|k| k.label == *job), "`{method}` needs {job}: kept");
+            }
+        }
+    }
+
+    /// A device's launchctl as far as a profile uses it: `list`, `print-disabled system`,
+    /// `disable`/`enable`/`bootout system/<label>`, with every call recorded.
+    struct FakeLaunchctl {
+        /// Loaded jobs: label → PID (None: loaded, not running).
+        loaded: std::collections::BTreeMap<String, Option<i32>>,
+        disabled: std::collections::BTreeMap<String, bool>,
+        refuse: Vec<String>,
+        calls: Vec<String>,
+    }
+
+    impl FakeLaunchctl {
+        fn new(loaded: &[&str]) -> Self {
+            let loaded = loaded.iter().enumerate().map(|(i, l)| ((*l).to_owned(), Some(100 + i as i32))).collect();
+            Self { loaded, disabled: Default::default(), refuse: Vec::new(), calls: Vec::new() }
+        }
+
+        fn run(&mut self, args: &[&str]) -> Result<sim_coresim::ExecOutput, String> {
+            self.calls.push(args.join(" "));
+            let out = |stdout: String, stderr: &str| Ok(sim_coresim::ExecOutput { pid: 1, stdout, stderr: stderr.to_owned() });
+            let label = args.get(1).and_then(|t| t.strip_prefix("system/")).unwrap_or_default().to_owned();
+            match args[0] {
+                "list" => {
+                    let rows: String =
+                        self.loaded.iter().map(|(l, pid)| format!("{}\t0\t{l}\n", pid.map_or("-".to_owned(), |p| p.to_string()))).collect();
+                    out(format!("PID\tStatus\tLabel\n{rows}"), "")
+                }
+                "print-disabled" => {
+                    let rows: String = self
+                        .disabled
+                        .iter()
+                        .map(|(l, off)| format!("\t\t\"{l}\" => {}\n", if *off { "disabled" } else { "enabled" }))
+                        .collect();
+                    out(format!("\tdisabled services = {{\n{rows}\t}}\n"), "")
+                }
+                _ if self.refuse.contains(&label) => out(String::new(), "Could not find service in domain for system\n"),
+                "disable" | "enable" => {
+                    self.disabled.insert(label, args[0] == "disable");
+                    out(String::new(), "")
+                }
+                "bootout" => {
+                    self.loaded.remove(&label);
+                    out(String::new(), "Boot-out failed: 5: Input/output error\n")
+                }
+                other => Err(format!("the fake launchctl has no `{other}`")),
+            }
+        }
+
+        fn count(&self, verb: &str) -> usize {
+            self.calls.iter().filter(|c| c.starts_with(&format!("{verb} "))).count()
+        }
+    }
+
+    #[test]
+    fn a_profile_applies_and_undoes_the_tables_jobs_through_launchctl() {
+        let slim = profile("slim").expect("slim");
+        // A fresh clone: every job of the table loaded and running, plus SpringBoard.
+        let mut loaded = slim.disabled.to_vec();
+        loaded.push("com.apple.SpringBoard");
+        let mut lc = FakeLaunchctl::new(&loaded);
+        let r = apply_jobs(slim.disabled, false, |a| lc.run(a)).expect("applied");
+        assert_eq!(r, Applied { changed: 74, failed: vec![], not_loaded: vec![], already: 0 });
+        assert_eq!((lc.count("disable"), lc.count("bootout"), lc.count("enable")), (74, 74, 0));
+        assert!(lc.disabled.values().all(|off| *off) && lc.disabled.len() == 74);
+        assert_eq!(lc.loaded.keys().collect::<Vec<_>>(), ["com.apple.SpringBoard"], "only the table's jobs were stopped");
+
+        // Applied again on a later boot where nothing came back: two reads, no spawn per job.
+        lc.calls.clear();
+        let r = apply_jobs(slim.disabled, false, |a| lc.run(a)).expect("again");
+        assert_eq!((r.changed, r.already, r.failed.len()), (74, 74, 0));
+        assert_eq!(lc.calls, ["list", "print-disabled system"]);
+
+        // Undo enables each of the table's jobs (they run from the next boot) and stops none.
+        lc.calls.clear();
+        let r = apply_jobs(slim.disabled, true, |a| lc.run(a)).expect("undone");
+        assert_eq!(r.to_json(true), json!({"enabled": 74, "failed": []}));
+        assert_eq!((lc.count("enable"), lc.count("disable"), lc.count("bootout")), (74, 0, 0));
+        assert!(lc.disabled.values().all(|off| !*off));
+
+        // A job launchctl refuses is reported, the rest still applied.
+        let mut lc = FakeLaunchctl::new(&loaded);
+        lc.refuse.push("com.apple.linkd".to_owned());
+        let r = apply_jobs(slim.disabled, false, |a| lc.run(a)).expect("applied");
+        assert_eq!((r.changed, r.failed), (73, vec!["com.apple.linkd".to_owned()]));
     }
 
     #[test]
