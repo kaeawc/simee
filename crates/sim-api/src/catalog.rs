@@ -74,10 +74,10 @@ pub fn effect(method: &str) -> Option<Effect> {
         "unlink" => Destroy,
         "appearance" | "location" | "status_bar" | "clear_status_bar" | "content_size" | "increase_contrast" | "dynamic_island"
         | "backlight" | "keyboard_language" | "hardware_keyboard" | "ca_debug" | "network_clear" | "audio_volume" | "audio_route"
-        | "audio_mute" | "fold" | "carplay" | "profile" | "privacy" => Set,
+        | "audio_mute" | "fold" | "carplay" | "profile" | "privacy" | "car_stop" => Set,
         "create" | "boot" | "boot_many" | "clone" | "tap" | "swipe" | "touch" | "button" | "type" | "key" | "open_url" | "install"
         | "memory_warning" | "biometric" | "rotate" | "rotary" | "watch_gesture" | "remote_swipe" | "xr" | "touchpad" | "stylus"
-        | "pointer" | "vehicle" | "audio_capture_stop" | "contrast_check" | "import" => Act,
+        | "pointer" | "vehicle" | "audio_capture_stop" | "contrast_check" | "import" | "car_start" => Act,
         // Runs programs, starts apps with an environment, replaces a network profile (inject "boot"
         // reboots the device), delivers a payload, writes a recording or a bundle to a path, drives
         // the console, signals a process. `notify` is here for Android, where it is an `am broadcast`
@@ -183,7 +183,8 @@ pub fn group(method: &str) -> Option<Group> {
         | "watch_gesture" | "remote_swipe" | "pointer" | "biometric" => Input,
         "open_url" | "install" | "uninstall" | "launch" | "terminate" | "apps" | "privacy" | "push" => Apps,
         "appearance" | "location" | "status_bar" | "clear_status_bar" | "content_size" | "increase_contrast" | "dynamic_island"
-        | "backlight" | "keyboard_language" | "hardware_keyboard" | "memory_warning" | "notify" | "carplay" | "vehicle" => Settings,
+        | "backlight" | "keyboard_language" | "hardware_keyboard" | "memory_warning" | "notify" | "carplay" | "vehicle" | "car_start"
+        | "car_stop" => Settings,
         "ca_debug" | "ca_debug_state" | "exec" | "processes" | "kill" | "connections" | "traffic" | "mem_leaks" | "mem_heap"
         | "mem_vmmap" | "mem_history" | "crash_reports" | "console" => Debug,
         "containers" | "ls" | "read" | "write" | "rm" | "du" | "clear_container" | "defaults_read" | "defaults_write"

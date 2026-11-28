@@ -399,7 +399,7 @@
         "readOnlyHint": true,
         "title": "screen"
       },
-      "description": "Screen size in pixels, the space tap, swipe and touch take (a folded Android foldable: the size its guest lays out for, a Pixel Fold's 1080x2092, as uiautomator's bounds). display (iOS): main is the screen in use (an unfolded iPhone Duo's inner one), outer and inner an iPhone Duo's two, carplay an iPhone's CarPlay screen. Read-only: changes nothing on the device or the host.\n\nPlatforms: Android, iOS. Parameters: device, display?(main|outer|inner|carplay); iOS: set?. Toolsets: core, observe.",
+      "description": "Screen size in pixels, the space tap, swipe and touch take (a folded Android foldable: the size its guest lays out for, a Pixel Fold's 1080x2092, as uiautomator's bounds). display (iOS): main is the screen in use (an unfolded iPhone Duo's inner one), outer and inner an iPhone Duo's two, carplay an iPhone's CarPlay screen; car: Android Auto's head unit (car_start). Read-only: changes nothing on the device or the host.\n\nPlatforms: Android, iOS. Parameters: device, display?(main|outer|inner|carplay|car); iOS: set?. Toolsets: core, observe.",
       "inputSchema": {
         "properties": {
           "device": {
@@ -411,7 +411,8 @@
               "main",
               "outer",
               "inner",
-              "carplay"
+              "carplay",
+              "car"
             ],
             "type": "string"
           },
@@ -449,7 +450,7 @@
         "readOnlyHint": true,
         "title": "screenshot"
       },
-      "description": "The device's screen as a PNG image, returned in the result. Read-only: changes nothing on the device or the host.\n\nPlatforms: Android, iOS. Parameters: device, display?(main|outer|inner|carplay); iOS: set?. Toolsets: core, observe.",
+      "description": "The device's screen as a PNG image, returned in the result. Read-only: changes nothing on the device or the host.\n\nPlatforms: Android, iOS. Parameters: device, display?(main|outer|inner|carplay|car); iOS: set?. Toolsets: core, observe.",
       "inputSchema": {
         "properties": {
           "device": {
@@ -461,7 +462,8 @@
               "main",
               "outer",
               "inner",
-              "carplay"
+              "carplay",
+              "car"
             ],
             "type": "string"
           },
@@ -501,7 +503,7 @@
         "readOnlyHint": false,
         "title": "tap"
       },
-      "description": "Tap at pixels, held hold_ms (default: iOS 10, Android 60) (display, iOS only: an iPhone Duo's outer or inner screen, an iPhone's CarPlay screen). Acts on the device each time it is called. Coordinates are device pixels, the space `screen` reports (not points).\n\nPlatforms: Android, iOS. Parameters: device, x, y, hold_ms?, display?(main|outer|inner|carplay); iOS: set?. Toolsets: core, input.",
+      "description": "Tap at pixels, held hold_ms (default: iOS 10, Android 60) (display, iOS only: an iPhone Duo's outer or inner screen, an iPhone's CarPlay screen; car: Android Auto's head unit, see car_start). Acts on the device each time it is called. Coordinates are device pixels, the space `screen` reports (not points).\n\nPlatforms: Android, iOS. Parameters: device, x, y, hold_ms?, display?(main|outer|inner|carplay|car); iOS: set?. Toolsets: core, input.",
       "inputSchema": {
         "properties": {
           "device": {
@@ -513,7 +515,8 @@
               "main",
               "outer",
               "inner",
-              "carplay"
+              "carplay",
+              "car"
             ],
             "type": "string"
           },
@@ -557,7 +560,7 @@
         "readOnlyHint": false,
         "title": "swipe"
       },
-      "description": "Swipe between pixels over duration_ms (default 300; iOS sends its samples on schedule, so a busy host doesn't stretch it); with edge (iOS) the touch comes in from that screen edge, as a drag from Simulator.app's bezel: home and the app switcher from the bottom, Notification Center and Control Center from the top (Android's edge gestures need only the start point). Acts on the device each time it is called. Coordinates are device pixels, the space `screen` reports (not points).\n\nPlatforms: Android, iOS. Parameters: device, x1, y1, x2, y2, duration_ms?, settle?, display?(main|outer|inner|carplay), edge?(top|bottom|left|right; iOS); iOS: set?. Toolsets: core, input.",
+      "description": "Swipe between pixels over duration_ms (default 300; iOS sends its samples on schedule, so a busy host doesn't stretch it); with edge (iOS) the touch comes in from that screen edge, as a drag from Simulator.app's bezel: home and the app switcher from the bottom, Notification Center and Control Center from the top (Android's edge gestures need only the start point). Acts on the device each time it is called. Coordinates are device pixels, the space `screen` reports (not points).\n\nPlatforms: Android, iOS. Parameters: device, x1, y1, x2, y2, duration_ms?, settle?, display?(main|outer|inner|carplay|car), edge?(top|bottom|left|right; iOS); iOS: set?. Toolsets: core, input.",
       "inputSchema": {
         "properties": {
           "device": {
@@ -569,7 +572,8 @@
               "main",
               "outer",
               "inner",
-              "carplay"
+              "carplay",
+              "car"
             ],
             "type": "string"
           },
