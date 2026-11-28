@@ -796,6 +796,27 @@ fn a_full_session_table_closes_only_the_callers_own_sessions() {
 }
 
 #[test]
+fn a_session_is_settled_before_its_reply_reaches_the_client() {
+    // A reply means the request is over: the session is idle and last used then. Were it settled
+    // after the write, the next client's request could land first and the eviction below would
+    // pick the wrong session (#550). Many rounds make that race all but certain to show.
+    for round in 0..40 {
+        let rig = Rig::with(|c| c.limits.max_sessions = 2);
+        let mut older = rig.client();
+        older.initialize("2025-11-25");
+        let mut newer = rig.client();
+        newer.initialize("2025-11-25");
+        assert_eq!(older.call("ping", json!({}))["result"], json!({}));
+        assert_eq!(newer.call("ping", json!({}))["result"], json!({}));
+        let mut third = rig.client();
+        third.initialize("2025-11-25");
+        let (reply, _) = older.request("ping", json!({}));
+        assert_eq!(reply.status, 404, "round {round}: {reply:?}");
+        assert_eq!(newer.call("ping", json!({}))["result"], json!({}), "round {round}");
+    }
+}
+
+#[test]
 fn an_idle_session_expires_even_while_a_get_stream_holds_it() {
     let rig = Rig::with(|c| c.limits.session_idle = Duration::from_millis(400));
     let mut client = rig.client();

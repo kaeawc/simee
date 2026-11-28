@@ -1610,7 +1610,7 @@ impl Exchange<'_> {
                 write_response(self.stream(), 202, &[], b"", false).is_ok()
             }
             Incoming::Request { id, method, mut params } => {
-                let _running = session.as_ref().map(InFlight::new);
+                let running = session.as_ref().map(InFlight::new);
                 // A tool call's reply is written here, after the server queued it: a shutdown waits for that.
                 let _held = (method == "tools/call").then(|| crate::Drain::shared().hold());
                 let key = self.shared.router.key();
@@ -1624,7 +1624,7 @@ impl Exchange<'_> {
                 }
                 server.handle_line(&json!({"jsonrpc": "2.0", "id": key, "method": method, "params": params}).to_string());
                 let headers: Vec<(&str, String)> = created.into_iter().map(|id| ("Mcp-Session-Id", id)).collect();
-                let keep = self.answer(&rx, &server, &key, &headers);
+                let keep = self.answer(&rx, &server, &key, &headers, running);
                 self.shared.router.forget(&key);
                 if let Some(s) = &session {
                     let mut cancels = lock(&s.cancels);
@@ -1641,7 +1641,10 @@ impl Exchange<'_> {
     /// notification for it comes first. A client that has gone (a write to it fails) cancels the
     /// request. One that only finished sending (a half-close) is still reading: if it takes an
     /// event stream, the response becomes one so its pings can tell; if not, it waits.
-    fn answer(&self, rx: &NoteRx, server: &Server, key: &str, headers: &[(&str, String)]) -> bool {
+    ///
+    /// `running` ends before the response is written, so a client that has its answer sees the
+    /// session idle and last used by this request: its next request, on any session, comes after.
+    fn answer(&self, rx: &NoteRx, server: &Server, key: &str, headers: &[(&str, String)], running: Option<InFlight>) -> bool {
         let stream = self.stream();
         let streams = self.head.accepts("text/event-stream");
         let cancel = || {
@@ -1651,6 +1654,7 @@ impl Exchange<'_> {
         loop {
             match rx.recv_timeout(self.shared.config.limits.ping) {
                 Ok(Out::Response(line)) => {
+                    drop(running);
                     return match &sse {
                         None => write_response(stream, 200, headers, line.as_bytes(), false).is_ok(),
                         Some(sse) => sse.event(&line).and_then(|()| sse.end()).is_ok() && sse.chunked,
