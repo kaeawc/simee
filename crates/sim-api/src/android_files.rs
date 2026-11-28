@@ -69,7 +69,7 @@ pub(crate) fn call(android: &Android, d: &Device, method: &str, p: &Value) -> Re
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use serde_json::{Value, json};
     use sim_android::files::fake::{FakeFiles, Root, fake_files_adb};

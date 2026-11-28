@@ -55,7 +55,8 @@ use std::time::{Duration, Instant};
 
 use crate::apps::{Adb, Captured, capture, failure, package_name, shell_quote};
 
-#[cfg(any(test, feature = "testing"))]
+/// A fake device for tests (`/bin/sh` scripts): unix only.
+#[cfg(all(unix, any(test, feature = "testing")))]
 pub mod fake;
 
 /// What a device-side guard prints (and exits with) when a path resolves outside its container.
@@ -688,7 +689,7 @@ fn owner_of(line: &str) -> (Option<String>, Option<String>) {
     (Some(format!("{uid}:{gid}")), number(mode).then(|| mode.to_owned()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
