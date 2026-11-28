@@ -482,6 +482,7 @@ impl ViewItem {
         ViewItem::ALL.into_iter().find(|a| a.key() == c)
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub fn id(self) -> &'static str {
         match self {
             ViewItem::Sidebar => "view-device-list",
@@ -519,7 +520,8 @@ impl ViewItem {
         }
     }
 
-    /// Picked in the View menu.
+    /// Picked in the View menu (macOS only; tests pick items directly).
+    #[cfg(any(target_os = "macos", test))]
     pub fn pick(self, s: &mut State, tx: &mut Tx) {
         self.perform(s, Cause::Menu);
         tx.request_poll();
