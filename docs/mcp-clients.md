@@ -15,7 +15,10 @@ comments stay as they are. It refuses to replace an existing entry of the same n
 `--force`; an identical entry is left alone. A file that isn't plain JSON (comments, trailing
 commas) is refused untouched instead of rewritten. The write is atomic (a temporary file in the
 same directory, then a rename), keeps the original file's permissions, and writes through a
-symlink. A new file is created private (`0600`). Restart the client afterwards.
+symlink to the file it points to; a symlink to a missing file is refused rather than replaced. If
+another program rewrites the file while `install` works (Claude Code updates `~/.claude.json`
+itself), `install` merges again from the new content once, then refuses. A new file is created
+private (`0600`). Restart the client afterwards.
 
 | Option | Meaning |
 | --- | --- |
@@ -23,7 +26,7 @@ symlink. A new file is created private (`0600`). Restart the client afterwards.
 | `--name NAME` | The server's name in the client's config (default `simee`) |
 | `--toolsets LIST` | Sets `SIMEE_MCP_TOOLSETS` for the server, e.g. `core,debug` (validated; see [Toolsets](mcp.md#toolsets)) |
 | `--env KEY=VALUE` | More environment for the server (repeatable) |
-| `--command PATH` | The binary the client starts (default: this `simee`, as an absolute path) |
+| `--command PATH` (alias `--bin`) | The binary the client starts. Default: the path you ran `simee` as, when that is a symlink to this binary (a Homebrew `bin/simee` outlives `brew upgrade`), else this binary's own path. Always absolute |
 | `--dry-run`, `--force` | `install` only |
 
 The command is an absolute path because GUI clients (Claude Desktop, VS Code, Cursor) don't start
@@ -38,7 +41,7 @@ with your shell's `PATH`.
 | Cursor | `~/.cursor/mcp.json` | `.cursor/mcp.json` | `mcpServers` | [Cursor MCP][cursor] |
 | VS Code | macOS `~/Library/Application Support/Code/User/mcp.json`; Windows `%APPDATA%\Code\User\mcp.json`; Linux `~/.config/Code/User/mcp.json` | `.vscode/mcp.json` | `servers` | [VS Code MCP][vscode] |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` | none | `mcpServers` | [Windsurf MCP][windsurf] |
-| Codex | `~/.codex/config.toml` | `.codex/config.toml` (trusted projects) | `[mcp_servers.NAME]` | [Codex MCP][codex] |
+| Codex | `$CODEX_HOME/config.toml`, else `~/.codex/config.toml` | `.codex/config.toml` (trusted projects) | `[mcp_servers.NAME]` | [Codex MCP][codex] |
 | Gemini CLI | `~/.gemini/settings.json` | `.gemini/settings.json` | `mcpServers` | [Gemini CLI MCP][gemini] |
 
 Claude Code's `~/.claude.json` is also where its local and user scopes live; `install` adds the
@@ -52,7 +55,8 @@ each client. The table's per-OS entries are covered by unit tests.
 
 ## Snippets
 
-`simee mcp config <client>` prints exactly these, with this machine's binary path. With
+`simee mcp config <client>` prints the same content under a `# Client: path` line, with this
+machine's binary path (and the arrays spread over several lines; they are shortened here). With
 `--toolsets core,debug`, each gets `SIMEE_MCP_TOOLSETS`:
 
 Claude Code and Cursor (`type` is part of their stdio entries):

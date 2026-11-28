@@ -54,8 +54,9 @@ pub struct EntryArgs {
     /// More environment for the server, `KEY=VALUE` (repeatable).
     #[arg(long, value_name = "KEY=VALUE")]
     env: Vec<String>,
-    /// The simee binary the client starts (default: this one, as an absolute path).
-    #[arg(long, value_name = "PATH")]
+    /// The simee binary the client starts. Default: the path this was run as when that is a
+    /// symlink to this binary (a Homebrew `bin/simee` survives `brew upgrade`), else this binary.
+    #[arg(long, visible_alias = "bin", value_name = "PATH")]
     command: Option<PathBuf>,
 }
 
@@ -91,6 +92,8 @@ pub struct Host {
     pub appdata: Option<PathBuf>,
     /// `$XDG_CONFIG_HOME` (Linux).
     pub xdg_config_home: Option<PathBuf>,
+    /// `$CODEX_HOME`: where Codex keeps `config.toml` instead of `~/.codex`.
+    pub codex_home: Option<PathBuf>,
     pub cwd: PathBuf,
 }
 
@@ -105,7 +108,14 @@ impl Host {
         };
         let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
         let home = var(if os == Os::Windows { "USERPROFILE" } else { "HOME" }).context("no home directory: set HOME")?;
-        Ok(Host { os, home, appdata: var("APPDATA"), xdg_config_home: var("XDG_CONFIG_HOME"), cwd: std::env::current_dir()? })
+        Ok(Host {
+            os,
+            home,
+            appdata: var("APPDATA"),
+            xdg_config_home: var("XDG_CONFIG_HOME"),
+            codex_home: var("CODEX_HOME"),
+            cwd: std::env::current_dir()?,
+        })
     }
 
     /// The per-user application config directory (`Code`, `Claude` live under it).
@@ -158,7 +168,7 @@ impl Client {
             (Client::Vscode, Scope::User) => host.app_config()?.join("Code/User/mcp.json"),
             (Client::Vscode, Scope::Project) => host.cwd.join(".vscode/mcp.json"),
             (Client::Windsurf, Scope::User) => host.home.join(".codeium/windsurf/mcp_config.json"),
-            (Client::Codex, Scope::User) => host.home.join(".codex/config.toml"),
+            (Client::Codex, Scope::User) => host.codex_home.clone().unwrap_or_else(|| host.home.join(".codex")).join("config.toml"),
             (Client::Codex, Scope::Project) => host.cwd.join(".codex/config.toml"),
             (Client::Gemini, Scope::User) => host.home.join(".gemini/settings.json"),
             (Client::Gemini, Scope::Project) => host.cwd.join(".gemini/settings.json"),
@@ -180,7 +190,11 @@ impl Entry {
     fn from_args(a: &EntryArgs) -> Result<Entry> {
         let command = match &a.command {
             Some(p) => p.clone(),
-            None => std::env::current_exe().context("can't find this binary: pass --command")?,
+            None => {
+                let exe = std::env::current_exe().context("can't find this binary: pass --command")?;
+                let argv0 = std::env::args_os().next();
+                stable_invocation(&exe, argv0.as_deref(), std::env::var_os("PATH").as_deref()).unwrap_or(exe)
+            }
         };
         let command = std::path::absolute(&command).unwrap_or(command);
         let mut env = BTreeMap::new();
@@ -402,18 +416,71 @@ pub fn snippet(client: Client, name: &str, entry: &Entry) -> String {
     }
 }
 
-/// Replaces `path` with `text` in one rename, so a reader never sees half a file. An existing
-/// file's permissions carry over (and a symlink is written through); a new file is private,
-/// since its env can hold secrets.
-fn write_atomic(path: &Path, text: &str) -> Result<()> {
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+/// The path this program was started by, when that is a symlink that still leads to `exe`.
+/// `current_exe` resolves symlinks on Linux, so a Homebrew install would otherwise record its
+/// versioned Cellar path, which `brew upgrade` removes. `argv0` without a separator is looked up
+/// in `path_var`, the way a shell found it.
+fn stable_invocation(exe: &Path, argv0: Option<&std::ffi::OsStr>, path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let argv0 = Path::new(argv0?);
+    let invoked = if argv0.components().count() > 1 {
+        std::path::absolute(argv0).ok()?
+    } else {
+        std::env::split_paths(path_var?).map(|d| d.join(argv0)).find(|c| c.is_file())?
+    };
+    let is_link = std::fs::symlink_metadata(&invoked).ok()?.file_type().is_symlink();
+    (is_link && std::fs::canonicalize(&invoked).ok()? == std::fs::canonicalize(exe).ok()?).then_some(invoked)
+}
+
+/// Where a write to `path` lands: the file itself, or what a symlink there points to. A symlink
+/// whose target is missing is refused: renaming over it would replace the link with a file.
+fn resolve_target(path: &Path) -> Result<PathBuf> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path)
+            .with_context(|| format!("{} is a symlink to a path that doesn't exist; fix or remove the link", path.display())),
+        _ => Ok(path.to_path_buf()),
+    }
+}
+
+/// What identifies a file's content cheaply: changes when another program rewrites it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Stamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    inode: u64,
+}
+
+fn stamp(path: &Path) -> Option<Stamp> {
+    let m = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let inode = std::os::unix::fs::MetadataExt::ino(&m);
+    #[cfg(not(unix))]
+    let inode = 0;
+    Some(Stamp { modified: m.modified().ok(), len: m.len(), inode })
+}
+
+/// A file changed between reading it and replacing it.
+#[derive(Debug)]
+struct Changed;
+
+impl std::fmt::Display for Changed {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("the file changed while it was being updated")
+    }
+}
+
+impl std::error::Error for Changed {}
+
+/// Replaces `target` with `text` in one rename, so a reader never sees half a file, unless the
+/// file no longer matches `seen` (what the merge was made from): then [`Changed`]. An existing
+/// file's permissions carry over; a new file is private, since its env can hold secrets.
+fn write_atomic(target: &Path, text: &str, seen: Option<Stamp>) -> Result<()> {
     let dir = target.parent().context("config path has no directory")?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let name = target.file_name().context("config path has no file name")?.to_string_lossy();
     let tmp = dir.join(format!(".{name}.simee-{}.tmp", std::process::id()));
     let result = (|| -> Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
-        match std::fs::metadata(&target) {
+        match std::fs::metadata(target) {
             Ok(meta) => f.set_permissions(meta.permissions())?,
             #[cfg(unix)]
             Err(_) => {
@@ -425,13 +492,79 @@ fn write_atomic(path: &Path, text: &str) -> Result<()> {
         }
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
-        std::fs::rename(&tmp, &target)?;
+        if stamp(target) != seen {
+            return Err(Changed.into());
+        }
+        std::fs::rename(&tmp, target)?;
         Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     result.with_context(|| format!("writing {}", target.display()))
+}
+
+/// Merges the entry into the client's file and writes it (or, with `dry_run`, describes it). The
+/// merge is redone once if another program rewrote the file meanwhile (Claude Code keeps its own
+/// state in `~/.claude.json`); a second change is refused. `before_write` runs between the merge
+/// and the write: tests change the file there.
+fn install_into(
+    a: &EntryArgs,
+    path: &Path,
+    entry: &Entry,
+    dry_run: bool,
+    force: bool,
+    out: &mut dyn Write,
+    before_write: &mut dyn FnMut(),
+) -> Result<()> {
+    let target = resolve_target(path)?;
+    let mut retried = false;
+    loop {
+        let seen = stamp(&target);
+        let existing = read_existing(&target)?;
+        let (text, change) = merge(a.client, existing.as_deref(), &a.name, entry, force).with_context(|| path.display().to_string())?;
+        let name = &a.name;
+        let verb = match change {
+            Change::Unchanged => String::new(),
+            Change::Created => "create".to_string(),
+            Change::Added => format!("add `{name}` to"),
+            Change::Replaced => format!("replace `{name}` in"),
+        };
+        if dry_run {
+            let mut shown = if change == Change::Unchanged {
+                format!("{} already has `{name}`; nothing to change", path.display())
+            } else {
+                format!("would {verb} {}:\n{text}", path.display())
+            };
+            writeln!(out, "{}", shown.trim_end())?;
+            return Ok(());
+        }
+        if change != Change::Unchanged {
+            before_write();
+            match write_atomic(&target, &text, seen) {
+                Err(e) if e.root_cause().is::<Changed>() && !retried => {
+                    retried = true;
+                    continue;
+                }
+                Err(e) if e.root_cause().is::<Changed>() => {
+                    bail!(
+                        "{} changed again while it was being updated; nothing was written. Close {} and run this again",
+                        path.display(),
+                        a.client.label()
+                    )
+                }
+                r => r?,
+            }
+        }
+        let done = match change {
+            Change::Unchanged => format!("`{name}` already set up in"),
+            Change::Created => format!("`{name}` created in"),
+            Change::Added => format!("`{name}` added to"),
+            Change::Replaced => format!("`{name}` replaced in"),
+        };
+        writeln!(out, "{}: {done} {}. Restart {} to load it.", a.client.label(), path.display(), a.client.label())?;
+        return Ok(());
+    }
 }
 
 fn read_existing(path: &Path) -> Result<Option<String>> {
@@ -453,33 +586,7 @@ pub fn run(action: &McpAction, host: &Host, out: &mut dyn Write) -> Result<()> {
         McpAction::Install { entry: a, dry_run, force } => {
             let entry = Entry::from_args(a)?;
             let path = a.client.config_path(a.scope, host)?;
-            let existing = read_existing(&path)?;
-            let (text, change) =
-                merge(a.client, existing.as_deref(), &a.name, &entry, *force).with_context(|| path.display().to_string())?;
-            let verb = match change {
-                Change::Unchanged => "already has",
-                Change::Created => "create",
-                Change::Added => "add `simee` to",
-                Change::Replaced => "replace `simee` in",
-            };
-            if *dry_run {
-                let mut shown = format!("would {verb} {}", path.display());
-                if change != Change::Unchanged {
-                    write!(shown, ":\n{text}")?;
-                }
-                writeln!(out, "{}", shown.trim_end())?;
-                return Ok(());
-            }
-            if change != Change::Unchanged {
-                write_atomic(&path, &text)?;
-            }
-            let done = match change {
-                Change::Unchanged => "already set up in",
-                Change::Created => "created",
-                Change::Added => "added to",
-                Change::Replaced => "replaced in",
-            };
-            writeln!(out, "{}: simee {done} {}. Restart {} to load it.", a.client.label(), path.display(), a.client.label())?;
+            install_into(a, &path, &entry, *dry_run, *force, out, &mut || {})?;
         }
     }
     Ok(())
@@ -496,6 +603,7 @@ mod tests {
             home: PathBuf::from("/home/u"),
             appdata: Some(PathBuf::from("/appdata")),
             xdg_config_home: None,
+            codex_home: None,
             cwd: PathBuf::from("/work"),
         }
     }
@@ -521,7 +629,7 @@ mod tests {
     }
 
     fn host_in(dir: &Dir) -> Host {
-        Host { os: Os::Linux, home: dir.0.join("home"), appdata: None, xdg_config_home: None, cwd: dir.0.join("cwd") }
+        Host { os: Os::Linux, home: dir.0.join("home"), appdata: None, xdg_config_home: None, codex_home: None, cwd: dir.0.join("cwd") }
     }
 
     fn args(client: &str, extra: &[&str]) -> McpAction {
@@ -738,21 +846,150 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).expect("ok").permissions().mode() & 0o777, 0o640);
     }
 
+    fn install_args(client: &str, extra: &[&str]) -> EntryArgs {
+        let McpAction::Install { entry, .. } = args(client, extra) else { panic!() };
+        entry
+    }
+
+    fn install(a: &EntryArgs, path: &Path, hook: &mut dyn FnMut()) -> Result<String> {
+        let mut out = Vec::new();
+        install_into(a, path, &entry(), false, false, &mut out, hook)?;
+        Ok(String::from_utf8(out).expect("ok"))
+    }
+
     #[test]
-    fn a_new_file_is_private_and_a_symlink_is_written_through() {
+    fn a_new_file_is_private() {
         use std::os::unix::fs::PermissionsExt;
         let dir = Dir::new();
         let fresh = dir.0.join("sub/new.json");
-        write_atomic(&fresh, "{}\n").expect("ok");
+        write_atomic(&fresh, "{}\n", None).expect("ok");
         assert_eq!(std::fs::metadata(&fresh).expect("ok").permissions().mode() & 0o777, 0o600);
+    }
 
+    #[test]
+    fn a_symlink_is_written_through_and_stays_a_symlink() {
+        let dir = Dir::new();
         let real = dir.0.join("dotfiles.json");
         let link = dir.0.join("link.json");
-        std::fs::write(&real, "{}").expect("ok");
+        std::fs::write(&real, r#"{"mcpServers": {"keep": {"command": "k"}}}"#).expect("ok");
         std::os::unix::fs::symlink(&real, &link).expect("ok");
-        write_atomic(&link, "{\"a\":1}\n").expect("ok");
+        install(&install_args("cursor", &[]), &link, &mut || {}).expect("ok");
         assert!(std::fs::symlink_metadata(&link).expect("ok").file_type().is_symlink());
-        assert_eq!(std::fs::read_to_string(&real).expect("ok"), "{\"a\":1}\n");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&real).expect("ok")).expect("ok");
+        assert_eq!(v["mcpServers"]["simee"]["command"], "/bin/simee");
+        assert_eq!(v["mcpServers"]["keep"]["command"], "k");
+    }
+
+    #[test]
+    fn a_dangling_symlink_is_refused_and_left_a_symlink() {
+        let dir = Dir::new();
+        let link = dir.0.join("link.json");
+        std::os::unix::fs::symlink(dir.0.join("missing.json"), &link).expect("ok");
+        let e = install(&install_args("cursor", &[]), &link, &mut || {}).expect_err("must fail");
+        assert!(format!("{e:#}").contains("symlink"), "{e:#}");
+        assert!(std::fs::symlink_metadata(&link).expect("ok").file_type().is_symlink());
+        assert!(!dir.0.join("missing.json").exists());
+    }
+
+    #[test]
+    fn a_file_rewritten_during_the_update_is_merged_again() {
+        let dir = Dir::new();
+        let path = dir.0.join("claude.json");
+        std::fs::write(&path, r#"{"numStartups": 1}"#).expect("ok");
+        let mut calls = 0;
+        let out = install(&install_args("claude-code", &[]), &path, &mut || {
+            calls += 1;
+            if calls == 1 {
+                std::fs::write(&path, r#"{"numStartups": 2, "mcpServers": {"other": {"command": "o"}}}"#).expect("ok");
+            }
+        })
+        .expect("ok");
+        assert!(out.contains("added to"), "{out}");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).expect("ok")).expect("ok");
+        assert_eq!(v["numStartups"], 2, "the other program's change survives");
+        assert_eq!(v["mcpServers"]["other"]["command"], "o");
+        assert_eq!(v["mcpServers"]["simee"]["command"], "/bin/simee");
+    }
+
+    #[test]
+    fn a_file_that_keeps_changing_is_refused_untouched() {
+        let dir = Dir::new();
+        let path = dir.0.join("claude.json");
+        std::fs::write(&path, "{}").expect("ok");
+        let mut n = 0;
+        let e = install(&install_args("claude-code", &[]), &path, &mut || {
+            n += 1;
+            std::fs::write(&path, format!("{{\"n\": {n}, \"pad\": \"{}\"}}", "x".repeat(n))).expect("ok");
+        })
+        .expect_err("must fail");
+        assert!(format!("{e:#}").contains("changed again"), "{e:#}");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).expect("ok")).expect("ok");
+        assert!(v.get("mcpServers").is_none(), "nothing of ours was written");
+        let leftovers = std::fs::read_dir(&dir.0).expect("ok").count();
+        assert_eq!(leftovers, 1, "no temp file left");
+    }
+
+    #[test]
+    fn a_file_created_during_the_update_is_not_overwritten() {
+        let dir = Dir::new();
+        let path = dir.0.join("new.json");
+        let mut calls = 0;
+        install(&install_args("cursor", &[]), &path, &mut || {
+            calls += 1;
+            if calls == 1 {
+                std::fs::write(&path, r#"{"mcpServers": {"other": {"command": "o"}}}"#).expect("ok");
+            }
+        })
+        .expect("ok");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).expect("ok")).expect("ok");
+        assert_eq!(v["mcpServers"]["other"]["command"], "o");
+        assert_eq!(v["mcpServers"]["simee"]["command"], "/bin/simee");
+    }
+
+    #[test]
+    fn codex_home_moves_the_codex_user_file_but_not_the_project_file() {
+        let mut h = host(Os::Linux);
+        h.codex_home = Some(PathBuf::from("/opt/codex"));
+        assert_eq!(Client::Codex.config_path(Scope::User, &h).expect("ok"), PathBuf::from("/opt/codex/config.toml"));
+        assert_eq!(Client::Codex.config_path(Scope::Project, &h).expect("ok"), PathBuf::from("/work/.codex/config.toml"));
+        assert_eq!(Client::Codex.config_path(Scope::User, &host(Os::Linux)).expect("ok"), PathBuf::from("/home/u/.codex/config.toml"));
+    }
+
+    #[test]
+    fn the_invoked_symlink_is_kept_over_its_resolved_target() {
+        let dir = Dir::new();
+        let cellar = dir.0.join("Cellar/simee/1.0/bin");
+        let bin = dir.0.join("bin");
+        std::fs::create_dir_all(&cellar).expect("ok");
+        std::fs::create_dir_all(&bin).expect("ok");
+        let exe = std::fs::canonicalize(&cellar).expect("ok").join("simee");
+        std::fs::write(&exe, "x").expect("ok");
+        let link = bin.join("simee");
+        std::os::unix::fs::symlink(&exe, &link).expect("ok");
+        let path = std::env::join_paths([&bin]).expect("ok");
+        // By name through PATH, and by a path.
+        assert_eq!(stable_invocation(&exe, Some("simee".as_ref()), Some(&path)), Some(link.clone()));
+        assert_eq!(stable_invocation(&exe, Some(link.as_os_str()), None), Some(link.clone()));
+        // The binary itself, not a link: nothing to prefer. A link to some other binary: ignored.
+        assert_eq!(stable_invocation(&exe, Some(exe.as_os_str()), None), None);
+        let other = dir.0.join("other");
+        std::fs::write(&other, "y").expect("ok");
+        let stray = bin.join("stray");
+        std::os::unix::fs::symlink(&other, &stray).expect("ok");
+        assert_eq!(stable_invocation(&exe, Some(stray.as_os_str()), None), None);
+        assert_eq!(stable_invocation(&exe, None, None), None);
+    }
+
+    #[test]
+    fn messages_name_the_entry_that_was_asked_for() {
+        let dir = Dir::new();
+        let path = dir.0.join("m.json");
+        let a = install_args("cursor", &["--name", "sim-two"]);
+        let out = install(&a, &path, &mut || {}).expect("ok");
+        assert!(out.contains("`sim-two` created") && !out.contains("`simee`"), "{out}");
+        let mut dry = Vec::new();
+        install_into(&a, &path, &entry(), true, false, &mut dry, &mut || {}).expect("ok");
+        assert!(String::from_utf8(dry).expect("ok").contains("already has `sim-two`"), "unchanged names its entry");
     }
 
     #[test]
