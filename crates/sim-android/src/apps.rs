@@ -392,8 +392,9 @@ pub(crate) fn failure(what: &str, text: &str) -> String {
 
 /// `package`'s first launcher component (`com.example.app/.MainActivity`) in `cmd package
 /// query-activities --brief --components`'s output, which lists one per line in the launcher's
-/// order. A component of another package (the system's chooser) is never one.
-fn launcher_component(out: &str, package: &str) -> Option<String> {
+/// order (`query-receivers` prints receivers the same way). A component of another package (the
+/// system's chooser) is never one.
+pub(crate) fn launcher_component(out: &str, package: &str) -> Option<String> {
     out.lines()
         .map(str::trim)
         .find(|l| !l.contains(' ') && l.split_once('/').is_some_and(|(p, class)| p == package && !class.is_empty()))

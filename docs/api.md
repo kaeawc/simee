@@ -166,7 +166,7 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `appearance` | iOS | device, mode(light\|dark) | Light or dark UI |
 | `location` | Android, iOS | device, latitude, longitude | Simulated location |
 | `privacy` | iOS | device, action(grant\|revoke), service, bundle_id | Privacy permission |
-| `push` | iOS | device, bundle_id, payload | Deliver an APNs payload (object) |
+| `push` | Android, iOS | device, bundle_id, payload; iOS: set? | Deliver a push to an app. iOS: an APNs payload (object). Android: an FCM message, {data, notification}: delivered to the app's Firebase receiver (com.google.android.c2dm.intent.RECEIVE) as Google Play services delivers one, as root (adbd's or `su 0`, which google_apis images have); data values are sent as strings, and notification's fields (title, body, channel_id, ...) make it a notification message the Firebase SDK shows as the app's own while the app is in the background. A force-stopped app gets nothing, as with real FCM |
 | `status_bar` | iOS | device, time?, data_network?, wifi_mode?, wifi_bars?, cellular_mode?, cellular_bars?, operator?, battery_state?, battery_level? | Override status bar |
 | `clear_status_bar` | iOS | device | Remove status bar overrides |
 | `content_size` | iOS | device, size | Dynamic Type size (name or 0-11) |
@@ -177,10 +177,10 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `hardware_keyboard` | iOS | device, on | Connect the hardware keyboard |
 | `ca_debug` | iOS | device, option, on | Render overlay (see ca_debug_state for names) |
 | `ca_debug_state` | iOS | device | Every render overlay and whether it is on |
-| `reset_keychain` | iOS | device | Delete every keychain item |
+| `reset_keychain` | iOS | device, set? | Delete every keychain item |
 | `memory_warning` | iOS | device | Simulate a memory warning |
-| `notify` | iOS | device, name, state? | Post a Darwin notification (optionally setting its state) |
-| `biometric` | iOS | device, action(match\|nomatch\|enroll\|unenroll), face? | Touch ID / Face ID |
+| `notify` | Android, iOS | device, name; iOS: state?, set?; Android: bundle_id?, extras? | Post a Darwin notification (optionally setting its state). Android: a broadcast, `am broadcast -a <name>` as the shell user, to bundle_id's receivers or every registered one (since Android 8 a manifest receiver hears an implicit broadcast only with bundle_id), with extras by JSON type (string, null, boolean, integer: int or long, other numbers: float); a protected system broadcast is refused, and a broadcast has no state |
+| `biometric` | Android, iOS | device, action(match\|nomatch\|enroll\|unenroll), face?; iOS: set?; Android: finger_id? | Touch ID / Face ID. Android: the fingerprint sensor (the console's `finger touch <id>` then `finger remove`): match touches an enrolled finger (finger_id, default 1), nomatch one that isn't (default 99); enroll, unenroll and face are iOS's (Android enrolls fingers in Settings, each touch a match) |
 | `exec` | Android, iOS | device, program, args?, env?; Android: timeout_s?, max_bytes? | Run a program inside the device; returns stdout/stderr. Android: over adb as the shell user, the argv passed through unchanged (quoted, so nothing in it is expanded; a program can't start with `-`), with exit_code; past timeout_s (30, at most 86400) it is stopped and the call fails, and a stream that reaches max_bytes (8 MiB) is cut there (truncated true) and the program stopped if it still ran (exit_code null). Stopping it stops its process group, so what it started too |
 | `logs` | iOS | device, last?, predicate? | Unified log lines (default last 1m) |
 | `processes` | Android, iOS | device | Device processes with CPU and memory. Android: the guest's `ps -A` (cpu is CPU time over the process's life), each app process with its package |
