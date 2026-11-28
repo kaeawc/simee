@@ -76,7 +76,7 @@ impl Device {
 impl Adb {
     /// Runs adb on the device with `args` after `-s <serial>`, for at most `limit`: its success
     /// and its stdout and stderr, in that order, as text.
-    fn run(&self, args: &[&str], limit: Duration) -> Result<(bool, String), String> {
+    pub(crate) fn run(&self, args: &[&str], limit: Duration) -> Result<(bool, String), String> {
         let what = format!("adb -s {} {}", self.serial, args.join(" "));
         let (ok, mut text, stderr) = output_within(Command::new(&self.adb).args(["-s", &self.serial]).args(args), limit, &what)?;
         text.push_str(&stderr);
@@ -84,7 +84,7 @@ impl Adb {
     }
 
     /// `adb shell <command>`, for at most `limit`: what it printed, or why it failed.
-    fn shell(&self, command: &str, limit: Duration) -> Result<String, String> {
+    pub(crate) fn shell(&self, command: &str, limit: Duration) -> Result<String, String> {
         match self.run(&["shell", command], limit)? {
             (true, text) => Ok(text),
             (false, text) => Err(failure(command, &text)),
@@ -211,14 +211,33 @@ impl Adb {
 /// never one reusing its PID) and the error names `what`. Output is read as it comes, so the
 /// call returns once the command exits even when a process it started still holds its pipes.
 fn output_within(command: &mut Command, limit: Duration, what: &str) -> Result<(bool, String, String), String> {
+    let (ok, stdout, stderr) = io_within(command, None, limit, what)?;
+    let [stdout, stderr] = [stdout, stderr].map(|b| String::from_utf8_lossy(&b).into_owned());
+    Ok((ok, stdout, stderr))
+}
+
+/// [`output_within`] as bytes, with `stdin` (when given) written to the command's input from a
+/// thread of its own (so a command that writes before it reads can't stall it) and then closed.
+pub(crate) fn io_within(
+    command: &mut Command,
+    stdin: Option<Vec<u8>>,
+    limit: Duration,
+    what: &str,
+) -> Result<(bool, Vec<u8>, Vec<u8>), String> {
     /// How often a quiet command is checked for having exited.
     const TICK: Duration = Duration::from_millis(20);
     let mut child = command
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("couldn't run {}: {e}", Path::new(command.get_program()).display()))?;
+    if let (Some(bytes), Some(mut input)) = (stdin, child.stdin.take()) {
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = input.write_all(&bytes);
+        });
+    }
     let deadline = Instant::now() + limit;
     let (tx, rx) = mpsc::channel::<(usize, Option<Vec<u8>>)>();
     let pipes: [Option<Box<dyn Read + Send>>; 2] = [
@@ -283,7 +302,7 @@ fn output_within(command: &mut Command, limit: Duration, what: &str) -> Result<(
             Err(_) => break,
         }
     }
-    let [stdout, stderr] = out.map(|b| String::from_utf8_lossy(&b).into_owned());
+    let [stdout, stderr] = out;
     Ok((status.success(), stdout, stderr))
 }
 
@@ -327,7 +346,7 @@ fn install_result(ok: bool, text: &str) -> Result<(), String> {
 }
 
 /// An error from a command's output, its last line if it printed any.
-fn failure(what: &str, text: &str) -> String {
+pub(crate) fn failure(what: &str, text: &str) -> String {
     let text = text.trim();
     let line = text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no output");
     format!("{what} failed: {}", line.trim())

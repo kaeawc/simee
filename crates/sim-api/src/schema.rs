@@ -432,8 +432,9 @@ mod tests {
         assert_eq!(rotary["properties"]["delta"]["description"], "Digital Crown units; iOS; give one of `ticks`, `delta`");
         assert_eq!(one_of("fold"), [["folded", "angle", "posture"]]);
         assert_eq!(one_of("console"), [["command", "commands"]]);
+        assert_eq!(one_of("write"), [["text", "base64"]]);
         // `text? | base64?` are both optional, and a lone name or a quoted word is no group.
-        assert!(one_of("write").is_empty() && one_of("audio_route").is_empty() && one_of("tap").is_empty());
+        assert!(parse("device, text? | base64?").1.is_empty() && one_of("audio_route").is_empty() && one_of("tap").is_empty());
     }
 
     #[test]

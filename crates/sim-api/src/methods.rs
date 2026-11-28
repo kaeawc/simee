@@ -281,13 +281,24 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          needs the app launched with malloc_stack_logging (MallocStackLogging=1 logs live allocations only). raw adds \
          the report as printed",
     ),
-    ("containers", "device, sizes?", "App data and bundle containers"),
-    ("ls", "device, path?", "List a directory under the device data dir"),
+    (
+        "containers",
+        "device, sizes?",
+        "App data and bundle containers. Android: each third-party app's data dir (`data/user/0/<package>`) and APK dir; the \
+         file methods take paths in one app's container (`data/data/<package>`, `data/user/<n>/<package>`, \
+         `sdcard/Android/data/<package>`, the APK dir read only) and reach it through run-as for a debuggable app, root otherwise",
+    ),
+    ("ls", "device, path?", "List a directory under the device data dir (Android: in an app's container)"),
     ("read", "device, path", "Read a file (base64)"),
-    ("write", "device, path, text? | base64?", "Write a file"),
+    ("write", "device, path, text | base64", "Write a file"),
     ("rm", "device, path", "Remove a file or directory"),
-    ("du", "device, path?", "Size in bytes"),
-    ("clear_container", "device, path", "Empty a container (an app's data) without deleting it"),
+    ("du", "device, path?", "Size in bytes (Android: of a path in an app's container)"),
+    (
+        "clear_container",
+        "device, path",
+        "Empty a container (an app's data) without deleting it (Android: or a directory in one; an app's data dir that neither \
+         run-as nor root reaches is cleared with `pm clear`, which also clears its external dir and stops it)",
+    ),
     ("defaults_read", "device, domain", "Read a preferences domain"),
     ("defaults_write", "device, domain, key, value, type?", "Write a preference (type: string|int|float|bool)"),
     (
@@ -523,6 +534,14 @@ const ALL_PLATFORMS: &[&str] = &[
     "prefs_delete",
     "prefs_batch",
     "prefs_watch",
+    // App files: Android through run-as or root (`android_files.rs`).
+    "containers",
+    "ls",
+    "read",
+    "write",
+    "rm",
+    "du",
+    "clear_container",
     // Needs no device: the host's camera sources.
     "camera_sources",
     // Camera links: Android through emu, iOS through the device-wide camera shim.
@@ -2923,6 +2942,8 @@ pub(crate) mod tests {
         ("delete", "refuses a running device before it reads parameters"),
         ("create", "its required parameters depend on `platform`, and it creates a device"),
         ("clone", "creates a device from a golden that has booted"),
+        ("ls", "without a path it lists the device's `/`, in no app's container; android_files.rs runs it on the files fake"),
+        ("du", "without a path it sizes the device's `/`, in no app's container; android_files.rs runs it on the files fake"),
     ];
 
     /// The parameters an iOS dispatcher arm reads with `need_*` or reports missing, found in its
