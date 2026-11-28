@@ -2765,17 +2765,26 @@ mod tests {
     /// a device's input worker, a boot thread).
     #[test]
     fn every_ios_method_connects_on_the_set_the_call_names() {
-        const SET: &str = "/nonexistent/simee-409/set";
+        // A writable place: `create` makes the set's directory, and a path under a read-only root
+        // (CI's macOS runner) fails that before any connection.
+        // Resolved up front: set names are resolved (`/tmp` is `/private/tmp` on macOS) once the
+        // directory exists, so the expected name must already be the resolved one.
+        let tmp = std::fs::canonicalize("/tmp").expect("/tmp");
+        let root = tmp.join(format!("simee-409-{}", std::process::id()));
+        let set_path = root.join("set");
+        let set = set_path.to_str().expect("utf-8").to_owned();
+        let set = set.as_str();
         let mut quiet = Vec::new();
         for env in [None, Some("/nonexistent/simee-409/env-set")] {
-            for (method, seen, why) in opened_by_every_method(&every_param(Some(SET)), env) {
-                assert!(seen.iter().all(|s| s.as_deref() == Some(SET)), "`{method}` (environment {env:?}) connected on {seen:?}");
+            for (method, seen, why) in opened_by_every_method(&every_param(Some(set)), env) {
+                assert!(seen.iter().all(|s| s.as_deref() == Some(set)), "`{method}` (environment {env:?}) connected on {seen:?}");
                 if seen.is_empty() && env.is_none() && !WHEN_SIMULATORS_RUN.contains(&method) {
                     quiet.push((method, why));
                 }
             }
         }
         let names: Vec<&str> = quiet.iter().map(|(m, _)| *m).collect();
+        std::fs::remove_dir_all(&root).ok();
         assert_eq!(names, NO_SERVICE, "these methods connected to no service; is one missing its device set? {quiet:#?}");
     }
 
