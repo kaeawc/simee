@@ -1082,9 +1082,9 @@ the call ends one sample step (17 ms) after the last move, when the finger lifts
 
 ## Desktop: Rune's native Metal backend against wgpu
 
-What the desktop window costs on wgpu's Metal backend (`SIMEE_GPU_BACKEND=wgpu`), which the 3D
-device view needs (Rune's native Metal backend has no depth attachments or MSAA resolves,
-anomalyco/rune#2547), against Rune's native Metal backend, the default. The flat view is the same in
+What the desktop window costs on wgpu's Metal backend (`SIMEE_GPU_BACKEND=wgpu`) against Rune's
+native Metal backend, the default. Both draw the 3D device view since anomalyco/rune#2563 (#193);
+its headless cost on each is in [desktop.md](desktop.md#3d-device-view). The flat view is the same in
 both. Apple M3 Max (Mac15,9, 16 CPUs), macOS 26.6.2, Rune `f6f6e04`, 2026-11-27. Each value is the
 median of 5 runs per backend, run alternately (metal then wgpu, then wgpu then metal). The 1-minute
 load average at the start of the runs was 5 to 11 for iOS and 8 to 22 for Android. Two Android
@@ -1379,3 +1379,8 @@ Claims that would belong in the README once someone runs them:
   median of 3 boots each on the same host and day (an earlier sample on API 36 showed no
   difference, but its boots and command weren't recorded).
 - A farm of SDK emulators on the same host, to compare with the emu farm above.
+- Android `settle` (#420): time from `boot` to settled on an API 34 and an API 36 phone, cold
+  and from a golden, and the guest's idle CPU it settles at; and what the Android `slim` profile
+  saves per entry (settle time, idle CPU, `dumpsys meminfo` total PSS), applied to a clone of
+  one golden against an unprofiled clone, median of 3 each. An entry that saves nothing
+  measurable comes out of the profile.
