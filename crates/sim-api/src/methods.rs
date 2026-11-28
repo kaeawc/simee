@@ -304,13 +304,27 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          needs the app launched with malloc_stack_logging (MallocStackLogging=1 logs live allocations only). raw adds \
          the report as printed",
     ),
-    ("containers", "device, sizes?, set?", "App data and bundle containers"),
-    ("ls", "device, path?, set?", "List a directory under the device data dir"),
-    ("read", "device, path, set?", "Read a file (base64)"),
-    ("write", "device, path, text? | base64?, set?", "Write a file"),
-    ("rm", "device, path, set?", "Remove a file or directory"),
-    ("du", "device, path?, set?", "Size in bytes"),
-    ("clear_container", "device, path, set?", "Empty a container (an app's data) without deleting it"),
+    (
+        "containers",
+        "device, sizes?; iOS: set?; Android: root?",
+        "App data and bundle containers. Android: each third-party app's data dir (`data/user/0/<package>`) and APK dir; the \
+         file methods take paths in one app's container (`data/data/<package>`, `data/user/<n>/<package>`, \
+         `sdcard/Android/data/<package>`, the APK dir read only) and reach it through run-as for a debuggable app, otherwise \
+         as root when adbd is root or `su 0` works. None of them runs `adb root` unless given root: true, since it restarts \
+         adbd and drops the device's adb forwards and open shells",
+    ),
+    ("ls", "device, path?; iOS: set?; Android: root?", "List a directory under the device data dir (Android: in an app's container)"),
+    ("read", "device, path; iOS: set?; Android: root?", "Read a file (base64; Android: at most 128 MiB)"),
+    ("write", "device, path, text | base64; iOS: set?; Android: root?", "Write a file"),
+    ("rm", "device, path; iOS: set?; Android: root?", "Remove a file or directory"),
+    ("du", "device, path?; iOS: set?; Android: root?", "Size in bytes (Android: of a path in an app's container)"),
+    (
+        "clear_container",
+        "device, path; iOS: set?; Android: root?, pm_clear?",
+        "Empty a container (an app's data) without deleting it (Android: or a directory in one. pm_clear: true clears an app's \
+         whole data dir with `pm clear --user <n>` instead, which reaches a release app without root but also stops the app, \
+         wipes its external dir and resets its runtime permissions)",
+    ),
     ("defaults_read", "device, domain, set?", "Read a preferences domain"),
     ("defaults_write", "device, domain, key, value, type?, set?", "Write a preference (type: string|int|float|bool)"),
     (
@@ -553,6 +567,14 @@ const ALL_PLATFORMS: &[&str] = &[
     "prefs_delete",
     "prefs_batch",
     "prefs_watch",
+    // App files: Android through run-as or root (`android_files.rs`).
+    "containers",
+    "ls",
+    "read",
+    "write",
+    "rm",
+    "du",
+    "clear_container",
     // Needs no device: the host's camera sources.
     "camera_sources",
     // Camera links: Android through emu, iOS through the device-wide camera shim.
@@ -1970,6 +1992,7 @@ pub(crate) mod tests {
             memory_available_bytes: None,
             memory_free_pct: Some(59.0),
             now: decide(&reading, &Thresholds::default()),
+            basis: None,
         }
     }
 
@@ -2972,6 +2995,8 @@ pub(crate) mod tests {
         ("delete", "refuses a running device before it reads parameters"),
         ("create", "its required parameters depend on `platform`, and it creates a device"),
         ("clone", "creates a device from a golden that has booted"),
+        ("ls", "without a path it lists the device's `/`, in no app's container; android_files.rs runs it on the files fake"),
+        ("du", "without a path it sizes the device's `/`, in no app's container; android_files.rs runs it on the files fake"),
         ("kill", "the probe's pid is 1, init, which kill refuses without force (its own tests read its parameters)"),
     ];
 
