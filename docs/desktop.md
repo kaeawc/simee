@@ -8,7 +8,8 @@ One window for iOS and Android devices.
 cd desktop
 cargo run --release                     # SIMEE_DEVICE=<udid|name|booted> preselects a device
 cargo run -- --snap shot.png --scene demo   # headless render; scenes: demo, android, foldable,
-                                            # folded, tablet, ipad, watch, tv, apple-watch, apple-tv, empty, resources
+                                            # folded, tablet, ipad, watch, tv, apple-watch, apple-tv,
+                                            # iphone-pro, pixel-pro, watch-ultra, empty, resources
 cargo run --release --features tooling -- --snap shot.png --scene demo   # the same, optimized
 ```
 
@@ -26,15 +27,50 @@ window looks and behaves the same on both, but wgpu costs a little more:
 ## 3D device view
 
 ⌘3 switches the screen to a 3D view: the device's body (`sim_core::body`: phones, tablets,
-foldables and watches) in perspective, lit, with its live screen on the screen face. It is drawn
-with a depth buffer and 4x MSAA. `SIMEE_VIEW=3d` starts the window with it on. It draws on both
+foldables, watches, TVs, car head units and XR headsets and glasses) in perspective, with its live
+screen on the screen face. It is drawn with a depth buffer and 4x MSAA. `SIMEE_VIEW=3d` starts the window with it on. It draws on both
 backends: Rune's native Metal backend, the default, has had depth attachments and MSAA resolves
 since anomalyco/rune#2563 (#193), and wgpu's (`SIMEE_GPU_BACKEND=wgpu`) remains an option.
-Headless renders of every scene (demo, android, foldable, folded, tablet, watch, turned) in the 3/4,
-side, back and face-on views, and flat, are byte-identical on the two backends. A TV, head unit or
-headset has no body and stays flat. Under live Rust editing (the `hot` feature) there is no
+Headless renders of every scene with a body in the 3/4, front, side, back and face-on views, and
+flat, are byte-identical on the two backends. Under live Rust editing (the `hot` feature) there is no
 compositor, so ⌘3 says it is unavailable there. With the 3D view off, the window is exactly the flat one:
 screenshots are byte-identical to the build without it on both backends.
+
+### What a body looks like
+
+A body is drawn as the hardware is built (#590). Each row of the body table carries the maker's
+published size, display diagonal and density, so the bezel is whatever those leave: 2.65 mm from
+the edge of an iPhone 17 Pro to its screen, 3.5 mm on a Pixel 9, of which the band's rounded edge
+takes 1.4 to 1.5 mm and the rest is black under the cover glass. Corners are continuous (a
+superellipse that reaches 1.42 times a circular corner's radius and reads as that circle), not
+arcs. The table has rows for the iPhone 17 and 16 lines, the iPhone Air, 16e and SE; the Pixel 9,
+9 Pro, 9 Pro XL, 8 and 8 Pro (an AVD made for one of those hardware definitions gets its row);
+the iPads and the Pixel Tablet; the Pixel Fold, Surface Duo and iPhone Duo; Apple Watch Series 10
+and 11, Ultra 2 and 3, and SE; and the SDK's Wear OS, TV, automotive and XR profiles. A device
+with no row gets a generic body round its own screen, built the same way. What nobody publishes
+(corner radii, the band's edge, camera housings and lens sizes, key positions) is estimated, and
+each row's source note says so. No row carries a logo or a vendor asset.
+
+| Part | Drawn as |
+| --- | --- |
+| Front | One sheet of cover glass over the screen and the black border round it, flat on a phone and curving down to the band on a watch |
+| Band | Anodized aluminium, polished metal or brushed titanium, per row, with its edges rounded over |
+| Back | Glossy glass, matte glass, aluminium or ceramic, per row, in a colour close to one the maker sells |
+| Keys | Pills of the band's metal standing 0.35 to 0.4 mm proud of a dark recess cut where the band's outline is; the iPhone's Camera Control lies flush |
+| Cameras | The Pixel's bar under one cover glass, the iPhone 17 Pro's plateau, the islands and pills of the others, each with its lenses, flash and sensor windows; the Dynamic Island and a Pixel's punch hole on the screen |
+| Watch | Crown on a recessed collar, side button, back crystal, lugs and a band that drapes behind the case; the Ultra's flat crystal, crown guard and Action button |
+
+Shading is metallic/roughness against an analytic studio fixed to the camera: a key box up and to
+the left, a strip behind and to the right that rims the far edges, a panel overhead, a slanted
+card low on each side and a small window behind the camera, over a room that darkens toward the
+floor. Every surface mirrors that studio by its roughness and Fresnel term, and a matte one also
+gathers it diffusely; highlights roll off instead of clipping. The body stands on a floor that
+shows only its contact shadow. Shading is in linear light into an sRGB target.
+
+The screen's pixels are never lit: the shader writes the device's own colour and adds what the
+cover glass mirrors, at 45% of what the black border beside it shows and never more than 9% of
+full white. Face on (⌘0) that reflection is off, so the screen is the flat view's, pixel for
+pixel.
 
 It starts in a 3/4 view from the right and above. `SIMEE_SCENE_CAMERA` starts it in another
 saved view: `front`, `side` (edge on: thickness, keys, camera bump), `back` or `face`.
@@ -104,6 +140,25 @@ the same on both within the runs' spread (about ±0.2 ms). That is why native Me
 view's default. The live rows below were taken on wgpu before native Metal could draw the scene
 (#260). They have not been taken again on Metal: a live run needs a window that stays visible on
 an idle desktop.
+
+The glass and metal shading, the floor and the finer meshes (#590) were measured the same way on
+2026-11-28 against the build before them, the two builds in turn in one session (Rune `e08594c`,
+1-minute load average 13 to 14, so the absolute numbers are not comparable with the table above):
+
+| 3D view | Metal before | Metal after | wgpu before | wgpu after |
+| --- | --- | --- | --- | --- |
+| iPhone 17 scene: frame CPU p50 / p95 | 0.34 / 0.49 ms | 0.35 / 0.54 ms | 0.50 / 0.65 ms | 0.59 / 0.96 ms |
+| iPhone 17 scene: encode and submit | 0.20 ms | 0.21 ms | 0.36 ms | 0.43 ms |
+| iPhone 17 scene: GPU per frame | 1.46 ms | 1.65 ms | 1.90 ms | 1.92 ms |
+| Pixel Fold scene: frame CPU p50 / p95 | 0.30 / 0.40 ms | 0.31 / 0.50 ms | 0.48 / 0.66 ms | 0.51 / 0.76 ms |
+| Pixel Fold scene: encode and submit | 0.18 ms | 0.19 ms | 0.36 ms | 0.38 ms |
+| Pixel Fold scene: GPU per frame | 1.52 ms | 1.51 ms | 1.78 ms | 1.71 ms |
+
+On native Metal a 3D frame costs about 0.01 ms more CPU than before, and the iPhone scene 0.19 ms
+more GPU; the Pixel Fold scene's GPU time and both scenes' on wgpu moved less than the runs'
+spread. The flat view is unchanged (it draws none of this). A body is now a draw for each
+material part (the glass, the band, the back, every key and its recess, every lens) where it was
+one for the whole shell, and its bounds are taken from each vertex once.
 
 What the 3D view costs, against the flat view on the same wgpu backend (Rune `f6f6e04`, #260):
 
