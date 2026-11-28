@@ -298,6 +298,7 @@ shell)
       echo "@self 7000"; echo "$n.00 1.00"; echo 1
       stat 1 init 0 10 20; stat 612 system_server 310 "$busy" 0; stat 900 ndroid.systemui 310 50 10
       stat 7000 sh 206 $((n * 100)) 0; stat 7001 cat 7000 $((n * 100)) 0;;
+    "pm list packages -3 -f") printf 'package:/data/app/~~Ab==/com.example.app-Cd==/base.apk=com.example.app\n';;
     "pm list packages") printf 'package:com.android.settings\npackage:com.example.zeta\npackage:android\npackage:com.example.app\n';;
     "cmd package query-activities --brief --components -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.example.app") echo 'com.example.app/.MainActivity';;
     "cmd package query-activities --brief --components -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.example.crash") echo 'com.example.crash/.Gone';;
