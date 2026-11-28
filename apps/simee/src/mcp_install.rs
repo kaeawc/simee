@@ -6,7 +6,6 @@
 //! rewritten. Paths come from [`Host`], so tests name their own home directory and operating system.
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -531,7 +530,7 @@ fn install_into(
             Change::Replaced => format!("replace `{name}` in"),
         };
         if dry_run {
-            let mut shown = if change == Change::Unchanged {
+            let shown = if change == Change::Unchanged {
                 format!("{} already has `{name}`; nothing to change", path.display())
             } else {
                 format!("would {verb} {}:\n{text}", path.display())
