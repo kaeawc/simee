@@ -427,6 +427,11 @@ fn profile(android: &Android, d: &sim_android::Device, p: &Value) -> Result<Valu
         r["not_loaded"] = json!(a.not_loaded);
         r["already"] = json!(a.already);
     }
+    // Only a flush that isn't verified shows: `deadline` (the guest never rewrote its package
+    // state: a stop now may lose it) or `blind` (no root shell to check; waited and synced).
+    if let Some(unverified) = a.flush.unverified() {
+        r["persist"] = json!(unverified);
+    }
     Ok(r)
 }
 
@@ -996,18 +1001,24 @@ mod tests {
         let again = run(&mut s, "profile", json!({"name": "slim"})).expect("again");
         assert_eq!(again, json!({"name": "slim", "disabled": 2, "already": 2, "failed": [partner], "not_loaded": [restore]}));
         let calls = adb.calls();
+        let flush = sim_android::profile::FLUSH;
         assert_eq!(
             calls[1],
             format!(
-                "shell pm disable-user --user 0 com.google.android.apps.turbo; pm disable-user --user 0 com.google.android.apps.wellbeing; pm disable-user --user 0 {partner}; echo @disabled; pm list packages -d"
+                "shell pm disable-user --user 0 com.google.android.apps.turbo; pm disable-user --user 0 com.google.android.apps.wellbeing; pm disable-user --user 0 {partner}; t=$(date +%s); echo @disabled; pm list packages -d; {flush}"
             )
         );
-        assert_eq!(calls[3], format!("shell pm disable-user --user 0 {partner}; echo @disabled; pm list packages -d"));
+        assert_eq!(
+            calls[3],
+            format!("shell pm disable-user --user 0 {partner}; t=$(date +%s); echo @disabled; pm list packages -d; {flush}")
+        );
         let undone = run(&mut s, "profile", json!({"name": "slim", "undo": true})).expect("undone");
         assert_eq!(undone, json!({"name": "slim", "enabled": 3, "failed": []}));
         assert_eq!(
             adb.calls()[5],
-            "shell pm enable --user 0 com.google.android.apps.turbo; pm enable --user 0 com.google.android.apps.wellbeing; echo @disabled; pm list packages -d"
+            format!(
+                "shell pm enable --user 0 com.google.android.apps.turbo; pm enable --user 0 com.google.android.apps.wellbeing; t=$(date +%s); echo @disabled; pm list packages -d; {flush}"
+            )
         );
         assert_eq!(run(&mut s, "profile", json!({"name": "tiny"})), Err("unknown profile `tiny` (slim)".into()));
         assert_eq!(run(&mut s, "profile", json!({})), Err("missing string parameter `name`".into()));

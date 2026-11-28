@@ -297,6 +297,12 @@ impl FakeAdb {
         std::fs::read_to_string(self.log.with_file_name("forwards")).unwrap_or_default().lines().map(str::to_owned).collect()
     }
 
+    /// Makes the guest's `package-restrictions.xml` never change after a profile's disables, so
+    /// the flush wait ends at its deadline.
+    pub fn flush_stuck(&self) {
+        std::fs::write(self.log.with_file_name("flush.stuck"), b"").expect("stuck flag");
+    }
+
     /// Each invocation's arguments, in order, without the leading `-s <serial>`.
     pub fn calls(&self) -> Vec<String> {
         let text = std::fs::read_to_string(&self.log).unwrap_or_default();
@@ -488,7 +494,12 @@ shell)
     "pm list packages -3") printf 'package:com.example.app\npackage:com.example.zeta\n';;
     "pm list packages; echo @disabled; pm list packages -d") installed; echo @disabled; cat "$d/disabled" 2>/dev/null || true;;
     "pm disable-user "*|"pm enable "*)
-      echo "$2" | tr ';' '\n' | while read -r c; do
+      # The guest's flush suffix (profile::FLUSH) has semicolons of its own: it is cut off and
+      # answered at the end, in order: `flush.stuck` beside the script (the file never changes:
+      # @timeout), `noroot` (no su: @blind), else @flushed. The state is kept as the guest has it
+      # when the flush runs, so a stop before it loses nothing here; the sequence is in adb.log.
+      line=${2%%; f=/data/system/users/0/package-restrictions.xml*}
+      echo "$line" | tr ';' '\n' | while read -r c; do
         p=${c##* }
         case "$c" in
           "pm disable-user --user 0 com.google.android.partnersetup")
@@ -502,7 +513,12 @@ shell)
           "echo @disabled") echo @disabled;;
           "pm list packages -d") cat "$d/disabled" 2>/dev/null || true;;
         esac
-      done;;
+      done
+      if [ "$line" != "$2" ]; then
+        if [ -e "$d/flush.stuck" ]; then echo @timeout
+        elif [ -e "$d/noroot" ]; then echo @blind
+        else echo @flushed; fi
+      fi;;
     "echo @self \$\$; cat /proc/uptime; getprop sys.boot_completed; cat /proc/[0-9]*/stat 2>/dev/null; true")
       n=$(cat "$d/settle.n" 2>/dev/null || echo 0); echo $((n + 1)) > "$d/settle.n"
       busy=$(( n == 0 ? 0 : 60 + (n - 1) * 2 ))
