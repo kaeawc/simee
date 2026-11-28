@@ -413,12 +413,13 @@ fn run_capture(hub: Weak<Inner>, capture: Arc<Capture>, mut source: Box<dyn Sour
                 }
                 let now = Instant::now();
                 if now >= next {
-                    break capture_spec(&state.subscribers).map(|spec| (spec, take_due(&mut state.subscribers, now)));
+                    let wanted = state.subscribers.iter().map(|s| (s.spec.width, s.spec.height)).collect::<Vec<_>>();
+                    break capture_spec(&state.subscribers).map(|spec| (spec, take_due(&mut state.subscribers, now), wanted));
                 }
                 state = capture.wake.wait_timeout(state, next - now).map(|(s, _)| s).unwrap_or_else(|p| p.into_inner().0);
             }
         };
-        let Some((spec, due)) = due_now else {
+        let Some((spec, due, wanted)) = due_now else {
             if stop_if_idle(&hub, &capture) {
                 return;
             }
@@ -427,7 +428,7 @@ fn run_capture(hub: Weak<Inner>, capture: Arc<Capture>, mut source: Box<dyn Sour
         let now = Instant::now();
         let pts = now - started;
         let tick = Tick { seq, pts, wall: wall + pts };
-        let frames = render(source.as_mut(), synthetic, spec, tick, &due, &mut fits);
+        let frames = render(source.as_mut(), synthetic, spec, tick, &due, &wanted, &mut fits);
         seq += 1;
         next = (next + spec.interval()).max(now);
         let mut state = lock(&capture.state);
@@ -461,15 +462,14 @@ fn take_due(subscribers: &mut [Subscriber], now: Instant) -> Vec<(u64, (u32, u32
     due
 }
 
-/// One frame per distinct size among the due subscribers. A synthetic source draws each size
-/// itself; a camera is asked for its frame once (every tick, so a stalled camera is noticed) and
-/// that frame is fitted to the other sizes.
 /// A capture's last source frame fitted to its subscribers' other sizes: a source that repeats a
 /// frame (a video file slower than the capture) shares its fits instead of scaling again.
 #[derive(Default)]
 struct Fits {
     /// The source pixels the fits are of; held, so a new frame can't reuse their address.
     source: Option<Arc<[u8]>>,
+    /// The source frame's size: the same pixels at another size are another picture.
+    size: (u32, u32),
     sizes: Fitted,
 }
 
@@ -478,8 +478,9 @@ impl Fits {
         if (width, height) == (frame.width, frame.height) {
             return frame.clone();
         }
-        if !self.source.as_ref().is_some_and(|s| Arc::ptr_eq(s, &frame.bgra)) {
-            self.source = Some(frame.bgra.clone());
+        let size = (frame.width, frame.height);
+        if !self.source.as_ref().is_some_and(|s| Arc::ptr_eq(s, &frame.bgra)) || self.size != size {
+            (self.source, self.size) = (Some(frame.bgra.clone()), size);
             self.sizes.clear();
         }
         let bgra = match self.sizes.iter().find(|(size, _)| *size == (width, height)) {
@@ -494,12 +495,17 @@ impl Fits {
     }
 }
 
+/// One frame per distinct size among the due subscribers. A synthetic source draws each size
+/// itself; a camera is asked for its frame once (every tick, so a stalled camera is noticed) and
+/// that frame is fitted to the other sizes. Fits are kept for the sizes in `wanted` (every
+/// subscriber's, due or not) and dropped for the rest.
 fn render(
     source: &mut dyn Source,
     synthetic: bool,
     spec: FrameSpec,
     tick: Tick,
     due: &[(u64, (u32, u32))],
+    wanted: &[(u32, u32)],
     fits: &mut Fits,
 ) -> Result<Vec<CameraFrame>> {
     let mut sizes: Vec<(u32, u32)> = Vec::new();
@@ -512,6 +518,8 @@ fn render(
         return sizes.into_iter().map(|(width, height)| source.frame(FrameSpec { width, height, ..spec }, tick)).collect();
     }
     let frame = source.frame(spec, tick)?;
+    // Only sizes a subscriber still asks for, due this tick or not, keep their fits.
+    fits.sizes.retain(|(size, _)| wanted.contains(size));
     Ok(sizes.into_iter().map(|(width, height)| fits.fit(&frame, width, height)).collect())
 }
 
@@ -711,30 +719,67 @@ mod tests {
         assert_eq!(crate::synth::testcard_seq(&fs), Some(fs.tick.seq as u32), "scaled from the capture frame");
     }
 
-    /// A camera-like source whose frame doesn't change (a paused or repeated video frame).
-    struct Same(Arc<[u8]>);
+    /// A camera-like source whose frame doesn't change (a paused or repeated video frame), at its
+    /// size.
+    struct Same(Arc<[u8]>, (u32, u32));
 
     impl Source for Same {
         fn frame(&mut self, _spec: FrameSpec, tick: Tick) -> Result<CameraFrame> {
-            Ok(CameraFrame { width: 4, height: 4, bgra: self.0.clone(), tick })
+            let (width, height) = self.1;
+            Ok(CameraFrame { width, height, bgra: self.0.clone(), tick })
         }
     }
 
     #[test]
     fn a_repeated_source_frame_is_fitted_once_per_subscriber_size() {
-        let mut same = Same(vec![9u8; 4 * 4 * 4].into());
+        let mut same = Same(vec![9u8; 4 * 4 * 4].into(), (4, 4));
         let due = [(1, (4, 4)), (2, (2, 2))];
+        let wanted = [(4, 4), (2, 2)];
         let mut fits = Fits::default();
         let mut tick = Tick::start();
-        let a = render(&mut same, false, spec(4, 4, 30), tick, &due, &mut fits).unwrap_or_else(|e| panic!("{e}"));
+        let a = render(&mut same, false, spec(4, 4, 30), tick, &due, &wanted, &mut fits).unwrap_or_else(|e| panic!("{e}"));
         tick.seq += 1;
-        let b = render(&mut same, false, spec(4, 4, 30), tick, &due, &mut fits).unwrap_or_else(|e| panic!("{e}"));
+        let b = render(&mut same, false, spec(4, 4, 30), tick, &due, &wanted, &mut fits).unwrap_or_else(|e| panic!("{e}"));
         assert!(Arc::ptr_eq(&a[0].bgra, &same.0) && Arc::ptr_eq(&b[0].bgra, &same.0), "the capture size is the source's own pixels");
         assert_eq!((b[1].width, b[1].height, b[1].tick.seq), (2, 2, 1));
         assert!(Arc::ptr_eq(&a[1].bgra, &b[1].bgra), "the smaller subscriber's fit is reused, not redone");
         same.0 = vec![7u8; 4 * 4 * 4].into();
-        let c = render(&mut same, false, spec(4, 4, 30), tick, &due, &mut fits).unwrap_or_else(|e| panic!("{e}"));
+        let c = render(&mut same, false, spec(4, 4, 30), tick, &due, &wanted, &mut fits).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(c[1].pixel(0, 0)[0], 7, "a new source frame is fitted afresh");
+    }
+
+    #[test]
+    fn fits_for_sizes_no_subscriber_wants_are_dropped() {
+        let mut same = Same(vec![9u8; 8 * 8 * 4].into(), (8, 8));
+        let mut fits = Fits::default();
+        let tick = Tick::start();
+        let all = [(1, (8, 8)), (2, (4, 4)), (3, (2, 2)), (4, (1, 1))];
+        let a = render(&mut same, false, spec(8, 8, 30), tick, &all, &[(8, 8), (4, 4), (2, 2), (1, 1)], &mut fits)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(fits.sizes.len(), 3);
+        // The 2x2 and 1x1 subscribers have gone; the 4x4 one is still there but not due this tick.
+        let still = [(8, 8), (4, 4)];
+        let b = render(&mut same, false, spec(8, 8, 30), tick, &all[..1], &still, &mut fits).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(b.len(), 1);
+        let kept: Vec<(u32, u32)> = fits.sizes.iter().map(|(size, _)| *size).collect();
+        assert_eq!(kept, [(4, 4)], "only the fit a subscriber still wants is kept");
+        let c = render(&mut same, false, spec(8, 8, 30), tick, &all[1..2], &still, &mut fits).unwrap_or_else(|e| panic!("{e}"));
+        assert!(Arc::ptr_eq(&a[1].bgra, &c[0].bgra), "and it is reused, not redone");
+    }
+
+    #[test]
+    fn the_same_pixels_at_another_size_are_fitted_afresh() {
+        // Pixel `i` of value `16 * i`: a 4x4 frame and an 8x2 frame of the same bytes differ.
+        let bgra: Arc<[u8]> = (0..16u8).flat_map(|i| [16 * i, 16 * i, 16 * i, 255]).collect::<Vec<u8>>().into();
+        let mut same = Same(bgra.clone(), (4, 4));
+        let mut fits = Fits::default();
+        let tick = Tick::start();
+        let square = render(&mut same, false, spec(4, 4, 30), tick, &[(1, (2, 2))], &[(2, 2)], &mut fits).unwrap_or_else(|e| panic!("{e}"));
+        same.1 = (8, 2);
+        let wide = render(&mut same, false, spec(8, 2, 30), tick, &[(1, (2, 2))], &[(2, 2)], &mut fits).unwrap_or_else(|e| panic!("{e}"));
+        let want = CameraFrame { width: 8, height: 2, bgra, tick }.fit(2, 2).bgra;
+        assert_ne!(&*square[0].bgra, &*want, "the two sizes fit differently");
+        assert_eq!(&*wide[0].bgra, &*want, "the 8x2 frame is fitted as itself, not as the 4x4 one");
     }
 
     /// What a QR frame at `w`x`h` must be: the source drawn at exactly that size.

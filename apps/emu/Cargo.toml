@@ -16,6 +16,12 @@ include = ["/Cargo.toml", "/LICENSE", "/build.rs", "/src", "/tests"]
 name = "emu"
 path = "src/main.rs"
 
+# Real signals to a child of its own: its own `main`, since the test harness's threads would take
+# them before they are blocked. It answers libtest's `--list` and `--exact`, so nextest runs it too.
+[[test]]
+name = "signals"
+harness = false
+
 [dependencies]
 anyhow.workspace = true
 emu-avd.workspace = true

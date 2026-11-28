@@ -183,10 +183,14 @@ short: it runs where the media is sent. `stream_start {input: true}` wires one t
 
 The channel only reaches a viewer whose peer connection ends at the publisher. MediaMTX doesn't
 relay it, and doesn't ignore it either: v1.19.2 refuses an offer with an `m=application` section
-(`406`, `{"status":"error","error":"unsupported media 'application'"}`, run by
-`mediamtx_refuses_the_input_channel_offer`). So `connect_with_input`, and `stream_start {input:
-true}`, fail against a MediaMTX endpoint; start the stream without input there. Input for a
-MediaMTX viewer needs a direct peer connection or a relay of its own, which isn't built.
+(`406`, `{"status":"error","error":"unsupported media 'application'"}`). So `connect_with_input`
+fails against a MediaMTX endpoint, and `Publisher::connect_with_input_or_without` (what
+`stream_start {input: true}` uses) answers that refusal, and only that one (a 406 to the POST whose
+body names `application`), by offering the stream again without the channel, once; it returns why
+the channel was dropped. Any other error, including the retry's own, is returned as it is
+(`mediamtx_takes_the_stream_without_the_input_channel` runs this against MediaMTX; the
+`input_fallback` tests pin the retry rules). Input for a MediaMTX viewer needs a direct peer
+connection or a relay of its own, which isn't built: the stream there runs with `input: false`.
 
 **Messages** are one compact JSON object per text frame. Every message has `"v":1` (the version)
 and a `kind`; `seq` (an integer) and `t` (the viewer's time in milliseconds, any clock, e.g.
@@ -332,6 +336,35 @@ re-request after a dropped IDR and `Controls::set_bitrate` work unchanged. It is
 every host. Building with the feature compiles OpenH264's C++ (`g++`); no system library is
 needed at run time.
 
+**Streaming from a Linux `simee`.** `stream_start` uses it in a build with the feature forwarded
+through `simee-api` and the CLI:
+
+```bash
+sudo apt-get install -y nasm g++        # g++ builds OpenH264's C++; nasm is the x86_64 speed-up (below)
+cargo install simee --features openh264 # or: cargo build --release -p simee --features openh264
+simee serve &                           # streams live in the serving process
+simee stream start emulator-5554 --whip http://127.0.0.1:8889/phone/whip
+```
+
+On Linux the device is an Android one (emu's display socket and frame ring, `AndroidSource`;
+iOS simulators run only on macOS, and asking for one fails `stream_start` with that reason). The
+settings are the macOS ones: real-time `ScreenContentRealTime`, Constrained Baseline unless the
+Main profile is asked for, no B-frames, an IDR at least every `keyframe_interval`, one on every
+`KeyframeRequested`, the target retuned on every `BitrateEstimate`, the SPS/PPS cached and put in
+front of every IDR, and the heartbeat re-encode on a static screen. A build without the feature
+fails `stream_start` with `unsupported: this build of simee has no H.264 encoder; rebuild with
+... --features openh264`, leaving nothing running.
+
+**Why `simee` doesn't enable it by default.** The owner approved the dependency on 2026-11-27
+behind an off-by-default feature. Three things keep the feature opt-in rather than on for Linux
+builds of `simee`: the patent point below (Cisco's coverage is for its own binary, not for source
+a product compiles), the C++ toolchain every Linux build and CI job would then need, and
+`scripts/check.sh`'s Linux cross-clippy from macOS, which stops in `openh264-sys2`'s build script
+with the feature on. Turning it on for `simee`'s Linux release binaries is one line in the CLI's
+`[features]` (`default = ["openh264"]`) and a decision on the patent point, not a code change;
+`simee-api` and `simee` forward the feature (`simee-api/openh264`, `simee/openh264`) so a
+packager can do it either way.
+
 **Install `nasm` on x86_64.** `openh264-sys2` assembles OpenH264's SIMD with `nasm`, and without it
 silently builds the plain C++: the encoder is 2.4 times slower (61.8 ms against 26.1 ms per
 full-size picture, [Encode cost on Linux](#encode-cost-on-linux)). `apt-get install nasm` (CI's
@@ -341,7 +374,7 @@ warning on x86 Linux with the feature when `nasm` isn't found, or when `OPENH264
 aarch64 needs nothing: its NEON code is assembled by `cc`.
 
 ```bash
-cargo test -p simee-encode --features openh264
+cargo test -p simee-encode -p simee-api --features openh264
 cargo run --release -p simee-encode --features openh264 --example linux_bench
 ```
 
@@ -490,6 +523,24 @@ follow that, though the time per picture mostly doesn't.
 | Output, kbit/s | 2190 | 1638 | 3830 | 3901 |
 | First IDR / median IDR, KB | 46.1 / 54.1 | 43.0 / 41.9 | 39.2 / 44.5 | 35.6 / 35.6 |
 
+Phone and tablet on one machine, same method (`scripts/bench/encode-linux.sh --rounds 3`), 2026-11-28.
+Host: a Linux VM (a different one from the table above, so compare rows within this table, not with
+it), Intel Xeon @ 2.20 GHz, 4 vCPUs, 7.8 GB, Ubuntu 22.04, kernel 6.1.189, OpenH264 built with
+`nasm`, load about 1.0. Medians of 3 rounds:
+
+| Synthetic screen | phone 1080x2400, 30 fps | phone, 60 fps | phone capped at 1280, 30 fps | phone capped at 1280, 60 fps | tablet 2560x1600, 30 fps | tablet, 60 fps | tablet capped at 1280, 30 fps | tablet capped at 1280, 60 fps |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Encoded, fps | 27.3 | 24.2 | 29.7 | 58.0 | 23.4 | 23.4 | 29.9 | 50.7 |
+| Encode latency p50 / p95, ms | 32.0 / 51.8 | 42.9 / 48.6 | 24.2 / 34.0 | 16.3 / 18.2 | 40.2 / 52.2 | 40.7 / 52.3 | 21.7 / 29.7 | 18.6 / 25.1 |
+| Colour conversion (and scaling) alone p50, ms | 6.0 | 6.1 | 6.7 | 6.7 | 9.2 | 9.1 | 9.6 | 9.8 |
+| Process CPU, % of a core | 96 | 99 | 76 | 97 | 100 | 100 | 68 | 100 |
+| Luma PSNR, dB | 45.2 | 44.9 | 42.6 | 39.5 | 48.5 | 48.3 | 47.6 | 47.5 |
+| Output, kbit/s | 2006 | 1417 | 3749 | 3883 | 1021 | 995 | 818 | 929 |
+
+A full-size tablet picture costs about 40 ms, so one encoder thread holds it to 23 fps; the cap
+(`max_size`, 1280 by default in `stream_start`) is what makes 30 fps. The output is under the
+4 Mbit/s target in every column.
+
 Built without `nasm` (`OPENH264_NO_ASM=1`, what a host without it gets, 30 fps, same method):
 61.8 ms p50 and 118 ms p95 at full size (13.6 fps, 100% of a core) and 35.0 / 57.9 ms capped
 (24.6 fps). With `nasm` the encoder itself is about 2.4 times faster.
@@ -536,7 +587,7 @@ on noise; with the `SetOption` call removed the second figure is 822 and the tes
 picture the rate control skips, the refusals (hardware required, over 3840x2160, a short buffer,
 fps 0), a retarget with no ceiling (not held to the starting target, an absurd request held to
 240 Mbit/s, the SPS unchanged), and the whole loop on a fake source and clock with the real encoder (the 30 fps cap, an
-IDR requested mid-run answered by the next picture, a retarget). The same tests passed on
+IDR requested mid-run answered by the next picture, a retarget), and a scrolling screen encoded at 30 and at 60 fps and decoded again, each picture at least 35 dB of luma PSNR from what the encoder was given (the worst of 40 is 40.5 dB; no timing is asserted). The same tests passed on
 `aarch64-unknown-linux-gnu` under `qemu-user` (OpenH264 built from source with its NEON code)
 and on x86_64 with `OPENH264_NO_ASM=1`.
 
@@ -546,19 +597,20 @@ and on x86_64 with `OPENH264_NO_ASM=1`.
 (docs/api.md, "Streams"), which the MCP server serves as the `stream` toolset:
 
 - `stream_start` (`device, whip_url, token?, fps?(30), max_size?(1280), bitrate?(2500000),
-  audio?(false), input?(false)`) → `{stream_id, whip_resource, lease_ttl_s, device}`.
+  audio?(false), input?(false)`) → `{stream_id, whip_resource, lease_ttl_s, device}`, plus `input`
+  (boolean) and, when the server refused the channel, `input_note`, when `input` was asked for.
 - `stream_status` (`stream_id`): the state, the stage timeline and the stats; renews the lease.
 - `stream_stop` (`stream_id`): ends the stream and sends the WHIP DELETE.
 - `streams` (`device?`): every stream of the process, without renewing anything.
 
 **What a stream is.** A worker thread runs `simee-encode`'s loop (`VtEncoder` on `IosSource` or
-`AndroidSource`, a 500 ms heartbeat on a still screen) and connects the publisher on the first
+`AndroidSource` on macOS, `OpenH264Encoder` on `AndroidSource` on Linux, a 500 ms heartbeat on a still screen) and connects the publisher on the first
 access unit, offering that IDR's own `profile-level-id`, as `examples/publish_device.rs` does.
 `stream_start` waits (at most 40 s) for that connection and fails with the reason when it
 doesn't come: the URL refused before any request (as `WhipClient::new` checks it: `https`,
 plaintext to a host that isn't loopback, another scheme), a 401/403 from the WHIP server ("pass a
 valid `token`"), a device that isn't booted, `audio: true` (the Opus track is #265), or a host with
-no encoder (only macOS has one; the Linux encoder is #263). A failed start leaves nothing behind.
+no encoder (macOS has VideoToolbox; Linux has OpenH264 in a build with `--features openh264`, and says how to get it). A failed start leaves nothing behind.
 The publisher's `KeyframeRequested` forces an IDR (counted as `pli` or `fir`), `BitrateEstimate`
 retargets the encoder, and `Disconnected` ends the stream.
 
@@ -579,7 +631,11 @@ stream that ended on its own stays listed as `ended`, with its `reason`, until i
 and a new stream to the same destination replaces it. There is one stream per device and WHIP
 URL; a second `stream_start` for the pair is refused with the running one's id.
 
-**Input.** With `input: true` the publisher is opened with `connect_with_input`, and the
+**Input.** With `input: true` the publisher is opened with `connect_with_input_or_without`: a
+server that refuses the data channel (MediaMTX: `406 unsupported media 'application'`) is offered
+the stream again without it, and the stream runs with `input: false` and an `input_note` (in the
+`stream_start` result and in `stream_status`, whose `input` is the live state), instead of failing.
+Where the channel is carried, the
 session's sink maps each event through a `DisplayMap` of the device's `screen` size (the space
 `touch` and `swipe` take) and queues one device call to a thread of the stream's own, which runs
 it through the method table (so the publisher's thread never waits on a device):
@@ -621,7 +677,11 @@ stop sending the DELETE, the refusals leaving nothing behind, keyframe requests 
 reaching the encoder and the stats, a peer disconnect, the input mapping (touch through the
 downscale, keys, text, a held button, a scroll, a rotation re-reading the screen, the second
 finger refused, the lift on stop), and that docs/api.md has each method's row as the table writes
-it. A real stream end to end (Chromium over WHEP) is #268's.
+it. With `--features openh264` on Linux, `cargo test -p simee-api --features openh264 linux_media`
+runs the real media path on a fake emulator display socket: an Android target's frames through
+OpenH264, a requested IDR with its SPS/PPS in front, heartbeats on the static screen, every access
+unit decoded; an iOS target and a missing display are refused with a reason. A real stream end to
+end (Chromium over WHEP) is #268's.
 
 ## Not yet
 
@@ -646,6 +706,12 @@ it. A real stream end to end (Chromium over WHEP) is #268's.
   the colour conversion is single-threaded. The Linux encoder is behind the `openh264` feature
   (`scripts/check.sh` doesn't build it; CI's `linux` job does), and `libloading` (Cisco's binary,
   with its patent coverage) isn't offered.
+- **A Linux `simee` that streams out of the box.** `stream_start` works on Linux only in a build
+  with `--features openh264` ([why it's opt-in](#linux-openh264)); the release binaries don't have
+  it. Not yet run: a stream from a real emulator's frames on Linux (the tests use a fake display
+  socket, and the bench synthetic screens), and `simee-api`'s `linux_media` tests in CI (the
+  `linux` job runs `cargo nextest run -p simee-encode --features openh264`; adding
+  `-p simee-api` to it covers them).
 - **Pipelined encoding.** One picture is in flight at a time, so a full-size iPhone stream can't
   quite reach 60 fps (17 ms per moving frame); submitting the next frame before the previous one
   is out would lift the rate, not the latency.

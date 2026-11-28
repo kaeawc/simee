@@ -179,14 +179,24 @@ and a BGRA track output (`crates/sim-camera/src/avf.rs`; the timeline is `src/vi
   them. Variable frame rates and a first frame after zero keep their timing.
 - Only a frame that is shown is copied out of the decoder; frames skipped past are released
   uncopied. A shown frame is fitted once per output size (the player's and the hub's), so a
-  repeated frame is the same pixels, not a fresh scale each tick.
+  repeated frame is the same pixels, not a fresh scale each tick. The hub keeps a fit only while
+  a subscriber still asks for its size.
 - The file loops: its length is the last frame's time plus the gap before it. At the end a new
   reader starts at the first frame. Once a pass has played, a long stall skips whole passes with
   one reader started at the right time (`timeRange`), without decoding the rest of the pass. A
-  one-frame file is a still and is never decoded again.
+  stall at least 120 frames behind and past the track's end (its `timeRange`) before the first
+  pass has been decoded to it wraps the same way, on the track's end as the length; a smaller
+  overshoot decodes on to the end of the pass instead. The first pass decoded to its last frame
+  replaces that length with the measured one, so the loop period never depends on whether the
+  host stalled. A jump that lands in the gap between the last frame and the track's end (no
+  frame there) treats the gap as the end of the pass and starts over, until a pass is measured.
+  A one-frame file is a still and is never decoded again.
 - A tick decodes at most 120 frames. Further behind than that, playback jumps with a reader
   started one frame before the time due (the track's end is known from its `timeRange`); a
-  reader still decodes from the keyframe before it, so a jump costs up to one keyframe interval.
+  reader still decodes from the keyframe before it, so a jump costs up to one keyframe interval,
+  but hands out frames only from its start time. Playback doesn't jump again until it has reached
+  the last jump's time, so a decoder that handed out a jump from its keyframe would catch up over
+  a few ticks instead of jumping every tick.
 - The track's rotation (`preferredTransform`, in quarter turns) is applied while the shown frame
   is copied out, so a portrait phone recording plays upright, at its turned size. A mirrored
   track's flip is not applied.

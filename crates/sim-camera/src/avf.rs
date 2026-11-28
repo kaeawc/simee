@@ -1191,7 +1191,7 @@ mod tests {
     /// AVAssetWriter's H.264 encoder: a tiny test file generated in the test, so no fixture is
     /// checked in.
     pub(crate) fn write_clip(path: &std::path::Path, width: u32, height: u32, fps: i32, colours: &[[u8; 4]]) {
-        write_movie(path, width, height, fps, IDENTITY, colours.len(), |i, _| colours[i]);
+        write_movie(path, width, height, fps, IDENTITY, None, colours.len(), |i, _| colours[i]);
     }
 
     const IDENTITY: Transform = Transform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: 0.0, ty: 0.0 };
@@ -1222,13 +1222,16 @@ mod tests {
     }
 
     /// Writes `frames` frames at `fps`, frame `i`'s column `x` in colour `paint(i, x)`, with the
-    /// track's `transform` (`preferredTransform` when read back).
+    /// track's `transform` (`preferredTransform` when read back) and at most `keyframes` frames
+    /// between keyframes (the encoder's default when `None`).
+    #[allow(clippy::too_many_arguments)]
     fn write_movie(
         path: &std::path::Path,
         width: u32,
         height: u32,
         fps: i32,
         transform: Transform,
+        keyframes: Option<u32>,
         frames: usize,
         paint: impl Fn(usize, u32) -> [u8; 4],
     ) {
@@ -1253,6 +1256,13 @@ mod tests {
                 (named(c"AVVideoWidthKey"), &w),
                 (named(c"AVVideoHeightKey"), &h),
             ]);
+            if let Some(n) = keyframes {
+                let n = number(n);
+                let compression = dictionary(&[(named(c"AVVideoMaxKeyFrameIntervalKey"), &n)]);
+                // SAFETY: `setObject:forKey:` on the mutable dictionary `dictionary` returned,
+                // with a non-nil value and a copyable key.
+                let _: () = unsafe { msg_send![&*settings, setObject: &*compression, forKey: named(c"AVVideoCompressionPropertiesKey")] };
+            }
             let bgra = number(FORMAT_BGRA);
             let attributes = dictionary(&[(object(api.pixel_format_key), &bgra)]);
             // SAFETY: takes a media type and output settings and returns an input; the adaptor
@@ -1366,7 +1376,7 @@ mod tests {
         let (w, h) = (64u32, 32u32);
         for turns in 0..4u8 {
             let path = temp_clip(&format!("turned-{turns}.mov"));
-            write_movie(&path, w, h, 10, clockwise(turns, w, h), 2, |_, x| if x < w / 2 { RED } else { BLUE });
+            write_movie(&path, w, h, 10, clockwise(turns, w, h), None, 2, |_, x| if x < w / 2 { RED } else { BLUE });
             let mut source = ok(crate::synth::open(&crate::SourceSpec::Video(path.clone())));
             let (sw, sh) = if turns % 2 == 1 { (h, w) } else { (w, h) };
             let frame = ok(source.frame(FrameSpec { width: sw, height: sh, fps: 10 }, Tick::start()));
@@ -1393,6 +1403,149 @@ mod tests {
         let err = crate::synth::open(&crate::SourceSpec::Video(text.clone())).err();
         assert!(matches!(&err, Some(Error::Invalid(m) | Error::Io(m)) if m.contains("notes.mov")), "{err:?}");
         let _ = std::fs::remove_file(&text);
+    }
+
+    /// A 10 s, 30 fps H.264 clip with one keyframe, at its start: frame `i` is grey level
+    /// `i * 255 / 299`, so a picture says roughly which frame it is. The key interval is only a
+    /// maximum, and the encoder cuts a keyframe of its own now and then when the host is busy
+    /// (seen with other encodes running), so a clip is written again until it has just the one.
+    fn long_gop_clip(path: &std::path::Path) {
+        // One at a time: the encoder cuts the most keyframes when several encodes run at once.
+        static ENCODING: Mutex<()> = Mutex::new(());
+        let _one = ENCODING.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..8 {
+            write_movie(path, 64, 48, 30, IDENTITY, Some(3000), 300, |i, _| {
+                let g = (i * 255 / 299) as u8;
+                [g, g, g, 255]
+            });
+            let reader = ok(autoreleasepool(|_| VideoReader::open("video:long-gop", path)));
+            if samples_and_keyframes(&reader.track) == (300, 1) {
+                return;
+            }
+        }
+        panic!("the encoder would not write a clip with a single keyframe");
+    }
+
+    /// `AVSampleCursorSyncInfo`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct SyncInfo {
+        full: Bool,
+        partial: Bool,
+        droppable: Bool,
+    }
+
+    // SAFETY: the three BOOL fields of `AVSampleCursorSyncInfo`, in order.
+    unsafe impl Encode for SyncInfo {
+        const ENCODING: Encoding = Encoding::Struct("?", &[Bool::ENCODING; 3]);
+    }
+
+    /// The samples of `track` and how many of them are keyframes (full sync samples), walking an
+    /// `AVSampleCursor` through the file's samples in decode order.
+    fn samples_and_keyframes(track: &AnyObject) -> (usize, usize) {
+        // SAFETY: `makeSampleCursorAtFirstSampleInDecodeOrder` returns a cursor or nil;
+        // `currentSampleSyncInfo` returns the sync struct and `stepInDecodeOrderByCount:`
+        // the number of samples stepped (0 at the last), on that cursor.
+        unsafe {
+            let cursor: Option<Obj> = msg_send![track, makeSampleCursorAtFirstSampleInDecodeOrder];
+            let cursor = cursor.expect("an AVSampleCursor for the track");
+            let (mut samples, mut keyframes) = (0, 0);
+            loop {
+                let info: SyncInfo = msg_send![&*cursor, currentSampleSyncInfo];
+                samples += 1;
+                keyframes += usize::from(info.full.as_bool());
+                let stepped: i64 = msg_send![&*cursor, stepInDecodeOrderByCount: 1i64];
+                if stepped == 0 {
+                    return (samples, keyframes);
+                }
+            }
+        }
+    }
+
+    /// The long-GOP clip really is one: 300 samples, a single keyframe (so a seek into it lands
+    /// in a GOP that starts at the clip's first frame, not in one the encoder cut short).
+    /// `long_gop_clip` retries until it is, so this pins the helper and the keyframe count.
+    #[test]
+    fn the_long_gop_clip_has_a_single_keyframe() {
+        let path = temp_clip("long-gop-keyframes.mov");
+        long_gop_clip(&path);
+        let reader = ok(autoreleasepool(|_| VideoReader::open("video:long-gop", &path)));
+        assert_eq!(samples_and_keyframes(&reader.track), (300, 1));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A reader started mid-GOP gives frames from the time it starts at, not from the keyframe
+    /// before it (it decodes from there, but trims what it hands out).
+    #[test]
+    fn a_reader_started_mid_gop_gives_frames_from_its_start() {
+        let path = temp_clip("long-gop-seek.mov");
+        long_gop_clip(&path);
+        let mut reader = ok(autoreleasepool(|_| VideoReader::open("video:long-gop", &path)));
+        for to in [Duration::from_millis(5_000), Duration::from_millis(8_000)] {
+            ok(reader.seek(to));
+            let first = ok(reader.next()).map(|s| s.pts);
+            let slack = reader.interval() + Duration::from_millis(1);
+            assert!(first.is_some_and(|pts| pts <= to && to - pts <= slack), "a seek to {to:?} gave {first:?} first");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A `VideoReader` that counts its jumps; with `from_keyframe`, each jump starts at the clip's
+    /// one keyframe, as a decoder that hands out a jump from its sync sample would.
+    struct Jumps {
+        reader: VideoReader,
+        seeks: Arc<Mutex<usize>>,
+        from_keyframe: bool,
+    }
+
+    impl Decode for Jumps {
+        type Data = SampleBuffer;
+
+        fn next(&mut self) -> Result<Option<Sample<SampleBuffer>>> {
+            self.reader.next()
+        }
+
+        fn pixels(&mut self, sample: &Sample<SampleBuffer>) -> Result<Vec<u8>> {
+            self.reader.pixels(sample)
+        }
+
+        fn seek(&mut self, to: Duration) -> Result<()> {
+            *self.seeks.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            self.reader.seek(if self.from_keyframe { Duration::ZERO } else { to })
+        }
+
+        fn interval(&self) -> Duration {
+            self.reader.interval()
+        }
+
+        fn end(&self) -> Option<Duration> {
+            self.reader.end()
+        }
+    }
+
+    /// Playback that starts 9 s into the long-GOP clip jumps once and plays on from there, also
+    /// when the jump lands on the keyframe at 0, 270 frames behind (150 after one tick decodes).
+    #[test]
+    fn a_jump_into_a_long_gop_clip_catches_up_and_never_livelocks() {
+        let path = temp_clip("long-gop-jump.mov");
+        long_gop_clip(&path);
+        for from_keyframe in [false, true] {
+            let reader = ok(autoreleasepool(|_| VideoReader::open("video:long-gop", &path)));
+            let seeks = Arc::new(Mutex::new(0));
+            let jumps = Jumps { reader, seeks: seeks.clone(), from_keyframe };
+            let mut player = ok(crate::video::Player::new("video:long-gop".into(), jumps));
+            let spec = FrameSpec { width: 64, height: 48, fps: 30 };
+            let mut shown = Vec::new();
+            for ms in (9_000u64..=9_300).step_by(33) {
+                let tick = Tick { seq: ms, pts: Duration::from_millis(ms), ..Tick::start() };
+                shown.push(ok(player.frame(spec, tick)).pixel(32, 24)[0]);
+            }
+            // 9.297 s in: frame 278, grey 237.
+            let last = shown.last().copied().unwrap_or_default();
+            assert!(last.abs_diff(237) <= 16, "from_keyframe {from_keyframe}: grey {last}, want about 237; all {shown:?}");
+            assert_eq!(*seeks.lock().unwrap_or_else(|e| e.into_inner()), 1, "from_keyframe {from_keyframe}: one jump; {shown:?}");
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A Logitech C920's list as AVFoundation reports it (each format one range of 30 fps down to

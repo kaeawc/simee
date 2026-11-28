@@ -181,7 +181,7 @@ pub fn whip_server() -> (FakeServer, Receiver<Viewer>) {
     (server, viewers)
 }
 
-fn receiver(offer: SdpOffer) -> (String, Viewer) {
+pub fn receiver(offer: SdpOffer) -> (String, Viewer) {
     let provider = Arc::new(str0m::crypto::from_feature_flags());
     let mut rtc = RtcConfig::new().set_crypto_provider(provider).build(Instant::now());
     let socket = UdpSocket::bind("127.0.0.1:0").expect("udp");

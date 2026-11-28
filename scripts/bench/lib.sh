@@ -43,6 +43,19 @@ bench_refuse_protected() {
   return 0
 }
 
+# bench_refuse_protected_port PORT: exits (status 2) unless PORT is an even number whose console
+# serial (emulator-PORT) and adb port's (emulator-PORT+1: the adb port is the next one up, and the
+# console that owns that number would collide with it) are both unprotected. It looks at the
+# number only, so a protected port is refused whether or not its device is up.
+bench_refuse_protected_port() {
+  local port=$1
+  case $port in '' | *[!0-9]*) bench_die "port '$port' is not a number" ;; *) ;; esac
+  { [ "${#port}" -le 5 ] && [ $((10#$port)) -le 65534 ]; } || bench_die "port $port is out of range"
+  port=$((10#$port))
+  [ $((port % 2)) = 0 ] || bench_die "port $port is odd: a console port is even (its adb port is the next one up)"
+  bench_refuse_protected "emulator-$port" "emulator-$((port + 1))"
+}
+
 bench_help() {
   awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 }

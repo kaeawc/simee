@@ -560,10 +560,9 @@ fn main() -> Result<()> {
         Cmd::Serve { socket } => {
             let path = socket.clone().unwrap_or_else(sim_api::default_socket);
             eprintln!("simee API on {}", path.display());
-            let served = sim_api::serve(&path);
-            sim_api::stop_streams();
-            served?;
-            return Ok(());
+            // Until SIGINT or SIGTERM, then a shutdown in order: 130 or 143.
+            let code = sim_api::serve(&path)?;
+            std::process::exit(code);
         }
         Cmd::McpAudit(audit) => {
             audit.run(&mut std::io::stdout().lock())?;
@@ -571,6 +570,7 @@ fn main() -> Result<()> {
         }
         Cmd::Mcp { http: None, safety, .. } => {
             safety.install()?;
+            mcp_shutdown_on_signal()?;
             // Methods run in this process, on the server's own threads: nothing but protocol
             // messages may reach stdout.
             let served = sim_mcp::serve_stdio(std::sync::Arc::new(sim_mcp::ApiBackend::new()));
@@ -581,6 +581,7 @@ fn main() -> Result<()> {
         Cmd::Mcp { http: Some(addr), token_file, no_auth, insecure_remote, safety } => {
             safety.install()?;
             let config = mcp_http_config(addr, token_file.clone(), *no_auth, *insecure_remote)?;
+            mcp_shutdown_on_signal()?;
             let served = sim_mcp::http::serve(std::sync::Arc::new(sim_mcp::ApiBackend::new()), config);
             sim_api::stop_streams();
             served?;
@@ -601,6 +602,23 @@ fn main() -> Result<()> {
     transport.require = flag("SIMEE_REQUIRE_SERVER");
     let (stdout, stderr) = (std::io::stdout(), std::io::stderr());
     run(cli.command, &mut transport, &mut stdout.lock(), &mut stderr.lock())
+}
+
+/// `simee mcp` on SIGINT or SIGTERM: the servers stop taking tool calls (each is answered
+/// `cancelled: server shutting down`), the calls in flight stop at their next safe point and get up
+/// to `sim_api::DRAIN`, the streams stop with their WHIP DELETE, and the process exits with 130 or
+/// 143 (a second signal exits at once). The transports answer until then, so every reply reaches
+/// the client first.
+fn mcp_shutdown_on_signal() -> Result<()> {
+    sim_api::shutdown::watch(|sig| {
+        if !sim_mcp::Drain::shared().finish(sim_api::DRAIN) {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "simee: calls still running after {} s: stopping anyway", sim_api::DRAIN.as_secs());
+        }
+        sim_api::stop_streams();
+        sim_api::shutdown::exit(sig);
+    })
+    .context("watching SIGINT and SIGTERM")
 }
 
 /// Whether an on/off environment variable is on (set, not empty, not `0`).

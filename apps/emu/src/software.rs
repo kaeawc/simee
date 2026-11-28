@@ -112,13 +112,15 @@ pub fn boot(
     {
         let stop = stop.clone();
         std::thread::Builder::new().name("stop-watch".into()).spawn(move || {
-            if signals.recv().is_ok() {
-                stop.store(true, Ordering::SeqCst);
-                // QEMU gets 10 s to quit (`emu_vmm::soft`); don't outlive that by much.
-                std::thread::sleep(std::time::Duration::from_secs(15));
-                eprintln!("emu: shutdown took over 15 s; exiting");
-                std::process::exit(0);
+            // QEMU gets 10 s to quit (`emu_vmm::soft`); don't outlive that by much, and a second
+            // signal exits at once.
+            let limit = std::time::Duration::from_secs(15);
+            let Some((sig, forced)) = crate::on_signal::watch(&signals, limit, || stop.store(true, Ordering::SeqCst)) else { return };
+            match forced {
+                crate::on_signal::Forced::Second(_) => eprintln!("emu: a second signal: exiting without finishing the shutdown"),
+                crate::on_signal::Forced::Overrun => eprintln!("emu: shutdown took over 15 s; exiting"),
             }
+            std::process::exit(crate::on_signal::exit_code(sig));
         })?;
     }
 
@@ -160,7 +162,8 @@ pub fn boot(
     println!("emu: {} on emulator-{} (adb port {adb_port})", avd.name, inst.console_port);
     let cfg = inst.soft_config(opts, qemu, accel)?;
     match emu_vmm::soft::run(cfg, stop)? {
-        emu_vmm::soft::Exit::PowerOff | emu_vmm::soft::Exit::Stopped => Ok(ExitCode::SUCCESS),
+        // 130 or 143 when a signal stopped it.
+        emu_vmm::soft::Exit::PowerOff | emu_vmm::soft::Exit::Stopped => Ok(crate::on_signal::stopped()),
         emu_vmm::soft::Exit::Failed(why) => {
             eprintln!("emu: {why}");
             Ok(ExitCode::FAILURE)

@@ -15,6 +15,7 @@ mod display_server;
 mod fold;
 mod golden;
 mod instance;
+mod on_signal;
 mod provision;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod software;
@@ -24,67 +25,6 @@ mod vkprobe;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-
-/// Blocks SIGINT/SIGTERM/SIGHUP in this thread (and so in every thread created after it,
-/// including native libraries' threads) and returns a receiver that fires once any of them
-/// arrives. A dedicated thread `sigwait`s for them, so a library that installs its own handlers
-/// (the GPU renderer does) can't swallow the shutdown signal.
-#[allow(unsafe_code)]
-fn shutdown_signals() -> std::sync::mpsc::Receiver<i32> {
-    // SAFETY: plain libc signal-mask calls on a stack-allocated, initialized sigset.
-    let set = unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-            libc::sigaddset(&mut set, sig);
-        }
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
-        set
-    };
-    // Native libraries may set these signals to SIG_IGN (the GPU renderer does), and ignored
-    // signals are discarded even while blocked. Keep their disposition at SIG_DFL: blocked
-    // everywhere, the default action never runs, and sigwait receives them.
-    let started = std::time::Instant::now();
-    let _ = std::thread::Builder::new().name("signal-guard".into()).spawn(move || {
-        emu_hvf::host::set_qos(emu_hvf::host::Qos::Utility);
-        loop {
-            for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-                // SAFETY: querying and restoring a disposition with zero-initialized sigactions.
-                unsafe {
-                    let mut cur: libc::sigaction = std::mem::zeroed();
-                    if libc::sigaction(sig, std::ptr::null(), &mut cur) == 0 && cur.sa_sigaction != libc::SIG_DFL {
-                        let mut dfl: libc::sigaction = std::mem::zeroed();
-                        dfl.sa_sigaction = libc::SIG_DFL;
-                        libc::sigaction(sig, &dfl, std::ptr::null_mut());
-                    }
-                }
-            }
-            std::thread::sleep(signal_guard_interval(started.elapsed()));
-        }
-    });
-    let (tx, rx) = std::sync::mpsc::channel();
-    let _ = std::thread::Builder::new().name("signals".into()).spawn(move || {
-        emu_hvf::host::set_qos(emu_hvf::host::Qos::Utility);
-        let mut sig = 0;
-        // SAFETY: `set` is a valid sigset; sigwait writes the delivered signal number.
-        if unsafe { libc::sigwait(&set, &mut sig) } == 0 {
-            let _ = tx.send(sig);
-        }
-    });
-    rx
-}
-
-/// While native libraries may still be installing handlers, the signal guard checks often.
-/// The renderer, which does, initializes in the first seconds (beside kernel load, hundreds of
-/// ms) and once per process (guest resets reuse it); the window leaves room for a cold disk and
-/// the first boot's GPU device setup.
-const SIGNAL_GUARD_FAST: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// How long the signal guard sleeps between checks, `since_start` after it started: 200 ms in
-/// [`SIGNAL_GUARD_FAST`], then 5 s (an idle emulator's guard wakes 0.2 times a second, not 5).
-fn signal_guard_interval(since_start: std::time::Duration) -> std::time::Duration {
-    if since_start < SIGNAL_GUARD_FAST { std::time::Duration::from_millis(200) } else { std::time::Duration::from_secs(5) }
-}
 
 /// macOS's `OPEN_MAX`: the most open files `setrlimit` grants a process there whatever its hard
 /// limit says, and room for the NAT's flow caps and the rest of emu.
@@ -186,7 +126,7 @@ fn create_avd(env: &emu_avd::Env, name: &str, sysdir: &str, opts: &args::Opts) -
 fn real_main() -> Result<ExitCode> {
     let launched = std::time::Instant::now();
     // First, before any thread exists.
-    let signals = shutdown_signals();
+    let signals = on_signal::shutdown_signals();
     // Before the NAT sizes its flow caps from it.
     raise_nofile();
     // Internal: `emu -probe-vulkan <lib64>` and `emu -warm-renderer <lib64>` (see vkprobe.rs).
@@ -386,25 +326,30 @@ fn boot(
         // Without it a SIGINT/SIGTERM would never stop the machine: fail the launch instead.
         let verbose = opts.verbose;
         std::thread::Builder::new().name("stop-watch".into()).spawn(move || {
-            if signals.recv().is_ok() {
+            // As the console's `kill` stops it. Device threads blocked in native code (e.g. a
+            // wedged renderer) can stall an orderly teardown; a second signal, or the limit,
+            // doesn't let that keep the process alive.
+            let stopping = || {
                 if let Some(f) = foldable.get() {
                     f.release();
                 }
                 emu_vmm::request_stop(&stop);
-                // Device threads blocked in native code (e.g. a wedged renderer) can stall an
-                // orderly teardown; don't let that keep the process alive.
-                std::thread::sleep(SHUTDOWN_LIMIT);
-                let step = emu_vmm::teardown_status();
-                // The orderly path prints the counts once the machine is down; it didn't get there.
-                let counts = verbose && step.as_ref().is_none_or(|(s, _)| s != EXITING);
-                eprintln!("emu: {}", overrun_line(step));
-                if let Some(exits) = emu_vmm::exit_counts().filter(|_| counts) {
-                    for line in exit_lines(&exits) {
-                        eprintln!("emu: {line}");
-                    }
-                }
-                std::process::exit(0);
+            };
+            let Some((sig, forced)) = on_signal::watch(&signals, SHUTDOWN_LIMIT, stopping) else { return };
+            if forced != on_signal::Forced::Overrun {
+                eprintln!("emu: a second signal: exiting without finishing the shutdown");
+                std::process::exit(on_signal::exit_code(sig));
             }
+            let step = emu_vmm::teardown_status();
+            // The orderly path prints the counts once the machine is down; it didn't get there.
+            let counts = verbose && step.as_ref().is_none_or(|(s, _)| s != EXITING);
+            eprintln!("emu: {}", overrun_line(step));
+            if let Some(exits) = emu_vmm::exit_counts().filter(|_| counts) {
+                for line in exit_lines(&exits) {
+                    eprintln!("emu: {line}");
+                }
+            }
+            std::process::exit(on_signal::exit_code(sig));
         })?;
     }
 
@@ -496,7 +441,8 @@ fn boot(
                 eprintln!("emu: guest fault: {msg}");
                 return Ok(ExitCode::FAILURE);
             }
-            _ => return Ok(ExitCode::SUCCESS),
+            // 130 or 143 when a signal stopped it.
+            _ => return Ok(on_signal::stopped()),
         }
     }
 }
@@ -520,18 +466,6 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert!(host_macos().is_some_and(|v| v.major >= 11));
         }
-    }
-
-    /// Checks the guard makes in `[from, to)` of its life, following its own schedule.
-    fn guard_checks(from: Duration, to: Duration) -> usize {
-        let (mut t, mut n) = (Duration::ZERO, 0);
-        while t < to {
-            if t >= from {
-                n += 1;
-            }
-            t += signal_guard_interval(t);
-        }
-        n
     }
 
     #[test]
@@ -562,18 +496,5 @@ mod tests {
         assert!(overrun_line(None).contains("had not started tearing down"));
         let exits = vec![vec![("mmio_read", 3), ("wfi", 0), ("canceled", 1)], vec![("mmio_read", 0)]];
         assert_eq!(exit_lines(&exits), ["  vcpu0: mmio_read=3 canceled=1", "  vcpu1: "]);
-    }
-
-    #[test]
-    fn the_signal_guard_checks_often_at_startup_then_rarely() {
-        // A handler a library installs during startup is undone within 200 ms.
-        assert_eq!(signal_guard_interval(Duration::ZERO), Duration::from_millis(200));
-        assert_eq!(signal_guard_interval(SIGNAL_GUARD_FAST - Duration::from_millis(1)), Duration::from_millis(200));
-        assert_eq!(guard_checks(Duration::from_secs(1), Duration::from_secs(2)), 5);
-        // Idle afterwards: at most one wakeup in any second (it was 5), and it never stops.
-        for start in [SIGNAL_GUARD_FAST, SIGNAL_GUARD_FAST * 2, SIGNAL_GUARD_FAST * 10] {
-            assert!(guard_checks(start, start + Duration::from_secs(1)) <= 1, "{start:?}");
-            assert!(guard_checks(start, start + Duration::from_secs(10)) >= 1, "{start:?}");
-        }
     }
 }

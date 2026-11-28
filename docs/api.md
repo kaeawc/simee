@@ -92,6 +92,27 @@ server's HID client outlives the command). The output is byte for byte the same.
   `audio_capture_start`, `audio_capture_stop`, `audio_mute` and `audio_state` (a capture or mute is
   a helper process its caller owns). These always run in the caller, and need no handshake.
 
+**Stopping a server** (#388). On SIGINT (Ctrl-C) or SIGTERM, `simee serve` shuts down in order.
+A call in flight stops at its next safe point and gets up to 10 s. Every call after the signal,
+on a connection already open or one made during the shutdown, isn't run. Both answer
+`cancelled: server shutting down`. Then it stops every stream with its WHIP DELETE, removes its
+socket and its camera feed sockets, and exits 130 (SIGINT) or 143 (SIGTERM). It keeps listening
+until it has removed its socket, so another `simee serve` can't take the path meanwhile. A second
+signal exits at once. From the signal on, `call_cancelled` is true for every call in the process.
+
+A shutdown leaves alone the devices the server didn't start, but it can stop or delete ones it
+did:
+- Ctrl-C at a terminal goes to the whole process group, so every Android emulator the server
+  started as its child gets the SIGINT too, powers off and exits 130. A SIGTERM sent to the
+  server's PID alone doesn't reach them.
+- A call cancelled at a safe point undoes what it made: a `create` or `clone` that finishes
+  during the drain is deleted, and a `boot` waiting for admission boots nothing.
+
+`simee mcp` shuts down the same way, over stdio and over HTTP: see "Stopping the server" in
+[mcp.md](mcp.md). A watched `boot` that launched its device for a call in flight may shut that
+device down as it is cancelled. `emu` stops its guest as the console's `kill` does and exits 130
+or 143 too.
+
 Relative `path` arguments (`screenshot`, `install`) are made absolute before they are sent.
 
 `device` is a UDID (an Android device's UDID is its AVD name), an exact name, or `booted` (the default: the only running device). It is resolved across both platforms; pass `platform` (`ios` or `android`) to look at one. Parameters ending in `?` are optional.
@@ -122,7 +143,7 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `erase` | iOS | device | Erase content and settings (shut down first) |
 | `screen` | Android, iOS | device, display?(main\|outer\|inner\|carplay) | Screen size in pixels, the space tap, swipe and touch take (a folded Android foldable: the size its guest lays out for, a Pixel Fold's 1080x2092, as uiautomator's bounds). display (iOS): main is the screen in use (an unfolded iPhone Duo's inner one), outer and inner an iPhone Duo's two, carplay an iPhone's CarPlay screen |
 | `screenshot` | Android, iOS | device, path?, display?(main\|outer\|inner\|carplay) | PNG to path, else base64 in `png` (a folded Android foldable: its outer screen as the scanout shows it, a Pixel Fold's 949x1840; an iPhone Duo's inner screen as its framebuffer holds it, 2007x2853) |
-| `stream_start` | Android, iOS | device, whip_url, token?, fps?(30), max_size?(1280), bitrate?(2500000), audio?(false), input?(false) | Stream the screen as H.264 over WebRTC to a WHIP endpoint (plaintext http to a loopback host only, e.g. MediaMTX's `http://127.0.0.1:8889/<path>/whip`), with token as its bearer token; max_size caps the longest side (0: full size), bitrate is in bit/s; input offers the `simee-input` data channel, whose touches, keys, text, buttons, rotations, folds and scrolls reach the device. One stream per device and URL, living in this process (`simee serve`) on a 30 s lease that stream_status renews: a stream nobody renews is stopped. Returns stream_id, whip_resource and lease_ttl_s. macOS hosts only for now; audio isn't streamed yet |
+| `stream_start` | Android, iOS | device, whip_url, token?, fps?(30), max_size?(1280), bitrate?(2500000), audio?(false), input?(false) | Stream the screen as H.264 over WebRTC to a WHIP endpoint (plaintext http to a loopback host only, e.g. MediaMTX's `http://127.0.0.1:8889/<path>/whip`), with token as its bearer token; max_size caps the longest side (0: full size), bitrate is in bit/s; input offers the `simee-input` data channel, whose touches, keys, text, buttons, rotations, folds and scrolls reach the device (a server that refuses the data channel, as MediaMTX does, gets the stream without it: the result's input is false and input_note says why). One stream per device and URL, living in this process (`simee serve`) on a 30 s lease that stream_status renews: a stream nobody renews is stopped. Returns stream_id, whip_resource and lease_ttl_s (and, with input, whether it is on). Encoded on macOS by VideoToolbox (iOS and Android devices) and on Linux by OpenH264 in a build with `--features openh264` (Android devices only); audio isn't streamed yet |
 | `stream_status` | Android, iOS | stream_id | A stream's state (starting, running, ended and why), its stages in the order reached (requested, first_encoded_frame, whip_connected, ended; ms since requested) and stats (encoded, sent, keyframes, bytes, fps, bitrate_bps, the publisher's bitrate_estimate_bps, the viewers' pli and fir keyframe requests, input events and errors); renews its lease |
 | `stream_stop` | Android, iOS | stream_id | Stop a stream: ends its encode loop and sends the WHIP DELETE; its last status, with deleted |
 | `streams` | Android, iOS | device? | This process's streams (or one device's), each as stream_status shows it, without renewing a lease |
@@ -434,7 +455,7 @@ encoded and the WHIP session is connected (the shape below; the values are place
   status with `deleted`.
 - **Errors.** A URL the publisher refuses (`https`, plaintext to a host that isn't loopback, not
   http), a device that isn't booted, the WHIP server refusing the token (401/403), `audio: true`
-  (#265), and any host without an encoder (Linux: #263) fail `stream_start`, leaving nothing
+  (#265), and a build without an encoder (a Linux `simee` built without `--features openh264`, or an iOS device on a Linux host) fail `stream_start`, leaving nothing
   running. The token is never echoed.
 - **Input.** `input: true` offers the `simee-input` data channel; its events reach the device's
   `touch`, `key`, `type`, `button`, `rotate`, `fold` and `swipe`, mapped from the stream frame to

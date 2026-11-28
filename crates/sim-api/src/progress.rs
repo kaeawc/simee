@@ -4,7 +4,8 @@
 //! of an `install`) and its waits ([`call_progress`]), and asks [`call_cancelled`] at its safe
 //! points. [`interruptible`] runs a backend call on a thread of its own, so a call that can't look
 //! at the flag itself (a boot in flight) is let go of at once, and undoes what it finishes after.
-//! Without hooks (the CLI, the socket API) a call runs as it always has.
+//! Without hooks (the CLI, the socket API) a call runs as it always has, until the process shuts
+//! down: then [`call_cancelled`] is true for every call.
 
 use std::cell::RefCell;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -51,9 +52,10 @@ pub(crate) fn has_call_hooks() -> bool {
     HOOKS.with(|h| h.borrow().is_some())
 }
 
-/// Whether the caller of the call on this thread cancelled it.
+/// Whether the caller of the call on this thread cancelled it, or the process is shutting down
+/// (a SIGINT or SIGTERM, [`crate::shutdown`]): every call in flight stops at its next safe point.
 pub fn call_cancelled() -> bool {
-    HOOKS.with(|h| h.borrow().as_ref().is_some_and(|h| (h.cancelled)()))
+    crate::shutdown::shutting_down() || HOOKS.with(|h| h.borrow().as_ref().is_some_and(|h| (h.cancelled)()))
 }
 
 fn report(p: &Progress) {

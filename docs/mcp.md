@@ -195,7 +195,7 @@ reverse):
 | --- | --- |
 | `help`, `identity`, `host`, `devices_usage`, `form_factors`, `devices`, `runtimes`, `create`, `delete`, `boot`, `boot_many`, `admission_check`, `clone`, `shutdown`, `screen`, `screenshot`, `contrast_check`, `tap`, `swipe`, `touch`, `button`, `type`, `key`, `open_url`, `install`, `uninstall`, `launch`, `terminate`, `apps`, `location`, `info`, `rotate`, `rotary`, `stylus`, `device_view` | Android, iOS |
 | `console`, `fold`, `xr`, `vehicle`, `touchpad`, `export`, `import` | Android (iOS bundles: the next step of #170) |
-| `stream_start`, `stream_status`, `stream_stop`, `streams` | Android, iOS (macOS hosts only for now: no Linux encoder, #263) |
+| `stream_start`, `stream_status`, `stream_stop`, `streams` | Android, iOS (macOS: VideoToolbox, both platforms; Linux: Android only, in a build with `--features openh264`) |
 | `camera_sources` | Android, iOS (the host's cameras and the synthetic sources; needs no device) |
 | `camera_link`, `camera_unlink`, `camera_links` | Android, iOS (iOS: device-wide shim injection, needs `simee serve`; see [camera.md](camera.md)) |
 | `prefs_stores`, `prefs_read`, `prefs_write`, `prefs_delete`, `prefs_batch`, `prefs_watch` | Android, iOS (iOS is implemented; Android answers "not yet available") |
@@ -502,6 +502,26 @@ median of 5 rounds, and the table gives the median of 3 runs, µs per call. Appl
 So HTTP adds about 25 µs per call on a kept-alive connection (checking a token adds about 1 µs)
 and about 85 µs with a connection per call: small next to a device method (a `tap` or `screenshot`
 takes milliseconds). Reproduce: `cargo test --release -p simee-mcp http_call_overhead -- --ignored --nocapture`.
+
+## Stopping the server
+
+On SIGINT or SIGTERM, `simee mcp` (stdio or `--http`) shuts down in order, the way `simee serve`
+does ([api.md](api.md), "Stopping a server"):
+
+1. It stops taking tool calls. Every `tools/call` from then on, on a connection already open or one
+   made during the shutdown, isn't run: it is answered with a tool error saying
+   `cancelled: server shutting down`, and filed in the audit log as refused. Other requests
+   (`tools/list`, resource reads) are still answered until the process exits.
+2. The calls in flight, tasks included, stop at their next safe point and get up to 10 s
+   (`sim_api::DRAIN`, the bound `simee serve` uses). A call that ends in an error meanwhile says the
+   shutdown cancelled it (`cancelled: server shutting down (<its error>)`). A question waiting for the
+   user's answer to a confirmation is dropped the same way, so the call is refused.
+3. Each reply is sent before the wait for its call ends, so a client reads the answer before it sees
+   the process exit. Calls still running after 10 s are abandoned, with a line on stderr.
+4. The streams stop with their WHIP DELETE, and the process exits 130 (SIGINT) or 143 (SIGTERM). A
+   second signal exits at once.
+
+Closing stdin is a different goodbye: the server waits up to 10 s for its requests and exits 0.
 
 ## Limits and what is not here
 

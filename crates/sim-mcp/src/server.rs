@@ -16,6 +16,7 @@ use serde_json::{Map, Value, json};
 
 use crate::audit::{self, Entry};
 use crate::backend::{Backend, Executor};
+use crate::drain::{Drain, Held, SHUTTING_DOWN};
 use crate::rpc::{self, Ctx, EXT_TASKS, Era, INTERNAL_ERROR, Incoming, LEGACY, MODERN, RpcError};
 use crate::safety::{self, Answer, Confirmation, Prepared, Safety, Verdict};
 use crate::tasks::{Ctl, Sink, Tasks};
@@ -95,6 +96,8 @@ struct Inner {
     pages: Arc<Pages>,
     /// The confirmations, device policy and audit log every call goes through.
     safety: Arc<Safety>,
+    /// Whether the process is shutting down, and the calls still running (#388).
+    drain: Arc<Drain>,
     /// Who the transport says the client is (a token's name), which a client's own `clientInfo`
     /// can't override.
     identity: Mutex<Option<String>>,
@@ -140,6 +143,19 @@ impl Server {
     /// A server whose calls go through `safety` (the default, [`Safety::shared`], is what
     /// `simee mcp` installed, or confirmations and admission alone).
     pub fn with_safety(backend: Arc<dyn Backend>, sink: Sink, timing: Timing, toolsets: Toolsets, safety: Arc<Safety>) -> Server {
+        Server::with_drain(backend, sink, timing, toolsets, safety, Drain::shared())
+    }
+
+    /// A server that stops taking calls, and counts the ones it runs, with `drain` (the default,
+    /// [`Drain::shared`], is the process's, which `simee mcp`'s signal handler finishes).
+    pub fn with_drain(
+        backend: Arc<dyn Backend>,
+        sink: Sink,
+        timing: Timing,
+        toolsets: Toolsets,
+        safety: Arc<Safety>,
+        drain: Arc<Drain>,
+    ) -> Server {
         Server {
             inner: Arc::new(Inner {
                 backend,
@@ -150,6 +166,7 @@ impl Server {
                 toolsets,
                 pages: Arc::default(),
                 safety,
+                drain,
                 identity: Mutex::new(None),
                 elicit_timeout: Mutex::new(None),
                 asked: Mutex::default(),
@@ -405,9 +422,17 @@ impl Call {
     }
 
     /// Runs the call as prepared on the client's guarded backend, then keeps what it changed and files it.
-    fn run(&self, safety: &Arc<Safety>, backend: Arc<dyn Backend>, pages: &tools::Pages, prepared: &Prepared, era: Era) -> Value {
+    fn run(
+        &self,
+        safety: &Arc<Safety>,
+        drain: &Drain,
+        backend: Arc<dyn Backend>,
+        pages: &tools::Pages,
+        prepared: &Prepared,
+        era: Era,
+    ) -> Value {
         let guarded = safety.guard(backend, &self.client);
-        let ran = tools::run(&*guarded, pages, &self.name, prepared.args(&self.args));
+        let ran = drain.outcome(tools::run(&*guarded, pages, &self.name, prepared.args(&self.args)));
         if let Ok(value) = &ran {
             safety.done(&self.client, &self.name, prepared, value);
         }
@@ -563,12 +588,19 @@ impl Inner {
     /// Runs `work` on a worker thread and answers with its outcome, unless the client cancelled the
     /// request meanwhile (then nothing more is sent for it).
     fn offload(self: &Arc<Self>, id: Value, ctx: Ctx, work: impl FnOnce(&Inner) -> Result<Value, RpcError> + Send + 'static) {
-        self.offload_with(id, ctx, |inner, _| work(inner));
+        self.offload_with(id, ctx, None, |inner, _| work(inner));
     }
 
     /// [`Server::offload`], with the request's [`Ctl`] for the work: its cancel flag is the one
     /// `notifications/cancelled` sets.
-    fn offload_with(self: &Arc<Self>, id: Value, ctx: Ctx, work: impl FnOnce(&Inner, &Ctl) -> Result<Value, RpcError> + Send + 'static) {
+    /// A `held` call is counted by the drain until its answer is sent.
+    fn offload_with(
+        self: &Arc<Self>,
+        id: Value,
+        ctx: Ctx,
+        held: Option<Held>,
+        work: impl FnOnce(&Inner, &Ctl) -> Result<Value, RpcError> + Send + 'static,
+    ) {
         let key = rpc::id_key(&id);
         let ctl = Ctl::default();
         let cancelled = ctl.cancelled.clone();
@@ -576,6 +608,7 @@ impl Inner {
         *lock(&self.running) += 1;
         let inner = self.clone();
         self.executor.submit(move || {
+            let _held = held;
             let outcome = catch_unwind(AssertUnwindSafe(|| work(&inner, &ctl)))
                 .unwrap_or_else(|_| Err(RpcError::new(INTERNAL_ERROR, "the request's thread panicked")));
             lock(&inner.inflight).remove(&key);
@@ -618,8 +651,13 @@ impl Inner {
         let retry = ["requestState", "inputResponses"].iter().filter_map(|k| params.get(*k).map(|v| ((*k).to_owned(), v.clone())));
         let call = Call { client, name, args, retry: Value::Object(retry.collect()), started: Instant::now() };
         let progress = ctx.progress_token.clone().filter(|_| tools::LONG_RUNNING.contains(&call.name.as_str()));
+        // Once the process is shutting down a call isn't run: it is answered, and audited, as cancelled.
+        let Some(held) = self.drain.enter() else {
+            let refused = call.refused(&self.safety, SHUTTING_DOWN.to_owned(), ctx.era);
+            return self.reply(&id, Ok(refused), Some(ctx));
+        };
         let ctx_for_work = ctx.clone();
-        self.offload_with(id, ctx.clone(), move |inner, ctl| inner.run_call(call, &ctx_for_work, progress, ctl));
+        self.offload_with(id, ctx.clone(), Some(held), move |inner, ctl| inner.run_call(call, &ctx_for_work, progress, ctl));
     }
 
     fn run_call(&self, call: Call, ctx: &Ctx, progress: Option<Value>, ctl: &Ctl) -> Result<Value, RpcError> {
@@ -638,10 +676,15 @@ impl Inner {
             },
         };
         if tools::as_task(&call.name, ctx) {
-            let (backend, pages, safety) = (self.backend.clone(), self.pages.clone(), self.safety.clone());
+            // The task's thread outlives this request, so it is counted on its own.
+            let Some(held) = self.drain.enter() else {
+                return Ok(call.refused(&self.safety, SHUTTING_DOWN.to_owned(), era));
+            };
+            let (backend, pages, safety, drain) = (self.backend.clone(), self.pages.clone(), self.safety.clone(), self.drain.clone());
             let name = call.name.clone();
             let created = self.tasks.create_with(&name, move |ctl| {
-                sim_api::with_call_hooks(ctl.hooks(), || call.run(&safety, backend, &pages, &prepared, Era::Modern))
+                let _held = held;
+                sim_api::with_call_hooks(ctl.hooks(), || call.run(&safety, &drain, backend, &pages, &prepared, Era::Modern))
             });
             let result = match created {
                 Ok(mut handle) => {
@@ -659,7 +702,9 @@ impl Inner {
             Some(beat) => ctl.clone().on_step(beat.steps()),
             None => ctl.clone(),
         };
-        let result = sim_api::with_call_hooks(ctl.hooks(), || call.run(&self.safety, self.backend.clone(), &self.pages, &prepared, era));
+        let result = sim_api::with_call_hooks(ctl.hooks(), || {
+            call.run(&self.safety, &self.drain, self.backend.clone(), &self.pages, &prepared, era)
+        });
         drop(beat);
         Ok(result)
     }
@@ -703,6 +748,9 @@ impl Inner {
         self.say(&json!({"jsonrpc": "2.0", "id": id, "method": "elicitation/create", "params": params}));
         let deadline = Instant::now() + wait;
         let answer = loop {
+            if self.drain.draining() {
+                break Err(SHUTTING_DOWN.to_owned());
+            }
             if ctl.cancelled.load(Ordering::Relaxed) {
                 break Err("the call was cancelled".to_owned());
             }

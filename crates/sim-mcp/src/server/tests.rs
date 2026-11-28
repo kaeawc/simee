@@ -39,6 +39,11 @@ impl Rig {
 
     /// [`Rig::over`], with these safety settings.
     fn guarded(toolsets: Toolsets, wrap: impl FnOnce(Arc<Fake>) -> Arc<dyn Backend>, safety: Arc<Safety>) -> Rig {
+        Rig::draining(toolsets, wrap, safety, Drain::shared())
+    }
+
+    /// [`Rig::guarded`], whose server counts its calls with `drain`.
+    fn draining(toolsets: Toolsets, wrap: impl FnOnce(Arc<Fake>) -> Arc<dyn Backend>, safety: Arc<Safety>, drain: Arc<Drain>) -> Rig {
         let fake = Arc::new(Fake::with_devices());
         let backend = wrap(fake.clone());
         let timing = Timing { watch: Pace::uniform(Duration::from_millis(20)), heartbeat: Duration::from_millis(40) };
@@ -56,7 +61,7 @@ impl Rig {
             vrx
         };
         Rig {
-            server: Server::with_safety(backend, sink, timing, toolsets, safety),
+            server: Server::with_drain(backend, sink, timing, toolsets, safety, drain),
             fake,
             rx,
             notes: RefCell::default(),
@@ -1190,4 +1195,5 @@ fn tool_call_overhead() {
     }
 }
 
+mod drain;
 mod safety;

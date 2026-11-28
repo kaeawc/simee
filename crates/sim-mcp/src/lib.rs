@@ -23,6 +23,7 @@
 pub mod app;
 pub mod audit;
 pub mod backend;
+pub mod drain;
 pub mod http;
 pub mod policy;
 pub mod prompts;
@@ -39,6 +40,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use backend::{ApiBackend, Backend};
+pub use drain::Drain;
 pub use policy::Policy;
 pub use safety::Safety;
 pub use server::Server;

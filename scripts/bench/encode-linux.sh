@@ -3,13 +3,13 @@
 # `openh264` feature) on synthetic phone screens: no device and no emulator, so it runs on any
 # Linux host with a C++ compiler (and `nasm`, which makes the x86_64 build about 2.3x faster).
 #
-#   scripts/bench/encode-linux.sh [--size WxH] [--max-size "0 1280"] [--fps "30 60"]
+#   scripts/bench/encode-linux.sh [--size "WxH ..."] [--max-size "0 1280"] [--fps "30 60"]
 #                                 [--seconds S] [--content drawer|noise] [--bitrate BPS]
 #                                 [--profile cb|main] [--rounds N] [--quick] [--out DIR]
 #
 # Each round, for each --max-size (0: the full frame) and each rate in --fps, runs the
-# linux_bench example for --seconds (10): an app drawer scrolling on a screen of --size
-# (1080x2400), presented at 60 fps and encoded at the cap through the real encode loop, and
+# linux_bench example for --seconds (10): an app drawer scrolling on a screen of each --size (a
+# phone's 1080x2400 and a tablet's 2560x1600), presented at 60 fps and encoded at the cap through the real encode loop, and
 # records: frames encoded per second, per-frame encode latency median and p95 (the colour
 # conversion and scaling included), the conversion on its own, CPU of the process (% of a core),
 # the luma PSNR of the decoded stream against what the encoder was given, output kbit/s, and the
@@ -20,7 +20,7 @@
 # gets). Reproduces docs/streaming.md "Encode cost on Linux".
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
-size=1080x2400
+sizes="1080x2400 2560x1600"
 max_sizes="0 1280"
 rates="30 60"
 seconds=10
@@ -28,7 +28,7 @@ extra=()
 while [ $# -gt 0 ]; do
   case $1 in
     --size)
-      size=$2
+      sizes=$2
       shift 2
       ;;
     --max-size)
@@ -71,20 +71,21 @@ bin="${CARGO_TARGET_DIR:-$BENCH_REPO/target}/release/examples/linux_bench"
 
 arms=""
 for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
-  for cap in $max_sizes; do
-    for fps in $rates; do
-      if [ "$cap" = 0 ]; then arm="$size full, $fps fps"; else arm="$size capped at $cap, $fps fps"; fi
-      case ",$arms," in *",$arm,"*) ;; *) arms="${arms:+$arms,}$arm" ;; esac
-      json="$BENCH_WORK/round-$BENCH_ROUND-$cap-$fps.json"
-      capflag=()
-      [ "$cap" = 0 ] || capflag=(--max-size "$cap")
-      if ! "$bin" --size "$size" --fps "$fps" --seconds "$seconds" ${capflag[@]+"${capflag[@]}"} ${extra[@]+"${extra[@]}"} >"$json" 2>"$BENCH_WORK/round-$BENCH_ROUND-$cap-$fps.log"; then
-        tail -5 "$BENCH_WORK/round-$BENCH_ROUND-$cap-$fps.log" >&2
-        bench_sample "$arm" "encoded, fps" failed
-        continue
-      fi
-      bench_log "$(cat "$json")"
-      python3 -I -c '
+  for size in $sizes; do
+    for cap in $max_sizes; do
+      for fps in $rates; do
+        if [ "$cap" = 0 ]; then arm="$size full, $fps fps"; else arm="$size capped at $cap, $fps fps"; fi
+        case ",$arms," in *",$arm,"*) ;; *) arms="${arms:+$arms,}$arm" ;; esac
+        json="$BENCH_WORK/round-$BENCH_ROUND-$size-$cap-$fps.json"
+        capflag=()
+        [ "$cap" = 0 ] || capflag=(--max-size "$cap")
+        if ! "$bin" --size "$size" --fps "$fps" --seconds "$seconds" ${capflag[@]+"${capflag[@]}"} ${extra[@]+"${extra[@]}"} >"$json" 2>"${json%.json}.log"; then
+          tail -5 "${json%.json}.log" >&2
+          bench_sample "$arm" "encoded, fps" failed
+          continue
+        fi
+        bench_log "$(cat "$json")"
+        python3 -I -c '
 import json, sys
 j = json.load(open(sys.argv[1]))
 rows = [
@@ -101,9 +102,10 @@ rows = [
 for metric, value in rows:
     print(f"{metric}\t{value}")
 ' "$json" | while IFS=$'\t' read -r metric value; do bench_sample "$arm" "$metric" "$value"; done
+      done
     done
   done
 done
 asm=with
 if [ -n "${OPENH264_NO_ASM:-}" ] || ! command -v nasm >/dev/null 2>&1; then asm=without; fi
-bench_finish "$arms" "OpenH264 built $asm x86 assembly, a ${size} synthetic app drawer scrolling, ${seconds} s per run, presented at 60 fps; ${extra[*]-encoder defaults}."
+bench_finish "$arms" "OpenH264 built $asm x86 assembly, a synthetic app drawer scrolling on ${sizes// /, }, ${seconds} s per run, presented at 60 fps; ${extra[*]-encoder defaults}."

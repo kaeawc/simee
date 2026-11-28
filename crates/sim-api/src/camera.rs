@@ -981,8 +981,13 @@ impl Feeds {
         };
         // Dropping a feed joins its readers (up to their write timeout): not under the lock every
         // other device's link and `camera_links` take.
-        drop(stale);
+        if let Some(stale) = stale {
+            crate::shutdown::forget(&stale.path());
+        }
         let feed = (self.serve)(socket, source)?;
+        // The feed lives in a static, so it never drops on a signal's exit: the shutdown removes
+        // its socket instead (its listener stays open until the process ends).
+        crate::shutdown::remove_on_exit(&feed.path());
         self.lock().insert(udid.to_owned(), feed);
         Ok(true)
     }
@@ -990,6 +995,9 @@ impl Feeds {
     /// Stops `udid`'s feed; whether one ran.
     fn stop(&self, udid: &str) -> bool {
         let feed = self.lock().remove(udid);
+        if let Some(feed) = &feed {
+            crate::shutdown::forget(&feed.path());
+        }
         feed.is_some()
     }
 
@@ -2363,6 +2371,25 @@ mod tests {
         drop(guard);
         unlink.join().expect("unlink thread");
         assert!(done.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_feeds_socket_is_removed_by_a_shutdown_until_the_feed_stops() {
+        let log: Arc<Mutex<Vec<String>>> = Arc::default();
+        let feed_log = log.clone();
+        let feeds = Feeds::new(move |path: &Path, source: sim_camera::SourceSpec| {
+            std::fs::write(path, b"").map_err(|e| e.to_string())?;
+            Ok(Box::new(FakeFeed { path: path.to_owned(), source: Mutex::new(source.to_string()), log: feed_log.clone() })
+                as Box<dyn LiveFeed>)
+        });
+        let socket = std::env::temp_dir().join(format!("simee-feed-shutdown-{}.sock", std::process::id()));
+        let source = sim_camera::SourceSpec::parse("qr:x").expect("spec");
+        assert_eq!(feeds.link("u", &socket, source), Ok(true));
+        // FEEDS is a static: a signal's exit never drops the feed, so the shutdown removes its file.
+        assert!(crate::shutdown::removes(&socket), "a running feed's socket is the shutdown's to remove");
+        assert!(feeds.stop("u"));
+        assert!(!crate::shutdown::removes(&socket), "a stopped feed removed its own socket");
+        assert!(!socket.exists());
     }
 
     #[test]

@@ -304,8 +304,8 @@ impl Job {
 #[derive(Debug)]
 enum Outcome {
     Sample(Result<Reading, String>),
-    /// A quick action's status line, and whether it worked.
-    Done(String, bool),
+    /// A quick action's status line, whether it worked, and the device it shut down.
+    Done(String, bool, Option<String>),
 }
 
 /// The API, as the panel calls it (a stand-in in tests).
@@ -326,15 +326,15 @@ fn run(call: Call, session: &mut Session, job: &Job) -> Outcome {
                 r
             }))
         }
-        Job::Shutdown { name, .. } => match answers.next() {
-            Some(Ok(_)) => Outcome::Done(format!("{name}: shut down"), true),
-            Some(Err(e)) => Outcome::Done(format!("shut down {name}: {e}"), false),
-            None => Outcome::Done(format!("shut down {name}: no answer"), false),
+        Job::Shutdown { name, device, .. } => match answers.next() {
+            Some(Ok(_)) => Outcome::Done(format!("{name}: shut down"), true, Some(device.clone())),
+            Some(Err(e)) => Outcome::Done(format!("shut down {name}: {e}"), false, None),
+            None => Outcome::Done(format!("shut down {name}: no answer"), false, None),
         },
         Job::StopStream { name, .. } => match answers.next() {
-            Some(Ok(_)) => Outcome::Done(format!("{name}: stream stopped"), true),
-            Some(Err(e)) => Outcome::Done(format!("stop {name}'s stream: {e}"), false),
-            None => Outcome::Done(format!("stop {name}'s stream: no answer"), false),
+            Some(Ok(_)) => Outcome::Done(format!("{name}: stream stopped"), true, None),
+            Some(Err(e)) => Outcome::Done(format!("stop {name}'s stream: {e}"), false, None),
+            None => Outcome::Done(format!("stop {name}'s stream: no answer"), false, None),
         },
     }
 }
@@ -372,6 +372,8 @@ pub struct Tick {
     pub status: Vec<String>,
     /// A quick action worked: the device list should be scanned again.
     pub rescan: bool,
+    /// Devices the API shut down.
+    pub stopped: Vec<String>,
     /// Seconds until the next sample is due.
     pub wake: Option<f64>,
 }
@@ -467,8 +469,9 @@ impl Resources {
                     tick.changed |= self.error.as_ref() != Some(&e);
                     self.error = Some(e);
                 }
-                Outcome::Done(line, ok) => {
+                Outcome::Done(line, ok, stopped) => {
                     tick.status.push(line);
+                    tick.stopped.extend(stopped);
                     tick.rescan |= ok;
                     self.pacer.hurry();
                 }
@@ -502,6 +505,10 @@ pub fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
     let changed = tick.changed || !tick.status.is_empty();
     if let Some(line) = tick.status.into_iter().last() {
         s.status = Some(line);
+    }
+    // A device that's out in its own window lets go of its connection once its shutdown worked.
+    for udid in &tick.stopped {
+        s.popouts.hub.borrow_mut().stop(udid);
     }
     if tick.rescan {
         s.rescan();
@@ -799,12 +806,10 @@ fn device_row(s: &State, r: &Row, sort: Sort, t: Theme) -> El {
 
 /// A row's Shut down. The device the window shows shuts down as the toolbar's button does, so its
 /// screen and connection close with it; any other goes through the API. One out in its own window
-/// lets go of its connection at once, so no frame of it outlives the shutdown.
+/// lets go of its connection when the API says it shut down (see `poll`), so no frame of it
+/// outlives the shutdown; if the call fails it keeps the connection and the error shows.
 pub fn shut_down(s: &mut State, udid: &str, platform: &str, name: &str) {
-    if s.popouts.is_open(udid) {
-        s.popouts.hub.borrow_mut().stop(udid);
-        s.resources.queued.push(Job::Shutdown { device: udid.to_owned(), platform: platform.to_owned(), name: name.to_owned() });
-    } else if s.selected.as_deref() == Some(udid) && s.showing_screen() {
+    if !s.popouts.is_open(udid) && s.selected.as_deref() == Some(udid) && s.showing_screen() {
         s.actions.push(Action::Shutdown);
     } else {
         s.resources.queued.push(Job::Shutdown { device: udid.to_owned(), platform: platform.to_owned(), name: name.to_owned() });

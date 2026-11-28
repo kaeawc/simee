@@ -19,6 +19,11 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# `stream_start` on Linux: OpenH264, built from its C++ source (needs a C++ compiler; `nasm` makes
+# it several times faster on x86_64). Off by default; macOS streams with VideoToolbox without it.
+openh264 = ["sim-api/openh264"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

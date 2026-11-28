@@ -12,7 +12,9 @@ use sim_rtc::{Profile as RtcProfile, ProfileLevelId};
 use simee_encode::annexb::{self, NAL_IDR, NAL_PPS, NAL_SPS};
 use simee_encode::pacing::Pacing;
 use simee_encode::stream::{self, Clock, Controls, Flow, Source};
-use simee_encode::{AccessUnit, Decoder, Encoder, EncoderConfig, Error, Hardware, OpenH264Encoder, Picture, PixelOrder, Profile};
+use simee_encode::{
+    AccessUnit, Converter, Decoder, Encoder, EncoderConfig, Error, Hardware, OpenH264Encoder, Picture, PixelOrder, Profile,
+};
 
 #[allow(dead_code)]
 #[path = "../examples/synthetic/mod.rs"]
@@ -362,4 +364,43 @@ fn the_loop_paces_requests_keyframes_and_retargets_with_the_real_encoder() {
     // Spaced by the 30 fps cap, except for the IDR that re-encodes the last picture at once.
     assert!(pts.windows(2).enumerate().all(|(i, w)| i == at || w[1] - w[0] >= Duration::from_micros(24_000)), "{pts:?}");
     assert_decodes(&units, (192, 384));
+}
+
+/// Luma PSNR in dB between two planes of the same size (99 when identical).
+fn psnr(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    let mse = a.iter().zip(b).map(|(&x, &y)| f64::from(x.abs_diff(y)).powi(2)).sum::<f64>() / a.len() as f64;
+    if mse == 0.0 { 99.0 } else { 10.0 * (255.0f64 * 255.0 / mse).log10() }
+}
+
+#[test]
+fn a_scrolling_screen_round_trips_at_30_and_60_fps_above_the_psnr_floor() {
+    // A drawer dragged up 3 pixels a frame, in the order emu's frames come in (RGBA), encoded at
+    // the frame rate asked for and decoded again: every picture that came out must be close to
+    // what the encoder was given. No timing: the pictures carry the timestamps of their rate.
+    let size = (216, 480);
+    for fps in [30u32, 60] {
+        let config = EncoderConfig { fps, keyframe_interval: Duration::from_secs(60), ..EncoderConfig::default() };
+        let mut encoder = OpenH264Encoder::new(config).expect("config");
+        let mut decoder = Decoder::new().expect("decoder");
+        let mut converter = Converter::new();
+        let (mut worst, mut decoded, mut keyframes) = (f64::MAX, 0, 0);
+        for i in 0..40u32 {
+            let picture = synthetic::picture(Content::Drawer, size.0, size.1, i * 3, PixelOrder::Rgba);
+            let pts = Duration::from_micros(u64::from(i) * 1_000_000 / u64::from(fps));
+            let units = encoder.encode(&picture, pts, false).unwrap_or_else(|e| panic!("{fps} fps, frame {i}: {e}"));
+            // At most one access unit per picture: the encoder may skip one to hold its rate.
+            assert!(units.len() <= 1, "{fps} fps, frame {i}: {} units", units.len());
+            let Some(unit) = units.first() else { continue };
+            keyframes += usize::from(unit.keyframe);
+            let planes = decoder.decode_planes(&unit.data).unwrap_or_else(|e| panic!("{fps} fps, frame {i}: {e}"));
+            assert_eq!((planes.width, planes.height), size);
+            let source = converter.convert(&picture.raster(), size).expect("convert");
+            worst = worst.min(psnr(source.y(), &planes.y));
+            decoded += 1;
+        }
+        assert_eq!(keyframes, 1, "{fps} fps: only the first picture is an IDR");
+        assert!(decoded >= 30, "{fps} fps: {decoded} of 40 pictures came out");
+        assert!(worst > 35.0, "{fps} fps: the worst picture has {worst:.1} dB of luma PSNR");
+    }
 }

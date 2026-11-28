@@ -149,9 +149,9 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "Stream the screen as H.264 over WebRTC to a WHIP endpoint (plaintext http to a loopback host only, e.g. MediaMTX's \
          `http://127.0.0.1:8889/<path>/whip`), with token as its bearer token; max_size caps the longest side (0: full size), \
          bitrate is in bit/s; input offers the `simee-input` data channel, whose touches, keys, text, buttons, rotations, folds \
-         and scrolls reach the device. One stream per device and URL, living in this process (`simee serve`) on a 30 s lease \
-         that stream_status renews: a stream nobody renews is stopped. Returns stream_id, whip_resource and lease_ttl_s. \
-         macOS hosts only for now; audio isn't streamed yet",
+         and scrolls reach the device (a server that refuses the data channel, as MediaMTX does, gets the stream without it: the result's input is false and input_note says why). One stream per device and URL, living in this process (`simee serve`) on a 30 s lease \
+         that stream_status renews: a stream nobody renews is stopped. Returns stream_id, whip_resource and lease_ttl_s (and, with input, whether it is on). \
+         Encoded on macOS by VideoToolbox (iOS and Android devices) and on Linux by OpenH264 in a build with `--features openh264` (Android devices only); audio isn't streamed yet",
     ),
     (
         "stream_status",
@@ -1470,7 +1470,7 @@ fn boot_many_hooked(s: &mut Session, p: &Value, hook: &dyn crate::progress::Boot
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::progress::{CallHooks, with_call_hooks};
 
@@ -1925,6 +1925,20 @@ mod tests {
     }
 
     const SERIOUS: Option<sim_host::ThermalState> = Some(sim_host::ThermalState::Serious);
+
+    /// A session on an SDK and AVD home under `dir` holding an AVD `pixel`, on a host whose
+    /// thermal state holds every boot: a `boot` with `admission: "wait"` waits until cancelled
+    /// (`shutdown`'s server child, which makes one per connection on the same files).
+    pub(crate) fn held_android_session(dir: &std::path::Path) -> Session {
+        let (mut s, root) = android_session_in(dir, "held");
+        fake_adb(&root);
+        s.fake_host = Some(fake_host(64, SERIOUS));
+        if !root.join("avd/pixel.ini").exists() {
+            let mobile = "system-images;android-36;google_apis;arm64-v8a";
+            call(&mut s, "create", &json!({"platform": "android", "name": "pixel", "system_image": mobile})).expect("pixel");
+        }
+        s
+    }
 
     #[test]
     fn admission_check_predicts_what_new_devices_cost() {

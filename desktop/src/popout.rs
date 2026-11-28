@@ -451,7 +451,12 @@ pub fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             // It never connected: a scan connecting it later doesn't pop it out unasked.
             s.popouts.pending = None;
             let name = s.selected_info().map_or(udid, |d| d.name.clone());
-            s.status = Some(format!("{name} didn't connect in time: pop it out again once it shows"));
+            let timeout = format!("{name} didn't connect in time: pop it out again once it shows");
+            // The connect's own error, if it failed, is the reason: the timeout follows it.
+            s.status = Some(match s.status.take() {
+                Some(error) => format!("{error} ({timeout})"),
+                None => timeout,
+            });
             changed = true;
         } else if move_out(s) {
             s.popouts.pending = None;
@@ -1280,20 +1285,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The resource panel's Shut down on a device that's out: its window lets go of the
-    /// connection at once, so popping it back in brings no frozen frame to the main window.
+    /// A stand-in resources API where every shutdown works.
+    fn shutdown_call(_: &mut sim_api::Session, _: &str, _: &serde_json::Value) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({}))
+    }
+
+    /// One where every shutdown is refused.
+    fn refusing_call(_: &mut sim_api::Session, _: &str, _: &serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("device busy".into())
+    }
+
+    fn with_api(rt: &mut Runtime<State>, call: crate::resources::Call) {
+        rt.update(|s, _| {
+            s.resources = crate::resources::Resources::with_call(call);
+            s.resources.connect(Arc::new(|| {}));
+        });
+    }
+
+    /// The resource panel's Shut down on a device that's out: once the API says it shut down, its
+    /// window lets go of the connection, so popping it back in brings no frozen frame to the main
+    /// window.
     #[test]
     fn shutting_down_a_popped_device_drops_its_connection() {
         let (mut main, dir, _lines) = live_pixel("shutdown");
+        with_api(&mut main, shutdown_call);
         act(&mut main, Action::PopOut("pixel_9".into()));
         let mut win = take_window(&mut main, "pixel_9");
         crate::resources::shut_down(&mut main.state, "pixel_9", "android", "Pixel 9");
-        assert_eq!(
-            main.state.resources.queued,
-            [crate::resources::Job::Shutdown { device: "pixel_9".into(), platform: "android".into(), name: "Pixel 9".into() }],
-            "shut down through the API"
-        );
-        main.frame(1.0 / 60.0);
+        assert!(!main.state.popouts.hub.borrow().stopped("pixel_9"), "not before the API has answered");
+        until(&mut main, "the shutdown answered", |m| m.state.popouts.hub.borrow().stopped("pixel_9"));
         win.frame(1.0 / 60.0);
         assert!(win.state.device.as_ref().is_some_and(|d| d.screen.is_none() && d.live.is_none()), "the connection is gone");
         assert!(win.find("popout-stopped").is_some());
@@ -1303,6 +1323,51 @@ mod tests {
         assert!(main.state.screen.is_none() && main.find("device-screen").is_none(), "no frozen frame came back");
         assert!(main.state.connect_pending, "the next scan connects it if it's running again");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A Shut down the API refuses leaves the device running: its pop-out keeps its connection
+    /// and the error shows.
+    #[test]
+    fn a_failed_shutdown_keeps_the_pop_out_connected() {
+        let (mut main, dir, _lines) = live_pixel("shutdown-fails");
+        with_api(&mut main, refusing_call);
+        act(&mut main, Action::PopOut("pixel_9".into()));
+        let mut win = take_window(&mut main, "pixel_9");
+        crate::resources::shut_down(&mut main.state, "pixel_9", "android", "Pixel 9");
+        until(&mut main, "the failure shows", |m| m.state.status.as_deref().is_some_and(|l| l.contains("device busy")));
+        win.frame(1.0 / 60.0);
+        assert!(!main.state.popouts.hub.borrow().stopped("pixel_9"), "the device still runs");
+        assert!(win.state.device.as_ref().is_some_and(|d| d.screen.is_some()), "the connection is kept");
+        assert!(win.find("popout-stopped").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An iOS pop-out whose device stops lets go of its framebuffer (what its [`Live`] presented),
+    /// so neither the pop-out nor the main window it returns to shows the last frame. (A real
+    /// [`Live`] needs the simulator service; its drop is what `let_go` does with `live`.)
+    #[test]
+    fn a_stopped_ios_pop_out_lets_go_of_its_frame() {
+        let mut main = main_window(two_running);
+        act(&mut main, Action::PopOut("A1".into()));
+        let mut win = take_window(&mut main, "A1");
+        let frame = rune::native_surface::ByteFrame {
+            width: 2,
+            height: 2,
+            format: rune::native_surface::Format::Bgra,
+            color: Default::default(),
+            planes: [vec![7; 16], Vec::new()],
+        };
+        win.state.device.as_ref().unwrap().native.push_bytes(frame, 1).expect("a frame");
+        assert!(win.state.device.as_ref().unwrap().native.latest().is_some());
+        set_state(&mut main, "A1", DeviceState::Shutdown);
+        main.frame(1.0 / 60.0);
+        win.frame(1.0 / 60.0);
+        let d = win.state.device.as_ref().unwrap();
+        assert!(d.live.is_none() && d.native.latest().is_none(), "the pop-out let go of the connection and its frame");
+        win.update(on_close);
+        main.frame(1.0 / 60.0);
+        assert_eq!(main.state.selected.as_deref(), Some("A1"));
+        assert!(main.state.native.latest().is_none() && main.state.live.is_none(), "nothing frozen came back");
     }
 
     /// An Android pop-out's console work reports in the pop-out, not the main window.
@@ -1317,6 +1382,36 @@ mod tests {
         main.frame(1.0 / 60.0);
         assert_eq!(main.state.status, before, "the main window says nothing new");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Once popped back in, the screen's console work reports in the main window again, and the
+    /// pop-out it left (closed) isn't told.
+    #[test]
+    fn console_results_return_to_the_main_window_after_pop_back_in() {
+        let (mut main, dir, _lines) = live_pixel("console-back");
+        act(&mut main, Action::PopOut("pixel_9".into()));
+        let mut win = take_window(&mut main, "pixel_9");
+        win.update(on_close);
+        main.frame(1.0 / 60.0);
+        assert!(main.state.screen.is_some() && main.state.status.is_none(), "back, with a clean status");
+        main.update(|s, _| s.actions.push(Action::Rotate));
+        until(&mut main, "the rotate's result in the main window", |m| m.state.status.is_some());
+        assert!(win.state.status.is_none(), "and not in the pop-out it left");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A pending pop-out that times out keeps the reason the connect failed.
+    #[test]
+    fn a_pending_pop_out_keeps_the_connect_error() {
+        let mut main = main_window(two_running);
+        main.state.offline_screen = false;
+        act(&mut main, Action::PopOut("A1".into()));
+        main.state.status = Some("couldn't connect: boom".into());
+        main.frame(PENDING_FOR + 1.0);
+        main.frame(1.0 / 60.0);
+        let status = main.state.status.clone().unwrap_or_default();
+        assert!(status.contains("couldn't connect: boom"), "the real error stays: {status}");
+        assert!(status.contains("didn't connect in time"), "and the timeout joins it: {status}");
     }
 
     /// A pop-out asked for on a device that never connects gives up rather than popping out

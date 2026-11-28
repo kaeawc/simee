@@ -117,14 +117,29 @@ pub(crate) trait Publication: Send {
     fn close(self: Box<Self>) -> sim_rtc::Result<()>;
 }
 
-/// Opens WHIP sessions.
+/// A connected WHIP session, and why it has no input channel when one was asked for.
+pub(crate) struct Connected {
+    pub publication: Box<dyn Publication>,
+    /// Set when the server refused the input data channel and the session runs without it.
+    pub input_note: Option<String>,
+}
+
+#[cfg(test)]
+impl Connected {
+    pub fn new(publication: Box<dyn Publication>) -> Connected {
+        Connected { publication, input_note: None }
+    }
+}
+
+/// Opens WHIP sessions. With `input`, a server that refuses the data channel is offered the
+/// session without it (`Connected::input_note` says so).
 pub(crate) trait Whip: Send + Sync {
     fn connect(
         &self,
         config: PublisherConfig,
         input: Option<InputSession>,
         on_event: Box<dyn FnMut(PublisherEvent) + Send>,
-    ) -> sim_rtc::Result<Box<dyn Publication>>;
+    ) -> sim_rtc::Result<Connected>;
 }
 
 /// A device's input methods, called on the stream's input thread (where it is made).
@@ -165,12 +180,12 @@ impl Whip for RtcWhip {
         config: PublisherConfig,
         input: Option<InputSession>,
         on_event: Box<dyn FnMut(PublisherEvent) + Send>,
-    ) -> sim_rtc::Result<Box<dyn Publication>> {
-        let publisher = match input {
-            Some(input) => sim_rtc::Publisher::connect_with_input(config, input, on_event)?,
-            None => sim_rtc::Publisher::connect(config, on_event)?,
+    ) -> sim_rtc::Result<Connected> {
+        let (publisher, input_note) = match input {
+            Some(input) => sim_rtc::Publisher::connect_with_input_or_without(config, input, on_event)?,
+            None => (sim_rtc::Publisher::connect(config, on_event)?, None),
         };
-        Ok(Box::new(publisher))
+        Ok(Connected { publication: Box::new(publisher), input_note })
     }
 }
 
@@ -188,17 +203,14 @@ impl Publication for sim_rtc::Publisher {
     }
 }
 
-/// VideoToolbox on the device's own frames: the iOS framebuffer's IOSurface, or emu's frame ring.
-struct VtMedia;
+/// The host's encoder on the device's own frames: VideoToolbox on macOS (the iOS framebuffer's
+/// IOSurface, or emu's frame ring), OpenH264 on Linux built with the `openh264` feature (emu's
+/// frame ring).
+struct HostMedia;
 
-impl Media for VtMedia {
+impl Media for HostMedia {
     fn available(&self) -> Result<(), String> {
-        if sim_encode::available() {
-            Ok(())
-        } else {
-            Err("unsupported: streaming needs an H.264 encoder, which only macOS hosts have so far (VideoToolbox; a Linux encoder is #263)"
-                .into())
-        }
+        if sim_encode::available() { Ok(()) } else { Err(UNAVAILABLE.into()) }
     }
 
     #[cfg(target_os = "macos")]
@@ -228,7 +240,28 @@ impl Media for VtMedia {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(target_os = "linux", feature = "openh264"))]
+    fn run(
+        &self,
+        target: &Target,
+        config: &EncoderConfig,
+        pacing: Pacing,
+        controls: &Controls,
+        sink: &mut dyn FnMut(AccessUnit) -> sim_encode::Result<Flow>,
+    ) -> Result<(), String> {
+        let text = |e: sim_encode::Error| e.to_string();
+        match target.platform {
+            Platform::Ios => Err(format!("unsupported: {} is an iOS device, and iOS simulators run only on macOS", target.name)),
+            Platform::Android => {
+                let dir = target.avd_dir.as_ref().ok_or_else(|| format!("{}: no AVD directory", target.name))?;
+                let mut encoder = sim_encode::OpenH264Encoder::new(config.clone()).map_err(text)?;
+                let mut source = sim_encode::AndroidSource::connect(dir, 0).map_err(text)?;
+                sim_encode::stream::run(&mut source, &mut encoder, pacing, controls, sink).map(drop).map_err(text)
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", feature = "openh264"))))]
     fn run(
         &self,
         _: &Target,
@@ -240,6 +273,14 @@ impl Media for VtMedia {
         self.available()
     }
 }
+
+/// Why `stream_start` fails on a host with no encoder: macOS has VideoToolbox, and a Linux build
+/// has OpenH264 when it is built with `--features openh264`.
+const UNAVAILABLE: &str = if cfg!(target_os = "linux") {
+    "unsupported: this build of simee has no H.264 encoder; rebuild with `cargo install simee --features openh264` (OpenH264, built from source; needs a C++ compiler)"
+} else {
+    "unsupported: streaming needs an H.264 encoder, which macOS (VideoToolbox) and Linux builds with the `openh264` feature have"
+};
 
 /// The device behind the `device` parameter, through `info` (and `screen`, with `screen`).
 fn lookup(s: &mut Session, p: &Value, screen: bool) -> Result<Target, String> {
@@ -270,12 +311,12 @@ pub(crate) fn stop_all() {
     }
 }
 
-/// The process's streams, on VideoToolbox, `simee-rtc` and the method table, with the thread that
+/// The process's streams, on the host's encoder, `simee-rtc` and the method table, with the thread that
 /// stops streams whose lease lapsed.
 fn global() -> &'static Arc<Streams> {
     GLOBAL.get_or_init(|| {
         let make: MakeInput = Arc::new(|| Box::new(ApiInput(Session::default())));
-        let streams = Arc::new(Streams::new(Arc::new(SystemClock), Arc::new(VtMedia), Arc::new(RtcWhip), make));
+        let streams = Arc::new(Streams::new(Arc::new(SystemClock), Arc::new(HostMedia), Arc::new(RtcWhip), make));
         let reaper = streams.clone();
         // Without it a lapsed lease is still seen (and its stream stopped) by the next stream call.
         let _ = std::thread::Builder::new().name("simee-stream-leases".into()).spawn(move || reaper.reap_forever());
@@ -394,6 +435,8 @@ struct Progress {
     input_events: u64,
     input_errors: u64,
     last_input_error: Option<String>,
+    /// Why the stream runs without the input it asked for (the server refused the channel).
+    input_note: Option<String>,
     resource: Option<String>,
     /// Why it is ending or ended: the first reason given wins.
     reason: Option<String>,
@@ -629,12 +672,20 @@ impl Streams {
                 if let Some(e) = self.entries().get_mut(&id) {
                     e.lease_until = self.clock.now() + self.ttl;
                 }
-                Ok(json!({
-                "stream_id": id,
-                "whip_resource": resource,
-                "lease_ttl_s": self.ttl.as_secs(),
-                "device": target.udid,
-                }))
+                let mut started = json!({
+                    "stream_id": id,
+                    "whip_resource": resource,
+                    "lease_ttl_s": self.ttl.as_secs(),
+                    "device": target.udid,
+                });
+                if options.settings.input {
+                    let note = shared.lock().input_note.clone();
+                    started["input"] = json!(note.is_none());
+                    if let Some(note) = note {
+                        started["input_note"] = json!(note);
+                    }
+                }
+                Ok(started)
             }
             Err(e) => {
                 shared.stop(e.clone());
@@ -755,7 +806,7 @@ impl Streams {
             "whip_url": e.whip_url,
             "whip_resource": p.resource,
             "state": state,
-            "input": e.input,
+            "input": e.input && p.input_note.is_none(),
             "lease_ttl_s": self.ttl.as_secs(),
             "lease_expires_in_s": (e.lease_until.saturating_duration_since(now).as_secs_f64() * 10.0).round() / 10.0,
             "stages": stages,
@@ -776,6 +827,9 @@ impl Streams {
         });
         if let Some(reason) = &p.reason {
             v["reason"] = json!(reason);
+        }
+        if let Some(note) = &p.input_note {
+            v["input_note"] = json!(note);
         }
         if let Some(e) = &p.last_input_error {
             v["stats"]["last_input_error"] = json!(e);
@@ -822,15 +876,19 @@ impl Worker {
         let result = self.media.run(&self.target, &config, Pacing::new(config.fps, Some(HEARTBEAT)), &shared.controls, &mut |unit| {
             shared.encoded(&unit);
             if publication.is_none() {
-                let p = match connect(&self.whip, &self.options, &config, &unit, input.take(), &shared) {
-                    Ok(p) => p,
+                let (p, input_note) = match connect(&self.whip, &self.options, &config, &unit, input.take(), &shared) {
+                    Ok(c) => (c.publication, c.input_note),
                     Err(e) => {
                         shared.lock().reason.get_or_insert(e.clone());
                         send_ready(&mut ready, Err(e.clone()));
                         return Err(sim_encode::Error::Encoder(e));
                     }
                 };
-                shared.lock().resource = Some(p.resource());
+                {
+                    let mut progress = shared.lock();
+                    progress.resource = Some(p.resource());
+                    progress.input_note = input_note;
+                }
                 shared.stage("whip_connected");
                 send_ready(&mut ready, Ok(p.resource()));
                 publication = Some(p);
@@ -886,7 +944,7 @@ fn connect(
     first: &AccessUnit,
     input: Option<InputSession>,
     shared: &Arc<Shared>,
-) -> Result<Box<dyn Publication>, String> {
+) -> Result<Connected, String> {
     let profile = sim_rtc::h264::nal_units(&first.data)
         .into_iter()
         .find_map(ProfileLevelId::from_sps)
@@ -1173,7 +1231,7 @@ fn posture_name(p: Posture) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use sim_rtc::datachannel::{ErrorCode, FrameSize, Point, Reply};
 
@@ -1301,6 +1359,8 @@ mod tests {
     #[derive(Default)]
     struct FakeWhip {
         refuse: Option<u16>,
+        /// Models a server that refuses the input data channel: the session runs without it.
+        refuse_input: bool,
         clock: Option<Arc<FakeClock>>,
         log: Arc<Mutex<Vec<String>>>,
         sessions: Mutex<Vec<FakeSession>>,
@@ -1322,8 +1382,10 @@ mod tests {
             config: PublisherConfig,
             input: Option<InputSession>,
             on_event: Box<dyn FnMut(PublisherEvent) + Send>,
-        ) -> sim_rtc::Result<Box<dyn Publication>> {
+        ) -> sim_rtc::Result<Connected> {
             self.log.lock().expect("log").push(format!("POST {}", config.endpoint));
+            let input_offered = input.is_some();
+            let input = if self.refuse_input { None } else { input };
             if let Some(status) = self.refuse {
                 return Err(sim_rtc::Error::Status { status, method: "POST", body: "unauthorized".into() });
             }
@@ -1340,7 +1402,9 @@ mod tests {
                 events: Arc::new(Mutex::new(Some(on_event))),
             };
             sessions.push(session.clone());
-            Ok(Box::new(FakePublication { resource, log: self.log.clone(), session }))
+            let input_note =
+                (self.refuse_input && input_offered).then(|| "the WHIP server refused the input data channel (406 fake)".to_owned());
+            Ok(Connected { publication: Box::new(FakePublication { resource, log: self.log.clone(), session }), input_note })
         }
     }
 
@@ -1432,6 +1496,72 @@ mod tests {
     }
 
     const URL: &str = "http://127.0.0.1:8889/sim/whip";
+
+    /// A WHIP session that appends its DELETE to a file another process reads (`shutdown`'s
+    /// tests), or, `wedged`, never finishes it.
+    struct FilePublication {
+        resource: String,
+        log: PathBuf,
+        wedged: bool,
+    }
+
+    impl Publication for FilePublication {
+        fn send(&mut self, access_unit: &[u8], _: Duration) -> sim_rtc::Result<Sent> {
+            Ok(Sent::Queued { packets: 1, keyframe: access_unit.get(4) == Some(&0x67) })
+        }
+
+        fn resource(&self) -> String {
+            self.resource.clone()
+        }
+
+        fn close(self: Box<Self>) -> sim_rtc::Result<()> {
+            if self.wedged {
+                loop {
+                    std::thread::park();
+                }
+            }
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.log).expect("log");
+            writeln!(f, "DELETE {}", self.resource).expect("write");
+            Ok(())
+        }
+    }
+
+    struct FileWhip {
+        log: PathBuf,
+        wedged: bool,
+    }
+
+    impl Whip for FileWhip {
+        fn connect(
+            &self,
+            config: PublisherConfig,
+            _: Option<InputSession>,
+            _: Box<dyn FnMut(PublisherEvent) + Send>,
+        ) -> sim_rtc::Result<Connected> {
+            let resource = format!("{}/session-0", config.endpoint);
+            Ok(Connected::new(Box::new(FilePublication { resource, log: self.log.clone(), wedged: self.wedged })))
+        }
+    }
+
+    struct NoInput;
+
+    impl DeviceInput for NoInput {
+        fn call(&mut self, _: &str, _: &Value) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+    }
+
+    /// Makes this process's streams (the ones the server stops as it exits) run on fakes whose
+    /// DELETE goes to `log` (or never finishes, `wedged`), and starts one; its id.
+    pub(crate) fn start_global_fake_stream(log: &std::path::Path, wedged: bool) -> String {
+        let make: MakeInput = Arc::new(|| Box::new(NoInput));
+        let whip = Arc::new(FileWhip { log: log.to_owned(), wedged });
+        let streams = Arc::new(Streams::new(Arc::new(SystemClock), Arc::new(FakeMedia::default()), whip, make));
+        assert!(GLOBAL.set(streams.clone()).is_ok(), "this process's streams were already made");
+        let started = streams.call("stream_start", &json!({"whip_url": URL}), &mut devices).expect("start");
+        started["stream_id"].as_str().expect("id").to_owned()
+    }
 
     impl Fixture {
         fn call(&self, method: &str, p: Value) -> Result<Value, String> {
@@ -1624,6 +1754,30 @@ mod tests {
         // The same destination can be streamed to again; the ended stream is replaced.
         assert_eq!(f.start(json!({"whip_url": URL})).expect("again")["stream_id"], "stream-2");
         assert_eq!(f.call("streams", json!({})).expect("streams").as_array().map(Vec::len), Some(1));
+        f.call("stream_stop", json!({"stream_id": "stream-2"})).expect("stop");
+    }
+
+    #[test]
+    fn a_server_that_refuses_the_input_channel_streams_without_input_and_says_why() {
+        let f = fixture_with(FakeWhip { refuse_input: true, ..FakeWhip::default() }, FakeMedia::default());
+        let started = f.start(json!({"whip_url": URL, "input": true})).expect("start");
+        assert_eq!(started["input"], false, "{started}");
+        let note = started["input_note"].as_str().expect("input_note");
+        assert!(note.contains("refused the input data channel"), "{note}");
+        let status = f.status("stream-1");
+        assert_eq!((&status["input"], &status["input_note"]), (&json!(false), &json!(note)), "{status}");
+        f.call("stream_stop", json!({"stream_id": "stream-1"})).expect("stop");
+    }
+
+    #[test]
+    fn start_reports_input_only_when_it_was_asked_for() {
+        let f = fixture();
+        let plain = f.start(json!({"whip_url": URL})).expect("start");
+        assert!(plain.get("input").is_none() && plain.get("input_note").is_none(), "{plain}");
+        f.call("stream_stop", json!({"stream_id": "stream-1"})).expect("stop");
+        let with = f.start(json!({"whip_url": URL, "input": true})).expect("start");
+        assert_eq!(with["input"], true, "{with}");
+        assert!(with.get("input_note").is_none(), "{with}");
         f.call("stream_stop", json!({"stream_id": "stream-2"})).expect("stop");
     }
 
@@ -1897,5 +2051,165 @@ mod tests {
             assert!(streaming.contains(&format!("`{m}`")), "docs/streaming.md doesn't describe `{m}`");
         }
         assert!(streaming.contains(&format!("{} s", LEASE_TTL.as_secs())) && streaming.contains("`stream` toolset"));
+    }
+}
+
+/// The Linux media path end to end on a fake emulator display (no device): `HostMedia::run` on an
+/// Android target reads frames off the display socket, encodes them with OpenH264 and hands the
+/// sink Annex B access units that decode.
+#[cfg(all(test, target_os = "linux", feature = "openh264"))]
+mod linux_media {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+
+    use sim_core::stream::FrameHeader;
+    use sim_encode::annexb::{self, NAL_IDR, NAL_PPS, NAL_SPS};
+
+    use super::*;
+
+    const SIZE: (u32, u32) = (96, 160);
+
+    /// A display socket in a fresh AVD directory that sends `frames` different solid frames, then
+    /// holds the connection open (a static screen) until dropped.
+    struct FakeDisplay {
+        dir: PathBuf,
+        done: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl FakeDisplay {
+        fn new(frames: u8) -> FakeDisplay {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            // Not under TMPDIR: a socket path has to fit in SUN_LEN.
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = PathBuf::from("/tmp").join(format!("simee-api-{}-{n}", std::process::id()));
+            let state = emu_avd::state_dir(&dir);
+            std::fs::create_dir_all(&state).expect("state dir");
+            let listener = UnixListener::bind(state.join("display.sock")).expect("bind");
+            let (done, done_rx) = std::sync::mpsc::channel::<()>();
+            std::thread::spawn(move || {
+                let Ok((mut conn, _)) = listener.accept() else { return };
+                // The client's request lines come first; any byte means it is connected.
+                let mut hello = [0u8; 1];
+                let _ = conn.read(&mut hello);
+                for i in 0..frames {
+                    let header = FrameHeader::new(SIZE.0, SIZE.1, SIZE.0, SIZE.1, u64::from(i)).expect("header");
+                    let mut out = header.encode().to_vec();
+                    // The same gradient with a bar moving down it: a small change, not a scene cut
+                    // (OpenH264 starts its own IDR when most of the screen changes at once).
+                    let stride = SIZE.0 as usize * 4;
+                    out.extend((0..header.len as usize).map(|p| {
+                        let (row, col) = (p / stride, p % stride / 4);
+                        if p % 4 == 3 || row / 8 == usize::from(i) { 255 } else { (col + row) as u8 }
+                    }));
+                    if conn.write_all(&out).is_err() {
+                        return;
+                    }
+                }
+                let _ = done_rx.recv();
+            });
+            FakeDisplay { dir, done: Some(done) }
+        }
+
+        fn target(&self, platform: Platform) -> Target {
+            Target {
+                platform,
+                udid: "emulator-5554".into(),
+                name: "Pixel".into(),
+                state: DeviceState::Booted,
+                avd_dir: Some(self.dir.clone()),
+                screen: None,
+            }
+        }
+    }
+
+    impl Drop for FakeDisplay {
+        fn drop(&mut self) {
+            // Let the serving thread finish: release its wait, and wake an `accept` no client
+            // reached (a connection it reads as closed at once), so no thread outlives the test.
+            self.done.take();
+            let _ = std::os::unix::net::UnixStream::connect(emu_avd::state_dir(&self.dir).join("display.sock"));
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn nal_types(unit: &AccessUnit) -> Vec<u8> {
+        annexb::annex_b_units(&unit.data).iter().map(|n| annexb::nal_type(n)).collect()
+    }
+
+    #[test]
+    fn an_android_device_streams_decodable_h264_with_keyframes_on_request_and_a_heartbeat() {
+        assert!(HostMedia.available().is_ok(), "built with the encoder");
+        let display = FakeDisplay::new(3);
+        let config = EncoderConfig { keyframe_interval: Duration::from_secs(60), ..EncoderConfig::default() };
+        let controls = Controls::default();
+        let mut units: Vec<AccessUnit> = Vec::new();
+        HostMedia
+            .run(&display.target(Platform::Android), &config, Pacing::new(60, Some(Duration::from_millis(10))), &controls, &mut |unit| {
+                units.push(unit);
+                // After the three frames, the screen is static: the next units are heartbeats.
+                if units.len() == 6 {
+                    controls.request_keyframe();
+                }
+                Ok(if units.len() == 9 { Flow::Stop } else { Flow::Continue })
+            })
+            .expect("run");
+        assert_eq!(units.len(), 9);
+        assert!(units.iter().any(|u| u.heartbeat), "a static screen is re-encoded");
+        let keys: Vec<usize> = units.iter().enumerate().filter(|(_, u)| u.keyframe).map(|(i, _)| i).collect();
+        assert_eq!(keys.len(), 2, "the first picture and the requested one: {keys:?}");
+        assert_eq!(keys[0], 0);
+        assert!(keys[1] >= 6, "the request comes after the sixth unit: {keys:?}");
+        for &k in &keys {
+            assert_eq!(&nal_types(&units[k])[..3], &[NAL_SPS, NAL_PPS, NAL_IDR], "unit {k}: SPS and PPS cached in front of every IDR");
+        }
+        for (i, unit) in units.iter().enumerate().filter(|(i, _)| !keys.contains(i)) {
+            let types = nal_types(unit);
+            assert!(
+                !types.iter().any(|t| [NAL_SPS, NAL_PPS, NAL_IDR].contains(t)),
+                "unit {i} is a P frame, with no SPS, PPS or IDR: {types:?}"
+            );
+        }
+        let mut decoder = sim_encode::Decoder::new().expect("decoder");
+        for (i, unit) in units.iter().enumerate() {
+            assert_eq!(decoder.decode(&unit.data).unwrap_or_else(|e| panic!("unit {i}: {e}")), SIZE, "unit {i}");
+        }
+        assert!(units.windows(2).all(|w| w[1].pts > w[0].pts), "strictly increasing timestamps");
+    }
+
+    #[test]
+    fn an_ios_device_and_an_android_device_with_no_display_are_refused_with_a_reason() {
+        let display = FakeDisplay::new(0);
+        let config = EncoderConfig::default();
+        let run = |target: &Target| {
+            HostMedia.run(target, &config, Pacing::new(30, None), &Controls::default(), &mut |_| Ok(Flow::Stop)).expect_err("refused")
+        };
+        let err = run(&display.target(Platform::Ios));
+        assert!(err.starts_with("unsupported") && err.contains("only on macOS"), "{err}");
+        let err = run(&Target { avd_dir: None, ..display.target(Platform::Android) });
+        assert!(err.contains("no AVD directory"), "{err}");
+        let err = run(&Target { avd_dir: Some(display.dir.join("missing")), ..display.target(Platform::Android) });
+        assert!(err.starts_with("frame source"), "{err}");
+    }
+}
+
+/// What `stream_start` says on a Linux build without the encoder.
+#[cfg(all(test, target_os = "linux", not(feature = "openh264")))]
+mod linux_without_the_encoder {
+    use super::*;
+
+    #[test]
+    fn the_refusal_says_how_to_get_an_encoder() {
+        let err = HostMedia.available().expect_err("no encoder in this build");
+        assert!(err.starts_with("unsupported") && err.contains("--features openh264"), "{err}");
+        let target = Target {
+            platform: Platform::Android,
+            udid: "emulator-5554".into(),
+            name: "Pixel".into(),
+            state: DeviceState::Booted,
+            avd_dir: None,
+            screen: None,
+        };
+        let run = HostMedia.run(&target, &EncoderConfig::default(), Pacing::new(30, None), &Controls::default(), &mut |_| Ok(Flow::Stop));
+        assert_eq!(run, Err(err), "run refuses with the same reason");
     }
 }

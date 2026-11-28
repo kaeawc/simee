@@ -68,24 +68,47 @@ impl Env {
 
     /// AVD names, sorted, as `emulator -list-avds` prints them.
     pub fn list_avds(&self) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(&self.avd_home)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().into_string().ok()?;
-                let stem = name.strip_suffix(".ini")?;
-                // The entry's own type (no stat); only a link needs following.
-                let file = match e.file_type() {
-                    Ok(t) if t.is_file() => true,
-                    Ok(t) if t.is_dir() => false,
-                    _ => e.path().is_file(),
-                };
-                file.then(|| stem.to_string())
-            })
-            .collect();
+        cache::listing(&self.avd_home, || self.read_avds())
+    }
+
+    /// The names [`Env::list_avds`] lists, read from the home, and whether that answer can be
+    /// remembered: not when any read failed (running out of file handles must not become "no
+    /// AVDs" until the directory changes), nor when a pointer is a link, because the directory's
+    /// stamp doesn't change when a link's target comes or goes.
+    fn read_avds(&self) -> (Vec<String>, bool) {
+        let mut cacheable = true;
+        let mut names = Vec::new();
+        match std::fs::read_dir(&self.avd_home) {
+            Err(_) => cacheable = false,
+            Ok(entries) => {
+                for e in entries {
+                    let Ok(e) = e else {
+                        cacheable = false;
+                        continue;
+                    };
+                    let Ok(name) = e.file_name().into_string() else { continue };
+                    let Some(stem) = name.strip_suffix(".ini") else { continue };
+                    // The entry's own type (no stat); only a link needs following.
+                    let file = match e.file_type() {
+                        Ok(t) if t.is_file() => true,
+                        Ok(t) if t.is_dir() => false,
+                        Ok(_) => {
+                            cacheable = false;
+                            e.path().is_file()
+                        }
+                        Err(_) => {
+                            cacheable = false;
+                            e.path().is_file()
+                        }
+                    };
+                    if file {
+                        names.push(stem.to_string());
+                    }
+                }
+            }
+        }
         names.sort();
-        names
+        (names, cacheable)
     }
 
     /// Whether [`Env::list_avds`] lists `name`, from one stat of its pointer `<name>.ini` instead
@@ -110,14 +133,18 @@ impl Env {
     }
 
     pub fn load(&self, name: &str) -> Result<Avd> {
-        let content_dir = self.content_dir(name)?;
+        self.load_in(name, self.content_dir(name)?)
+    }
+
+    /// [`Env::load`] for an AVD whose directory the caller resolved ([`Env::content_dir`]).
+    pub fn load_in(&self, name: &str, content_dir: PathBuf) -> Result<Avd> {
         let path = content_dir.join("config.ini");
         let config = cache::ini(&path)?.ok_or_else(|| Error::Io(path, std::io::ErrorKind::NotFound.into()))?;
         Avd::new(name, content_dir, config, self.sdk_root.as_deref())
     }
 
     /// AVD `name`'s directory: its pointer's `path=` (or `path.rel=`), else `<name>.avd`.
-    fn content_dir(&self, name: &str) -> Result<PathBuf> {
+    pub fn content_dir(&self, name: &str) -> Result<PathBuf> {
         let pointer = self.avd_home.join(format!("{name}.ini"));
         Ok(if let Some(p) = cache::ini(&pointer)? {
             p.get("path")
@@ -787,15 +814,31 @@ impl Env {
     /// Only the AVDs `names` are looked at (each one's lock), and `probe` is asked only about a
     /// process whose lock names a live PID.
     pub fn stock_instances_among_with(&self, names: &[String], skip: &[Running], probe: &Probe) -> Vec<Running> {
-        names
-            .iter()
-            .filter(|name| !skip.iter().any(|r| r.avd_name == **name))
-            .filter_map(|name| {
-                let dir = self.content_dir(name).ok()?;
+        let avds: Vec<(String, PathBuf)> = names.iter().filter_map(|name| Some((name.clone(), self.content_dir(name).ok()?))).collect();
+        Self::stock_instances_in_with(avds.iter().map(|(n, d)| (n.as_str(), d.as_path())), skip, probe)
+    }
+
+    /// [`Env::stock_instances_among_with`] for AVDs whose directories the caller resolved
+    /// ([`Env::content_dir`]), so listing and looking at them resolves each once.
+    pub fn stock_instances_in_with<'a>(
+        avds: impl IntoIterator<Item = (&'a str, &'a Path)>,
+        skip: &[Running],
+        probe: &Probe,
+    ) -> Vec<Running> {
+        avds.into_iter()
+            .filter(|(name, _)| !skip.iter().any(|r| r.avd_name == *name))
+            .filter_map(|(name, dir)| {
                 let bytes = std::fs::read(dir.join("hardware-qemu.ini.lock")).ok()?;
                 let digits: String = bytes.iter().take_while(|c| c.is_ascii_digit()).map(|&c| c as char).collect();
                 let pid: i32 = digits.parse().ok()?;
-                let r = Running { pid, avd_name: name.clone(), console_port: 0, adb_port: 0, avd_dir: Some(dir), simee: false };
+                let r = Running {
+                    pid,
+                    avd_name: name.to_owned(),
+                    console_port: 0,
+                    adb_port: 0,
+                    avd_dir: Some(dir.to_path_buf()),
+                    simee: false,
+                };
                 if !r.alive() {
                     return None;
                 }
@@ -1044,6 +1087,27 @@ mod tests {
         assert!(found, "found by its pointer alone");
         assert!(!not);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_listing_with_a_link_or_a_failed_read_is_not_cacheable() {
+        let tmp = std::env::temp_dir().join(format!("emu-avd-readavds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("home");
+        let env = Env { sdk_root: None, avd_home: tmp.clone() };
+        std::fs::write(tmp.join("a.ini"), "").expect("a");
+        std::fs::create_dir(tmp.join("d.ini")).expect("a directory named like a pointer");
+        assert_eq!(env.read_avds(), (vec!["a".to_owned()], true));
+        // A link: its target coming or going doesn't touch the home's stamp.
+        std::fs::write(tmp.join("target"), "").expect("target");
+        std::os::unix::fs::symlink(tmp.join("target"), tmp.join("b.ini")).expect("link");
+        assert_eq!(env.read_avds(), (vec!["a".to_owned(), "b".to_owned()], false));
+        std::fs::remove_file(tmp.join("target")).expect("dangling");
+        assert_eq!(env.read_avds(), (vec!["a".to_owned()], false), "a dangling link isn't an AVD");
+        // A home that can't be read is no AVDs this time, not for good.
+        let missing = Env { sdk_root: None, avd_home: tmp.join("missing") };
+        assert_eq!(missing.read_avds(), (Vec::new(), false));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

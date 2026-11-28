@@ -34,6 +34,7 @@ sim-android = { package = "simee-android", path = "crates/sim-android", version 
 sim-bundle = { package = "simee-bundle", path = "crates/sim-bundle", version = "=0.2.0" }
 sim-rtc = { package = "simee-rtc", path = "crates/sim-rtc", version = "=0.2.0" }
 sim-encode = { package = "simee-encode", path = "crates/sim-encode", version = "=0.2.0" }
+emu-container = { package = "simee-emu-container", path = "crates/emu-container", version = "=0.2.0" }
 emu-avd = { package = "simee-emu-avd", path = "crates/emu-avd", version = "=0.2.0" }
 emu-gfxstream = { package = "simee-emu-gfxstream", path = "crates/emu-gfxstream", version = "=0.2.0" }
 emu-ext4 = { package = "simee-emu-ext4", path = "crates/emu-ext4", version = "=0.2.0" }
@@ -63,7 +64,13 @@ flate2 = { version = "1", default-features = false, features = ["zlib-rs", "runt
 libc = { version = "0.2", default-features = false }
 # Safe syscall wrappers (plain fsync: std's sync_data is F_FULLFSYNC on macOS; the adb bridge's
 # non-blocking send).
-rustix = { version = "1", default-features = false, features = ["event", "fs", "net", "process", "std"] }
+rustix = { version = "1", default-features = false, features = ["event", "fs", "mount", "net", "process", "std"] }
+# SIGINT/SIGTERM for `simee serve` and `simee mcp` (sim-api's `shutdown`, #388): its iterator's
+# handler only writes to a self-pipe; a thread of the server's own does the shutdown.
+signal-hook = { version = "0.4.6", default-features = false, features = ["iterator"] }
+# SHA-256 for the container backend's image pins (emu-container): the digest every OCI blob is
+# checked against before it is unpacked.
+sha2 = { version = "0.11", default-features = false }
 # The user-mode NAT behind virtio-net (emu-vmm): smoltcp's TCP state machine, in safe Rust. Its
 # unsafe code is only in the tap, raw-socket and bpf backends, which stay off.
 smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp"] }

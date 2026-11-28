@@ -19,6 +19,8 @@ doctest = false
 emu-avd.workspace = true
 png.workspace = true
 sim-core.workspace = true
+# `usage::argv_from_procargs`, which reads a macOS process's arguments.
+sim-host.workspace = true
 
 # The macOS host's per-process reads (libproc), the calls `processes` and `connections` use.
 [target.'cfg(target_os = "macos")'.dependencies]
