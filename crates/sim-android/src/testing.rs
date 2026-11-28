@@ -25,22 +25,33 @@ pub struct FakeEmulator {
     pub cameras: Arc<Mutex<Vec<(String, String)>>>,
     /// A facing (`back`, `front`) whose `camera link` fails with `KO`; None: none does.
     pub camera_link_fails: Arc<Mutex<Option<String>>>,
+    /// The NAT's conditions, as `network status` reports them: a test can seed them (a loss the
+    /// API's integer percent can't ask for).
+    pub network: Arc<Mutex<sim_core::network::Conditions>>,
+    /// While true, `network loss` fails with `KO` (an emu that has the command but errs).
+    pub loss_fails: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Starts a fake emulator for AVD `avd` and advertises it in `android`'s running dir, so the AVD
 /// lists as booted. `screenshot <path>` writes a 2x1 PNG; `car get`/`car list` answer with
 /// vehicle HAL readings.
 pub fn fake_emulator(android: &Android, avd: &str) -> FakeEmulator {
-    fake(android, avd, false)
+    fake(android, avd, false, false)
 }
 
 /// [`fake_emulator`] as the stock emulator: advertised without `emulator=simee`, and simee's own
-/// console commands (`fold status`) get stock's refusal.
+/// console commands (`fold status`, `network loss`) get stock's refusal.
 pub fn fake_stock_emulator(android: &Android, avd: &str) -> FakeEmulator {
-    fake(android, avd, true)
+    fake(android, avd, true, false)
 }
 
-fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
+/// [`fake_emulator`] as a simee emu built before `network loss`: advertised `emulator=simee`, but
+/// its console answers `network loss` with stock's `KO:  bad sub-command`.
+pub fn fake_old_emulator(android: &Android, avd: &str) -> FakeEmulator {
+    fake(android, avd, false, true)
+}
+
+fn fake(android: &Android, avd: &str, stock: bool, no_loss: bool) -> FakeEmulator {
     let console = Arc::new(Mutex::new(Vec::new()));
     let fold_status: Arc<Mutex<Option<String>>> = Arc::default();
     let status = fold_status.clone();
@@ -51,6 +62,9 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
     let (links, fails) = (cameras.clone(), camera_link_fails.clone());
     // `network speed|delay|status`, shared by every console session as the emulator's NAT is.
     let network: Arc<Mutex<sim_core::network::Conditions>> = Arc::default();
+    let shared_network = network.clone();
+    let loss_fails: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+    let loss_broken = loss_fails.clone();
     // The advertised adb port is the console's plus one, so the console must not be on 65535 (an
     // ephemeral port the OS hands out now and then): bind again, keeping the unusable one held so
     // the next bind gets another.
@@ -70,6 +84,7 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
             // A thread per connection, so concurrent clients are served concurrently.
             let (log, status, turned) = (log.clone(), status.clone(), turned.clone());
             let (links, fails, network) = (links.clone(), fails.clone(), network.clone());
+            let loss_broken = loss_broken.clone();
             std::thread::spawn(move || {
                 let mut out = stream.try_clone().expect("clone");
                 let _ = out.write_all(b"Android Console: type 'help' for a list of commands\r\nOK\r\n");
@@ -132,6 +147,15 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
                             true => "OK".to_owned(),
                             false => "KO: invalid <delay> argument, see 'help network delay' for valid values".to_owned(),
                         },
+                        // simee's own: stock's console has no such sub-command.
+                        ["network", "loss", ..] if stock || no_loss => "KO:  bad sub-command".to_owned(),
+                        ["network", "loss", ..] if loss_broken.load(std::sync::atomic::Ordering::SeqCst) => {
+                            "KO: network loss failed".to_owned()
+                        }
+                        ["network", "loss", loss @ ..] => match network.lock().expect("network").set_loss(&loss.join(" ")) {
+                            Ok(()) => "OK".to_owned(),
+                            Err(why) => format!("KO: invalid <loss> argument: {why}; use <percent> or <up>:<down>"),
+                        },
                         ["screenshot", path] => {
                             let frame = Frame { width: 2, height: 1, rgba: vec![9, 9, 9, 255, 8, 8, 8, 255] };
                             std::fs::write(path, sim_core::frame::encode_png(&frame).expect("png")).expect("write png");
@@ -167,7 +191,7 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
     let emulator = if stock { "" } else { "emulator=simee\n" };
     let ad = format!("port.serial={port}\nport.adb={}\navd.name={avd}\n{emulator}", port + 1);
     std::fs::write(running.join(format!("pid_{}.ini", std::process::id())), ad).expect("advertise");
-    FakeEmulator { console, display, fold_status, rotation, cameras, camera_link_fails }
+    FakeEmulator { console, display, fold_status, rotation, cameras, camera_link_fails, network: shared_network, loss_fails }
 }
 
 /// `lines` once it holds `n` entries (or after 5 s, whatever it holds).
