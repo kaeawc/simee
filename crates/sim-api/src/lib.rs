@@ -393,10 +393,8 @@ fn bind(path: &Path) -> std::io::Result<UnixListener> {
     // Fix this server's identity now, before its executable can be rebuilt under it.
     identity();
     SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
-    // Start the host sampler now, off this thread, so its history exists at the first `host` call.
-    let _ = std::thread::Builder::new().name("simee-host-start".into()).spawn(|| {
-        sim_host::global();
-    });
+    // The host sampler is not started here: it starts at the first read (`host`, `devices_usage`,
+    // an admission check) and parks again a minute after the last (`sim_host::LINGER`).
     if path.exists() && UnixStream::connect(path).is_err() {
         std::fs::remove_file(path)?;
     }
