@@ -18,7 +18,8 @@ on macOS and depends (normal or dev) on a crate that is in. Code gated off on ma
 missing from the list (or listed without reason), so the macOS test run can't silently drop one.
 `check` also derives what Software mode's `cargo build -p` compiles on Linux (`cargo metadata`,
 then the module trees) and fails when its pull_request paths skip a file that build reads, or
-name a crate it doesn't build.
+name a crate it doesn't build. And it checks that desktop/Cargo.toml's `ci` profile builds every
+workspace crate the desktop depends on at opt-level 0 (its registry dependencies stay at 2).
 
 `changes` reads changed paths (one per line; renames as both paths) and prints `lint`,
 `desktop`, `emu` and `macos` (desktop or emu) as true/false: whether the change can affect the
@@ -621,12 +622,15 @@ def cmd_check():
                           % (LIST, n, "; ".join(derived[n][:3])))
     sw_errors, sw_crates = software_errors(crates)
     errors += sw_errors
+    profile_errors, local = desktop_profile_errors(crates)
+    errors += profile_errors
     for e in errors:
         print("ci-scope: " + e, file=sys.stderr)
     if not errors:
         print("ci-scope: %s matches the %d crates that can behave differently on macOS" % (LIST, sum(1 for v in derived.values() if v)))
         print("ci-scope: %s's pull_request paths take every file its build of %d crates reads on Linux"
               % (SOFTWARE, len(sw_crates)))
+        print("ci-scope: %s's ci profile builds its %d path dependencies at opt-level 0" % (DESKTOP, len(local)))
     return 1 if errors else 0
 
 
@@ -807,6 +811,29 @@ def desktop_deps(crates):
     for n in names:
         out |= closure(crates, n)
     return out
+
+
+DESKTOP = "desktop/Cargo.toml"
+
+
+def desktop_profile_errors(crates):
+    """The desktop's `ci` profile names every workspace crate it builds as a path dependency, and
+    nothing else, at opt-level 0: one it misses builds at `dev`'s opt-level 2 in CI, and one it
+    names that the desktop doesn't build makes cargo warn (#213)."""
+    local = desktop_deps(crates)
+    named = {}
+    for h, lines in toml_sections(read(DESKTOP)):
+        m = re.match(r'profile\.ci\.package\."?([A-Za-z0-9_-]+)"?$', h)
+        if m:
+            named[m.group(1)] = any(re.match(r"opt-level\s*=\s*0$", ln) for ln in lines)
+    errors = []
+    for n in sorted(local - set(named)):
+        errors.append("%s: the desktop builds %s; add [profile.ci.package.%s] with opt-level = 0" % (DESKTOP, n, n))
+    for n in sorted(set(named) - local):
+        errors.append("%s: [profile.ci.package.%s] names a package the desktop doesn't build from this workspace" % (DESKTOP, n))
+    for n in sorted(k for k, zero in named.items() if not zero and k in local):
+        errors.append("%s: [profile.ci.package.%s] should set opt-level = 0" % (DESKTOP, n))
+    return errors, local
 
 
 REFERENCED = re.compile(r'"(?:\.\./)*((?:docs|scripts)/[A-Za-z0-9_./-]+)"')
