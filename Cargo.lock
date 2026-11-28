@@ -2106,6 +2106,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "simee-emu-container"
+version = "0.2.0"
+dependencies = [
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "simee-emu-ext4"
 version = "0.2.0"
 

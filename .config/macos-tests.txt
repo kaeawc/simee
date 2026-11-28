@@ -13,6 +13,7 @@ simee-camera
 simee-coresim
 simee-emu
 simee-emu-avd
+simee-emu-container
 simee-emu-gfxstream
 simee-emu-hvf
 simee-emu-sdk
