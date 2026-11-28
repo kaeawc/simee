@@ -8,7 +8,7 @@ all of it is on without a flag except the limits on devices and tools, which you
 
 | Default | What it does | How to change it |
 | --- | --- | --- |
-| Destructive tools confirm | `delete`, `erase`, `kill`, `clear_container`, `reset_keychain`, and `shutdown` of a device this client didn't boot ask a person first | Add tools with `confirm` in the policy file. Nothing turns it off |
+| Destructive tools confirm | `delete`, `erase`, `kill`, `clear_container`, `reset_keychain`, `rm`, `uninstall`, `prefs_delete`, and `shutdown` of a device this client didn't boot ask a person first, as do a `prefs_batch` with a delete in it and a `console` command that stops the emulator or deletes a snapshot | Add tools with `confirm` in the policy file. Nothing turns it off |
 | Boots are admitted | `boot`, `boot_many`, `create` and `clone` fail fast, with the verdict, when the host can't take another device | `--admission ignore` |
 | Calls are audited | Every `tools/call` is a line in `mcp-audit.log` in simee's state directory | `--audit-log PATH`, `--no-audit-log` |
 | No limits on devices or tools | A client may touch any device and use the toolsets the server serves | `--allow-device`, `--created-devices-only`, `--read-only`, `--policy FILE` |
@@ -52,7 +52,32 @@ same call the person agreed to.
 when the client's `boot` or `boot_many` asked for it is the client's own to stop, and needs no
 confirmation. Booting a device that was already running doesn't make it the client's.
 
-A policy can add tools to the confirming set (`"confirm": ["uninstall", "rm"]`).
+A policy can add tools to the confirming set (`"confirm": ["write", "exec"]`). A name that isn't a
+tool is an error when the policy is read: a misspelt tool would confirm nothing.
+
+### What confirms, and what doesn't
+
+Every tool the catalog marks as changing something was looked at. The rule: a call confirms when
+it removes something that nothing puts back (a device, files, an app and its data, a container, the
+keychain, a preference), signals a process, or stops a device the client didn't start.
+
+| Confirms | Why |
+| --- | --- |
+| `delete`, `erase` | The device, or what is on it |
+| `rm`, `clear_container` | Files, or an app's whole container |
+| `uninstall` | The app and its data |
+| `reset_keychain` | Every keychain item |
+| `prefs_delete`, and `prefs_batch` when an op has `delete` | A preference key |
+| `kill` | Ends a process on the device |
+| `shutdown`, and `console` with `kill`, `avd stop` | Stops a device. Not asked for one this client booted |
+| `console` with `avd snapshot delete` | A snapshot's data |
+
+| Doesn't confirm | Why not, and what to do |
+| --- | --- |
+| `write`, `defaults_write`, `prefs_write`, and a `prefs_batch` that only sets | They replace a value with another: the work of a test run, which an agent does constantly. Add them to `confirm` for a client that shouldn't |
+| `exec`, `launch`, `push`, `network_shape`, the rest of `console` | They run code or change state, but delete nothing by themselves. `exec` can do anything its program can: put it in `confirm`, or out of the client's toolsets, where that matters |
+| `terminate`, `stream_stop`, `camera_unlink` | They stop something that starts again |
+| `export`, `audio_capture_start` | They write a file on the host where the caller says. The policy has no path rules yet |
 
 ## Which devices and tools a client may use
 
@@ -86,6 +111,9 @@ client of that name. A client's rules are the default's with its own fields on t
 | `confirm` | More tools that need confirmation |
 | `admission` | `refuse` (default) or `ignore`, below |
 
+`tools/list` and the resource templates differ by client (its toolsets and read-only), so they are
+answered with `cacheScope: private`: a cache shared between clients mustn't serve one's list to another.
+
 Flags set the `default` and replace the same field of the file's `default` (`--allow-device` replaces
 its `devices`). `--allow-device` and `--created-devices-only` together mean the pattern's devices and
 the client's own. A key the server doesn't know is an error: a policy that silently skips a rule is
@@ -97,8 +125,19 @@ How `devices` is applied:
   the method does, through `info`, and checks the device it is. A UDID, a name and `booted`
   can't be used to name a device around the list. A name that doesn't resolve is refused, since it
   can't be checked.
+- A call names a device in more places than `device`. `camera_link`'s `source` and `boot`'s
+  `camera_back` and `camera_front` can be `device:<name or UDID>[:x,y,w,h]`, which shows another
+  device's screen on the camera: that device is checked too, however the source id is spelt. A
+  stream (`stream_status`, `stream_stop`) is named by its id, and is judged by the device it shows.
+  (An `audio_capture_stop` capture id isn't tied to a device here: ids are the server's, and the
+  call stops only a capture this process started.)
 - The check is in the backend every tool, resource and subscription reads through, so
   `simee://devices/...` resources and change notifications hide a device the same way `devices` does.
+- A long list a client pages through (`processes`, `logs`, `connections`, `devices_usage`) is
+  kept as a snapshot for its next pages. The snapshot belongs to the client that read it and its
+  cursor holds a random 128-bit id, so another client holding the cursor gets "expired", and each
+  next page asks the policy again about the call that made the list: a device the client may no
+  longer touch (one it deleted, say) doesn't give up the rest of its list.
 - `devices_usage` leaves out the devices a client may not see. `streams` and `camera_links` list
   every device's, so without `device` they are refused for a client with a device list.
 - `create`, `clone` and `import` make a device: its name has to be one the client may touch

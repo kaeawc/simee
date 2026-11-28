@@ -32,7 +32,8 @@ use crate::tools::{self, VIEW_TOOL};
 /// The tools every client confirms: they delete a device or data that nothing replaces (a file, an
 /// app and its data, a container, the keychain, a preference), kill a process, or (for `shutdown`)
 /// stop a device this client didn't boot. A policy may add tools (`confirm`).
-pub const CONFIRM: &[&str] = &["delete", "erase", "kill", "clear_container", "reset_keychain", "rm", "uninstall", "prefs_delete", "shutdown"];
+pub const CONFIRM: &[&str] =
+    &["delete", "erase", "kill", "clear_container", "reset_keychain", "rm", "uninstall", "prefs_delete", "shutdown"];
 
 /// The tools that confirm only for some arguments: `prefs_batch` when an op deletes a key, and
 /// `console` for a command that stops the emulator or deletes a snapshot.
@@ -563,7 +564,11 @@ impl Guard {
     /// Whether this client may touch the device `query` names, as the error that says why not.
     fn permit(&self, method: &str, query: &str) -> Result<(), String> {
         let device = resolve(&*self.inner, query).map_err(|e| unresolved_refusal(method, &e))?;
-        if self.safety.may_touch(&self.client, &self.policy, &device) { Ok(()) } else { Err(device_refusal(&self.policy, method, query, Some(&device))) }
+        if self.safety.may_touch(&self.client, &self.policy, &device) {
+            Ok(())
+        } else {
+            Err(device_refusal(&self.policy, method, query, Some(&device)))
+        }
     }
 }
 
@@ -591,7 +596,9 @@ impl Guard {
         queries.sort();
         queries.dedup();
         if matches!(method, "streams" | "camera_links") && params.get("device").is_none_or(Value::is_null) {
-            return Err(format!("{REFUSED}`{method}` without `device` lists every device's, and this client may touch only some: name a device"));
+            return Err(format!(
+                "{REFUSED}`{method}` without `device` lists every device's, and this client may touch only some: name a device"
+            ));
         }
         for query in queries {
             self.permit(method, &query)?;

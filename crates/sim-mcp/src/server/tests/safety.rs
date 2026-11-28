@@ -351,7 +351,10 @@ fn tools_that_only_sometimes_destroy_confirm_only_when_they_do() {
     let (rig, _) = rig_world(Policy::default(), None);
     // Setting and keeping a preference, and a console command that stops nothing, are not asked about.
     for (tool, args) in [
-        ("prefs_batch", json!({"device": "ci-2", "bundle_id": "b", "store": "visible", "ops": [{"key": "a", "type": "string", "value": "1"}]})),
+        (
+            "prefs_batch",
+            json!({"device": "ci-2", "bundle_id": "b", "store": "visible", "ops": [{"key": "a", "type": "string", "value": "1"}]}),
+        ),
         ("prefs_batch", json!({"device": "ci-2", "bundle_id": "b", "store": "visible", "ops": [{"key": "a", "delete": false}]})),
         ("console", json!({"device": "ci-2", "command": "avd snapshot list"})),
         ("console", json!({"device": "ci-2", "command": "network status"})),
