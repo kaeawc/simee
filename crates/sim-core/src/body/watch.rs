@@ -300,7 +300,9 @@ fn straps(body: &Body, band: f32) -> Vec<Block> {
     out
 }
 
-#[cfg(test)]
+// Its one test pins raw f32 mesh fingerprints, which differ by platform: macOS only. Tests that
+// hold on every platform go outside this gate.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use crate::form_factor::Kind;
