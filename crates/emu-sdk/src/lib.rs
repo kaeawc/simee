@@ -9,6 +9,7 @@
 //! (see [`renderer`]). Other hosts (Linux, for preparing images and AVDs) use the `curl` and
 //! `unzip` on their `PATH`.
 
+pub mod dhu;
 mod manifest;
 pub mod renderer;
 
@@ -19,7 +20,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 pub use manifest::{
-    Archive, Download, Host, Manifest, RemotePackage, Revision, SysImagePath, install_dir, parse_site_list, system_image_path,
+    Archive, Download, Host, License, Manifest, RemotePackage, Revision, SysImagePath, install_dir, parse_site_list, system_image_path,
 };
 
 /// Google's SDK repository.
@@ -79,6 +80,8 @@ pub enum Error {
     Verify { path: PathBuf, what: &'static str, expected: String, got: String },
     #[error("{0}: expected exactly one top-level directory in the archive, found {1} entries")]
     Layout(PathBuf, usize),
+    #[error("package license '{0}' not accepted")]
+    License(String),
     #[error("{0}: no emulator/lib64/{1} in the archive")]
     NoRenderer(PathBuf, &'static str),
 }
@@ -115,15 +118,26 @@ pub fn format_size(bytes: u64) -> String {
     if b >= 1e9 { format!("{:.2} GB", b / 1e9) } else { format!("{:.1} MB", b / MB) }
 }
 
-/// Moves the unpacked directory `src` to `dest`, replacing whatever is there.
+/// Moves the unpacked directory `src` to `dest`, replacing whatever is there. The old directory
+/// is set aside first and put back if the move fails, so `dest` is never left half-replaced.
 fn replace_dir(src: &Path, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(io(parent))?;
     }
-    if dest.symlink_metadata().is_ok() {
-        std::fs::remove_dir_all(dest).map_err(io(dest))?;
+    if dest.symlink_metadata().is_err() {
+        return std::fs::rename(src, dest).map_err(io(dest));
     }
-    std::fs::rename(src, dest).map_err(io(dest))
+    let mut aside = dest.as_os_str().to_owned();
+    aside.push(format!(".old-{}", std::process::id()));
+    let aside = PathBuf::from(aside);
+    let _ = std::fs::remove_dir_all(&aside);
+    std::fs::rename(dest, &aside).map_err(io(dest))?;
+    if let Err(e) = std::fs::rename(src, dest) {
+        let _ = std::fs::rename(&aside, dest);
+        return Err(io(dest)(e));
+    }
+    let _ = std::fs::remove_dir_all(&aside);
+    Ok(())
 }
 
 /// Links the directory `target` (relative to `link`'s parent, or absolute) at `link`. On Windows
@@ -284,6 +298,13 @@ impl Sdk {
     /// into `d.install_dir()`. Returns the installed directory. Replaces any incomplete install
     /// already there; callers skip installed packages with [`Sdk::is_installed`].
     pub fn install(&self, d: &Download) -> Result<PathBuf> {
+        self.install_with(d, false, |_| Ok(()))
+    }
+
+    /// [`Sdk::install`], calling `prepare` on the unpacked package before it moves into place
+    /// (a failure there leaves the existing install alone). With `allow_flat`, an archive whose
+    /// files sit at the top, not under one directory, is the package itself.
+    pub(crate) fn install_with(&self, d: &Download, allow_flat: bool, prepare: impl FnOnce(&Path) -> Result<()>) -> Result<PathBuf> {
         let part = self.fetch_verified(d)?;
         // Disk images stream out of the archive into sparse files: most of a system image is
         // zeros (8.1 of TV 34's 8.6 GB), which unzip would write out in full. Everything else
@@ -311,8 +332,10 @@ impl Sdk {
             .collect();
         let top = match entries.as_slice() {
             [one] if one.is_dir() => one.clone(),
+            [_, ..] if allow_flat => tmp.0.clone(),
             _ => return Err(Error::Layout(part, entries.len())),
         };
+        prepare(&top)?;
         if !top.join("source.properties").is_file() {
             self.say(&format!("warning: {} has no source.properties", d.file_name()));
         }

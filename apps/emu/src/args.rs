@@ -14,6 +14,7 @@ usage: emu -avd NAME [options]
        emu -delete-avd NAME               (refused while any emulator, simee or stock, runs it)
        emu -provision API [-tag google_apis] [-abi arm64-v8a] [-no-renderer] [-dry-run] [-create-avd NAME [-lcd WxH@DPI] [-cores N] [-memory MB] [-profile software-lite]]
        emu -provision-renderer [-dry-run]
+       emu -provision-dhu [-dhu-beta] [-accept-licenses] [-dry-run]
        emu -list-images [-tag TAG] [-abi arm64-v8a]
 
 provisioning (no Java or sdkmanager; SDK at $ANDROID_HOME, default ~/Library/Android/sdk):
@@ -23,6 +24,10 @@ provisioning (no Java or sdkmanager; SDK at $ANDROID_HOME, default ~/Library/And
                     install or update just the renderer: lib64 of the emulator package, into
                     $ANDROID_HOME/simee/renderer/<revision>; both then initialize the renderer
                     once, so its Metal shaders are cached before the first boot
+  -provision-dhu    install Google's Android Auto Desktop Head Unit (extras;google;auto) into
+                    $ANDROID_HOME/extras/google/auto, only when asked; it is under the SDK license,
+                    which -accept-licenses accepts (simee never bundles it). -dhu-beta picks the
+                    beta (r2.1) over the stable release (r2.0)
   -no-renderer      with -provision: skip the renderer (emu then boots without graphics)
   -profile NAME     with -create-avd: software-lite makes a phone for software mode (x86_64 Linux
                     without KVM): 540x960 at 240 dpi and a 30 Hz display (hw.lcd.vsync=30), for a
@@ -172,6 +177,12 @@ pub struct Opts {
     pub provision: Option<String>,
     /// `-provision-renderer`: install or update only the gfxstream renderer.
     pub provision_renderer: bool,
+    /// `-provision-dhu`: install the Android Auto Desktop Head Unit.
+    pub provision_dhu: bool,
+    /// `-dhu-beta`: with `-provision-dhu`, the beta channel's release.
+    pub dhu_beta: bool,
+    /// `-accept-licenses`: the user accepts the SDK license of what is being installed.
+    pub accept_licenses: bool,
     /// `-no-renderer`: `-provision` without the renderer.
     pub no_renderer: bool,
     /// `-no-golden`: `-create-avd` neither builds nor clones the image's golden user data.
@@ -281,6 +292,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Opts> {
             "lcd" => o.lcd = Some(parse_lcd(&value(flag)?)?),
             "provision" => o.provision = Some(value(flag)?),
             "provision-renderer" => o.provision_renderer = true,
+            "provision-dhu" => o.provision_dhu = true,
+            "dhu-beta" => o.dhu_beta = true,
+            "accept-licenses" => o.accept_licenses = true,
             "no-renderer" => o.no_renderer = true,
             "no-golden" => o.no_golden = true,
             "list-images" => o.list_images = true,
@@ -472,6 +486,11 @@ mod tests {
         assert!(o.no_renderer && !o.provision_renderer && o.ignored.is_empty());
         let o = p("-provision-renderer -dry-run");
         assert!(o.provision_renderer && o.dry_run && o.provision.is_none() && o.ignored.is_empty());
+
+        let o = p("-provision-dhu -dhu-beta -accept-licenses -dry-run");
+        assert!(o.provision_dhu && o.dhu_beta && o.accept_licenses && o.dry_run && o.ignored.is_empty());
+        let o = p("-provision-dhu");
+        assert!(o.provision_dhu && !o.dhu_beta && !o.accept_licenses);
 
         let o = p("-list-images -tag android-tv");
         assert!(o.list_images && o.provision.is_none());

@@ -1,4 +1,4 @@
-//! `-provision`, `-provision-renderer` and `-list-images`: install what simee needs
+//! `-provision`, `-provision-renderer`, `-provision-dhu` and `-list-images`: install what simee needs
 //! (platform-tools, a system image and the gfxstream renderer) straight from Google's
 //! repository, with no Java, sdkmanager or avdmanager.
 use std::path::PathBuf;
@@ -210,6 +210,45 @@ fn install_renderer(sdk: &Sdk, opts: &Opts, update: bool) -> Result<()> {
         emu_sdk::format_size(renderer::disk_usage(&inst.dir)),
         emu_sdk::format_size(d.size)
     );
+    Ok(())
+}
+
+/// `-provision-dhu`: install Google's Android Auto Desktop Head Unit on request. Reuses an
+/// install already in `<sdk>/extras/google/auto` (Android Studio's SDK Manager puts it there).
+/// Never runs without `-accept-licenses`; `-dry-run` shows what would be fetched and under which
+/// license, and needs no acceptance.
+pub fn provision_dhu(env: &Env, opts: &Opts) -> Result<()> {
+    use emu_sdk::dhu;
+    let sdk = sdk(env)?;
+    println!("SDK: {}", sdk.root().display());
+    if let Some(exe) = dhu::executable(sdk.root()).filter(|_| sdk.is_installed(&emu_sdk::install_dir(dhu::PACKAGE))) {
+        println!("have {} ({})", dhu::PACKAGE, exe.display());
+        return Ok(());
+    }
+    let channel = if opts.dhu_beta { dhu::Channel::Beta } else { dhu::Channel::Stable };
+    let plan = dhu::resolve(&sdk.manifest(&emu_sdk::repository_url())?, Host::current(), channel)?;
+    let d = &plan.download;
+    let license = plan.license.as_ref().map_or("none", |l| l.id.as_str());
+    if opts.dry_run {
+        println!("{} r{}", dhu::PACKAGE, d.revision);
+        println!("  url     {}", d.url);
+        println!("  size    {} ({})", d.size, emu_sdk::format_size(d.size));
+        println!("  sha1    {}", d.sha1);
+        println!("  license {license}");
+        println!("  into    {}", dhu::dir(sdk.root()).display());
+        return Ok(());
+    }
+    if !opts.accept_licenses {
+        bail!(
+            "{} is under the Android SDK license '{license}', which doesn't allow redistribution, so simee fetches it from \
+             Google only when you accept it: read the terms at https://developer.android.com/studio/terms and rerun with -accept-licenses",
+            dhu::PACKAGE
+        );
+    }
+    println!("installing {} r{} ({})", dhu::PACKAGE, d.revision, emu_sdk::format_size(d.size));
+    let accepted: Vec<&str> = plan.license.iter().map(|l| l.id.as_str()).collect();
+    let dest = sdk.install_dhu(&plan, &accepted)?;
+    println!("installed {} r{} at {}", dhu::PACKAGE, d.revision, dest.display());
     Ok(())
 }
 

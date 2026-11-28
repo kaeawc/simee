@@ -23,6 +23,15 @@ impl Host {
     /// Apple silicon, the only host simee boots guests on (and so the renderer's host).
     pub const MACOS_ARM64: Host = Host { os: "macosx", arch: "aarch64" };
 
+    /// The hosts the repository publishes archives for.
+    pub const KNOWN: [Host; 5] = [
+        Host { os: "macosx", arch: "aarch64" },
+        Host { os: "macosx", arch: "x64" },
+        Host { os: "linux", arch: "x64" },
+        Host { os: "linux", arch: "aarch64" },
+        Host { os: "windows", arch: "x64" },
+    ];
+
     /// The machine this binary runs on, for host tools such as platform-tools.
     pub fn current() -> Host {
         let os = if cfg!(target_os = "macos") {
@@ -131,6 +140,15 @@ pub struct RemotePackage {
     /// (`system-images;android-34;google-xr;arm64-v8a` is tagged `android-xr`).
     pub tags: Vec<String>,
     pub archives: Vec<Archive>,
+    /// The id of the license the package is under (`uses-license`).
+    pub license: Option<String>,
+}
+
+/// A license the repository asks users to accept before installing a package.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct License {
+    pub id: String,
+    pub text: String,
 }
 
 /// A package version picked for a host: everything needed to fetch, verify and install it.
@@ -168,6 +186,7 @@ pub struct Manifest {
     /// Directory URL the manifest was fetched from, ending in `/`; archive URLs are relative to it.
     pub base_url: String,
     pub packages: Vec<RemotePackage>,
+    pub licenses: Vec<License>,
 }
 
 fn child<'a, 'i>(n: Node<'a, 'i>, name: &str) -> Option<Node<'a, 'i>> {
@@ -192,6 +211,11 @@ impl Manifest {
         let root = doc.root_element();
         let channels: BTreeMap<&str, &str> =
             root.children().filter(|c| c.has_tag_name("channel")).filter_map(|c| Some((c.attribute("id")?, c.text()?.trim()))).collect();
+        let licenses = root
+            .children()
+            .filter(|c| c.has_tag_name("license"))
+            .filter_map(|l| Some(License { id: l.attribute("id")?.to_string(), text: l.text().unwrap_or_default().trim().to_string() }))
+            .collect();
         let mut packages = Vec::new();
         for pkg in root.children().filter(|c| c.has_tag_name("remotePackage")) {
             let path = pkg.attribute("path").ok_or_else(|| Error::Manifest("remotePackage without a path".into()))?;
@@ -235,9 +259,10 @@ impl Manifest {
                 api_level: details.and_then(|d| text(d, "api-level")).map(String::from),
                 tags,
                 archives,
+                license: child(pkg, "uses-license").and_then(|l| l.attribute("ref")).map(String::from),
             });
         }
-        Ok(Manifest { base_url: base_url.to_string(), packages })
+        Ok(Manifest { base_url: base_url.to_string(), packages, licenses })
     }
 
     fn absolute(&self, url: &str) -> String {
@@ -245,7 +270,11 @@ impl Manifest {
     }
 
     fn candidates(&self, host: Host) -> impl Iterator<Item = Download> + '_ {
-        self.packages.iter().filter(|p| p.channel == "stable").flat_map(move |p| {
+        self.candidates_in(host, &["stable"])
+    }
+
+    fn candidates_in<'a>(&'a self, host: Host, channels: &'a [&str]) -> impl Iterator<Item = Download> + 'a {
+        self.packages.iter().filter(|p| channels.contains(&p.channel.as_str())).flat_map(move |p| {
             p.archives.iter().filter(move |a| a.runs_on(host)).map(move |a| Download {
                 path: p.path.clone(),
                 revision: p.revision,
@@ -267,6 +296,39 @@ impl Manifest {
             .filter(|d| d.path == path)
             .max_by_key(|d| d.revision)
             .ok_or_else(|| Error::NoArchive(path.to_string(), host.to_string()))
+    }
+
+    /// [`Manifest::resolve`] over the channels in `channels` (`stable`, `beta`...): the newest
+    /// version in any of them.
+    pub fn resolve_in(&self, path: &str, host: Host, channels: &[&str]) -> Result<Download> {
+        if !self.packages.iter().any(|p| p.path == path) {
+            return Err(Error::UnknownPackage(path.to_string(), self.base_url.clone()));
+        }
+        self.candidates_in(host, channels)
+            .filter(|d| d.path == path)
+            .max_by_key(|d| d.revision)
+            .ok_or_else(|| Error::NoArchive(path.to_string(), host.to_string()))
+    }
+
+    /// The license package `path` is under, with the text the repository shows for it.
+    pub fn license_of(&self, path: &str) -> Option<&License> {
+        let id = self.packages.iter().filter(|p| p.path == path).find_map(|p| p.license.as_deref())?;
+        self.licenses.iter().find(|l| l.id == id)
+    }
+
+    /// Every host that has an archive for some version of `path` in `channels`.
+    pub fn hosts_of(&self, path: &str, channels: &[&str]) -> Vec<Host> {
+        let mut hosts: Vec<Host> = Vec::new();
+        for p in self.packages.iter().filter(|p| p.path == path && channels.contains(&p.channel.as_str())) {
+            for a in &p.archives {
+                for host in Host::KNOWN.iter().copied().filter(|h| a.runs_on(*h)) {
+                    if !hosts.contains(&host) {
+                        hosts.push(host);
+                    }
+                }
+            }
+        }
+        hosts
     }
 
     /// The system image for `api`, `tag` and `abi`. When `api` is a bare level (`34`) that the
