@@ -3,7 +3,6 @@
 //!
 //! The device models build and test on any unix host; the machine that runs them (vCPUs, the GIC,
 //! the GPU renderer) needs Hypervisor.framework on Apple silicon.
-#![cfg(unix)]
 
 pub mod acpi;
 pub mod audio;

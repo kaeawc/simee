@@ -80,6 +80,7 @@ fi
 bench_refuse_protected ${androids[@]+"${androids[@]}"} ${ioses[@]+"${ioses[@]}"}
 [ "$host" = 1 ] || [ ${#androids[@]} -gt 0 ] || [ ${#ioses[@]} -gt 0 ] || bench_die "--no-host with no --android or --ios: nothing to run"
 
+bench_target ${androids[@]+"${androids[@]}"} ${ioses[@]+"${ioses[@]}"}
 bench_start camera
 cd "$BENCH_REPO" || exit 2
 bench_log "building the camera-bench example"

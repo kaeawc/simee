@@ -1,7 +1,9 @@
+#![cfg(unix)]
 //! The shaper's portable core (`native/netshape.c`), built with the host C compiler and run by
 //! `native/netshape_test.c` against real host sockets: profile parsing and publishing, rule
 //! matching and its cache, per-fd state, the I/O gates and pacing. Also checks that the shaper and
-//! the Rust side (the proxy's `Profile::for_host`) give every host the same profile.
+//! the Rust side (the proxy's `Profile::for_host`) give every host the same profile. Unix only: the C
+//! test uses POSIX sockets and `-pthread`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
