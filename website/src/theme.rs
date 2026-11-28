@@ -54,6 +54,13 @@ impl Theme {
         }
     }
 
+    /// The reader's choice from `<html data-theme>`, then from `localStorage`: the first that
+    /// names Light or Dark, else System.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub fn chosen(attr: Option<&str>, stored: Option<&str>) -> Theme {
+        [attr, stored].into_iter().flatten().map(Theme::parse).find(|t| *t != Theme::System).unwrap_or(Theme::System)
+    }
+
     /// Whether the page is dark, given the system's scheme.
     pub fn dark(self, system_dark: bool) -> bool {
         match self {
@@ -64,15 +71,21 @@ impl Theme {
     }
 }
 
-/// The reader's stored choice (the web), else the system's.
+/// The reader's choice as the page's head script left it on `<html data-theme>` (it reads
+/// `localStorage` before anything paints), else `localStorage`, else the system's. Rune's first
+/// frame starts from this, so it never draws the system's theme for a reader who chose one.
 pub fn load() -> Theme {
     #[cfg(target_arch = "wasm32")]
-    {
-        let stored = web_sys::window().and_then(|w| w.local_storage().ok().flatten()).and_then(|s| s.get_item(KEY).ok().flatten());
-        return stored.map_or(Theme::System, |s| Theme::parse(&s));
-    }
+    let theme = {
+        let window = web_sys::window();
+        let attr =
+            window.as_ref().and_then(|w| w.document()).and_then(|d| d.document_element()).and_then(|r| r.get_attribute("data-theme"));
+        let stored = window.and_then(|w| w.local_storage().ok().flatten()).and_then(|s| s.get_item(KEY).ok().flatten());
+        Theme::chosen(attr.as_deref(), stored.as_deref())
+    };
     #[cfg(not(target_arch = "wasm32"))]
-    Theme::System
+    let theme = Theme::System;
+    theme
 }
 
 /// Keeps `theme` for the next page and puts it on `<html data-theme>` (none for System).
