@@ -9,6 +9,10 @@
 //! - [`launch`]: the namespaces, mounts and `/init` arguments as data, and the runner.
 //!
 //! Safe Rust throughout: namespaces and mounts go through `unshare(1)` and `mount(8)`.
+//!
+//! Unix only (the host kernel is Linux; the logic builds and tests on macOS too); the crate is
+//! empty on Windows.
+#![cfg(unix)]
 
 pub mod helper;
 pub mod image;

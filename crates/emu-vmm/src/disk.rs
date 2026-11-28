@@ -5,11 +5,11 @@
 //! - `Ephemeral`: a read-only base (a system image in the SDK) with guest writes kept in
 //!   memory for the life of the process — the stock emulator's behaviour for system and vendor
 //!   images unless `-writable-system` is given.
+use sim_core::hostfs::FileExt;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use emu_hvf::GuestRam;
@@ -125,7 +125,7 @@ impl Disk {
     pub fn persistent(path: &Path) -> io::Result<Disk> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let size = file.metadata()?.len();
-        let block = rustix::fs::fstatvfs(&file).ok().map(|s| s.f_frsize).filter(|b| b.is_power_of_two() && *b >= 512).unwrap_or(CHUNK);
+        let block = fs_block_size(&file).filter(|b| b.is_power_of_two() && *b >= 512).unwrap_or(CHUNK);
         Ok(Disk { file, size, block, punch: true, overlay: None, fsync: false })
     }
 
@@ -266,7 +266,7 @@ impl Disk {
         match emu_hvf::host::punch_hole(&self.file, first, last - first) {
             Ok(()) => Ok(()),
             Err(e) => {
-                if [Some(libc::ENOTSUP), Some(libc::EOPNOTSUPP)].contains(&e.raw_os_error()) {
+                if no_holes(&e) {
                     self.punch = false;
                 }
                 write_zeroes(&self.file, first, last)
@@ -289,8 +289,32 @@ impl Disk {
         // macOS, which also drains the drive's cache: it made guest FLUSHes (ext4 commits,
         // fsync-heavy first boot) the dominant cost of booting. Data written before a flush has
         // already reached the host page cache, so an emulator crash loses nothing either way.
-        rustix::fs::fsync(&self.file).map_err(io::Error::from)
+        #[cfg(unix)]
+        return rustix::fs::fsync(&self.file).map_err(io::Error::from);
+        // Windows' FlushFileBuffers is what sync_data calls; there is no F_FULLFSYNC to avoid.
+        #[cfg(windows)]
+        return self.file.sync_data();
     }
+}
+
+/// The file system's block size, which holes are punched in multiples of.
+#[cfg(unix)]
+fn fs_block_size(file: &File) -> Option<u64> {
+    rustix::fs::fstatvfs(file).ok().map(|s| s.f_frsize)
+}
+
+/// Windows has no `fstatvfs` this crate reads: the default chunk stands in.
+#[cfg(windows)]
+fn fs_block_size(_file: &File) -> Option<u64> {
+    None
+}
+
+/// Whether `e` says the file system can't punch holes.
+fn no_holes(e: &io::Error) -> bool {
+    #[cfg(unix)]
+    return [Some(libc::ENOTSUP), Some(libc::EOPNOTSUPP)].contains(&e.raw_os_error());
+    #[cfg(windows)]
+    return e.kind() == io::ErrorKind::Unsupported;
 }
 
 /// Zeroes `[start, end)` of an ephemeral disk chunk by chunk (the partial chunks of a range).
@@ -357,6 +381,7 @@ pub fn ensure_copy(src: &Path, dst: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
 
     const RAM: u64 = 0x4000_0000;
@@ -523,6 +548,8 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    // Counts `st_blocks`, and punching holes isn't implemented on Windows.
+    #[cfg(unix)]
     #[test]
     fn persistent_zero_range_punches_holes() {
         const LEN: u64 = 4 << 20;

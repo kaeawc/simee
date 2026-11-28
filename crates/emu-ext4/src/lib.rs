@@ -18,9 +18,50 @@
 //! which would otherwise write hundreds of megabytes of zeroes into the image. No
 //! `resize_inode` (the image is never grown online) and no `64bit` (up to 16 TiB).
 
+use hostfs::FileExt;
 use std::fs::File;
 use std::io::{self, Error, ErrorKind};
-use std::os::unix::fs::FileExt;
+
+/// Positional writes and reads: std's unix trait there, `seek_write` and `seek_read` on Windows.
+mod hostfs {
+    #[cfg(unix)]
+    pub use std::os::unix::fs::FileExt;
+
+    #[cfg(windows)]
+    pub trait FileExt {
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()>;
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()>;
+    }
+
+    #[cfg(windows)]
+    impl FileExt for std::fs::File {
+        fn write_all_at(&self, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
+            use std::os::windows::fs::FileExt as _;
+            while !buf.is_empty() {
+                match self.seek_write(buf, offset) {
+                    Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                    Ok(n) => (buf, offset) = (&buf[n..], offset + n as u64),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        }
+
+        fn read_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+            use std::os::windows::fs::FileExt as _;
+            while !buf.is_empty() {
+                match self.seek_read(buf, offset) {
+                    Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                    Ok(n) => (buf, offset) = (&mut buf[n..], offset + n as u64),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        }
+    }
+}
 
 pub const BLOCK_SIZE: u64 = 4096;
 /// Smallest image accepted: 4096 blocks, enough for the minimum 1024-block journal.

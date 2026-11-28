@@ -6,7 +6,7 @@
 //! handshake within [`HANDSHAKE_TIMEOUT`]. Anything else (an older or newer build, a server that
 //! doesn't know `identity`, a suspended or wedged one) and the command runs in the caller.
 
-use std::os::unix::net::UnixStream;
+use sim_core::net::UnixStream;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -80,7 +80,7 @@ fn in_environment(key: &str) -> bool {
 
 /// The first `name` on `path` that is an executable file.
 fn on_path(path: &std::ffi::OsStr, name: &str) -> Option<std::path::PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
+    use sim_core::hostfs::PermissionsExt;
     std::env::split_paths(path)
         .map(|dir| dir.join(name))
         .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
@@ -127,7 +127,7 @@ pub fn build() -> String {
 /// without one, its path, inode, size and modification time, which any rebuild changes. Either way
 /// a CLI rebuilt from changed code while a server runs doesn't match it.
 fn executable() -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
+    use sim_core::hostfs::MetadataExt;
     let path = std::env::current_exe().ok()?.canonicalize().ok()?;
     if let Some(uuid) = macho_uuid_of(&path) {
         return Some(format!("macho-uuid:{uuid}"));
@@ -239,7 +239,7 @@ impl Client {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;

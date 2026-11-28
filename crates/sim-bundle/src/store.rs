@@ -154,10 +154,13 @@ mod tests {
         assert!(matches!(store.get(&h, 1 << 20), Err(Error::ChunkHash(_))));
         assert!(matches!(store.get(&hash(b"absent"), 1 << 20), Err(Error::Missing { .. })));
         // A chunk that is a link (to /dev/zero, which would read forever) is refused unread.
-        std::fs::remove_file(store.path(&h)).expect("rm");
-        std::os::unix::fs::symlink("/dev/zero", store.path(&h)).expect("symlink");
-        assert!(matches!(store.get(&h, 1 << 20), Err(Error::Unsupported(m)) if m.contains("regular file")));
-        assert!(read_regular(Path::new("/dev/zero"), 1 << 20).is_err(), "a device");
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(store.path(&h)).expect("rm");
+            std::os::unix::fs::symlink("/dev/zero", store.path(&h)).expect("symlink");
+            assert!(matches!(store.get(&h, 1 << 20), Err(Error::Unsupported(m)) if m.contains("regular file")));
+            assert!(read_regular(Path::new("/dev/zero"), 1 << 20).is_err(), "a device");
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 }

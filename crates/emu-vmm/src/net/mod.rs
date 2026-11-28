@@ -17,31 +17,58 @@
 //! One thread per device runs it, blocked in `poll(2)` over the host sockets it is waiting on
 //! and a wakeup the device rings when the guest sends; its timeout is smoltcp's next timer or
 //! the next idle flow's expiry. An idle device costs no CPU.
+//!
+//! The engine is POSIX throughout (`poll(2)` over raw descriptors, a socket pair for the wakeup),
+//! so it exists on unix only. Elsewhere (Windows) [`Nat::new`] fails with
+//! [`io::ErrorKind::Unsupported`] and the device runs link only, as it does when the NAT can't
+//! start.
+#[cfg(unix)]
 mod engine;
+#[cfg(unix)]
 mod host;
+// Pure frame and shaping logic: built everywhere (and tested), used by the unix-only engine.
+#[cfg_attr(not(unix), allow(dead_code))]
 mod packet;
+#[cfg_attr(not(unix), allow(dead_code))]
 mod shape;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
 
+#[cfg(unix)]
 use std::collections::VecDeque;
-use std::io::{self, Write};
-use std::net::{IpAddr, Ipv4Addr};
+use std::io;
+#[cfg(unix)]
+use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use std::sync::MutexGuard;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::thread::JoinHandle;
-
-pub use host::Dns;
 
 use crate::virtio::net::{Backend, RxReady};
 
 /// slirp's MAC for its virtual hosts (`52:55:0a:00:02:02`), which the guest learns for 10.0.2.2.
 pub const GATEWAY_MAC: [u8; 6] = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
 
+/// Where DNS to the guest's resolver address goes.
+#[derive(Clone, Debug)]
+pub enum Dns {
+    /// The host's resolver, from `/etc/resolv.conf` (which macOS keeps current), re-read when
+    /// the host's network may have changed.
+    System,
+    Fixed(SocketAddr),
+}
+
 /// Frames held for the guest. Past this smoltcp holds its segments (and retries) instead.
+#[cfg(unix)]
 const TO_GUEST: usize = 256;
 /// Frames from the guest waiting for the net thread; past this they drop, as on a full link.
+#[cfg(unix)]
 const TO_HOST: usize = 1024;
 
 /// The guest's network, as stock lays it out.
@@ -93,7 +120,11 @@ impl Limits {
 
     /// The caps for this process's current `RLIMIT_NOFILE` (emu raises it at start).
     pub fn from_rlimit() -> Limits {
+        #[cfg(unix)]
         let fds = rustix::process::getrlimit(rustix::process::Resource::Nofile).current.unwrap_or(u64::MAX);
+        // No descriptor limit to read: sockets there are handles, capped by memory.
+        #[cfg(not(unix))]
+        let fds = u64::MAX;
         Limits::for_fds(fds)
     }
 }
@@ -114,6 +145,7 @@ impl Default for Config {
 }
 
 /// What the device's worker and the net thread share.
+#[cfg(unix)]
 struct Shared {
     to_host: Mutex<VecDeque<Vec<u8>>>,
     to_guest: Mutex<VecDeque<Vec<u8>>>,
@@ -139,10 +171,12 @@ struct Shared {
     flows: AtomicUsize,
 }
 
+#[cfg(unix)]
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+#[cfg(unix)]
 impl Shared {
     fn wake(&self) {
         // A full socket buffer means a wakeup is already pending.
@@ -172,6 +206,7 @@ impl Shared {
 
 /// The NAT, as the virtio-net device's [`Backend`]. Its thread starts on the device's first
 /// activation; a later activation (the guest rebooted or reset the device) drops every flow.
+#[cfg(unix)]
 pub struct Nat {
     shared: Arc<Shared>,
     /// The engine's wakeup end and config, until the thread takes them.
@@ -179,6 +214,7 @@ pub struct Nat {
     thread: Option<JoinHandle<()>>,
 }
 
+#[cfg(unix)]
 impl Nat {
     pub fn new(cfg: Config) -> io::Result<Nat> {
         let (wake, wait) = UnixStream::pair()?;
@@ -225,6 +261,7 @@ impl Nat {
     }
 }
 
+#[cfg(unix)]
 impl Backend for Nat {
     fn attach(&mut self, ready: RxReady) {
         *lock(&self.shared.ready) = Some(ready);
@@ -283,6 +320,7 @@ impl Backend for Nat {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Nat {
     fn drop(&mut self) {
         if let Some(h) = self.thread.take() {
@@ -290,5 +328,42 @@ impl Drop for Nat {
             self.shared.wake();
             let _ = h.join();
         }
+    }
+}
+
+/// No NAT where the engine doesn't exist: no value can be built, so the device gets
+/// [`io::ErrorKind::Unsupported`] and falls back to link only.
+#[cfg(not(unix))]
+pub struct Nat(std::convert::Infallible);
+
+#[cfg(not(unix))]
+impl Nat {
+    pub fn new(_cfg: Config) -> io::Result<Nat> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "the user-mode NAT is not available on this host yet; the network is link only"))
+    }
+}
+
+#[cfg(not(unix))]
+impl Backend for Nat {
+    fn attach(&mut self, _ready: RxReady) {
+        match self.0 {}
+    }
+
+    fn transmit(&mut self, _frame: &[u8]) {
+        match self.0 {}
+    }
+
+    fn receive(&mut self) -> Option<Vec<u8>> {
+        match self.0 {}
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+mod unsupported_tests {
+    use super::*;
+
+    #[test]
+    fn the_nat_says_it_is_unsupported() {
+        assert_eq!(Nat::new(Config::default()).err().map(|e| e.kind()), Some(io::ErrorKind::Unsupported));
     }
 }
