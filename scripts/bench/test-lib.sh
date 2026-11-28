@@ -80,6 +80,45 @@ pids+=("$late")
 BENCH_TRACK_WAIT=30 # 3 s
 bench_track "$late" "$sleep_bin"
 check "bench_track waits for the exec: it records the command, not the launcher's" "$([ "$(bench_identity "$late")" = "$(bench_pid_start "$late")|$sleep_bin 60" ] && echo ok)"
+# A slow start: emu takes longer than the wait to exec, so its command is never seen. The entry
+# keeps the start time alone (not the launcher's command, which would fail every later check), and
+# the process is still stopped by it once it has exec'd.
+# shellcheck disable=SC2016 # the inner shell's $0 expands when it runs
+"$BASH" -c 'sleep 2; exec "$0" 60' "$sleep_bin" &
+slow=$!
+pids+=("$slow")
+slow_start=$(bench_pid_start "$slow")
+BENCH_PIDS=()
+BENCH_TRACK_WAIT=5 # 0.5 s, well before the exec
+bench_track "$slow" "$sleep_bin"
+check "slow start: no command is recorded when emu's was never seen" "$([ "$(bench_identity "$slow")" = "$slow_start|" ] && echo ok)"
+launcher_cmd=$(bench_pid_cmd "$slow")
+for _ in $(seq 1 50); do
+  case $(bench_pid_cmd "$slow") in "$sleep_bin"*) break ;; *) sleep 0.1 ;; esac
+done
+check "slow start: the launcher's command would no longer match after the exec" "$(no_if bench_pid_is "$slow" "$slow_start|$launcher_cmd")"
+check "slow start: after the exec the start-time-only identity still matches" "$(yes_if bench_pid_is "$slow" "$(bench_identity "$slow")")"
+bench_stop_pid "$slow" 1
+check "slow start: bench_stop_pid still stops the emulator" "$(no_if alive "$slow")"
+BENCH_PIDS=()
+
+# The PID is tracked before the poll for its command, so an interrupt during the poll still stops it.
+# shellcheck disable=SC2016 # the inner shell's $0 expands when it runs
+"$BASH" -c 'sleep 1; exec "$0" 60' "$sleep_bin" &
+early=$!
+pids+=("$early")
+(
+  # shellcheck disable=SC2329 # shadows the command, and bench_track calls it
+  sleep() {
+    printf '%s' "${BENCH_PIDS[*]}" >"$work/during"
+    command sleep "$@"
+  }
+  BENCH_TRACK_WAIT=2
+  bench_track "$early" /nonexistent
+)
+check "the PID is tracked, with its start time, while the command is still being polled for" "$([ "$(cat "$work/during")" = "$early|$(bench_pid_start "$early")|" ] && echo ok)"
+kill "$early" 2>/dev/null
+BENCH_PIDS=()
 BENCH_PIDS=()
 spawn
 gone=$spawned
@@ -167,6 +206,23 @@ bench_track "$mine" "$sleep_bin"
 android_stop "$mine" 5700
 check "android_stop: the process that was started gets the console kill" "$(grep -qx -- '-s emulator-5700 emu kill' "$fake_log" && echo ok)"
 check "and is gone" "$(no_if alive "$mine")"
+
+# A slow start, as above: the real emulator still gets the console kill.
+# shellcheck disable=SC2016 # the inner shell's $0 expands when it runs
+"$BASH" -c 'sleep 1; exec "$0" 60' "$sleep_bin" &
+slow=$!
+pids+=("$slow")
+echo "$slow" >"$work/target.pid"
+: >"$fake_log"
+BENCH_PIDS=()
+BENCH_TRACK_WAIT=2 # 0.2 s, before the exec
+bench_track "$slow" "$sleep_bin"
+for _ in $(seq 1 50); do
+  case $(bench_pid_cmd "$slow") in "$sleep_bin"*) break ;; *) sleep 0.1 ;; esac
+done
+android_stop "$slow" 5700
+check "android_stop: an emulator whose command was never seen still gets the console kill" "$(grep -qx -- '-s emulator-5700 emu kill' "$fake_log" && echo ok)"
+check "and is gone" "$(no_if alive "$slow")"
 
 if [ "$fails" = 0 ]; then echo "all passed"; else echo "$fails failed"; fi
 exit "$([ "$fails" = 0 ] && echo 0 || echo 1)"

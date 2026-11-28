@@ -61,7 +61,7 @@
 # BENCH_PROTECTED_DEVICES), whether or not that device is up. Before every boot the ports are
 # checked free again; emu is told to quit on the console only while it is the process this run
 # started and the one listening on the port, and is signalled only while its PID still has the
-# start time it had at launch.
+# start time and command (when it was seen) it had at launch.
 # Results: one JSON per API (renderers-api<N>-*.json) and one for the inits (renderers-init-*).
 # Reproduces docs/research/renderers.md.
 set -uo pipefail

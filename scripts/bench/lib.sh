@@ -144,8 +144,8 @@ bench_on_exit() { BENCH_CLEANUP+=("$*"); }
 
 # A PID alone is not an identity: hours into a run macOS can hand a finished process's PID to an
 # unrelated one. A process this run started is its PID and its start time (ps lstart, which an
-# exec doesn't change) and, where the caller gives the command it will run, that command. A
-# tracked PID is signalled only while all of these still match. BENCH_PIDS holds the entries,
+# exec doesn't change) and, where the caller gives the command it will run and it was seen, that
+# command. A tracked PID is signalled only while all of these still match. BENCH_PIDS holds the entries,
 # "PID|lstart|command" (command empty when none was recorded); an identity is the part after the
 # PID, "lstart|command".
 bench_pid_start() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'; }
@@ -156,22 +156,33 @@ bench_pid_is() {
   [ -n "$1" ] && [ -n "$want_start" ] && [ "$(bench_pid_start "$1")" = "$want_start" ] || return 1
   [ -z "$want_cmd" ] || [ "$(bench_pid_cmd "$1")" = "$want_cmd" ]
 }
-# bench_track PID [COMMAND]: records PID's start time now, at launch. With COMMAND (a path), also
-# the command line once the process has exec'd it (a launch is a fork, then exec's, and the
-# command shows the launching shell's until then): polled for BENCH_TRACK_WAIT/10 s (5 s), then
-# whatever it shows. A process already gone is recorded with no start time, so it is never signalled.
+# bench_track PID [COMMAND]: records PID's start time now, at launch, and tracks it at once (an
+# interrupt from here on still stops it). With COMMAND (a path), it then adds the command line
+# once the process has exec'd it (a launch is a fork, then exec's, and the command shows the
+# launching shell's until then), polled for BENCH_TRACK_WAIT/10 s (5 s). A command that was never
+# seen is not recorded at all: the entry keeps the start time alone, which still identifies the
+# process, where the launcher's command would fail every later check on the real one. A process
+# already gone is recorded with no start time, so it is never signalled.
 bench_track() {
-  local pid=$1 expect=${2:-} start cmd="" i
+  local pid=$1 expect=${2:-} start cmd i e keep=()
   start=$(bench_pid_start "$pid")
-  if [ -n "$expect" ] && [ -n "$start" ]; then
-    for i in $(seq 1 "${BENCH_TRACK_WAIT:-50}"); do
-      cmd=$(bench_pid_cmd "$pid")
-      case $cmd in "$expect"*) break ;; *) cmd="" ;; esac
-      sleep 0.1
-    done
-    [ -n "$cmd" ] || cmd=$(bench_pid_cmd "$pid")
-  fi
-  BENCH_PIDS+=("$pid|$start|$cmd")
+  BENCH_PIDS+=("$pid|$start|")
+  [ -n "$expect" ] && [ -n "$start" ] || return 0
+  for i in $(seq 1 "${BENCH_TRACK_WAIT:-50}"); do
+    cmd=$(bench_pid_cmd "$pid")
+    case $cmd in
+      "$expect"*)
+        for e in "${BENCH_PIDS[@]}"; do
+          if [ "$e" = "$pid|$start|" ]; then keep+=("$pid|$start|$cmd"); else keep+=("$e"); fi
+        done
+        BENCH_PIDS=("${keep[@]}")
+        return 0
+        ;;
+      *) ;;
+    esac
+    sleep 0.1
+  done
+  return 0
 }
 # bench_identity PID: the identity recorded for a tracked PID ("lstart|command"); status 1 when
 # PID isn't tracked.
