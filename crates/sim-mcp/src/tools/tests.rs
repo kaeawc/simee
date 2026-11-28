@@ -219,6 +219,7 @@ fn every_destructive_method_is_annotated_destructive() {
         "exec",
         "launch",
         "push",
+        "notify",
         "network_shape",
         "console",
         "audio_capture_start",

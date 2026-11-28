@@ -72,6 +72,8 @@ fn what_a_tool_carries_as_content_is_kept_by_size_not_by_text() {
     assert_eq!(redact("defaults_write", &json!({"key": "k", "value": "v"}))["value"], "[redacted] (1 bytes)");
     assert_eq!(redact("prefs_batch", &json!({"ops": [{"key": "k", "value": "v"}]}))["ops"], REDACTED);
     assert_eq!(redact("push", &json!({"payload": {"aps": {"alert": "hi"}}}))["payload"], REDACTED);
+    assert_eq!(redact("notify", &json!({"name": "a.b", "extras": {"k": "v"}}))["extras"], REDACTED);
+    assert_eq!(redact("notify", &json!({"name": "a.b"}))["name"], "a.b");
     // The same word in another tool is an argument like any other.
     assert_eq!(redact("tap", &json!({"text": "kept"}))["text"], "kept");
     assert_eq!(redact("type", &json!({"device": "d"})).get("text"), None);

@@ -488,6 +488,31 @@ mod tests {
     const WAIT: Duration = Duration::from_secs(5);
     const QUIET: Duration = Duration::from_millis(150);
 
+    /// Waits for the first `method` call, failing after `WAIT` instead of spinning forever.
+    fn until_called(fake: &Fake, method: &str) {
+        let deadline = Instant::now() + WAIT;
+        while fake.called(method).is_empty() {
+            assert!(Instant::now() < deadline, "no {method} call within {WAIT:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Waits until `method`'s call count holds still for `QUIET`, and returns it; fails after
+    /// `WAIT` if the calls never stop.
+    fn until_quiet(fake: &Fake, method: &str) -> usize {
+        let deadline = Instant::now() + WAIT;
+        let mut seen = fake.called(method).len();
+        loop {
+            assert!(Instant::now() < deadline, "{method} calls kept coming for {WAIT:?}: {seen}");
+            std::thread::sleep(QUIET);
+            let now = fake.called(method).len();
+            if now == seen {
+                return seen;
+            }
+            seen = now;
+        }
+    }
+
     #[test]
     fn a_changed_resource_is_announced_and_an_unchanged_one_is_not() {
         let fake = Arc::new(Fake::with_devices());
@@ -495,9 +520,7 @@ mod tests {
         let (emit, rx) = collecting();
         let _watcher = spawn(fake.clone(), spec(&["simee://devices/phone", "simee://runtimes"], false), Pace::uniform(TICK), emit);
         // Nothing for what was already there (the first read, of both, is the baseline).
-        while fake.called("runtimes").is_empty() {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        until_called(&fake, "runtimes");
         assert!(rx.recv_timeout(QUIET).is_err());
         // Only the resource whose answer changed is announced.
         fake.answer("info", Ok(json!({"state": "Booted"})));
@@ -512,9 +535,7 @@ mod tests {
         let fake = Arc::new(Fake::with_devices());
         let (emit, rx) = collecting();
         let _watcher = spawn(fake.clone(), spec(&[], true), Pace::uniform(TICK), emit);
-        while fake.called("devices").is_empty() {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        until_called(&fake, "devices");
         assert!(rx.recv_timeout(QUIET).is_err());
         fake.answer("devices", Ok(json!([{"udid": "phone", "name": "phone", "state": "Shutdown", "platform": "android"}])));
         assert_eq!(rx.recv_timeout(WAIT).expect("list changed").0, "notifications/resources/list_changed");
@@ -526,26 +547,14 @@ mod tests {
         fake.answer("apps", Ok(json!(["a"])));
         let (emit, rx) = collecting();
         let watcher = spawn(fake.clone(), spec(&["simee://runtimes"], false), Pace::uniform(TICK), emit);
-        while fake.called("runtimes").is_empty() {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        until_called(&fake, "runtimes");
         watcher.update(spec(&["simee://runtimes", "simee://devices/phone/apps"], false));
-        while fake.called("apps").is_empty() {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        until_called(&fake, "apps");
         fake.answer("apps", Ok(json!(["a", "b"])));
         assert_eq!(rx.recv_timeout(WAIT).expect("apps").1["uri"], "simee://devices/phone/apps");
         // Drop runtimes: once its in-flight read is over, no more.
         watcher.update(spec(&["simee://devices/phone/apps"], false));
-        let mut seen = fake.called("runtimes").len();
-        loop {
-            std::thread::sleep(QUIET);
-            let now = fake.called("runtimes").len();
-            if now == seen {
-                break;
-            }
-            seen = now;
-        }
+        let seen = until_quiet(&fake, "runtimes");
         std::thread::sleep(QUIET);
         assert_eq!(fake.called("runtimes").len(), seen);
     }
@@ -557,15 +566,7 @@ mod tests {
         let watcher = spawn(fake.clone(), spec(&[], true), Pace::uniform(TICK), emit);
         drop(watcher);
         // The thread may be mid-read when it is dropped: wait until its reads have stopped for good.
-        let mut calls = fake.called("devices").len();
-        loop {
-            std::thread::sleep(QUIET);
-            let now = fake.called("devices").len();
-            if now == calls {
-                break;
-            }
-            calls = now;
-        }
+        let calls = until_quiet(&fake, "devices");
         fake.answer("devices", Ok(json!([])));
         std::thread::sleep(QUIET);
         assert_eq!(fake.called("devices").len(), calls, "no more reads");
@@ -579,9 +580,7 @@ mod tests {
         let fake = Arc::new(Fake::with_devices());
         let (emit, _rx) = collecting();
         let _watcher = spawn(fake.clone(), spec(&[], true), Pace::uniform(Duration::from_secs(60)), emit);
-        while fake.called("devices").is_empty() {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        until_called(&fake, "devices");
         std::thread::sleep(QUIET);
         assert_eq!(fake.called("devices").len(), 1);
     }

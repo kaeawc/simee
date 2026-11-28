@@ -224,7 +224,9 @@ pub fn wait_for(lines: &Mutex<Vec<String>>, n: usize) -> Vec<String> {
 /// system_server uses 60% of a core between the first two probes and 2% after (the probe's own
 /// shell and `cat` busy throughout, as they are left out). The package manager has the `slim`
 /// profile's `apps.turbo`, `apps.wellbeing` and `partnersetup` (which it refuses to disable) and
-/// not `apps.restore`; what is disabled is kept in `disabled` beside the script.
+/// not `apps.restore`; what is disabled is kept in `disabled` beside the script. `com.example.app` has
+/// an FCM receiver that a root `am broadcast` reaches (`noroot` beside the script: no `su`), and
+/// `am broadcast -a` succeeds except for the protected `BOOT_COMPLETED`.
 pub fn fake_adb(android: &Android) -> FakeAdb {
     let dir = android.env.sdk_root.as_ref().expect("sdk root").join("platform-tools");
     std::fs::create_dir_all(&dir).expect("platform-tools");
@@ -500,6 +502,17 @@ shell)
     # After the airplane-mode arm above: case takes the first match.
     "settings put "*) ;;
     "am broadcast -a android.intent.action.AIRPLANE_MODE"*) echo "Broadcast completed: result=0";;
+    # sim_android::notify: com.example.app has an FCM receiver; the broadcast goes as root unless
+    # `noroot` is beside the script (no su); BOOT_COMPLETED is a protected broadcast.
+    "cmd package query-receivers --brief --components -a com.google.android.c2dm.intent.RECEIVE com.example.app")
+      echo 'com.example.app/com.google.firebase.iid.FirebaseInstanceIdReceiver';;
+    "cmd package query-receivers"*) echo "No receivers found";;
+    "if [ \"\$(id -u)\" = 0 ]; then am broadcast -n "*)
+      if [ -e "$d/noroot" ]; then echo "/system/bin/sh: su: inaccessible or not found" >&2; exit 127; fi
+      printf 'Broadcasting: Intent { act=com.google.android.c2dm.intent.RECEIVE flg=0x400000 cmp=com.example.app/com.google.firebase.iid.FirebaseInstanceIdReceiver (has extras) }\nBroadcast completed: result=-1\n';;
+    "am broadcast -a 'android.intent.action.BOOT_COMPLETED'"*)
+      printf 'Broadcasting: Intent { act=android.intent.action.BOOT_COMPLETED flg=0x400000 }\nSecurity exception: Permission Denial: not allowed to send broadcast android.intent.action.BOOT_COMPLETED from pid=7001, uid=2000\n\njava.lang.SecurityException: Permission Denial: not allowed to send broadcast android.intent.action.BOOT_COMPLETED from pid=7001, uid=2000\n' >&2; exit 255;;
+    "am broadcast -a '"*) printf 'Broadcasting: Intent { flg=0x400000 }\nBroadcast completed: result=0\n';;
     "cmd connectivity airplane-mode enable") echo 1 > "$(dirname "$0")/airplane";;
     "cmd connectivity airplane-mode disable") echo 0 > "$(dirname "$0")/airplane";;
     # sim_android::net's socket listing, as root (google_apis has su), and its traffic counters.

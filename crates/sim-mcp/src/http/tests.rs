@@ -284,11 +284,7 @@ impl Client {
         let body = if status == 204 {
             String::new()
         } else if find("transfer-encoding").as_deref() == Some("chunked") {
-            let mut body = String::new();
-            while let Some(chunk) = self.chunk() {
-                body.push_str(&chunk);
-            }
-            body
+            self.rest().concat()
         } else if let Some(length) = find("content-length") {
             let mut data = vec![0; length.parse().expect("length")];
             self.reader.read_exact(&mut data).expect("body");
@@ -326,6 +322,19 @@ impl Client {
         let response = reply.json();
         assert_eq!(response["id"], id, "{response}");
         response
+    }
+
+    /// Every chunk to the end of a chunked body, bounded by [`WAIT`] overall: an event stream's
+    /// pings keep the socket busy, so its read timeout alone never fires on a stream that never
+    /// ends (#533).
+    fn rest(&mut self) -> Vec<String> {
+        let deadline = Instant::now() + WAIT;
+        let mut chunks = Vec::new();
+        while let Some(chunk) = self.chunk() {
+            chunks.push(chunk);
+            assert!(Instant::now() < deadline, "the body did not end within {WAIT:?}; so far: {chunks:?}");
+        }
+        chunks
     }
 
     /// The next event of `method` on an open event stream, past pings and other events. Bounded by
@@ -438,10 +447,7 @@ fn a_long_call_streams_its_progress_then_its_response() {
     assert_eq!(first[0]["method"], "notifications/progress", "{first:?}");
     assert_eq!(first[0]["params"]["progressToken"], "p-1");
     gate.release();
-    let mut rest = Vec::new();
-    while let Some(chunk) = client.chunk() {
-        rest.extend(events_of(&chunk));
-    }
+    let rest: Vec<Value> = client.rest().iter().flat_map(|chunk| events_of(chunk)).collect();
     let (response, before) = rest.split_last().expect("the response ends the stream");
     assert_eq!((response["id"].clone(), response["result"]["structuredContent"]["boot_s"].clone()), (json!(41), json!(3)), "{response}");
     assert!(before.iter().all(|n| n["method"] == "notifications/progress" && n["params"]["progressToken"] == "p-1"), "{before:?}");
@@ -516,7 +522,9 @@ fn ending_a_session_stops_what_it_watches() {
     assert_eq!(client.read_reply().status, 204);
     // A read under way may finish; then none follows.
     let mut reads = rig.fake.called("screenshot").len();
+    let deadline = Instant::now() + WAIT;
     loop {
+        assert!(Instant::now() < deadline, "screenshot reads kept coming {WAIT:?} after DELETE: {reads}");
         std::thread::sleep(Duration::from_millis(150));
         let now = rig.fake.called("screenshot").len();
         if now == reads {
@@ -981,7 +989,7 @@ fn concurrent_sessions_are_isolated() {
     a.write_request("DELETE", &[], b"");
     assert_eq!(a.read_reply().status, 204);
     a_stream.reader.get_ref().tcp().set_read_timeout(Some(WAIT)).expect("timeout");
-    while a_stream.chunk().is_some() {}
+    a_stream.rest();
     assert_eq!(b.call("ping", json!({}))["result"], json!({}));
     assert_eq!(rig.running.sessions(), 1);
 }
@@ -1551,4 +1559,50 @@ fn http_call_overhead() {
     println!("HTTP, kept-alive connection      {kept_us:>8.1}");
     println!("HTTP, kept-alive, bearer token   {token_us:>8.1}");
     println!("HTTP, new connection per call    {fresh_us:>8.1}");
+}
+
+#[test]
+fn stopping_wakes_the_accept_loop_again_when_a_wake_is_missed() {
+    // The loop ends only on its third wake: the first two were lost (their connects timed out).
+    let (woke, wakes) = std::sync::mpsc::channel::<()>();
+    let accept = std::thread::spawn(move || {
+        for _ in 0..3 {
+            wakes.recv_timeout(WAIT).expect("a wake");
+        }
+    });
+    let mut sent = 0;
+    let stopped = stop_accepting(
+        accept,
+        || {
+            sent += 1;
+            woke.send(()).ok();
+        },
+        WAIT,
+    );
+    assert!(stopped, "the loop ended, so it was joined");
+    // A wake that lands while the loop is already ending is harmless, so on a loaded host there
+    // may be a fourth: only "at least until it ended" is deterministic.
+    assert!(sent >= 3, "woken until it ended: {sent}");
+}
+
+#[test]
+fn stopping_gives_up_on_an_accept_loop_that_never_ends() {
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let accept = std::thread::spawn(move || {
+        let _ = held.recv_timeout(WAIT);
+    });
+    let start = Instant::now();
+    assert!(!stop_accepting(accept, || {}, Duration::from_millis(250)), "never ended, so not joined");
+    assert!(start.elapsed() < Duration::from_secs(2), "the bound held: {:?}", start.elapsed());
+    release.send(()).ok();
+}
+
+#[test]
+fn dropping_a_server_returns_promptly() {
+    let rig = Rig::new();
+    let mut client = rig.client();
+    assert_eq!(client.call("server/discover", json!({}))["result"]["supportedVersions"][0], MODERN);
+    let start = Instant::now();
+    drop(rig);
+    assert!(start.elapsed() < STOP_LIMIT, "{:?}", start.elapsed());
 }

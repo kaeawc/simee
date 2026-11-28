@@ -972,7 +972,9 @@ fn a_task_a_confirmation_to_come_and_a_policy_refusal_are_logged_too() {
     );
     let created = rig.response(created);
     let id = created["result"]["taskId"].as_str().expect("task").to_owned();
+    let deadline = Instant::now() + WAIT;
     while rig.modern("tasks/get", json!({"taskId": id}))["result"]["status"] != "completed" {
+        assert!(Instant::now() < deadline, "the boot task did not complete within {WAIT:?}");
         std::thread::yield_now();
     }
     // Asked, not yet confirmed.
