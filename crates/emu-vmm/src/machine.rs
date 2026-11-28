@@ -350,6 +350,8 @@ pub struct MachineConfig {
     pub car: Option<Arc<pipe::car::Car>>,
     /// The virtio-snd card (ALSA card 0) and what it may do on the host.
     pub sound: Option<crate::audio::Options>,
+    /// The tap on the card's playback (console `audio capture`).
+    pub sound_tap: Arc<crate::audio::tap::Tap>,
     /// Touchscreen size; enables the virtio-input touchscreen, keyboard and rotary devices.
     pub input: Option<(u32, u32)>,
     /// With `input`: a multi-touch screen (false for `hw.screen=no-touch`, TV's).
@@ -639,7 +641,7 @@ fn boot_and_run(cfg: MachineConfig, stop: Arc<AtomicBool>) -> Result<Outcome> {
     };
     slots[slots::NET as usize] = Some(Box::new(virtio::net::Net::new(net)));
     if let Some(opts) = cfg.sound {
-        slots[slots::SOUND as usize] = Some(Box::new(virtio::snd::Snd::new(opts)));
+        slots[slots::SOUND as usize] = Some(Box::new(virtio::snd::Snd::with_tap(opts, cfg.sound_tap.clone())));
     }
     let mut dma_renderer = None;
     let mut gpu_renderer = None;

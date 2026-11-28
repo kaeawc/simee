@@ -163,6 +163,8 @@ emu -provision 36 -dry-run                              # resolve only: URL, siz
 emu -provision 36 -no-renderer                          # skip the renderer (boots without graphics)
 emu -provision 34 -tag android-automotive               # no plain 34 image: picks the newest, 34-ext9
 emu -provision-renderer                                 # install or update just the renderer
+emu -provision-dhu -dry-run                             # Android Auto's Desktop Head Unit: URL, size, sha1, license
+emu -provision-dhu -accept-licenses [-dhu-beta]         # install it into <sdk>/extras/google/auto
 emu -create-avd NAME -sysdir system-images/android-36/google_apis/arm64-v8a -lcd 720x1280@320
 emu -create-avd NAME -sysdir ... -no-golden             # a pristine first boot: no golden user data
 emu -create-avd NAME -sysdir ... -profile software-lite # a phone for software mode: 540x960, 30 Hz (below)
@@ -173,6 +175,18 @@ system image: the first AVD of an image boots once to the launcher and is stoppe
 AVD of that image starts from a copy-on-write clone of it, skipping the first boot's extra minutes
 (apexd decompressing the image's compressed APEX files, `system_server`'s first-boot work). How it
 is keyed, locked and invalidated, and what it saves, is in [farm-android.md](farm-android.md#golden-user-data-per-system-image).
+
+`-provision-dhu` fetches Google's Android Auto Desktop Head Unit (`extras;google;auto`) only when
+asked. It is under the `android-sdk-license` terms, which don't allow redistribution, so simee
+never bundles it and refuses to install it without `-accept-licenses`; `-dry-run` needs no
+acceptance. The archive is chosen per host (macOS arm64 and x64, Linux x64, Windows x64; any other
+host is told which have one), stable (r2.0) by default and `-dhu-beta` for r2.1, checked against
+the manifest's size and sha1, unpacked beside its final name, `desktop-head-unit` made executable
+and the directory moved in whole (the replaced copy is set aside under `.downloads`). Archive members
+that are absolute or contain `..` are refused, and so is a program that is a symlink. It lands in the
+SDK's own `extras/google/auto`, so an install by Android Studio's SDK Manager is reused when it is
+the requested revision. simee records the revision and channel it installed in `.simee-dhu`; a
+newer revision, or `-dhu-beta` over a stable install (or the reverse), installs over it.
 
 `crates/emu-sdk` reads Google's repository manifests (`repository2-3.xml`, and
 `sys-img/<tag>/sys-img2-3.xml` per tag), picks the newest stable archive for the host
@@ -563,6 +577,26 @@ input only with `-allow-host-audio`; otherwise it is silence. After the host des
 card's thread for longer than a period, only one overdue buffer completes at once and the rest
 follow at the stream's rate: returning every queued period in one burst left the guest's
 driver queueing nothing more, and every HAL write then timed out (EIO).
+
+**Capturing playback.** The console copies what the guest plays, with or without `-no-audio`
+(`crates/emu-vmm/src/audio/tap.rs`; a second reader on the playback path, ahead of the host ring):
+
+```
+audio capture start <path|unix:/socket> [wav|raw]   # a file is a WAV by default, a socket raw
+audio capture status                                # running or stopped, format, frames captured, frames dropped
+audio capture stop                                  # finishes the file, then the same report
+```
+
+The bytes are the guest's own, in the guest's format (rate, channels and sample format are in
+the WAV header, and in `status` once the guest has played something; 24-bit samples are a
+`WAVE_FORMAT_EXTENSIBLE` WAV, left-justified in a 32-bit word as that format says, so the WAV's samples are the guest's shifted up a byte; a raw capture keeps the guest's words as written). With no capture running a buffer costs
+one atomic load. With one running it is copied into a 1 MiB queue that a writer thread drains;
+the guest never waits for it, and frames the queue can't take (a slow socket) are dropped and
+counted. A capture holds what the guest plays, not wall-clock time: silence the guest doesn't
+queue isn't in it. A stream that changes format mid-capture has its new frames dropped and
+counted. A socket reader that pauses (a write that times out after 2 s) costs the frames it didn't take, counted as dropped; the capture ends when the peer closes, or when it stays paused for more than about 6 s in the middle of a frame. `stop` and emu's exit wait at most about 2 s for a stalled reader, then drop and count what is still queued. A file's WAV sizes are filled in on `stop`, when emu exits (power-off, `kill`, SIGINT/SIGTERM) and once a second while capturing, so a file from an emu that was killed hard opens with at most about a second of audio missing, plus whatever was still queued; a socket's say "unknown". Software mode
+(QEMU) has no tap. Not yet: the `audio_capture_start`/`audio_capture_stop` API methods for
+Android (#265).
 
 Checked on API 36 `google_apis` (phone, `android.hardware.audio@7.1-impl.ranchu`): the card
 is `/proc/asound` card 0 (`pcmC0D0p`, `pcmC0D0c`); AudioFlinger's primary output (48 kHz,

@@ -18,7 +18,7 @@
 #   lavapipe      -gpu lavapipe (software Vulkan; host GLES as emu picks it)
 #   swiftshader   -gpu swiftshader (software Vulkan; host GLES as emu picks it)
 # Under -gpu host, ANDROID_EMU_VK_ICD=moltenvk or =kosmickrisp picks emu's driver (without it,
-# API 34 and 35 run KosmicKrisp, #412), and emu's configure_environment
+# API 35 runs KosmicKrisp, #412, and API 34 MoltenVK, #495), and emu's configure_environment
 # (crates/emu-gfxstream/src/lib.rs) then sets ANDROID_EMU_VK_ICD, VK_DRIVER_FILES and
 # VK_ICD_FILENAMES to that driver whatever they held, printing a notice when it overrides one.
 # The other variables (ANGLE_DEFAULT_PLATFORM, MVK_*) are set only when unset, so the arm's win.

@@ -151,6 +151,7 @@ pub fn boot(
             xr: inst.xr.clone(),
             car: inst.car.clone(),
             network: inst.network.clone(),
+            audio: inst.audio_tap.clone(),
             // Foldable postures aren't wired in software mode yet.
             fold: None,
             rotation_unknown: instance::rotation_unknown(&avd),

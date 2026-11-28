@@ -82,3 +82,38 @@ incremental = true
 inherits = "dev"
 debug = false
 incremental = false
+
+# `ci` inherits `dev`, so CI's clippy and tests build every dependency at opt-level 2. Keep that for
+# the registry and git crates (Rune's GPU stack): they come from rust-cache, and opt-level 0 makes
+# that cache 22% larger. The workspace's own crates, path dependencies here, rebuild on most pull
+# requests, and nothing in the view tests needs them fast: build those at 0. A warm `cargo test
+# --profile ci` after a sim-core edit, 4-CPU Linux VM: 29.8 s at 2, 17.4 s this way (#213).
+# `scripts/ci-scope.py check` keeps this list equal to the path dependencies.
+[profile.ci.package.simee-android]
+opt-level = 0
+[profile.ci.package.simee-api]
+opt-level = 0
+[profile.ci.package.simee-audio]
+opt-level = 0
+[profile.ci.package.simee-bundle]
+opt-level = 0
+[profile.ci.package.simee-camera]
+opt-level = 0
+[profile.ci.package.simee-core]
+opt-level = 0
+[profile.ci.package.simee-coresim]
+opt-level = 0
+[profile.ci.package.simee-debug]
+opt-level = 0
+[profile.ci.package.simee-emu-avd]
+opt-level = 0
+[profile.ci.package.simee-emu-hvf]
+opt-level = 0
+[profile.ci.package.simee-encode]
+opt-level = 0
+[profile.ci.package.simee-host]
+opt-level = 0
+[profile.ci.package.simee-netshape]
+opt-level = 0
+[profile.ci.package.simee-rtc]
+opt-level = 0

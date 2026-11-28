@@ -828,7 +828,8 @@ impl Icd {
 /// numeric type than the shader's input (a float format for a `uvec2`): Vulkan leaves the values
 /// undefined and compiles them, Metal refuses ("Vertex attribute ... of type uint2 cannot be
 /// read using MTLAttributeFormatFloat4"), so MoltenVK fails each one and the draw is lost.
-/// No MoltenVK setting changes that; KosmicKrisp compiles them (issue #412).
+/// No MoltenVK setting changes that; KosmicKrisp compiles them (issue #412). emu says
+/// `ui_gl_on_angle` for API 35 only: on KosmicKrisp an API 34 guest's screen stays blank (#495).
 pub fn gpu_icd(ui_gl_on_angle: bool, kosmickrisp_ships: bool, asked: Option<&str>) -> Icd {
     match asked.and_then(Icd::from_name) {
         Some(Icd::MoltenVk) => Icd::MoltenVk,
@@ -1651,9 +1652,9 @@ mod tests {
 
     #[test]
     fn a_ui_on_skia_gl_on_angle_runs_on_kosmickrisp_where_it_ships() {
-        // API 34/35 phones: the guest's ANGLE asks for vertex inputs whose numeric type differs
-        // from the shader's (a float format for a uvec2 input), which Metal refuses to compile
-        // under MoltenVK and KosmicKrisp compiles (issue #412).
+        // API 35 phones (API 34 stays on MoltenVK, #495): the guest's ANGLE asks for vertex
+        // inputs whose numeric type differs from the shader's (a float format for a uvec2
+        // input), which Metal refuses to compile under MoltenVK and KosmicKrisp compiles (#412).
         assert_eq!(gpu_icd(true, true, None), Icd::KosmicKrisp);
         // A renderer revision without KosmicKrisp keeps MoltenVK.
         assert_eq!(gpu_icd(true, false, None), Icd::MoltenVk);

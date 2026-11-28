@@ -138,7 +138,7 @@ measures, refuses with exit status 4 and a list of what is busy when the host st
 a host record beside its results. `--no-quiet-gate` skips the gate for a smoke run, and `run-all.sh
 --quiet` is the run whose numbers get published. The protocol, the record's fields and the noise
 budgets are in [research/bench-protocol.md](research/bench-protocol.md); its tests are
-`scripts/bench/test-quiet.sh`, `test-run-all.sh`, `test-renderers.sh` and `test-ios-slim.sh`,
+`scripts/bench/test-quiet.sh`, `test-run-all.sh`, `test-renderers.sh`, `test-ios-slim.sh` and `test-soft-host.sh`,
 which need no device.
 
 ## Harness
