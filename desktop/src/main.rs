@@ -85,6 +85,9 @@ pub enum Action {
     Xr(sim_core::xr::XrCommand),
     /// Android tablets: the pointer becomes a stylus, or a finger again.
     ToggleStylus,
+    /// iPhones on iOS 26 or earlier: the CarPlay display on (the API's `carplay`, then the view
+    /// shows it in the iPhone's place) or off (the iPhone's screen again).
+    ToggleCarPlay,
     /// ⌘3: the 3D device view on or off ([`scene`]).
     ToggleView3d,
     /// A change of the 3D view: face on, a saved view, flip, spin ([`scene::Command`]).
@@ -145,6 +148,9 @@ pub struct State {
     offline_size: (u32, u32),
     /// How far a headless scene's screen is turned (a live Android screen says itself).
     offline_turn: Rotation,
+    /// A headless scene shows the iPhone's CarPlay display: the iPhone's screen size to go back
+    /// to (a live device says itself, [`device::Shared::showing_carplay`]).
+    offline_carplay: Option<(u32, u32)>,
     /// The UI thread's simulator service connection, made when an iOS device is first shown
     /// (the scanner has its own).
     ctx: Option<Result<Context, String>>,
@@ -225,6 +231,12 @@ impl State {
     /// Whether a device screen is shown (live, or a headless scene's).
     pub fn showing_screen(&self) -> bool {
         self.live.is_some() || self.screen.is_some() || self.offline_screen
+    }
+
+    /// Whether the screen shown is the iPhone's CarPlay display: its size, touches and body
+    /// ([`scene::body_for`]) are the car display's.
+    pub fn carplay_shown(&self) -> bool {
+        self.offline_carplay.is_some() || self.live.as_ref().is_some_and(|l| l.shared.showing_carplay.load(Ordering::Relaxed))
     }
 
     /// Asks the scanner for a scan now; `poll` applies it when it arrives.
@@ -439,6 +451,7 @@ fn init() -> State {
         offline_screen: false,
         offline_size: (1206, 2622),
         offline_turn: Rotation::Deg0,
+        offline_carplay: None,
         ctx: None,
         android_backend: None,
         scanner: None,
@@ -652,6 +665,29 @@ fn apple_tv_scene(s: &mut State) {
     select_running(s, "F6", (960, 540), Shape::Rectangle);
 }
 
+/// The iPhone 17 (iOS 26.5) with its CarPlay display on: the car display's 800x480 in the
+/// iPhone's place. The 3D view draws the `CarPlay-800x480` head unit, flat while there is none.
+fn carplay_scene(s: &mut State) {
+    select_running(s, "A1", (402, 874), Shape::Rounded);
+    show_offline_carplay(s, true);
+}
+
+/// A headless scene's CarPlay display on (the synthetic car display) or off (the iPhone's
+/// screen it showed before).
+fn show_offline_carplay(s: &mut State, on: bool) {
+    match (on, s.offline_carplay) {
+        (true, None) => {
+            s.offline_carplay = Some(s.offline_size);
+            gradient(s, sim_core::carplay::WIDTH, sim_core::carplay::HEIGHT);
+        }
+        (false, Some((w, h))) => {
+            s.offline_carplay = None;
+            gradient(s, w, h);
+        }
+        _ => {}
+    }
+}
+
 /// The demo data with `device`, which the demo list doesn't have, added, selected and running.
 fn select_added(s: &mut State, device: DeviceInfo, size: (u32, u32), shape: Shape) {
     select_running(s, &device.udid.clone(), size, shape);
@@ -669,14 +705,6 @@ fn say_if_no_body(s: &mut State) {
 /// An Android Automotive head unit (the reference 1024x768 screen).
 fn auto_scene(s: &mut State) {
     select_running(s, "automotive", (1024, 768), Shape::Rectangle);
-    say_if_no_body(s);
-}
-
-/// An iPhone's CarPlay display (800x480), as the device type `CarPlay-800x480`.
-fn carplay_scene(s: &mut State) {
-    let carplay = info("H8", "CarPlay (iPhone 17)", "CarPlay-800x480", "iOS-26-5", DeviceState::Booted)
-        .with_kind(Kind::new(Platform::Ios, FormFactor::Auto).ok());
-    select_added(s, carplay, (800, 480), Shape::Rectangle);
     say_if_no_body(s);
 }
 
@@ -784,6 +812,12 @@ fn fold_to(d: &sim_android::Device, posture: Posture) -> Result<(), String> {
 /// Folds an iPhone Duo through the API's `fold` (SpringBoard sweeps its hinge: a second or two),
 /// off the UI thread; the capture thread then shows the screen in use.
 fn apple_fold(s: &mut State, udid: String, posture: Posture) {
+    // The busy slot stays with the job holding it until that returns: a fold sharing it would
+    // clear it with the first job's completion, letting a second attach start beside the fold.
+    if let Some(running) = s.busy {
+        s.status = Some(format!("Wait for {running} to finish"));
+        return;
+    }
     s.run_async("Folding…", move || {
         let params = serde_json::json!({"device": udid, "posture": posture});
         sim_api::call_method(&mut sim_api::Session::default(), "fold", &params).map(drop)
@@ -828,6 +862,10 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
         changed = true;
         if action == Action::ToggleView3d {
             toggle_view3d(s);
+            continue;
+        }
+        if action == Action::ToggleCarPlay {
+            toggle_carplay(s);
             continue;
         }
         if let Action::View3d(c) = action {
@@ -904,7 +942,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             }
             Action::Xr(command) => android_action(s, move |d| d.xr(&command).map(drop)),
             Action::ToggleStylus => toggle_stylus(s),
-            Action::ToggleView3d | Action::View3d(_) | Action::PopOut(_) | Action::PopIn(_) => {}
+            Action::ToggleView3d | Action::ToggleCarPlay | Action::View3d(_) | Action::PopOut(_) | Action::PopIn(_) => {}
             Action::Debug(a) => {
                 if let Some(udid) = s.live.as_ref().map(|l| l.udid.clone())
                     && let Some(msg) = s.debug.perform(&udid, a)
@@ -1031,6 +1069,30 @@ fn toggle_view3d(s: &mut State) {
     }
 }
 
+/// The toolbar's CarPlay button: attaches the iPhone's CarPlay display through the API's `carplay`
+/// off the UI thread (it takes a second or more), then the capture thread shows it in the
+/// iPhone's place as soon as it has rendered; off, the iPhone's screen comes back at once and the
+/// display detaches behind it. A headless scene swaps its synthetic screens.
+fn toggle_carplay(s: &mut State) {
+    let on = !(s.carplay_shown() || s.live.as_ref().is_some_and(|l| l.shared.carplay.load(Ordering::Relaxed)));
+    if s.offline {
+        show_offline_carplay(s, on);
+        return;
+    }
+    // One attach or detach at a time: a second press while one runs would race it.
+    let Some(live) = s.live.as_ref().filter(|_| s.busy.is_none()) else { return };
+    let (udid, shared) = (live.udid.clone(), live.shared.clone());
+    if !on {
+        shared.carplay.store(false, Ordering::Relaxed);
+    }
+    s.run_async(if on { "Attaching CarPlay…" } else { "Detaching CarPlay…" }, move || {
+        let params = serde_json::json!({"device": udid, "on": on});
+        sim_api::call_method(&mut sim_api::Session::default(), "carplay", &params)?;
+        shared.carplay.store(on, Ordering::Relaxed);
+        Ok(())
+    });
+}
+
 /// Window shortcuts the focused control left alone: ⌘3 toggles the 3D view; while it shows, ⌘0,
 /// ⌘1 ⌘2 ⌘4 ⌘5, ⌘F and ⌘[ ⌘] move it ([`scene::Command::for_key`]). ⌘S saves a screenshot
 /// wherever the focus is. ⌘⌥S and ⌘⌥I hide and show the sidebar and the inspector ([`panes`]),
@@ -1141,8 +1203,9 @@ fn apply(s: &State, input: Input) {
     };
     if let Some(live) = &s.live {
         // Edge touches go through the API's worker; while any are still on their way, this one
-        // follows them there, so a tap after a bezel swipe can't overtake it.
-        if s.bezel.busy() {
+        // follows them there, so a tap after a bezel swipe can't overtake it. CarPlay's display
+        // has no edge gestures: its touches go straight to it.
+        if s.bezel.busy() && !s.carplay_shown() {
             s.bezel.send(&live.udid, (x, y), phase, None);
         } else {
             live.touch(x, y, phase);
@@ -1154,8 +1217,11 @@ fn apply(s: &State, input: Input) {
 
 /// Sends one sample of a touch from the screen's `edge` (a drag from the bezel): on iOS through the
 /// API's `touch` with `edge`, on Android as an ordinary touch, already on the edge.
+/// CarPlay's display has no edge gestures: there it is an ordinary touch.
 fn edge_touch(s: &State, x: f32, y: f32, phase: Phase, edge: sim_core::gesture::ScreenEdge) {
-    if let Some(live) = &s.live {
+    if let Some(live) = s.live.as_ref().filter(|_| s.carplay_shown()) {
+        live.touch(x, y, phase);
+    } else if let Some(live) = &s.live {
         s.bezel.send(&live.udid, (x, y), phase, Some(edge));
     } else if let Some(sc) = &s.screen {
         sc.touch(x, y, phase);
@@ -1487,9 +1553,8 @@ mod tests {
     fn form_factor_scenes_show_their_device_in_3d_or_say_it_has_no_body() {
         use sim_core::platform::{AndroidOs, AppleOs, SubPlatform};
         type Scene = fn(&mut State);
-        let cases: [(Scene, SubPlatform, (u32, u32)); 5] = [
+        let cases: [(Scene, SubPlatform, (u32, u32)); 4] = [
             (auto_scene, SubPlatform::Android(AndroidOs::Automotive), (1024, 768)),
-            (carplay_scene, SubPlatform::Apple(AppleOs::CarPlay), (800, 480)),
             (vision_pro_scene, SubPlatform::Apple(AppleOs::VisionOs), (1366, 1024)),
             (android_xr_scene, SubPlatform::Android(AndroidOs::Xr), (1280, 1279)),
             (glasses_scene, SubPlatform::Android(AndroidOs::Xr), (450, 450)),
@@ -1604,6 +1669,108 @@ mod tests {
         assert_eq!(rt.state.shape, Shape::Round);
         assert!(view::screen_radius(Shape::Round, w) >= w / 2.0);
         assert!(view::screen_radius(Shape::Rounded, w) < w / 4.0);
+    }
+
+    /// The body a state draws, as a pointer: two states pick the same row or the same nothing.
+    fn body_ptr(s: &State) -> Option<*const sim_core::body::Body> {
+        scene::body_for(s).as_ref().map(Arc::as_ptr)
+    }
+
+    /// The headless `carplay` scene: an iPhone on iOS 26 with its CarPlay display on, shown in
+    /// the iPhone's place at the car display's 800x480, with the toggle to turn it off.
+    #[test]
+    fn the_carplay_scene_shows_the_car_display_in_the_iphones_place() {
+        let rt = runtime(carplay_scene);
+        assert_eq!(text_of(&rt, "device-title"), "iPhone 17 · iOS · Phone · Booted");
+        assert!(rt.state.carplay_shown());
+        assert_eq!(rt.state.screen_size(), (sim_core::carplay::WIDTH, sim_core::carplay::HEIGHT));
+        let ([_, _, w, h], _) = rt.presented("device-screen").expect("screen drawn");
+        assert!((w / h - 800.0 / 480.0).abs() < 0.01, "the car display's shape: {w}x{h}");
+        assert!(rt.find("carplay-button").is_some());
+        // An iPhone on iOS 27 has no toggle: CarPlay renders black there.
+        let rt = runtime(|s| {
+            demo(s);
+            s.selected = Some("C3".into());
+        });
+        assert!(rt.find("home-button").is_some() && rt.find("carplay-button").is_none());
+    }
+
+    /// While the CarPlay display shows, the 3D view draws the car head unit's body
+    /// (`CarPlay-800x480`), not the iPhone's; with no such body (#503) it stays flat and says so.
+    #[test]
+    fn body_selection_picks_the_carplay_body_while_the_display_shows() {
+        let iphone = runtime(demo);
+        let carplay = runtime(carplay_scene);
+        assert!(body_ptr(&iphone.state).is_some(), "the iPhone has a body");
+        assert_eq!(body_ptr(&carplay.state), sim_core::body::get(scene::CARPLAY_BODY).as_ref().map(Arc::as_ptr));
+        assert_ne!(body_ptr(&carplay.state), body_ptr(&iphone.state), "never the iPhone's body on the car display");
+        let mut rt = polled_runtime(carplay_scene);
+        rt.on_key = Some(on_key);
+        rt.state.view3d.supported = true;
+        rt.key(cmd('3'));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.view3d.on);
+        if sim_core::body::get(scene::CARPLAY_BODY).is_none() {
+            assert_eq!(rt.state.status.as_deref(), Some(scene::NO_BODY.as_str()));
+            assert!(rt.find("scene-3d").is_none(), "no head unit body yet: flat");
+            assert!(rt.find("device-screen").is_some());
+        } else {
+            assert!(rt.find("scene-3d").is_some(), "the head unit is drawn");
+        }
+    }
+
+    /// A drag on the CarPlay view lands at CarPlay's pixels (the 800x480 car display, not the
+    /// iPhone's screen); the live device normalizes them by that size for `carplay_touch`.
+    #[test]
+    fn touches_on_the_carplay_view_map_to_carplay_pixels() {
+        let mut rt = runtime(carplay_scene);
+        let ([x, y, w, h], _) = rt.presented("device-screen").expect("screen drawn");
+        rt.pointer_down(x + w * 0.25, y + h * 0.75);
+        rt.frame(1.0 / 60.0);
+        rt.pointer_up(x + w * 0.25, y + h * 0.75);
+        rt.frame(1.0 / 60.0);
+        let near = |a: f32, b: f32| (a - b).abs() < 2.0;
+        assert!(
+            matches!(rt.state.inputs.first(), Some(Input::Down(px, py)) if near(*px, 200.0) && near(*py, 360.0)),
+            "{:?}",
+            rt.state.inputs
+        );
+        assert!(matches!(rt.state.inputs.last(), Some(Input::Up(..))), "{:?}", rt.state.inputs);
+    }
+
+    /// The toggle turns the CarPlay display off: the iPhone's own screen, its size and its body
+    /// come back; on again shows the car display.
+    #[test]
+    fn toggling_carplay_off_returns_to_the_iphone_screen() {
+        let iphone = runtime(demo);
+        let mut rt = polled_runtime(carplay_scene);
+        press(&mut rt, "carplay-button");
+        run_for(&mut rt, 0.5);
+        assert!(!rt.state.carplay_shown());
+        assert_eq!(rt.state.screen_size(), iphone.state.screen_size());
+        assert_eq!(body_ptr(&rt.state), body_ptr(&iphone.state));
+        let ([_, _, w, h], _) = rt.presented("device-screen").expect("screen drawn");
+        assert!(h > w, "the iPhone's portrait screen again: {w}x{h}");
+        press(&mut rt, "carplay-button");
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.carplay_shown());
+        assert_eq!(rt.state.screen_size(), (800, 480));
+    }
+
+    /// A Duo fold while CarPlay attaches (or any job runs) leaves the busy slot alone: the slot
+    /// stays held until the attach call returns, so a second attach can't start beside the fold.
+    #[test]
+    fn a_fold_waits_for_the_job_holding_the_busy_slot() {
+        let mut s = init();
+        s.waker = Some(Arc::new(|| {}));
+        s.busy = Some("Attaching CarPlay…");
+        s.work_done.store(false, Ordering::Relaxed);
+        apple_fold(&mut s, "no-such-device".into(), Posture::Closed);
+        assert_eq!(s.busy, Some("Attaching CarPlay…"));
+        assert!(!s.work_done.load(Ordering::Relaxed), "the attach's completion flag was not reset");
+        s.busy = None;
+        apple_fold(&mut s, "no-such-device".into(), Posture::Closed);
+        assert_eq!(s.busy, Some("Folding…"), "a free slot runs it");
     }
 
     #[test]

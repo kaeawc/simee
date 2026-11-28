@@ -46,6 +46,8 @@ pub struct Disk {
     /// Cleared once the host filesystem reports it can't punch holes.
     punch: bool,
     overlay: Option<Overlay>,
+    /// Syncs [`Disk::sync`] made (the stop's; a guest FLUSH under `-disk-cache fsync` isn't one).
+    syncs: u32,
 }
 
 /// An ephemeral disk's in-memory changes on top of its read-only base.
@@ -126,13 +128,13 @@ impl Disk {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let size = file.metadata()?.len();
         let block = fs_block_size(&file).filter(|b| b.is_power_of_two() && *b >= 512).unwrap_or(CHUNK);
-        Ok(Disk { file, size, block, punch: true, overlay: None, fsync: false })
+        Ok(Disk { file, size, block, punch: true, overlay: None, fsync: false, syncs: 0 })
     }
 
     pub fn ephemeral(path: &Path) -> io::Result<Disk> {
         let file = File::open(path)?;
         let size = file.metadata()?.len();
-        Ok(Disk { file, size, block: CHUNK, punch: false, overlay: Some(Overlay::default()), fsync: false })
+        Ok(Disk { file, size, block: CHUNK, punch: false, overlay: Some(Overlay::default()), fsync: false, syncs: 0 })
     }
 
     pub fn size(&self) -> u64 {
@@ -276,13 +278,37 @@ impl Disk {
 
     /// Whether guest flushes reach the drive (`-disk-cache fsync`). Off by default: writes are
     /// already in the host page cache, which survives an emulator crash; only a host crash or
-    /// power loss can lose them.
+    /// power loss while the guest runs can lose them ([`Disk::sync`] runs when it stops).
     pub fn set_fsync(&mut self, on: bool) {
         self.fsync = on;
     }
 
     pub fn flush(&self) -> io::Result<()> {
-        if self.overlay.is_some() || !self.fsync {
+        if !self.fsync {
+            return Ok(());
+        }
+        self.fsync_file()
+    }
+
+    /// Hands a persistent disk's writes to the drive once, whatever `-disk-cache` says: the
+    /// machine is stopping (#388), so userdata isn't left half-written in the page cache when a
+    /// host crash or power loss follows the stop. Nothing for an ephemeral disk, whose writes
+    /// are discarded.
+    pub fn sync(&mut self) -> io::Result<()> {
+        self.fsync_file()?;
+        if self.overlay.is_none() {
+            self.syncs += 1;
+        }
+        Ok(())
+    }
+
+    /// How many times [`Disk::sync`] synced the file.
+    pub fn syncs(&self) -> u32 {
+        self.syncs
+    }
+
+    fn fsync_file(&self) -> io::Result<()> {
+        if self.overlay.is_some() {
             return Ok(());
         }
         // Plain fsync hands dirty pages to the drive. std's sync_data/sync_all use F_FULLFSYNC on
@@ -545,6 +571,21 @@ mod tests {
         d.write_from_guest(&mem, 512, RAM, 4).expect("write");
         d.flush().expect("flush");
         assert_eq!(&std::fs::read(&path).expect("read")[512..516], b"data");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_stop_syncs_a_persistent_disk_whatever_the_cache_mode() {
+        let path = tmp("sync");
+        ensure_sparse(&path, 2 * CHUNK).expect("create");
+        let mut d = Disk::persistent(&path).expect("open");
+        d.flush().expect("flush");
+        assert_eq!(d.syncs(), 0, "a guest FLUSH under -disk-cache unsafe syncs nothing");
+        d.sync().expect("sync");
+        assert_eq!(d.syncs(), 1, "the stop's sync reaches the file under -disk-cache unsafe");
+        let mut e = Disk::ephemeral(&path).expect("open");
+        e.sync().expect("sync");
+        assert_eq!(e.syncs(), 0, "an ephemeral disk's writes are discarded: nothing to sync");
         let _ = std::fs::remove_file(path);
     }
 

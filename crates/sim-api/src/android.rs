@@ -187,6 +187,46 @@ fn debug(android: &Android, d: &sim_android::Device, method: &str, p: &Value) ->
     }
 }
 
+/// `audio_state`, `audio_volume` and `audio_mute` on the guest's media stream, over adb, in iOS's
+/// shapes: `{settings, muted, host_devices}` (settings: the media stream's `volume` as
+/// `audio_volume`'s level, every stream, the ringer mode and the focus stack; muted: the media
+/// stream's; no host devices, since emu plays on the host's default output and can't be routed),
+/// nothing for `audio_volume`, and `{muted}` read back after a mute. Parameters are read first.
+fn audio(android: &Android, d: &sim_android::Device, method: &str, p: &Value) -> Result<Value, String> {
+    match method {
+        "audio_volume" => {
+            let level = opt_u64(p, "level").ok_or("missing number parameter `level`")?.min(100) as u8;
+            d.adb(android)?.set_media_volume(level).map(|_| Value::Null)
+        }
+        "audio_mute" => {
+            let on = crate::params::need_bool(p, "on")?;
+            d.adb(android)?.set_media_mute(on).map(|muted| json!({"muted": muted}))
+        }
+        _ => {
+            let state = d.adb(android)?.audio_state()?;
+            let music = state.stream("music");
+            let streams: Vec<Value> = state
+                .streams
+                .iter()
+                .map(|s| json!({"stream": s.name, "volume": s.volume, "min": s.min, "max": s.max, "muted": s.muted, "devices": s.devices}))
+                .collect();
+            let focus: Vec<Value> =
+                state.focus.iter().map(|f| json!({"package": f.package, "uid": f.uid, "gain": f.gain, "client": f.client})).collect();
+            Ok(json!({
+                "settings": {
+                    "volume": music.and_then(|m| Some(sim_android::audio::level(m.volume?, m.min, m.max?))),
+                    "streams": streams,
+                    "ringer_mode": state.ringer_mode,
+                    "focus": focus,
+                    "focus_owner": state.focus.last().map(|f| f.package.clone()),
+                },
+                "muted": music.is_some_and(|m| m.muted),
+                "host_devices": Value::Null,
+            }))
+        }
+    }
+}
+
 /// `fold`: `folded` (the console's `fold` or `unfold`), a hinge `angle`, or a `posture` (stock's
 /// names or ids: closed, half-opened, opened, flipped, tent); a `null` one is absent. Answers
 /// with the hinge as simee's emulator then has it (angle, posture, whether folded, the display
@@ -435,6 +475,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             }))
         }
         "shutdown" => null(d.shutdown()),
+        m if crate::android_state::is_method(m) => crate::android_state::call(&android, &d, m, p),
         // The guest's layout, which tap, swipe and touch take (a folded foldable's outer screen).
         "screen" => d.layout_size().map(|(w, h)| json!({"width": w, "height": h})),
         // The emulator's own PNG, passed through: with `path` it writes the file itself.
@@ -465,6 +506,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
         "install" | "uninstall" | "launch" | "terminate" | "apps" | "open_url" => app(&android, &d, method, p),
         m if crate::android_files::METHODS.contains(&m) => crate::android_files::call(&android, &d, m, p),
         "processes" | "kill" | "exec" => debug(&android, &d, method, p),
+        "audio_state" | "audio_volume" | "audio_mute" => audio(&android, &d, method, p),
         "network_shape" | "network_state" | "network_clear" | "connections" | "traffic" => {
             crate::android_net::call(&android, &d, method, p)
         }
@@ -737,6 +779,151 @@ mod tests {
             );
         }
         assert!(adb.calls().is_empty(), "{:?}", adb.calls());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn help_row(method: &str) -> Value {
+        let help = call(&mut Session::default(), "help", &Value::Null).expect("help");
+        help.as_array().and_then(|a| a.iter().find(|x| x["method"] == method)).cloned().expect(method)
+    }
+
+    #[test]
+    fn audio_state_volume_and_mute_work_on_both_platforms() {
+        for method in ["audio_state", "audio_volume", "audio_mute"] {
+            let row = help_row(method);
+            assert_eq!(row["platforms"], json!(["android", "ios"]), "{method}");
+            // The iOS device set stays an iOS parameter (#409's form).
+            assert!(row["params"].as_str().is_some_and(|p| p.contains("iOS: set?")), "{row}");
+        }
+    }
+
+    #[test]
+    fn audio_route_and_capture_stay_ios_only_and_say_why() {
+        for method in ["audio_route", "audio_capture_start", "audio_capture_stop"] {
+            let row = help_row(method);
+            assert_eq!(row["platforms"], json!(["ios"]), "{method}");
+            let description = row["doc"].as_str().unwrap_or_default();
+            assert!(description.contains("Android: not available"), "{method}: {description}");
+        }
+        let (mut s, root, adb, _emulator) = session("audioios");
+        let err = run(&mut s, "audio_route", json!({"scope": "output", "uid": "default"})).expect_err("ios only");
+        assert_eq!(err, "`audio_route` isn't available on Android devices (it works on iOS)");
+        assert!(adb.calls().is_empty(), "{:?}", adb.calls());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The iOS side is untouched: the same platforms and the same result shapes.
+    #[test]
+    fn the_ios_audio_methods_keep_their_shapes() {
+        use crate::methods::platforms;
+        use sim_core::platform::Platform;
+        for method in ["audio_state", "audio_volume", "audio_route", "audio_capture_start", "audio_capture_stop", "audio_mute"] {
+            assert!(platforms(method).contains(&Platform::Ios), "{method}");
+        }
+        let shape = |m: &str| {
+            crate::outputs::OUTPUTS.iter().find(|(name, _)| *name == m).map(|(_, s)| s.split_whitespace().collect::<Vec<_>>().join(" "))
+        };
+        assert_eq!(shape("audio_state").as_deref(), Some("{settings: object|null, muted: boolean, host_devices: [object]|null}"));
+        assert_eq!(shape("audio_volume").as_deref(), Some("null"));
+        assert_eq!(shape("audio_mute").as_deref(), Some("{muted: boolean}"));
+    }
+
+    #[test]
+    fn audio_state_answers_in_the_ios_shape_from_dumpsys_audio() {
+        let (mut s, root, adb, _emulator) = session("audiostate");
+        let state = run(&mut s, "audio_state", json!({})).expect("audio_state");
+        assert_eq!((&state["muted"], &state["host_devices"]), (&json!(false), &Value::Null), "{state}");
+        let settings = &state["settings"];
+        // The media stream's index 5 of 0..25, as audio_volume's level.
+        assert_eq!(settings["volume"], json!(20), "{settings}");
+        assert_eq!(settings["ringer_mode"], json!("VIBRATE"), "the external mode, what the user sees: {settings}");
+        assert_eq!(settings["focus_owner"], json!("com.example.app"), "the top of the focus stack: {settings}");
+        assert_eq!(
+            settings["focus"][1],
+            json!({"package": "com.example.app", "uid": 10190, "gain": "GAIN",
+                "client": "android.media.AudioManager@6b7c8d9com.example.app.Player@1a2b3c"})
+        );
+        let streams = settings["streams"].as_array().expect("streams");
+        assert_eq!(streams.iter().map(|s| s["stream"].clone()).collect::<Vec<_>>(), [json!("voice_call"), json!("ring"), json!("music")]);
+        assert_eq!(streams[2], json!({"stream": "music", "volume": 5, "min": 0, "max": 25, "muted": false, "devices": ["speaker"]}));
+        assert_eq!(adb.calls(), ["shell dumpsys audio"]);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn audio_volume_scales_the_level_to_the_media_streams_range() {
+        let (mut s, root, adb, _emulator) = session("audiovol");
+        assert_eq!(run(&mut s, "audio_volume", json!({"level": 60})), Ok(Value::Null));
+        assert_eq!(
+            adb.calls(),
+            ["shell cmd media_session volume --stream 3 --get", "shell cmd media_session volume --stream 3 --set 15 --get"]
+        );
+        assert_eq!(run(&mut s, "audio_state", json!({})).expect("state")["settings"]["volume"], json!(60));
+        // As on iOS, a level over 100 is 100: the stream's top index.
+        assert_eq!(run(&mut s, "audio_volume", json!({"level": 150})), Ok(Value::Null));
+        assert!(adb.calls().last().is_some_and(|c| c.ends_with("--set 25 --get")), "{:?}", adb.calls());
+        assert_eq!(run(&mut s, "audio_volume", json!({"level": 0})), Ok(Value::Null));
+        assert_eq!(run(&mut s, "audio_state", json!({})).expect("state")["settings"]["streams"][2]["volume"], json!(0));
+        let before = adb.calls().len();
+        assert_eq!(run(&mut s, "audio_volume", json!({})), Err("missing number parameter `level`".into()));
+        assert_eq!(adb.calls().len(), before, "refused before adb");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn audio_volume_uses_the_media_tool_on_older_images() {
+        let (mut s, root, adb, _emulator) = session("audioold");
+        adb.image("old-media");
+        assert_eq!(run(&mut s, "audio_volume", json!({"level": 100})), Ok(Value::Null));
+        let calls = adb.calls();
+        assert_eq!(
+            calls,
+            [
+                "shell cmd media_session volume --stream 3 --get",
+                "shell media volume --stream 3 --get",
+                "shell cmd media_session volume --stream 3 --set 25 --get",
+                "shell media volume --stream 3 --set 25 --get",
+            ]
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn audio_mute_mutes_the_media_stream_and_reads_it_back() {
+        let (mut s, root, adb, _emulator) = session("audiomute");
+        assert_eq!(run(&mut s, "audio_mute", json!({"on": true})), Ok(json!({"muted": true})));
+        assert_eq!(adb.calls(), ["shell getprop ro.build.version.sdk", "shell cmd audio adj-mute 3", "shell dumpsys audio"]);
+        assert_eq!(run(&mut s, "audio_state", json!({})).expect("state")["muted"], json!(true));
+        assert_eq!(run(&mut s, "audio_mute", json!({"on": false})), Ok(json!({"muted": false})));
+        assert_eq!(run(&mut s, "audio_state", json!({})).expect("state")["muted"], json!(false));
+        let before = adb.calls().len();
+        assert_eq!(run(&mut s, "audio_mute", json!({})), Err("missing boolean parameter `on`".into()));
+        assert_eq!(adb.calls().len(), before, "refused before adb");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn audio_mute_on_api_34_says_what_the_image_lacks() {
+        let (mut s, root, adb, _emulator) = session("audio34");
+        adb.image("api34");
+        let err = run(&mut s, "audio_mute", json!({"on": true})).expect_err("no adj-mute");
+        assert!(err.contains("API 35") && err.contains("API 34"), "{err}");
+        assert!(!adb.calls().iter().any(|c| c.contains("adj-mute")), "refused before sending it: {:?}", adb.calls());
+        // The volume and the state still work there.
+        assert_eq!(run(&mut s, "audio_volume", json!({"level": 40})), Ok(Value::Null));
+        assert_eq!(run(&mut s, "audio_state", json!({})).expect("state")["muted"], json!(false));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_volume_or_mute_that_does_not_apply_is_an_error() {
+        let (mut s, root, adb, _emulator) = session("audionoapply");
+        adb.image("fixed-volume");
+        let err = run(&mut s, "audio_volume", json!({"level": 40})).expect_err("not applied");
+        assert!(err.contains("didn't change"), "{err}");
+        adb.image("mute-ignored");
+        let err = run(&mut s, "audio_mute", json!({"on": true})).expect_err("not applied");
+        assert!(err.contains("still not muted"), "{err}");
         std::fs::remove_dir_all(root).ok();
     }
 

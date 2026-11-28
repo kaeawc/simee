@@ -31,6 +31,15 @@ pub fn config_plist(on: bool) -> String {
     )
 }
 
+/// The refusal of an iOS 27 or later runtime: it names the iOS 26 runtime to use and the issue that
+/// tracks whether Apple restores simulated CarPlay (kaeawc/simee#441); a test pins the text.
+pub fn unsupported_message(major: u32) -> String {
+    format!(
+        "CarPlay isn't supported on iOS {major} simulator runtimes (Apple renders it black); use an iOS 26 runtime \
+         (kaeawc/simee#441 tracks whether Apple restores it; scripts/bench/carplay-check.sh re-checks each Xcode release)"
+    )
+}
+
 /// Whether an iPhone on this runtime (`com.apple.CoreSimulator.SimRuntime.iOS-26-5`) can show
 /// CarPlay. iOS 27 runtimes render it black (Apple: "iOS Simulator is not supported for CarPlay").
 pub fn runtime_supports(runtime_id: &str) -> Result<(), String> {
@@ -39,7 +48,7 @@ pub fn runtime_supports(runtime_id: &str) -> Result<(), String> {
     let major: u32 =
         version.split('-').next().and_then(|m| m.parse().ok()).ok_or_else(|| format!("can't read the iOS version of `{runtime_id}`"))?;
     if major >= 27 {
-        return Err(format!("CarPlay isn't supported on iOS {major} simulator runtimes (Apple renders it black); use an iOS 26 runtime"));
+        return Err(unsupported_message(major));
     }
     Ok(())
 }
@@ -73,7 +82,19 @@ mod tests {
         assert_eq!(runtime_supports(&format!("{rt}iOS-26-5")), Ok(()));
         assert_eq!(runtime_supports(&format!("{rt}iOS-18-6")), Ok(()));
         assert!(runtime_supports(&format!("{rt}iOS-27-0")).expect_err("27").contains("iOS 27"));
+        assert_eq!(runtime_supports(&format!("{rt}iOS-27-2-iPhone19-4")), Err(unsupported_message(27)));
         assert!(runtime_supports(&format!("{rt}watchOS-26-0")).expect_err("watch").contains("needs an iOS runtime"));
         assert!(runtime_supports(&format!("{rt}iOS-x")).is_err());
+    }
+
+    #[test]
+    fn the_refusal_points_at_ios_26_and_the_issue() {
+        assert_eq!(
+            unsupported_message(27),
+            "CarPlay isn't supported on iOS 27 simulator runtimes (Apple renders it black); use an iOS 26 runtime \
+             (kaeawc/simee#441 tracks whether Apple restores it; scripts/bench/carplay-check.sh re-checks each Xcode release)"
+        );
+        let err = runtime_supports("com.apple.CoreSimulator.SimRuntime.iOS-27-0").expect_err("27");
+        assert!(err.contains("use an iOS 26 runtime") && err.contains("#441"));
     }
 }

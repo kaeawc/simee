@@ -1209,7 +1209,11 @@ impl Device {
         if !matches!(info.form_factor, Some(FormFactor::Phone | FormFactor::Foldable)) {
             return Err(Error::Invalid(format!("CarPlay attaches to an iPhone; {} is {}", info.name, info.label())));
         }
-        sim_core::carplay::runtime_supports(&info.runtime_id).map_err(Error::Invalid)?;
+        // `SIMEE_CARPLAY_UNGATED=1` lifts the runtime gate for scripts/bench/carplay-check.sh, which
+        // has to try an iOS 27 runtime to learn whether Apple restored CarPlay there (#441).
+        if std::env::var_os("SIMEE_CARPLAY_UNGATED").is_none_or(|v| v != "1") {
+            sim_core::carplay::runtime_supports(&info.runtime_id).map_err(Error::Invalid)?;
+        }
         let hid = self.hid()?;
         if on {
             crate::carplay::set_display(&self.obj, &self.data_path(), true)?;
