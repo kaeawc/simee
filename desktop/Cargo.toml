@@ -28,7 +28,7 @@ serde_json = "1"
 # device. Rune doesn't re-export wgpu: this is the version and features Rune already builds, so
 # it adds no crate (its backends come from Rune's per-target features). Bump it with Rune's.
 wgpu = { version = "30.0.2", default-features = false, features = ["std", "wgsl"] }
-rune = { git = "https://github.com/anomalyco/rune", rev = "f6f6e045b8cd1bce6111ab65e1b50d84f93d045b" }
+rune = { git = "https://github.com/anomalyco/rune", rev = "e08594ce74a1e9100e5842ab44be0ec5794a76c3" }
 
 [features]
 # Live Rust editing through Rune's devserver (`scripts/rune-dev` in the Rune repo).
@@ -41,14 +41,14 @@ tooling = ["rune/tooling"]
 # Rune doesn't propagate its patches; apps must repeat them at the same rev. Bump all of these
 # together with `rune` above.
 [patch.crates-io]
-winit = { git = "https://github.com/anomalyco/rune", rev = "f6f6e045b8cd1bce6111ab65e1b50d84f93d045b" }
-sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "f6f6e045b8cd1bce6111ab65e1b50d84f93d045b" }
-parley_engine = { git = "https://github.com/anomalyco/rune", rev = "f6f6e045b8cd1bce6111ab65e1b50d84f93d045b" }
-wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "f6f6e045b8cd1bce6111ab65e1b50d84f93d045b" }
-accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "f6f6e045b8cd1bce6111ab65e1b50d84f93d045b" }
-accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "f6f6e045b8cd1bce6111ab65e1b50d84f93d045b" }
-accesskit_atspi_common = { git = "https://github.com/anomalyco/rune", rev = "f6f6e045b8cd1bce6111ab65e1b50d84f93d045b" }
-naga = { git = "https://github.com/anomalyco/rune", rev = "f6f6e045b8cd1bce6111ab65e1b50d84f93d045b" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "e08594ce74a1e9100e5842ab44be0ec5794a76c3" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "e08594ce74a1e9100e5842ab44be0ec5794a76c3" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "e08594ce74a1e9100e5842ab44be0ec5794a76c3" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "e08594ce74a1e9100e5842ab44be0ec5794a76c3" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "e08594ce74a1e9100e5842ab44be0ec5794a76c3" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "e08594ce74a1e9100e5842ab44be0ec5794a76c3" }
+accesskit_atspi_common = { git = "https://github.com/anomalyco/rune", rev = "e08594ce74a1e9100e5842ab44be0ec5794a76c3" }
+naga = { git = "https://github.com/anomalyco/rune", rev = "e08594ce74a1e9100e5842ab44be0ec5794a76c3" }
 
 # `deny`, not `forbid`: only `src/surface.rs` (the zero-copy IOSurface bridge) opts back in.
 [lints.rust]

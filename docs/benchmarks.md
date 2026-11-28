@@ -1082,9 +1082,9 @@ the call ends one sample step (17 ms) after the last move, when the finger lifts
 
 ## Desktop: Rune's native Metal backend against wgpu
 
-What the desktop window costs on wgpu's Metal backend (`SIMEE_GPU_BACKEND=wgpu`), which the 3D
-device view needs (Rune's native Metal backend has no depth attachments or MSAA resolves,
-anomalyco/rune#2547), against Rune's native Metal backend, the default. The flat view is the same in
+What the desktop window costs on wgpu's Metal backend (`SIMEE_GPU_BACKEND=wgpu`) against Rune's
+native Metal backend, the default. Both draw the 3D device view since anomalyco/rune#2563 (#193);
+its headless cost on each is in [desktop.md](desktop.md#3d-device-view). The flat view is the same in
 both. Apple M3 Max (Mac15,9, 16 CPUs), macOS 26.6.2, Rune `f6f6e04`, 2026-11-27. Each value is the
 median of 5 runs per backend, run alternately (metal then wgpu, then wgpu then metal). The 1-minute
 load average at the start of the runs was 5 to 11 for iOS and 8 to 22 for Android. Two Android
