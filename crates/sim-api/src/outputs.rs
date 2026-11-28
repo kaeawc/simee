@@ -300,6 +300,8 @@ pub const OUTPUTS: &[(&str, &str)] = &[
     ("remote_swipe", "null"),
     ("pointer", "null"),
     ("carplay", "null|{display: string, width: number, height: number}"),
+    ("car_start", "{pid: number, serial: string, forward_port: number, resolution: string, dpi: number, input: string, headless: boolean}"),
+    ("car_stop", "{pid: number, was_running: boolean, forward_removed: boolean}"),
 ];
 
 /// The JSON Schema of a successful `method`'s result, or `None` for a name that isn't in

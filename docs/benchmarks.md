@@ -1346,6 +1346,11 @@ Claims that would belong in the README once someone runs them:
   the emulator package (`-provision-renderer -dry-run`), which wasn't run without the owner's
   go-ahead; the host load was also 15 to 17, not under 16.
 
+- The idle cost of a `net-segment` (#539): host CPU and resident memory of an emu process with a
+  second NIC joined to a segment of two and of four members, against the same AVD with none, on a
+  quiet host after boot (`emu -avd <avd> -net-segment dir=<dir>,subnet=1,member=<k>`, then
+  `ps -o time,rss` over 60 s as `scripts/net-bench.sh idle` does). Only the relay's thread
+  wakeups are pinned (a test: zero while idle); no guest has run it.
 - First boot with and without interrupt kicks at a 1-minute load under 8: three more runs per arm (two `none` runs and three `targeted` runs are published), and the `targeted` default below macOS 26 has no measurement on that macOS.
 - `simee screenshot` against `xcrun simctl io screenshot` on a quiet host (the run above had load
   13-69).

@@ -37,6 +37,7 @@ pub mod plist;
 pub mod pointer;
 pub mod reuse;
 pub mod rotation;
+pub mod segment;
 pub mod shot;
 pub mod stream;
 pub mod stylus;

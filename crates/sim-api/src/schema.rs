@@ -67,7 +67,12 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         // stream_* (#266)
         "whip_url" | "token" | "stream_id" => Str,
         "fps" | "max_size" | "bitrate" => Int,
+        "input" if method == "car_start" => Str,
         "input" => Bool,
+        // car_start (#437)
+        "resolution" => Str,
+        "dpi" => Int,
+        "headless" => Bool,
         "device" | "platform" | "form_factor" | "name" | "device_type" | "runtime" | "system_image" | "path" | "url" | "bundle_id"
         | "text" | "base64" | "domain" | "key" | "language" | "uid" | "capture_id" | "program" | "command" | "predicate" | "last"
         | "preset" | "direction" | "gesture" | "button" | "phase" | "action" | "service" | "scope" | "display" | "orientation"
@@ -382,7 +387,7 @@ mod tests {
         assert_eq!(tap["required"], json!(["device", "x", "y"]));
         assert_eq!(tap["properties"]["x"]["type"], "number");
         assert_eq!(tap["properties"]["hold_ms"]["type"], "integer");
-        assert_eq!(tap["properties"]["display"]["enum"], json!(["main", "outer", "inner", "carplay"]));
+        assert_eq!(tap["properties"]["display"]["enum"], json!(["main", "outer", "inner", "carplay", "car"]));
         assert_eq!(tap["properties"]["device"]["description"], "A device's UDID, name or `booted`");
         assert_eq!(schema("devices").get("required"), None, "every parameter is optional");
         assert_eq!(schema("help"), json!({"type": "object", "properties": {}}));
@@ -507,6 +512,7 @@ mod tests {
             (Platform::Android, "boot") => text(crate::android::boot_options(p)),
             (Platform::Android, "boot_many") => text(crate::android::boot_many_options(p)),
             (Platform::Android, "import") => text(crate::android::import_allows_mismatch(p)),
+            (Platform::Android, "car_start") => text(crate::android_car::start_options(p)),
             // Android's `settle` reads what iOS's does.
             (Platform::Android, "settle") => text(crate::settle::options(p)),
             // It needs a platform to read the rest.

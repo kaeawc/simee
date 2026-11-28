@@ -436,9 +436,8 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
     let d = android.device(udid)?;
     match crate::params::display(p)? {
         sim_core::duo::Display::Active => {}
-        sim_core::duo::Display::CarPlay => {
-            return Err("display=carplay is an iPhone's CarPlay screen; Android devices have one display".into());
-        }
+        // `car` and `carplay` are one name: on an Android phone, the Android Auto head unit's screen.
+        sim_core::duo::Display::CarPlay => return crate::android_car::display(&d, method, p),
         sim_core::duo::Display::Builtin(s) => {
             return Err(format!("display={} is an iPhone Duo's screen; an Android foldable shows the screen `fold` sets", s.as_str()));
         }
@@ -474,7 +473,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
                 "dropped": m.dropped,
             }))
         }
-        "shutdown" => null(d.shutdown()),
+        "shutdown" => null(android.shutdown(&d)),
         m if crate::android_state::is_method(m) => crate::android_state::call(&android, &d, m, p),
         // The guest's layout, which tap, swipe and touch take (a folded foldable's outer screen).
         "screen" => d.layout_size().map(|(w, h)| json!({"width": w, "height": h})),
@@ -507,6 +506,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
         m if crate::android_files::METHODS.contains(&m) => crate::android_files::call(&android, &d, m, p),
         "processes" | "kill" | "exec" => debug(&android, &d, method, p),
         "audio_state" | "audio_volume" | "audio_mute" => audio(&android, &d, method, p),
+        m if crate::android_car::METHODS.contains(&m) => crate::android_car::call(&android, &d, m, p),
         m if crate::android_notify::METHODS.contains(&m) => crate::android_notify::call(&android, &d, m, p),
         "network_shape" | "network_state" | "network_clear" | "connections" | "traffic" => {
             crate::android_net::call(&android, &d, method, p)
@@ -578,6 +578,10 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             d.xr(&command).map(|lines| json!(lines))
         }
         "vehicle" => {
+            // With a head unit running, the DHU's console takes speed, gear, night and parking-brake.
+            if let Some(result) = crate::android_car::vehicle(&d, p) {
+                return result;
+            }
             let area = vehicle_area(p)?;
             match (str_param(p, "property"), vehicle_value(p)?) {
                 (None, None) => d.vehicle_list().map(|all| all.iter().map(reading_json).collect()),
