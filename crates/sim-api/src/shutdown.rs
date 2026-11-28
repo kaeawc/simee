@@ -15,20 +15,24 @@
 
 /// `eprintln!` without its panic on a closed stderr: a shutdown message must never stop the
 /// shutdown it announces.
+#[cfg(unix)]
 macro_rules! say {
     ($($arg:tt)*) => {{
         use std::io::Write as _;
         let _ = writeln!(std::io::stderr(), $($arg)*);
     }};
 }
+#[cfg(unix)]
 pub(crate) use say;
 
-use std::os::unix::fs::MetadataExt as _;
+use sim_core::hostfs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use signal_hook::consts::{SIGINT, SIGTERM};
 
 /// What a call that the shutdown cancelled, or never ran, answers (its own error follows, if any).
@@ -94,6 +98,7 @@ pub fn exit_code(sig: i32) -> i32 {
 }
 
 /// The signal's name, for the lines a shutdown prints.
+#[cfg(unix)]
 fn name(sig: i32) -> &'static str {
     match sig {
         SIGINT => "SIGINT",
@@ -106,6 +111,7 @@ fn name(sig: i32) -> &'static str {
 /// `first` (the server's shutdown, which exits or ends the server) on a thread of its own, so
 /// the watch goes on; a second exits at once, with [`exit_code`] of it, after removing the
 /// sockets [`remove_on_exit`] names. Call it once per process.
+#[cfg(unix)]
 pub fn watch(first: impl FnOnce(i32) + Send + 'static) -> std::io::Result<()> {
     let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM])?;
     std::thread::Builder::new().name("simee-signals".into()).spawn(move || {
@@ -124,6 +130,13 @@ pub fn watch(first: impl FnOnce(i32) + Send + 'static) -> std::io::Result<()> {
         }
     })?;
     Ok(())
+}
+
+/// Windows has no signals, and its console events aren't watched yet: `serve` and `mcp` shut
+/// down by the process being stopped.
+#[cfg(not(unix))]
+pub fn watch(_first: impl FnOnce(i32) + Send + 'static) -> std::io::Result<()> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "watching for a shutdown signal isn't implemented on Windows yet"))
 }
 
 /// Exits the process a signal stopped, with [`exit_code`] of it, removing its sockets first
@@ -149,7 +162,7 @@ pub(crate) fn forget(path: &Path) {
 }
 
 /// Whether a shutdown would remove the socket at `path`.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn removes(path: &Path) -> bool {
     lock(&SOCKETS).iter().any(|b| b.path == path)
 }
@@ -185,12 +198,13 @@ pub(crate) fn enter() -> Option<Call> {
 }
 
 /// How many calls are running.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn in_flight() -> usize {
     *lock(&IN_FLIGHT)
 }
 
 /// Waits up to `limit` for the calls running to end; whether they all did.
+#[cfg(unix)]
 pub(crate) fn drain(limit: Duration) -> bool {
     let until = Instant::now() + limit;
     let mut n = lock(&IN_FLIGHT);
@@ -213,7 +227,7 @@ pub(crate) fn outcome(result: Result<serde_json::Value, String>) -> Result<serde
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::io::{BufRead as _, BufReader, Read as _};
     use std::path::Path;

@@ -6,7 +6,7 @@
         "readOnlyHint": true,
         "title": "devices"
       },
-      "description": "List devices with their platform, form factor and sub-platform. Read-only: changes nothing on the device or the host.\n\nPlatforms: Android, iOS. Parameters: booted?, platform?(android|ios), form_factor?. Toolsets: core, lifecycle.",
+      "description": "List devices with their platform, form factor and sub-platform. Read-only: changes nothing on the device or the host.\n\nPlatforms: Android, iOS. Parameters: booted?, platform?(android|ios), form_factor?; iOS: set?. Toolsets: core, lifecycle.",
       "inputSchema": {
         "properties": {
           "booted": {
@@ -20,6 +20,10 @@
               "android",
               "ios"
             ],
+            "type": "string"
+          },
+          "set": {
+            "description": "iOS only",
             "type": "string"
           }
         },
@@ -92,7 +96,7 @@
         "readOnlyHint": false,
         "title": "boot"
       },
-      "description": "Boot and wait until finished (iOS: env is the device launchd's environment, shaped injects the network shaper; settle also waits up to settle_timeout_s (600) until the device's processes use under settle_cpu_pct (10) % of a core for settle_window_s (10) s (settle_foreground, the default: counting only foreground-QoS CPU) and returns the timings with cpu_pct, foreground_cpu_pct, background_cpu_pct and cpu_s (CPU-seconds the tree used since the boot; for a device already booted, since the first sample), settled false if it ran out of time; profile turns off a named set of daemons (written before the boot of a shut-down device, so they never start); Android: starts emu and waits for sys.boot_completed, silent unless audio, which plays the device on the host's default output; camera_back and camera_front link a camera source first, as camera_link does, saved for later boots too). Returns `admission`, what the device would do to the host (as `admission_check`; nothing for one already booted): admission ignore, the default, only reports it; refuse fails fast unless the verdict is admit; wait waits until it is (at most admission_timeout_s, 600) and returns `pacing`. Acts on the device each time it is called. Can take a while (seconds to minutes): a client with the tasks extension gets a task to poll.\n\nPlatforms: Android, iOS. Parameters: device, timeout_s?, admission?(ignore|refuse|wait), admission_timeout_s?; iOS: env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, settle_foreground?(true), settle_timeout_s?, profile?(\"slim\"); Android: audio?(false), camera_back?, camera_front?. Toolsets: core, lifecycle.",
+      "description": "Boot and wait until finished (iOS: env is the device launchd's environment, shaped injects the network shaper; settle also waits up to settle_timeout_s (600) until the device's processes use under settle_cpu_pct (10) % of a core for settle_window_s (10) s (settle_foreground, the default: counting only foreground-QoS CPU) and returns the timings with cpu_pct, foreground_cpu_pct, background_cpu_pct and cpu_s (CPU-seconds the tree used since the boot; for a device already booted, since the first sample), settled false if it ran out of time; profile turns off a named set of daemons (written before the boot of a shut-down device, so they never start); Android: starts emu and waits for sys.boot_completed, silent unless audio, which plays the device on the host's default output; camera_back and camera_front link a camera source first, as camera_link does, saved for later boots too). Returns `admission`, what the device would do to the host (as `admission_check`; nothing for one already booted): admission ignore, the default, only reports it; refuse fails fast unless the verdict is admit; wait waits until it is (at most admission_timeout_s, 600) and returns `pacing`. Acts on the device each time it is called. Can take a while (seconds to minutes): a client with the tasks extension gets a task to poll.\n\nPlatforms: Android, iOS. Parameters: device, timeout_s?, admission?(ignore|refuse|wait), admission_timeout_s?; iOS: env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, settle_foreground?(true), settle_timeout_s?, profile?(\"slim\"), set?; Android: audio?(false), camera_back?, camera_front?. Toolsets: core, lifecycle.",
       "inputSchema": {
         "properties": {
           "admission": {
@@ -136,6 +140,10 @@
             "enum": [
               "slim"
             ],
+            "type": "string"
+          },
+          "set": {
+            "description": "iOS only",
             "type": "string"
           },
           "settle": {
@@ -353,11 +361,15 @@
         "readOnlyHint": false,
         "title": "shutdown"
       },
-      "description": "Shut down. Destructive: deletes, stops or overwrites something; deleted or overwritten data is not recovered, and a stopped device or app can be started again. Can take a while (seconds to minutes): a client with the tasks extension gets a task to poll.\n\nPlatforms: Android, iOS. Parameters: device. Toolsets: core, lifecycle.",
+      "description": "Shut down. Destructive: deletes, stops or overwrites something; deleted or overwritten data is not recovered, and a stopped device or app can be started again. Can take a while (seconds to minutes): a client with the tasks extension gets a task to poll.\n\nPlatforms: Android, iOS. Parameters: device; iOS: set?. Toolsets: core, lifecycle.",
       "inputSchema": {
         "properties": {
           "device": {
             "description": "A device's UDID, name or `booted`",
+            "type": "string"
+          },
+          "set": {
+            "description": "iOS only",
             "type": "string"
           }
         },
@@ -380,7 +392,7 @@
         "readOnlyHint": true,
         "title": "screen"
       },
-      "description": "Screen size in pixels, the space tap, swipe and touch take (a folded Android foldable: the size its guest lays out for, a Pixel Fold's 1080x2092, as uiautomator's bounds). display (iOS): main is the screen in use (an unfolded iPhone Duo's inner one), outer and inner an iPhone Duo's two, carplay an iPhone's CarPlay screen. Read-only: changes nothing on the device or the host.\n\nPlatforms: Android, iOS. Parameters: device, display?(main|outer|inner|carplay). Toolsets: core, observe.",
+      "description": "Screen size in pixels, the space tap, swipe and touch take (a folded Android foldable: the size its guest lays out for, a Pixel Fold's 1080x2092, as uiautomator's bounds). display (iOS): main is the screen in use (an unfolded iPhone Duo's inner one), outer and inner an iPhone Duo's two, carplay an iPhone's CarPlay screen. Read-only: changes nothing on the device or the host.\n\nPlatforms: Android, iOS. Parameters: device, display?(main|outer|inner|carplay); iOS: set?. Toolsets: core, observe.",
       "inputSchema": {
         "properties": {
           "device": {
@@ -394,6 +406,10 @@
               "inner",
               "carplay"
             ],
+            "type": "string"
+          },
+          "set": {
+            "description": "iOS only",
             "type": "string"
           }
         },
@@ -426,7 +442,7 @@
         "readOnlyHint": true,
         "title": "screenshot"
       },
-      "description": "The device's screen as a PNG image, returned in the result. Read-only: changes nothing on the device or the host.\n\nPlatforms: Android, iOS. Parameters: device, display?(main|outer|inner|carplay). Toolsets: core, observe.",
+      "description": "The device's screen as a PNG image, returned in the result. Read-only: changes nothing on the device or the host.\n\nPlatforms: Android, iOS. Parameters: device, display?(main|outer|inner|carplay); iOS: set?. Toolsets: core, observe.",
       "inputSchema": {
         "properties": {
           "device": {
@@ -440,6 +456,10 @@
               "inner",
               "carplay"
             ],
+            "type": "string"
+          },
+          "set": {
+            "description": "iOS only",
             "type": "string"
           }
         },
@@ -474,7 +494,7 @@
         "readOnlyHint": false,
         "title": "tap"
       },
-      "description": "Tap at pixels, held hold_ms (default: iOS 10, Android 60) (display, iOS only: an iPhone Duo's outer or inner screen, an iPhone's CarPlay screen). Acts on the device each time it is called. Coordinates are device pixels, the space `screen` reports (not points).\n\nPlatforms: Android, iOS. Parameters: device, x, y, hold_ms?, display?(main|outer|inner|carplay). Toolsets: core, input.",
+      "description": "Tap at pixels, held hold_ms (default: iOS 10, Android 60) (display, iOS only: an iPhone Duo's outer or inner screen, an iPhone's CarPlay screen). Acts on the device each time it is called. Coordinates are device pixels, the space `screen` reports (not points).\n\nPlatforms: Android, iOS. Parameters: device, x, y, hold_ms?, display?(main|outer|inner|carplay); iOS: set?. Toolsets: core, input.",
       "inputSchema": {
         "properties": {
           "device": {
@@ -493,6 +513,10 @@
           "hold_ms": {
             "description": "milliseconds",
             "type": "integer"
+          },
+          "set": {
+            "description": "iOS only",
+            "type": "string"
           },
           "x": {
             "description": "device pixels (the space `screen` reports), not points",
@@ -526,7 +550,7 @@
         "readOnlyHint": false,
         "title": "swipe"
       },
-      "description": "Swipe between pixels over duration_ms (default 300; iOS sends its samples on schedule, so a busy host doesn't stretch it); with edge (iOS) the touch comes in from that screen edge, as a drag from Simulator.app's bezel: home and the app switcher from the bottom, Notification Center and Control Center from the top (Android's edge gestures need only the start point). Acts on the device each time it is called. Coordinates are device pixels, the space `screen` reports (not points).\n\nPlatforms: Android, iOS. Parameters: device, x1, y1, x2, y2, duration_ms?, settle?, display?(main|outer|inner|carplay), edge?(top|bottom|left|right; iOS). Toolsets: core, input.",
+      "description": "Swipe between pixels over duration_ms (default 300; iOS sends its samples on schedule, so a busy host doesn't stretch it); with edge (iOS) the touch comes in from that screen edge, as a drag from Simulator.app's bezel: home and the app switcher from the bottom, Notification Center and Control Center from the top (Android's edge gestures need only the start point). Acts on the device each time it is called. Coordinates are device pixels, the space `screen` reports (not points).\n\nPlatforms: Android, iOS. Parameters: device, x1, y1, x2, y2, duration_ms?, settle?, display?(main|outer|inner|carplay), edge?(top|bottom|left|right; iOS); iOS: set?. Toolsets: core, input.",
       "inputSchema": {
         "properties": {
           "device": {
@@ -554,6 +578,10 @@
               "left",
               "right"
             ]
+          },
+          "set": {
+            "description": "iOS only",
+            "type": "string"
           },
           "settle": {
             "type": "boolean"
@@ -600,7 +628,7 @@
         "readOnlyHint": false,
         "title": "button"
       },
-      "description": "Press a hardware button, as the device's form factor has it: the Siri Remote on Apple TV (menu/back, home, select, play-pause, arrows) and the D-pad on Android TV; on Apple Watch home is the crown's press. Held hold_ms (default: 10 for home and lock on an iPhone or iPad, else 80). Acts on the device each time it is called.\n\nPlatforms: Android, iOS. Parameters: device, button(home|lock|side|siri|apple-pay|action | back|volume-up|volume-down|recents|menu|up|down|left|right|select|play-pause), hold_ms?. Toolsets: core, input.",
+      "description": "Press a hardware button, as the device's form factor has it: the Siri Remote on Apple TV (menu/back, home, select, play-pause, arrows) and the D-pad on Android TV; on Apple Watch home is the crown's press. Held hold_ms (default: 10 for home and lock on an iPhone or iPad, else 80). Acts on the device each time it is called.\n\nPlatforms: Android, iOS. Parameters: device, button(home|lock|side|siri|apple-pay|action | back|volume-up|volume-down|recents|menu|up|down|left|right|select|play-pause), hold_ms?; iOS: set?. Toolsets: core, input.",
       "inputSchema": {
         "properties": {
           "button": {
@@ -632,6 +660,10 @@
           "hold_ms": {
             "description": "milliseconds",
             "type": "integer"
+          },
+          "set": {
+            "description": "iOS only",
+            "type": "string"
           }
         },
         "required": [
@@ -656,11 +688,15 @@
         "readOnlyHint": false,
         "title": "type"
       },
-      "description": "Type on the hardware keyboard (iOS: a key report every 3 ms). Acts on the device each time it is called.\n\nPlatforms: Android, iOS. Parameters: device, text. Toolsets: core, input.",
+      "description": "Type on the hardware keyboard (iOS: a key report every 3 ms). Acts on the device each time it is called.\n\nPlatforms: Android, iOS. Parameters: device, text; iOS: set?. Toolsets: core, input.",
       "inputSchema": {
         "properties": {
           "device": {
             "description": "A device's UDID, name or `booted`",
+            "type": "string"
+          },
+          "set": {
+            "description": "iOS only",
             "type": "string"
           },
           "text": {
@@ -689,11 +725,15 @@
         "readOnlyHint": false,
         "title": "key"
       },
-      "description": "Press a key by HID usage (iOS: down and up 3 ms apart). Acts on the device each time it is called.\n\nPlatforms: Android, iOS. Parameters: device, usage. Toolsets: core, input.",
+      "description": "Press a key by HID usage (iOS: down and up 3 ms apart). Acts on the device each time it is called.\n\nPlatforms: Android, iOS. Parameters: device, usage; iOS: set?. Toolsets: core, input.",
       "inputSchema": {
         "properties": {
           "device": {
             "description": "A device's UDID, name or `booted`",
+            "type": "string"
+          },
+          "set": {
+            "description": "iOS only",
             "type": "string"
           },
           "usage": {
@@ -722,11 +762,15 @@
         "readOnlyHint": false,
         "title": "open_url"
       },
-      "description": "Open a URL (Android: `am start -a VIEW`). Acts on the device each time it is called.\n\nPlatforms: Android, iOS. Parameters: device, url. Toolsets: core, apps.",
+      "description": "Open a URL (Android: `am start -a VIEW`). Acts on the device each time it is called.\n\nPlatforms: Android, iOS. Parameters: device, url; iOS: set?. Toolsets: core, apps.",
       "inputSchema": {
         "properties": {
           "device": {
             "description": "A device's UDID, name or `booted`",
+            "type": "string"
+          },
+          "set": {
+            "description": "iOS only",
             "type": "string"
           },
           "url": {
@@ -755,7 +799,7 @@
         "readOnlyHint": false,
         "title": "install"
       },
-      "description": "Install an .app (Android: an .apk with `adb install -r`, an .aab through bundletool when it is on the PATH). Acts on the device each time it is called. Can take a while (seconds to minutes): a client with the tasks extension gets a task to poll.\n\nPlatforms: Android, iOS. Parameters: device, path. Toolsets: core, apps.",
+      "description": "Install an .app (Android: an .apk with `adb install -r`, an .aab through bundletool when it is on the PATH). Acts on the device each time it is called. Can take a while (seconds to minutes): a client with the tasks extension gets a task to poll.\n\nPlatforms: Android, iOS. Parameters: device, path; iOS: set?. Toolsets: core, apps.",
       "inputSchema": {
         "properties": {
           "device": {
@@ -763,6 +807,10 @@
             "type": "string"
           },
           "path": {
+            "type": "string"
+          },
+          "set": {
+            "description": "iOS only",
             "type": "string"
           }
         },
@@ -788,7 +836,7 @@
         "readOnlyHint": false,
         "title": "uninstall"
       },
-      "description": "Uninstall an app (Android: the package name; `pm uninstall`). Destructive: deletes, stops or overwrites something; deleted or overwritten data is not recovered, and a stopped device or app can be started again.\n\nPlatforms: Android, iOS. Parameters: device, bundle_id. Toolsets: core, apps.",
+      "description": "Uninstall an app (Android: the package name; `pm uninstall`). Destructive: deletes, stops or overwrites something; deleted or overwritten data is not recovered, and a stopped device or app can be started again.\n\nPlatforms: Android, iOS. Parameters: device, bundle_id; iOS: set?. Toolsets: core, apps.",
       "inputSchema": {
         "properties": {
           "bundle_id": {
@@ -796,6 +844,10 @@
           },
           "device": {
             "description": "A device's UDID, name or `booted`",
+            "type": "string"
+          },
+          "set": {
+            "description": "iOS only",
             "type": "string"
           }
         },
@@ -821,7 +873,7 @@
         "readOnlyHint": false,
         "title": "launch"
       },
-      "description": "Launch (iOS: with arguments and environment, shaped injecting the network shaper, malloc_stack_logging setting MallocStackLogging=1 for mem_leaks' stacks and mem_history; Android: the package's launcher activity); restart: terminate a running instance first, default true (Android: `am start -S`); false brings a running app to the front; returns pid (Android: and the activity it started). Caution: runs code, restarts or replaces state, or writes files; repeating it can differ.\n\nPlatforms: Android, iOS. Parameters: device, bundle_id, restart?; iOS: args?, env?, shaped?, malloc_stack_logging?. Toolsets: core, apps.",
+      "description": "Launch (iOS: with arguments and environment, shaped injecting the network shaper, malloc_stack_logging setting MallocStackLogging=1 for mem_leaks' stacks and mem_history; Android: the package's launcher activity); restart: terminate a running instance first, default true (Android: `am start -S`); false brings a running app to the front; returns pid (Android: and the activity it started). Caution: runs code, restarts or replaces state, or writes files; repeating it can differ.\n\nPlatforms: Android, iOS. Parameters: device, bundle_id, restart?; iOS: args?, env?, shaped?, malloc_stack_logging?, set?. Toolsets: core, apps.",
       "inputSchema": {
         "properties": {
           "args": {
@@ -851,6 +903,10 @@
           },
           "restart": {
             "type": "boolean"
+          },
+          "set": {
+            "description": "iOS only",
+            "type": "string"
           },
           "shaped": {
             "description": "iOS only",
@@ -891,7 +947,7 @@
         "readOnlyHint": false,
         "title": "terminate"
       },
-      "description": "Terminate an app (Android: `am force-stop`). Destructive: deletes, stops or overwrites something; deleted or overwritten data is not recovered, and a stopped device or app can be started again.\n\nPlatforms: Android, iOS. Parameters: device, bundle_id. Toolsets: core, apps.",
+      "description": "Terminate an app (Android: `am force-stop`). Destructive: deletes, stops or overwrites something; deleted or overwritten data is not recovered, and a stopped device or app can be started again.\n\nPlatforms: Android, iOS. Parameters: device, bundle_id; iOS: set?. Toolsets: core, apps.",
       "inputSchema": {
         "properties": {
           "bundle_id": {
@@ -899,6 +955,10 @@
           },
           "device": {
             "description": "A device's UDID, name or `booted`",
+            "type": "string"
+          },
+          "set": {
+            "description": "iOS only",
             "type": "string"
           }
         },
@@ -922,7 +982,7 @@
         "readOnlyHint": true,
         "title": "apps"
       },
-      "description": "Installed bundle ids (Android: the third-party packages, with all the system's too). Read-only: changes nothing on the device or the host.\n\nPlatforms: Android, iOS. Parameters: device; Android: all?. Toolsets: core, apps.",
+      "description": "Installed bundle ids (Android: the third-party packages, with all the system's too). Read-only: changes nothing on the device or the host.\n\nPlatforms: Android, iOS. Parameters: device; iOS: set?; Android: all?. Toolsets: core, apps.",
       "inputSchema": {
         "properties": {
           "all": {
@@ -931,6 +991,10 @@
           },
           "device": {
             "description": "A device's UDID, name or `booted`",
+            "type": "string"
+          },
+          "set": {
+            "description": "iOS only",
             "type": "string"
           }
         },
@@ -956,7 +1020,7 @@
         "readOnlyHint": false,
         "title": "appearance"
       },
-      "description": "Light or dark UI. Sets a value on the device; repeating it changes nothing more.\n\nPlatforms: iOS. Parameters: device, mode(light|dark). Toolsets: core, settings.",
+      "description": "Light or dark UI. Sets a value on the device; repeating it changes nothing more.\n\nPlatforms: iOS. Parameters: device, mode(light|dark), set?. Toolsets: core, settings.",
       "inputSchema": {
         "properties": {
           "device": {
@@ -968,6 +1032,9 @@
               "light",
               "dark"
             ],
+            "type": "string"
+          },
+          "set": {
             "type": "string"
           }
         },
@@ -993,7 +1060,7 @@
         "readOnlyHint": false,
         "title": "location"
       },
-      "description": "Simulated location. Sets a value on the device; repeating it changes nothing more.\n\nPlatforms: Android, iOS. Parameters: device, latitude, longitude. Toolsets: core, settings.",
+      "description": "Simulated location. Sets a value on the device; repeating it changes nothing more.\n\nPlatforms: Android, iOS. Parameters: device, latitude, longitude; iOS: set?. Toolsets: core, settings.",
       "inputSchema": {
         "properties": {
           "device": {
@@ -1005,6 +1072,10 @@
           },
           "longitude": {
             "type": "number"
+          },
+          "set": {
+            "description": "iOS only",
+            "type": "string"
           }
         },
         "required": [
@@ -1028,7 +1099,7 @@
         "readOnlyHint": true,
         "title": "logs"
       },
-      "description": "Unified log lines (default last 1m), as `log show --style compact` prints them. stream: the first call starts one in-device `log stream` for the device's boot, and later calls answer the window from it without spawning (log show answers a window reaching back before the stream started, a predicate, and a `last` other than <n>s|m|h|d); the stream stops after 5 idle minutes or a reboot. It omits launchd_sim's lines, signpost state dumps and `Last log repeated` lines (iOS 27.2: 12% of a settled device's lines, 1% of a just-booted one's), and its timestamps are often 1 ms later. Read-only: changes nothing on the device or the host. A long list pages: give `limit` (at most 1000) and pass back `next_cursor` as `cursor` for the next page; without either, the whole list.\n\nPlatforms: iOS. Parameters: device, last?, predicate?, stream?(false). Toolsets: core, observe.",
+      "description": "Unified log lines (default last 1m), as `log show --style compact` prints them. stream: the first call starts one in-device `log stream` for the device's boot, and later calls answer the window from it without spawning (log show answers a window reaching back before the stream started, a predicate, and a `last` other than <n>s|m|h|d); the stream stops after 5 idle minutes or a reboot. It omits launchd_sim's lines, signpost state dumps and `Last log repeated` lines (iOS 27.2: 12% of a settled device's lines, 1% of a just-booted one's), and its timestamps are often 1 ms later. Read-only: changes nothing on the device or the host. A long list pages: give `limit` (at most 1000) and pass back `next_cursor` as `cursor` for the next page; without either, the whole list.\n\nPlatforms: iOS. Parameters: device, last?, predicate?, stream?(false), set?. Toolsets: core, observe.",
       "inputSchema": {
         "properties": {
           "cursor": {
@@ -1049,6 +1120,9 @@
             "type": "integer"
           },
           "predicate": {
+            "type": "string"
+          },
+          "set": {
             "type": "string"
           },
           "stream": {
@@ -1105,11 +1179,15 @@
         "readOnlyHint": true,
         "title": "info"
       },
-      "description": "Paths and identity. Read-only: changes nothing on the device or the host.\n\nPlatforms: Android, iOS. Parameters: device. Toolsets: core, lifecycle.",
+      "description": "Paths and identity. Read-only: changes nothing on the device or the host.\n\nPlatforms: Android, iOS. Parameters: device; iOS: set?. Toolsets: core, lifecycle.",
       "inputSchema": {
         "properties": {
           "device": {
             "description": "A device's UDID, name or `booted`",
+            "type": "string"
+          },
+          "set": {
+            "description": "iOS only",
             "type": "string"
           }
         },
@@ -1304,7 +1382,7 @@
         "readOnlyHint": false,
         "title": "rotate"
       },
-      "description": "Rotate the device 90° clockwise, or to an orientation (iOS). Acts on the device each time it is called.\n\nPlatforms: Android, iOS. Parameters: device, orientation?(portrait|landscape-right|portrait-upside-down|landscape-left; iOS). Toolsets: core, input.",
+      "description": "Rotate the device 90° clockwise, or to an orientation (iOS). Acts on the device each time it is called.\n\nPlatforms: Android, iOS. Parameters: device, orientation?(portrait|landscape-right|portrait-upside-down|landscape-left; iOS); iOS: set?. Toolsets: core, input.",
       "inputSchema": {
         "properties": {
           "device": {
@@ -1319,6 +1397,10 @@
               "portrait-upside-down",
               "landscape-left"
             ],
+            "type": "string"
+          },
+          "set": {
+            "description": "iOS only",
             "type": "string"
           }
         },

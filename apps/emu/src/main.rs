@@ -14,6 +14,8 @@ mod display_server;
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
 mod fold;
 mod golden;
+#[cfg(windows)]
+mod host_windows;
 mod instance;
 mod on_signal;
 mod provision;
@@ -22,18 +24,22 @@ mod software;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vkprobe;
 
+#[cfg(windows)]
+use host_windows::raise_nofile;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 
 /// macOS's `OPEN_MAX`: the most open files `setrlimit` grants a process there whatever its hard
 /// limit says, and room for the NAT's flow caps and the rest of emu.
+#[cfg_attr(not(unix), allow(dead_code))]
 const NOFILE_WANT: u64 = 10240;
 
 /// Raises the soft open-file limit (256 by default on macOS) toward the hard one, up to
 /// [`NOFILE_WANT`]: each of the guest's network flows is a host socket of this process, and
 /// running out also fails the console's and the adb bridge's `accept`. Never lowers it. Returns
 /// the soft limit in force.
+#[cfg(unix)]
 fn raise_nofile() -> u64 {
     use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
     let cur = getrlimit(Resource::Nofile);
@@ -102,6 +108,10 @@ fn main() -> ExitCode {
 /// image's golden user data (`golden.rs`) unless `-no-golden`.
 fn create_avd(env: &emu_avd::Env, name: &str, sysdir: &str, opts: &args::Opts) -> Result<()> {
     let mut spec = emu_avd::NewAvd::for_image(name, sysdir);
+    // The profile first, so an explicit -lcd, -cores or -memory still wins over it.
+    if let Some(profile) = &opts.profile {
+        spec = spec.with_profile(profile)?;
+    }
     if let Some(lcd) = opts.lcd {
         spec.lcd = lcd;
     }
@@ -129,18 +139,21 @@ fn real_main() -> Result<ExitCode> {
     let signals = on_signal::shutdown_signals();
     // Before the NAT sizes its flow caps from it.
     raise_nofile();
-    // Internal: `emu -probe-vulkan <lib64>` and `emu -warm-renderer <lib64>` (see vkprobe.rs).
+    // Internal: `emu -probe-vulkan <lib64>`, `emu -probe-kosmickrisp <lib64>` and
+    // `emu -warm-renderer <lib64>` (see vkprobe.rs).
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         let raw: Vec<String> = std::env::args().collect();
         let child: Option<fn(&std::path::Path) -> bool> = match raw.get(1).map(String::as_str) {
             Some("-probe-vulkan") => Some(vkprobe::probe),
+            Some("-probe-kosmickrisp") => Some(vkprobe::probe_kosmickrisp),
             Some("-warm-renderer") => Some(vkprobe::warm_child),
             _ => None,
         };
         if let Some(run) = child {
             let ok = raw.get(2).is_some_and(|p| run(std::path::Path::new(p)));
-            return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+            // A clean "no" has a status of its own: a crash, a panic or a signal isn't a verdict.
+            return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::from(vkprobe::PROBE_FAILED) });
         }
     }
     let opts = args::parse(std::env::args().skip(1))?;
@@ -468,6 +481,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_open_file_limit_is_raised_toward_the_hard_limit_and_never_lowered() {
         use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};

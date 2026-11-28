@@ -9,7 +9,6 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, TcpStream};
-use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -18,8 +17,8 @@ use std::time::Duration;
 static TOKEN: Mutex<Option<String>> = Mutex::new(None);
 
 fn read_token_file() -> Option<String> {
-    let home = std::env::var_os("HOME")?;
-    let token = std::fs::read_to_string(PathBuf::from(home).join(".emulator_console_auth_token")).ok()?;
+    // `HOME` on unix, `USERPROFILE` on Windows: where the stock console keeps it too.
+    let token = std::fs::read_to_string(std::env::home_dir()?.join(".emulator_console_auth_token")).ok()?;
     Some(token.trim().to_owned()).filter(|t| !t.is_empty())
 }
 

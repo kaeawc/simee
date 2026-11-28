@@ -55,6 +55,8 @@ on:
       - "scripts/android-bench.sh"
       - "scripts/bench/android-boot.sh"
       - "scripts/bench/lib.sh"
+      - "scripts/bench/quiet.sh"
+      - "scripts/bench/noise-budgets.tsv"
       - "scripts/bench/summarize.py"
       - ".github/workflows/software-mode.yml"
       - "!**/*.md"
@@ -244,6 +246,9 @@ jobs:
       # smoke test); main and manual runs three, the medians docs/benchmarks.md quotes. The stock
       # emulator is a pinned release, checked against its SHA-256, in an SDK of its own that links
       # the cached SDK's image, platform-tools and renderer, so it never enters the SDK cache.
+      # --no-quiet-gate keeps this run as it was: a hosted runner is a shared VM that has just built
+      # the workspace, and its rows are labelled by runner, never mixed with a quiet-host row.
+      # How runner data is gated is #453's.
       - name: emu against the stock emulator on KVM
         if: matrix.accel == 'kvm'
         env:
@@ -262,7 +267,7 @@ jobs:
           # shellcheck disable=SC2086 # ROUNDS is one or two words.
           ANDROID_HOME="$stock_sdk" ANDROID_SDK_ROOT="$stock_sdk" \
             scripts/bench/android-boot.sh --image system-images/android-36/default/x86_64 --lcd 720x1280@320 --port 5580 \
-            --out bench/results $ROUNDS | tee bench-table.md
+            --out bench/results --no-quiet-gate $ROUNDS | tee bench-table.md
           {
             echo "### emu against the stock emulator on KVM ($(nproc) vCPUs, $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs))"
             echo

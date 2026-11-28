@@ -8,6 +8,7 @@
 //! output is the same either way.
 
 mod doctor;
+mod mcp_install;
 mod stream_cli;
 
 use std::io::Write;
@@ -30,6 +31,12 @@ struct Cli {
     /// server fail instead of running here.
     #[arg(long, global = true)]
     verbose: bool,
+    /// The iOS device set to work in: a directory of simulators, as `simctl --set` takes (`create`
+    /// makes it). Its devices boot with no Simulator.app window. Default: `$SIMEE_IOS_DEVICE_SET`,
+    /// else the default set; `--set ''` is the default set. For `serve` and `mcp`, set
+    /// `SIMEE_IOS_DEVICE_SET` instead.
+    #[arg(long, global = true, value_name = "DIR")]
+    set: Option<String>,
     #[command(subcommand)]
     command: Cmd,
 }
@@ -443,7 +450,11 @@ enum Cmd {
     /// a tool, devices as resources, long operations as tasks, a device view as an app. Configure
     /// it in the agent's MCP settings as the command `simee mcp` (see docs/mcp.md). With `--http`,
     /// serve MCP's Streamable HTTP transport instead, at `http://ADDR/mcp`.
+    #[command(args_conflicts_with_subcommands = true)]
     Mcp {
+        /// `install` writes a client's MCP config; `config` prints it (docs/mcp-clients.md).
+        #[command(subcommand)]
+        action: Option<mcp_install::McpAction>,
         /// Serve Streamable HTTP on ADDR (default 127.0.0.1:8377). Every request needs a bearer
         /// token (see `--token-file`); a non-loopback ADDR also needs TLS (`--tls-cert` and
         /// `--tls-key`, or `--tls-self-signed`) or `--insecure-remote`.
@@ -580,6 +591,10 @@ fn mcp_http_config(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let set = command_set(cli.set.as_deref(), std::env::var(sim_core::device::DEVICE_SET_ENV).ok().as_deref());
+    if cli.set.is_some() && matches!(cli.command, Cmd::Serve { .. } | Cmd::Mcp { .. }) {
+        anyhow::bail!("--set names the device set of one command; start a server on a set with SIMEE_IOS_DEVICE_SET=<dir>");
+    }
     match &cli.command {
         Cmd::Serve { socket } => {
             let path = socket.clone().unwrap_or_else(sim_api::default_socket);
@@ -587,6 +602,10 @@ fn main() -> Result<()> {
             // Until SIGINT or SIGTERM, then a shutdown in order: 130 or 143.
             let code = sim_api::serve(&path)?;
             std::process::exit(code);
+        }
+        Cmd::Mcp { action: Some(action), .. } => {
+            let stdout = std::io::stdout();
+            return mcp_install::run(action, &mcp_install::Host::current()?, &mut stdout.lock());
         }
         Cmd::Mcp { http: None, .. } => {
             mcp_shutdown_on_signal()?;
@@ -597,7 +616,7 @@ fn main() -> Result<()> {
             served?;
             return Ok(());
         }
-        Cmd::Mcp { http: Some(addr), token_file, no_auth, insecure_remote, tls } => {
+        Cmd::Mcp { http: Some(addr), token_file, no_auth, insecure_remote, tls, .. } => {
             let config = mcp_http_config(addr, token_file.clone(), *no_auth, *insecure_remote, tls)?;
             mcp_shutdown_on_signal()?;
             let served = sim_mcp::http::serve(std::sync::Arc::new(sim_mcp::ApiBackend::new()), config);
@@ -608,7 +627,7 @@ fn main() -> Result<()> {
         Cmd::Call { method, params, socket } => {
             let path = socket.clone().unwrap_or_else(sim_api::default_socket);
             let params: Value = serde_json::from_str(params).context("params must be JSON")?;
-            let result = sim_api::call(&path, method, params).map_err(anyhow::Error::msg)?;
+            let result = sim_api::call(&path, method, with_set(params, set.as_deref())).map_err(anyhow::Error::msg)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             return Ok(());
         }
@@ -618,6 +637,7 @@ fn main() -> Result<()> {
     let mut transport = if in_process { Transport::local() } else { Transport::open(&sim_api::default_socket()) };
     transport.verbose = cli.verbose || flag("SIMEE_VERBOSE");
     transport.require = flag("SIMEE_REQUIRE_SERVER");
+    transport.set = set;
     let (stdout, stderr) = (std::io::stdout(), std::io::stderr());
     run(cli.command, &mut transport, &mut stdout.lock(), &mut stderr.lock())
 }
@@ -632,6 +652,32 @@ fn mcp_shutdown_on_signal() -> Result<()> {
         sim_api::shutdown::exit(sig);
     })
     .context("watching SIGINT and SIGTERM")
+}
+
+/// `--set`'s directory as it is sent: absolute (the process that runs the method may be a server
+/// elsewhere), or empty for the default set.
+fn set_arg(dir: &str) -> String {
+    match dir {
+        "" => String::new(),
+        dir => std::path::absolute(dir).map_or_else(|_| dir.to_owned(), |p| p.display().to_string()),
+    }
+}
+
+/// The iOS device set this command works in, sent with every call (#409): `--set`, else this
+/// process's `SIMEE_IOS_DEVICE_SET` (`env`), else `""`, the default set. It is always said, so a
+/// server never fills it in from its own environment.
+fn command_set(flag: Option<&str>, env: Option<&str>) -> Option<String> {
+    Some(set_arg(flag.or(env).unwrap_or("")))
+}
+
+/// `params` with the command's `set` added when they have none (#409).
+fn with_set(params: Value, set: Option<&str>) -> Value {
+    let Some(set) = set else { return params };
+    let mut params = if params.is_null() { json!({}) } else { params };
+    if let Some(p) = params.as_object_mut() {
+        p.entry("set").or_insert_with(|| json!(set));
+    }
+    params
 }
 
 /// Whether an on/off environment variable is on (set, not empty, not `0`).
@@ -661,6 +707,8 @@ struct Transport {
     local: Option<Box<sim_api::Session>>,
     verbose: bool,
     require: bool,
+    /// The command's iOS device set ([`command_set`]), sent with every method.
+    set: Option<String>,
 }
 
 impl Transport {
@@ -672,6 +720,7 @@ impl Transport {
             local: None,
             verbose: false,
             require: false,
+            set: None,
         }
     }
 
@@ -702,6 +751,7 @@ impl Transport {
     }
 
     fn route(&mut self, method: &str, params: Value, binary: bool) -> Result<(Value, Option<Vec<u8>>)> {
+        let params = with_set(params, self.set.as_deref());
         let forwards = sim_api::forwards(method);
         let forward = forwards && self.connected();
         if forwards && !forward {
@@ -1355,12 +1405,33 @@ fn xr_params(device: &str, words: &[String]) -> Result<Value> {
 mod tests {
     use super::*;
 
+    /// #409: `--set` goes with every method a command calls, as an absolute path, before or after
+    /// the subcommand; a `set` the params already have stays; with no set at all (a test's
+    /// transport) nothing is added.
+    #[test]
+    fn the_set_flag_goes_with_every_call_as_an_absolute_path() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).expect("arguments");
+        assert_eq!(parse(&["--set", "/farm/set", "list"]).set.as_deref(), Some("/farm/set"));
+        assert_eq!(parse(&["list", "--set", "/farm/set"]).set.as_deref(), Some("/farm/set"));
+        assert_eq!(parse(&["list"]).set, None);
+        let cwd = std::env::current_dir().expect("cwd");
+        assert_eq!(set_arg("sets/a"), cwd.join("sets/a").display().to_string());
+        assert_eq!(set_arg("/farm/set"), "/farm/set");
+        assert_eq!(set_arg(""), "", "the default set, over the environment's");
+        assert_eq!(with_set(json!({"device": "booted"}), Some("/s")), json!({"device": "booted", "set": "/s"}));
+        assert_eq!(with_set(json!({"set": "/mine"}), Some("/s")), json!({"set": "/mine"}));
+        assert_eq!(with_set(json!({"device": "booted"}), None), json!({"device": "booted"}));
+        assert_eq!(with_set(Value::Null, Some("/s")), json!({"set": "/s"}));
+    }
+
     #[test]
     fn camera_file_sources_are_sent_as_absolute_paths() {
         let cwd = std::env::current_dir().expect("cwd");
+        // `/abs/clip.mov` has no drive on Windows, so it isn't absolute there.
+        let abs = std::env::temp_dir().join("clip.mov").display().to_string();
         for kind in ["image", "video"] {
             assert_eq!(camera_source(&format!("{kind}:clip.mov")), format!("{kind}:{}", cwd.join("clip.mov").display()));
-            assert_eq!(camera_source(&format!("{kind}:/abs/clip.mov")), format!("{kind}:/abs/clip.mov"));
+            assert_eq!(camera_source(&format!("{kind}:{abs}")), format!("{kind}:{abs}"));
         }
         assert_eq!(camera_source("qr:hello"), "qr:hello");
         assert_eq!(camera_source("webcam:0"), "webcam:0");
@@ -1499,6 +1570,7 @@ mod tests {
         (String::from_utf8(out).expect("utf-8"), String::from_utf8(err).expect("utf-8"), result.err().map(|e| e.to_string()))
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_server_and_this_process_print_the_same_bytes() {
         let root = android_root("forward");
@@ -1538,6 +1610,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     /// A command's stdout as bytes (a PNG isn't UTF-8) and its error, run through `transport`.
     fn output_bytes(transport: &mut Transport, args: &[&str]) -> (Vec<u8>, Option<String>) {
         let cli = Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).expect("arguments");
@@ -1546,6 +1619,7 @@ mod tests {
         (out, result.err().map(|e| e.to_string()))
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_screenshot_to_stdout_is_the_png_here_and_on_a_server() {
         let root = android_root("stdout");
@@ -1574,6 +1648,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_stale_socket_falls_back_to_this_process() {
         let root = android_root("stale");
@@ -1586,6 +1661,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_required_server_that_cant_be_used_fails_the_command_with_why() {
         let root = android_root("require");
@@ -1664,9 +1740,18 @@ mod tests {
         let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
         assert!(matches!(parse(&["mcp"]), Ok(Cmd::Mcp { http: None, token_file: None, no_auth: false, insecure_remote: false, .. })));
         let mut transport = Transport::local();
-        let stdio = Cmd::Mcp { http: None, token_file: None, no_auth: false, insecure_remote: false, tls: McpTls::default() };
+        let stdio = Cmd::Mcp { action: None, http: None, token_file: None, no_auth: false, insecure_remote: false, tls: McpTls::default() };
         let e = run(stdio, &mut transport, &mut Vec::new(), &mut Vec::new()).expect_err("served by main, not run");
         assert!(e.to_string().contains("`mcp` don't run through a transport"));
+    }
+
+    #[test]
+    fn mcp_install_and_config_are_subcommands_that_do_not_mix_with_serving_flags() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
+        assert!(matches!(parse(&["mcp", "install", "cursor", "--dry-run"]), Ok(Cmd::Mcp { action: Some(_), http: None, .. })));
+        assert!(matches!(parse(&["mcp", "config", "claude-desktop"]), Ok(Cmd::Mcp { action: Some(_), .. })));
+        assert!(parse(&["mcp", "--http", "install", "cursor"]).is_err());
+        assert!(parse(&["mcp", "install", "nonsense"]).is_err());
     }
 
     #[test]
@@ -1752,24 +1837,33 @@ mod tests {
     }
 
     /// A fake server's reply to a method: its result or its error.
+    #[cfg(unix)]
     type Answer = fn(&str) -> std::result::Result<Value, String>;
 
+    #[cfg(unix)]
     /// A server on `socket` that records each method it is sent and answers with `answer`; `None`
     /// never answers (a wedged server).
     fn fake_server(socket: &std::path::Path, answer: Option<Answer>) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        fake_server_params(socket, answer).0
+    }
+
+    /// [`fake_server`], recording each request's params too.
+    fn fake_server_params(socket: &std::path::Path, answer: Option<Answer>) -> (Seen<String>, Seen<Value>) {
         use std::io::BufRead;
         let listener = std::os::unix::net::UnixListener::bind(socket).expect("bind");
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let record = seen.clone();
+        let params = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (record, record_params) = (seen.clone(), params.clone());
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let record = record.clone();
+                let (record, record_params) = (record.clone(), record_params.clone());
                 std::thread::spawn(move || {
                     let mut writer = stream.try_clone().expect("clone");
                     for line in std::io::BufReader::new(stream).lines().map_while(Result::ok) {
                         let req: Value = serde_json::from_str(&line).expect("request");
                         let method = req["method"].as_str().unwrap_or("").to_owned();
                         record.lock().expect("lock").push(method.clone());
+                        record_params.lock().expect("lock").push(req["params"].clone());
                         match answer {
                             Some(answer) => {
                                 let reply = match answer(&method) {
@@ -1784,9 +1878,41 @@ mod tests {
                 });
             }
         });
-        seen
+        (seen, params)
     }
 
+    /// What a fake server has been sent, as it arrives.
+    type Seen<T> = std::sync::Arc<std::sync::Mutex<Vec<T>>>;
+
+    /// #409: the device set is this command's, said on every call: `--set`, else this process's
+    /// `SIMEE_IOS_DEVICE_SET` (made absolute), else the default set (`""`). A server with another
+    /// set in its environment never picks the set (it would be the owner's default set).
+    #[test]
+    fn the_commands_own_device_set_reaches_a_server_on_every_call() {
+        let root = android_root("set-forward");
+        let cwd = std::env::current_dir().expect("cwd");
+        for (i, (flag, env, sent)) in [
+            (None, Some("/farm/sims"), "/farm/sims".to_owned()),
+            (None, Some("farm/sims"), cwd.join("farm/sims").display().to_string()),
+            (Some("/mine"), Some("/farm/sims"), "/mine".to_owned()),
+            (Some(""), Some("/farm/sims"), String::new()),
+            (None, None, String::new()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let socket = root.join(format!("{i}.sock"));
+            let (seen, params) =
+                fake_server_params(&socket, Some(|m| Ok(if m == "identity" { sim_api::identity().clone() } else { Value::Null })));
+            let mut transport = Transport { set: command_set(flag, env), ..Transport::open(&socket) };
+            assert_eq!(outputs(&mut transport, &["shutdown", "booted"]).2, None, "{flag:?} {env:?}");
+            assert_eq!(*seen.lock().expect("lock"), ["identity", "shutdown"], "{flag:?} {env:?}: forwarded");
+            assert_eq!(params.lock().expect("lock")[1], json!({"device": "booted", "set": sent}), "{flag:?} {env:?}");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
     #[test]
     fn a_server_that_never_answers_runs_the_command_here() {
         let root = android_root("wedged");
@@ -1803,6 +1929,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn another_build_or_an_old_server_runs_the_command_here() {
         let root = android_root("skew");
@@ -1836,6 +1963,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn boot_runs_here_even_with_a_matching_server() {
         let root = android_root("boot");
@@ -1869,6 +1997,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn camera_commands_link_swap_and_unlink_through_the_api() {
         let root = android_root("camera");
@@ -1927,6 +2056,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     fn android_backend(root: &std::path::Path) -> sim_android::Android {
         let env = emu_avd::Env { sdk_root: Some(root.join("sdk")), avd_home: root.join("avd") };
         let mut android = sim_android::Android::new(env);
@@ -1938,7 +2068,8 @@ mod tests {
     fn path_parameters_are_made_absolute() {
         let here = std::env::current_dir().expect("cwd");
         assert_eq!(absolute("shot.png"), here.join("shot.png").display().to_string());
-        assert_eq!(absolute("/tmp/x.png"), "/tmp/x.png");
+        let abs = std::env::temp_dir().join("x.png").display().to_string();
+        assert_eq!(absolute(&abs), abs);
     }
 
     #[test]

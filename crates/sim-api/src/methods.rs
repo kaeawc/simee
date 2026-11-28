@@ -33,7 +33,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "devices_usage",
-        "",
+        "iOS: set?",
         "Which running devices load the host, sampled without forking: per device (iOS simulator: its launchd_sim tree; Android: \
          simee's emu or the stock emulator's qemu, with their children) id, name, platform, form factor, CPU % of a core over 1 s and \
          1 min, resident memory and footprint, disk read/write bytes/s, energy (W) where the kernel reports it, and process count, \
@@ -44,27 +44,31 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "platform?, form_factor?",
         "Every form factor on every platform: sub-platform, inputs and reference profile, or why it's unsupported",
     ),
-    ("devices", "booted?, platform?(android|ios), form_factor?", "List devices with their platform, form factor and sub-platform"),
-    ("runtimes", "platform?", "List installed runtimes (Android: system images)"),
+    (
+        "devices",
+        "booted?, platform?(android|ios), form_factor?; iOS: set?",
+        "List devices with their platform, form factor and sub-platform",
+    ),
+    ("runtimes", "platform?; iOS: set?", "List installed runtimes (Android: system images)"),
     (
         "device_types",
-        "platform?",
+        "platform?; iOS: set?",
         "List device types. Android: the hardware a new AVD follows (phone and tablet, the foldables pixel_fold and surface_duo, \
          and the SDK definitions for Wear OS, TV, Automotive and Android XR's headset and glasses), each with its screen, the scale \
          its dpi over 160; `create` takes its form factor, and a foldable's identifier as `device`",
     ),
     (
         "create",
-        "name, platform?(ios|android), form_factor?, admission?(ignore|refuse); iOS: device_type, runtime; Android: system_image, device?(pixel_fold|surface_duo)",
+        "name, platform?(ios|android), form_factor?, admission?(ignore|refuse); iOS: device_type, runtime, set?; Android: system_image, device?(pixel_fold|surface_duo)",
         "Create a device. form_factor is checked against the device type (iOS) or the system image (Android) and shapes a new AVD. \
          Returns the device with `admission`, what booting it would do to the host (as `admission_check`); admission refuse fails \
          fast, creating nothing, unless the verdict is admit",
     ),
-    ("delete", "device", "Delete a device"),
+    ("delete", "device; iOS: set?", "Delete a device"),
     (
         "boot",
         "device, timeout_s?, admission?(ignore|refuse|wait), admission_timeout_s?; iOS: env?, shaped?, settle?, settle_cpu_pct?, settle_window_s?, \
-         settle_foreground?(true), settle_timeout_s?, profile?(\"slim\"); Android: audio?(false), camera_back?, camera_front?",
+         settle_foreground?(true), settle_timeout_s?, profile?(\"slim\"), set?; Android: audio?(false), camera_back?, camera_front?",
         "Boot and wait until finished (iOS: env is the device launchd's environment, shaped injects the network shaper; settle also waits \
          up to settle_timeout_s (600) until the device's processes use under settle_cpu_pct (10) % of a core for settle_window_s (10) s \
          (settle_foreground, the default: counting only foreground-QoS CPU) and returns the timings with cpu_pct, foreground_cpu_pct, \
@@ -79,7 +83,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     (
         "boot_many",
         "devices, concurrency?, timeout_s?, admission?(ignore|refuse|wait), admission_timeout_s?; iOS: env?, shaped?, settle?(default true), \
-         settle_cpu_pct?, settle_window_s?, settle_foreground?(true), settle_timeout_s?, profile?(\"slim\"); Android: first_port?(5554)",
+         settle_cpu_pct?, settle_window_s?, settle_foreground?(true), settle_timeout_s?, profile?(\"slim\"), set?; Android: first_port?(5554)",
         "Boot several devices of one platform, at most `concurrency` at once (default: a quarter of the host's CPUs, at least 2), each as \
          `boot` does (iOS: a slot is held until the device settles, unless settle is false); returns each device's timings or error, \
          failed and unsettled counts, and the time until all were done. Android: each on its own console port from first_port up. \
@@ -100,7 +104,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "settle",
-        "device, cpu_pct?, window_s?, foreground?(true), timeout_s?(600)",
+        "device, cpu_pct?, window_s?, foreground?(true), timeout_s?(600); iOS: set?",
         "Wait until a booted device is quiet: its processes under cpu_pct (10) % of a core for window_s (10) s (foreground, the default: \
          only foreground-QoS CPU counts), SpringBoard running; returns settle_s, cpu_pct, foreground_cpu_pct and background_cpu_pct, and cpu_s and background_cpu_s (CPU-seconds used since the first sample). \
          Android: the guest's processes and kernel threads from /proc over adb, once a second on the guest's clock (the probe's own \
@@ -109,7 +113,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "profile",
-        "device, name(slim), undo?",
+        "device, name(slim), undo?; iOS: set?",
         "Turn a named set of daemons off on a booted device (iOS: disabled in its launchd database and stopped; Android: packages \
          disabled for user 0, `pm disable-user`; both stay off across reboots), or with undo back on (iOS: from the next boot; \
          Android: at once); returns how many changed, those that failed and those that weren't loaded (Android: not on this image). \
@@ -117,7 +121,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "clone",
-        "device, name, admission?(ignore|refuse)",
+        "device, name, admission?(ignore|refuse); iOS: set?",
         "Create a device as a copy of a shut-down one. iOS: a simulator (data, settings, apps; APFS clones of its files); Android: an AVD \
          from a golden that has booted under simee (copy-on-write clones of its disks). A booted-once template's copies skip the \
          first-boot work. Returns the copy with `admission`, as `create` does",
@@ -140,23 +144,23 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          config.ini keys holding host paths (listed in `dropped`); writes nothing unless it all succeeds. The import keeps the \
          exported device's guest identity (ro.serialno, android_id). iOS: not yet",
     ),
-    ("shutdown", "device", "Shut down"),
-    ("erase", "device", "Erase content and settings (shut down first)"),
+    ("shutdown", "device; iOS: set?", "Shut down"),
+    ("erase", "device, set?", "Erase content and settings (shut down first)"),
     (
         "screen",
-        "device, display?(main|outer|inner|carplay)",
+        "device, display?(main|outer|inner|carplay); iOS: set?",
         "Screen size in pixels, the space tap, swipe and touch take (a folded Android foldable: the size its guest lays out for, a Pixel Fold's 1080x2092, as uiautomator's bounds). \
          display (iOS): main is the screen in use (an unfolded iPhone Duo's inner one), outer and inner an iPhone Duo's two, carplay an iPhone's CarPlay screen",
     ),
     (
         "screenshot",
-        "device, path?, display?(main|outer|inner|carplay)",
+        "device, path?, display?(main|outer|inner|carplay); iOS: set?",
         "PNG to path, else base64 in `png` (a folded Android foldable: its outer screen as the scanout shows it, a Pixel Fold's 949x1840; \
          an iPhone Duo's inner screen as its framebuffer holds it, 2007x2853)",
     ),
     (
         "stream_start",
-        "device, whip_url, token?, fps?(30), max_size?(1280), bitrate?(2500000), audio?(false), input?(false)",
+        "device, whip_url, token?, fps?(30), max_size?(1280), bitrate?(2500000), audio?(false), input?(false); iOS: set?",
         "Stream the screen as H.264 over WebRTC to a WHIP endpoint (plaintext http to a loopback host only, e.g. MediaMTX's \
          `http://127.0.0.1:8889/<path>/whip`), with token as its bearer token; max_size caps the longest side (0: full size), \
          bitrate is in bit/s; input offers the `simee-input` data channel, whose touches, keys, text, buttons, rotations, folds \
@@ -172,10 +176,10 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          bitrate_estimate_bps, the viewers' pli and fir keyframe requests, input events and errors); renews its lease",
     ),
     ("stream_stop", "stream_id", "Stop a stream: ends its encode loop and sends the WHIP DELETE; its last status, with deleted"),
-    ("streams", "device?", "This process's streams (or one device's), each as stream_status shows it, without renewing a lease"),
+    ("streams", "device?; iOS: set?", "This process's streams (or one device's), each as stream_status shows it, without renewing a lease"),
     (
         "contrast_check",
-        "device, region?, scale?, appearance?(current|both), restore?(light|dark), settle_ms?(500), path?, display?(main|outer|inner|carplay)",
+        "device, region?, scale?, appearance?(current|both), restore?(light|dark), settle_ms?(500), path?, display?(main|outer|inner|carplay); iOS: set?",
         "Text and controls below WCAG contrast in a screenshot, from pixels alone: finds text-like regions, estimates each one's foreground and \
          background, and reports those under 4.5:1 (normal text) or 3:1 (large text of about 18 pt, icons and controls) with their box, the \
          two colours and the ratio, and the screenshot with the findings boxed (`png`, or written to path). Text over a photo or a busy \
@@ -185,13 +189,13 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "tap",
-        "device, x, y, hold_ms?, display?(main|outer|inner|carplay)",
+        "device, x, y, hold_ms?, display?(main|outer|inner|carplay); iOS: set?",
         "Tap at pixels, held hold_ms (default: iOS 10, Android 60) (display, iOS only: an iPhone Duo's outer or inner screen, an \
          iPhone's CarPlay screen)",
     ),
     (
         "swipe",
-        "device, x1, y1, x2, y2, duration_ms?, settle?, display?(main|outer|inner|carplay), edge?(top|bottom|left|right; iOS)",
+        "device, x1, y1, x2, y2, duration_ms?, settle?, display?(main|outer|inner|carplay), edge?(top|bottom|left|right; iOS); iOS: set?",
         "Swipe between pixels over duration_ms (default 300; iOS sends its samples on schedule, so a busy host doesn't stretch \
          it); with edge (iOS) the touch comes in from that screen edge, as a drag from Simulator.app's bezel: \
          home and the app switcher from the bottom, Notification Center and Control Center from the top (Android's edge \
@@ -199,60 +203,60 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "touch",
-        "device, x, y, phase(down|move|up), display?(main|outer|inner|carplay), edge?(top|bottom|left|right; iOS)",
+        "device, x, y, phase(down|move|up), display?(main|outer|inner|carplay), edge?(top|bottom|left|right; iOS); iOS: set?",
         "One raw touch sample",
     ),
     (
         "button",
-        "device, button(home|lock|side|siri|apple-pay|action | back|volume-up|volume-down|recents|menu|up|down|left|right|select|play-pause), hold_ms?",
+        "device, button(home|lock|side|siri|apple-pay|action | back|volume-up|volume-down|recents|menu|up|down|left|right|select|play-pause), hold_ms?; iOS: set?",
         "Press a hardware button, as the device's form factor has it: the Siri Remote on Apple TV (menu/back, home, select, \
          play-pause, arrows) and the D-pad on Android TV; on Apple Watch home is the crown's press. Held hold_ms (default: 10 \
          for home and lock on an iPhone or iPad, else 80)",
     ),
-    ("type", "device, text", "Type on the hardware keyboard (iOS: a key report every 3 ms)"),
-    ("key", "device, usage", "Press a key by HID usage (iOS: down and up 3 ms apart)"),
-    ("open_url", "device, url", "Open a URL (Android: `am start -a VIEW`)"),
+    ("type", "device, text; iOS: set?", "Type on the hardware keyboard (iOS: a key report every 3 ms)"),
+    ("key", "device, usage; iOS: set?", "Press a key by HID usage (iOS: down and up 3 ms apart)"),
+    ("open_url", "device, url; iOS: set?", "Open a URL (Android: `am start -a VIEW`)"),
     (
         "install",
-        "device, path",
+        "device, path; iOS: set?",
         "Install an .app (Android: an .apk with `adb install -r`, an .aab through bundletool when it is on the PATH)",
     ),
-    ("uninstall", "device, bundle_id", "Uninstall an app (Android: the package name; `pm uninstall`)"),
+    ("uninstall", "device, bundle_id; iOS: set?", "Uninstall an app (Android: the package name; `pm uninstall`)"),
     (
         "launch",
-        "device, bundle_id, restart?; iOS: args?, env?, shaped?, malloc_stack_logging?",
+        "device, bundle_id, restart?; iOS: args?, env?, shaped?, malloc_stack_logging?, set?",
         "Launch (iOS: with arguments and environment, shaped injecting the network shaper, malloc_stack_logging setting \
          MallocStackLogging=1 for mem_leaks' stacks and mem_history; Android: the package's launcher activity); \
          restart: terminate a running instance first, default true (Android: `am start -S`); false brings a running app to the \
          front; returns pid (Android: and the activity it started)",
     ),
-    ("terminate", "device, bundle_id", "Terminate an app (Android: `am force-stop`)"),
-    ("apps", "device; Android: all?", "Installed bundle ids (Android: the third-party packages, with all the system's too)"),
-    ("appearance", "device, mode(light|dark)", "Light or dark UI"),
-    ("location", "device, latitude, longitude", "Simulated location"),
-    ("privacy", "device, action(grant|revoke), service, bundle_id", "Privacy permission"),
-    ("push", "device, bundle_id, payload", "Deliver an APNs payload (object)"),
+    ("terminate", "device, bundle_id; iOS: set?", "Terminate an app (Android: `am force-stop`)"),
+    ("apps", "device; iOS: set?; Android: all?", "Installed bundle ids (Android: the third-party packages, with all the system's too)"),
+    ("appearance", "device, mode(light|dark), set?", "Light or dark UI"),
+    ("location", "device, latitude, longitude; iOS: set?", "Simulated location"),
+    ("privacy", "device, action(grant|revoke), service, bundle_id, set?", "Privacy permission"),
+    ("push", "device, bundle_id, payload, set?", "Deliver an APNs payload (object)"),
     (
         "status_bar",
-        "device, time?, data_network?, wifi_mode?, wifi_bars?, cellular_mode?, cellular_bars?, operator?, battery_state?, battery_level?",
+        "device, time?, data_network?, wifi_mode?, wifi_bars?, cellular_mode?, cellular_bars?, operator?, battery_state?, battery_level?, set?",
         "Override status bar",
     ),
-    ("clear_status_bar", "device", "Remove status bar overrides"),
-    ("content_size", "device, size", "Dynamic Type size (name or 0-11)"),
-    ("increase_contrast", "device, on", "Increase Contrast"),
-    ("dynamic_island", "device, suppressed", "Hide the Dynamic Island"),
-    ("backlight", "device, on", "Display backlight"),
-    ("keyboard_language", "device, language", "Software keyboard language"),
-    ("hardware_keyboard", "device, on", "Connect the hardware keyboard"),
-    ("ca_debug", "device, option, on", "Render overlay (see ca_debug_state for names)"),
-    ("ca_debug_state", "device", "Every render overlay and whether it is on"),
-    ("reset_keychain", "device", "Delete every keychain item"),
-    ("memory_warning", "device", "Simulate a memory warning"),
-    ("notify", "device, name, state?", "Post a Darwin notification (optionally setting its state)"),
-    ("biometric", "device, action(match|nomatch|enroll|unenroll), face?", "Touch ID / Face ID"),
+    ("clear_status_bar", "device, set?", "Remove status bar overrides"),
+    ("content_size", "device, size, set?", "Dynamic Type size (name or 0-11)"),
+    ("increase_contrast", "device, on, set?", "Increase Contrast"),
+    ("dynamic_island", "device, suppressed, set?", "Hide the Dynamic Island"),
+    ("backlight", "device, on, set?", "Display backlight"),
+    ("keyboard_language", "device, language, set?", "Software keyboard language"),
+    ("hardware_keyboard", "device, on, set?", "Connect the hardware keyboard"),
+    ("ca_debug", "device, option, on, set?", "Render overlay (see ca_debug_state for names)"),
+    ("ca_debug_state", "device, set?", "Every render overlay and whether it is on"),
+    ("reset_keychain", "device, set?", "Delete every keychain item"),
+    ("memory_warning", "device, set?", "Simulate a memory warning"),
+    ("notify", "device, name, state?, set?", "Post a Darwin notification (optionally setting its state)"),
+    ("biometric", "device, action(match|nomatch|enroll|unenroll), face?, set?", "Touch ID / Face ID"),
     (
         "exec",
-        "device, program, args?, env?; Android: timeout_s?, max_bytes?",
+        "device, program, args?, env?; iOS: set?; Android: timeout_s?, max_bytes?",
         "Run a program inside the device; returns stdout/stderr. Android: over adb as the shell user, the argv passed through \
          unchanged (quoted, so nothing in it is expanded; a program can't start with `-`), with exit_code; past timeout_s (30, at \
          most 86400) it is stopped and the call fails, and a stream that reaches max_bytes (8 MiB) is cut there (truncated true) \
@@ -260,7 +264,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "logs",
-        "device, last?, predicate?, stream?(false)",
+        "device, last?, predicate?, stream?(false), set?",
         "Unified log lines (default last 1m), as `log show --style compact` prints them. stream: the first call starts one in-device \
          `log stream` for the device's boot, and later calls answer the window from it without spawning (log show answers a window \
          reaching back before the stream started, a predicate, and a `last` other than <n>s|m|h|d); the stream stops after 5 idle \
@@ -269,67 +273,67 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "processes",
-        "device",
+        "device; iOS: set?",
         "Device processes with CPU and memory. Android: the guest's `ps -A` (cpu is CPU time over the process's life), each app \
          process with its package",
     ),
     (
         "kill",
-        "device, pid | bundle_id, signal?; Android: force?",
+        "device, pid | bundle_id, signal?; iOS: set?; Android: force?",
         "Signal a device process (default 15, SIGTERM). iOS takes pid only. Android: bundle_id stops the app instead (`am \
          force-stop`); a process the shell user may not signal is signalled as root (`su 0`, on google_apis images); init, zygote, \
          zygote64, system_server, surfaceflinger, servicemanager, hwservicemanager, vndservicemanager, vold, lmkd, logd, adbd, netd, \
          installd, ueventd, keystore2 and statsd are refused unless force",
     ),
-    ("connections", "device", "Open sockets of device processes"),
-    ("traffic", "device", "Bytes in/out per device process"),
+    ("connections", "device, set?", "Open sockets of device processes"),
+    ("traffic", "device, set?", "Bytes in/out per device process"),
     // Memory tools on one app (#183): the host's leaks, heap, vmmap and malloc_history on its pid.
     (
         "mem_leaks",
-        "device, bundle_id | pid, raw?, timeout_s?(120)",
+        "device, bundle_id | pid, raw?, timeout_s?(120), set?",
         "Leaked memory of a running app (the host's `leaks`): totals, and the leaks grouped by type and allocation stack, \
          most bytes first, each with its instances and stack (innermost frame first; launch with malloc_stack_logging for \
          stacks). raw adds the report as printed",
     ),
     (
         "mem_heap",
-        "device, bundle_id | pid, raw?, timeout_s?(120)",
+        "device, bundle_id | pid, raw?, timeout_s?(120), set?",
         "A running app's heap by class (the host's `heap`): zones, node and byte totals, and every class with its count, \
          bytes and average size, most instances first. raw adds the report as printed",
     ),
     (
         "mem_vmmap",
-        "device, bundle_id | pid, raw?, timeout_s?(120)",
+        "device, bundle_id | pid, raw?, timeout_s?(120), set?",
         "A running app's memory regions (the host's `vmmap --summary`): each region type's virtual, resident, dirty, \
          swapped, volatile and empty bytes and count, the malloc zones with allocations and fragmentation, and the \
          totals. raw adds the report as printed",
     ),
     (
         "mem_history",
-        "device, bundle_id | pid, address, raw?, timeout_s?(120)",
+        "device, bundle_id | pid, address, raw?, timeout_s?(120), set?",
         "The allocation stack of an address in a running app (the host's `malloc_history`), as events with their stacks; \
          needs the app launched with malloc_stack_logging (MallocStackLogging=1 logs live allocations only). raw adds \
          the report as printed",
     ),
-    ("containers", "device, sizes?", "App data and bundle containers"),
-    ("ls", "device, path?", "List a directory under the device data dir"),
-    ("read", "device, path", "Read a file (base64)"),
-    ("write", "device, path, text? | base64?", "Write a file"),
-    ("rm", "device, path", "Remove a file or directory"),
-    ("du", "device, path?", "Size in bytes"),
-    ("clear_container", "device, path", "Empty a container (an app's data) without deleting it"),
-    ("defaults_read", "device, domain", "Read a preferences domain"),
-    ("defaults_write", "device, domain, key, value, type?", "Write a preference (type: string|int|float|bool)"),
+    ("containers", "device, sizes?, set?", "App data and bundle containers"),
+    ("ls", "device, path?, set?", "List a directory under the device data dir"),
+    ("read", "device, path, set?", "Read a file (base64)"),
+    ("write", "device, path, text? | base64?, set?", "Write a file"),
+    ("rm", "device, path, set?", "Remove a file or directory"),
+    ("du", "device, path?, set?", "Size in bytes"),
+    ("clear_container", "device, path, set?", "Empty a container (an app's data) without deleting it"),
+    ("defaults_read", "device, domain, set?", "Read a preferences domain"),
+    ("defaults_write", "device, domain, key, value, type?, set?", "Write a preference (type: string|int|float|bool)"),
     (
         "prefs_stores",
-        "device, bundle_id",
+        "device, bundle_id; iOS: set?",
         "An app's preference stores, each with the id the other prefs_* methods take: Android `shared_prefs/<name>.xml` and DataStore \
          `datastore/<name>.preferences_pb`, iOS the app's domain (its bundle id) and its app-group suites; any other iOS domain is \
          reachable by its name",
     ),
     (
         "prefs_read",
-        "device, bundle_id, store?, fresh?",
+        "device, bundle_id, store?, fresh?; iOS: set?",
         "Every key of an app's preference stores (or one) with its typed value, {type, value}: string, int, long, float, double, \
          bool, string_set (Android), date (ISO 8601), data (base64), array and dictionary (iOS; of typed values), and the \
          read-only unsupported {native, raw} for what no type holds exactly. iOS reads integers as long and reals as double. \
@@ -338,50 +342,50 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "prefs_write",
-        "device, bundle_id, store, key, value, type(string|int|long|float|double|bool|string_set|date|data|array|dictionary)",
+        "device, bundle_id, store, key, value, type(string|int|long|float|double|bool|string_set|date|data|array|dictionary); iOS: set?",
         "Set one key to a typed value (refused when the value isn't of its type or the store can't hold the type); visible says \
          whether the app sees it now or after_relaunch, app what was done to the app for it (untouched, stopped, relaunched: \
          a running Android app writes its old values back over the file), with a note on why",
     ),
-    ("prefs_delete", "device, bundle_id, store, key", "Remove one key; visible and app as prefs_write's"),
+    ("prefs_delete", "device, bundle_id, store, key; iOS: set?", "Remove one key; visible and app as prefs_write's"),
     (
         "prefs_batch",
-        "device, bundle_id, store, ops([{key, type, value} | {key, delete: true}])",
+        "device, bundle_id, store, ops([{key, type, value} | {key, delete: true}]); iOS: set?",
         "Set and remove several keys of one store, all or nothing: every op is checked first (each key once), then the store \
          is written once or not at all",
     ),
     (
         "prefs_watch",
-        "device, bundle_id, store?, cursor?, wait_ms?",
+        "device, bundle_id, store?, cursor?, wait_ms?; iOS: set?",
         "Changes to an app's preference stores (or one), as `logs` stream does: the first call starts a feed in this process and \
          returns a cursor; a call with it returns the changes since, {store, key, old, new, at}, oldest first, waiting up to \
          wait_ms (at most 60000) for one, and the next cursor (reset: the feed restarted, re-read; missed: changes dropped unread \
          past its 16 MiB; ended: the device stopped or nobody read it for 5 minutes, and a call without a cursor starts anew)",
     ),
-    ("crash_reports", "device", "Host crash reports for this device"),
-    ("info", "device", "Paths and identity"),
+    ("crash_reports", "device, set?", "Host crash reports for this device"),
+    ("info", "device; iOS: set?", "Paths and identity"),
     (
         "network_shape",
-        "device, preset?(offline|3g|edge|lte|lossy|very-bad|none), offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?, port_base?, port_count?, rules?([{pattern, offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?}]), proxy?(default true), inject?(false|true|\"launchd\"|\"boot\")",
+        "device, preset?(offline|3g|edge|lte|lossy|very-bad|none), offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?, port_base?, port_count?, rules?([{pattern, offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?}]), proxy?(default true), inject?(false|true|\"launchd\"|\"boot\"), set?",
         "Shape the device's network without root. proxy: a shaping HTTP/SOCKS proxy set in the device's configd_sim. inject: an in-process socket shaper; \"boot\" reboots the device with it in launchd's environment so every process, WebKit included, is shaped live by the profile",
     ),
-    ("network_state", "device", "Current profile, proxy port and injection state"),
-    ("network_flows", "device", "Connections through the device's shaping proxy (host, bytes, duration, outcome)"),
-    ("network_clear", "device", "Remove shaping: clear the device proxy, stop the proxy, remove injection"),
-    ("audio_state", "device", "Device audio settings (routed host UIDs, volume) and every host audio device"),
-    ("audio_volume", "device, level(0-100)", "Device output volume (100 = unity); applies to audio clients started afterwards"),
+    ("network_state", "device, set?", "Current profile, proxy port and injection state"),
+    ("network_flows", "device, set?", "Connections through the device's shaping proxy (host, bytes, duration, outcome)"),
+    ("network_clear", "device, set?", "Remove shaping: clear the device proxy, stop the proxy, remove injection"),
+    ("audio_state", "device, set?", "Device audio settings (routed host UIDs, volume) and every host audio device"),
+    ("audio_volume", "device, level(0-100), set?", "Device output volume (100 = unity); applies to audio clients started afterwards"),
     (
         "audio_route",
-        "device, scope(input|output), uid | \"default\"",
+        "device, scope(input|output), uid | \"default\", set?",
         "Pin the device's input or output to a host device (any device, including loopback); applies to clients started afterwards",
     ),
     (
         "audio_capture_start",
-        "device, path?(.wav), mute?",
+        "device, path?(.wav), mute?, set?",
         "Capture this device's audio output with a process tap (no driver); mute silences it on the host meanwhile; returns capture_id",
     ),
     ("audio_capture_stop", "capture_id", "Stop a capture: frames, duration_ms, rms, peak, dbfs, path"),
-    ("audio_mute", "device, on", "Silence (or restore) this device's audio on the host: a per-device null sink"),
+    ("audio_mute", "device, on, set?", "Silence (or restore) this device's audio on the host: a per-device null sink"),
     // Device cameras (#323): host cameras, virtual cameras and synthetic sources (`sim-camera`).
     (
         "camera_sources",
@@ -393,7 +397,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "camera_link",
-        "device, facing(back|front|both), source",
+        "device, facing(back|front|both), source; iOS: set?",
         "Feed a device camera from a source: a source id (webcam:<id>, pattern:testcard, qr:<text>, text:<text>, image:<absolute path>, video:<absolute path> (macOS, looped), \
          solid:<colour>; emulated is the test card, none turns the camera off) or a host camera's name, index or part of its name \
          (obs finds OBS Virtual Camera; an ambiguous one fails listing the matches), saved by its stable id. Saved with the device: \
@@ -403,19 +407,19 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "camera_unlink",
-        "device, facing?(back|front|both)",
+        "device, facing?(back|front|both); iOS: set?",
         "Remove a device camera's link (default both): it goes back to the AVD's own camera (config.ini hw.camera.*), live on a running \
          device and at every boot",
     ),
     (
         "camera_links",
-        "device?",
+        "device?; iOS: set?",
         "Each linked device camera (one device, or every device): facing, source (and a host camera's name), live (what the running \
          emulator shows) and state: linked, saved (applies at the next boot), relinked (changed from the console; the next boot \
          restores the saved link), unsaved (linked from the console only), off, source missing (the host no longer lists the camera: \
          the device shows the test card until it is back) or permission missing, with the fix",
     ),
-    ("network_env", "device", "Environment that makes one app launch shaped (for simctl: prefix each key with SIMCTL_CHILD_)"),
+    ("network_env", "device, set?", "Environment that makes one app launch shaped (for simctl: prefix each key with SIMCTL_CHILD_)"),
     (
         "console",
         "device, command | commands",
@@ -423,12 +427,12 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "rotate",
-        "device, orientation?(portrait|landscape-right|portrait-upside-down|landscape-left; iOS)",
+        "device, orientation?(portrait|landscape-right|portrait-upside-down|landscape-left; iOS); iOS: set?",
         "Rotate the device 90° clockwise, or to an orientation (iOS)",
     ),
     (
         "fold",
-        "device, folded(true|false) | angle(0-180; 0-360 dual-screen) | posture(closed|half-opened|opened|flipped|tent)",
+        "device, folded(true|false) | angle(0-180; 0-360 dual-screen) | posture(closed|half-opened|opened|flipped|tent); iOS: set?",
         "Set a foldable's hinge. Android: as the console's fold, unfold and posture do (the hinge sensor, the posture and, folded, \
          the outer screen). iOS: an iPhone Duo's (closed, half-opened is the 100° book posture, opened), which SpringBoard sweeps \
          to, moving the content to the inner screen when it opens past its swap boundary. Returns angle, posture, folded and the \
@@ -446,7 +450,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "stylus",
-        "device, x, y, phase?(tap|hover|down|move|up|leave), pressure?(1-255), button?, eraser? | x, y, to_x, to_y, duration_ms? (a stroke)",
+        "device, x, y, phase?(tap|hover|down|move|up|leave), pressure?(1-255), button?, eraser? | x, y, to_x, to_y, duration_ms? (a stroke); iOS: set?",
         "A stylus on the touch screen at pixels. Android: what the stock emulator's gRPC pen events send: hover over it, \
          touch, move, lift or leave, with the barrel button or the eraser end; or draw a stroke. iPad: the Apple Pencil \
          (UITouch type .pencil): tap, down, move, up or a stroke; hover, pressure, button and eraser are refused (the \
@@ -454,7 +458,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "rotary",
-        "device, ticks | delta (Digital Crown units; iOS)",
+        "device, ticks | delta (Digital Crown units; iOS); iOS: set?",
         "Turn a watch's rotary input: the Wear OS crown or bezel, the Apple Watch Digital Crown",
     ),
     (
@@ -463,11 +467,11 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "Android Automotive's vehicle HAL: list every property's value, read one, or set one when `value` is given \
          (typed by the property: drive, 12.5, true); through the emulator console's `car` command (simee)",
     ),
-    ("watch_gesture", "device, gesture(double-tap|wrist-flick)", "An Apple Watch hand gesture"),
-    ("remote_swipe", "device, direction(up|down|left|right), duration_ms?", "Swipe on the Siri Remote's touch surface (Apple TV)"),
+    ("watch_gesture", "device, gesture(double-tap|wrist-flick), set?", "An Apple Watch hand gesture"),
+    ("remote_swipe", "device, direction(up|down|left|right), duration_ms?, set?", "Swipe on the Siri Remote's touch surface (Apple TV)"),
     (
         "pointer",
-        "device, x, y, action?(move|click|down|up), button?(primary|secondary), hold_ms? | x, y, to_x, to_y, button? (a drag)",
+        "device, x, y, action?(move|click|down|up), button?(primary|secondary), hold_ms? | x, y, to_x, to_y, button? (a drag), set?",
         "The iPad's pointer (a mouse, as Simulator.app's pointer capture connects): move it to pixels and hover there, click, \
          press or release a button there, or drag to to_x, to_y. Exact on iOS 26.5, within ~20 pt on 27.2. A button held by \
          `down` keeps the pointer's place for the next calls on a server (`simee serve`) until a reboot; `down` without a \
@@ -475,7 +479,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "carplay",
-        "device, on",
+        "device, on, set?",
         "Attach (or detach) the CarPlay display to a booted iPhone (iOS 26 runtimes); then tap/swipe/screenshot with display=carplay",
     ),
 ];
@@ -490,6 +494,9 @@ pub struct Session {
     /// A host state admission judges by instead of this host's (and the seed costs).
     #[cfg(test)]
     pub(crate) fake_host: Option<sim_host::admission::HostState>,
+    /// The iOS device set the environment names, instead of `SIMEE_IOS_DEVICE_SET`'s.
+    #[cfg(test)]
+    pub(crate) fake_env_set: Option<Option<String>>,
 }
 
 impl Session {
@@ -642,6 +649,8 @@ fn ios_list<T: serde::de::DeserializeOwned>(s: &mut Session, method: &str) -> Re
 /// safe point when cancelled (#297).
 pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
     let p = if p.is_null() { &Value::Object(Default::default()) } else { p };
+    let set = device_set(s, p);
+    s.ios.use_set(set);
     match method {
         "boot" | "boot_many" | "create" | "clone" => admitted(s, method, p),
         "admission_check" => {
@@ -653,6 +662,23 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         m if STEPPED.contains(&m) && has_call_hooks() => stepped(s, m, p),
         _ => dispatch(s, method, p),
     }
+}
+
+/// The iOS device set the call uses: its `set`, else the environment's, else the default set
+/// (#409). An unusable one fails only the methods that connect to the simulator service.
+fn device_set(s: &Session, p: &Value) -> Result<Option<String>, String> {
+    #[cfg(test)]
+    if let Some(env) = &s.fake_env_set {
+        return crate::params::device_set_with(p, env.as_deref());
+    }
+    let _ = s;
+    crate::params::device_set(p)
+}
+
+/// The iOS device set the environment names (`SIMEE_IOS_DEVICE_SET`, else the default set): the
+/// one a call naming no set uses, and the one a camera's `device:` source is found in.
+pub(crate) fn environment_set(s: &Session) -> Result<Option<String>, String> {
+    device_set(s, &Value::Null)
 }
 
 /// How a lifecycle call heeds the admission verdict (#275).
@@ -1456,7 +1482,7 @@ fn dispatch(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         m if crate::prefs::is_method(m) => {
             let (platform, udid) = resolve(s, p)?;
             ios_device_exists(s, platform, str_param(p, "device").unwrap_or("booted"))?;
-            crate::prefs::call(s.prefs.backend(platform), platform, &udid, m, p)
+            crate::prefs::call(s.prefs.backend_on(platform, &s.ios)?, platform, &udid, m, p)
         }
         m if METHODS.iter().any(|(name, ..)| *name == m) => {
             let (platform, udid) = resolve(s, p)?;
@@ -1515,7 +1541,7 @@ fn boot_many_hooked(s: &mut Session, p: &Value, hook: &dyn crate::progress::Boot
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) mod tests {
     use super::*;
     use crate::progress::{CallHooks, with_call_hooks};

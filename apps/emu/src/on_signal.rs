@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 /// including native libraries' threads) and returns a receiver that gets each one that arrives.
 /// A dedicated thread `sigwait`s for them, so a library that installs its own handlers (the GPU
 /// renderer does) can't swallow the shutdown signal.
+#[cfg(unix)]
 #[allow(unsafe_code)]
 pub(crate) fn shutdown_signals() -> std::sync::mpsc::Receiver<i32> {
     // SAFETY: plain libc signal-mask calls on a stack-allocated, initialized sigset.
@@ -68,14 +69,21 @@ pub(crate) fn shutdown_signals() -> std::sync::mpsc::Receiver<i32> {
     rx
 }
 
+/// Windows has no signals: the console's control events (Ctrl-C, closing the window, logoff,
+/// shutdown) arrive on the same receiver as the signal numbers they stand for.
+#[cfg(windows)]
+pub(crate) use crate::host_windows::shutdown_signals;
+
 /// While native libraries may still be installing handlers, the signal guard checks often.
 /// The renderer, which does, initializes in the first seconds (beside kernel load, hundreds of
 /// ms) and once per process (guest resets reuse it); the window leaves room for a cold disk and
 /// the first boot's GPU device setup.
+#[cfg(unix)]
 pub(crate) const SIGNAL_GUARD_FAST: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long the signal guard sleeps between checks, `since_start` after it started: 200 ms in
 /// [`SIGNAL_GUARD_FAST`], then 5 s (an idle emulator's guard wakes 0.2 times a second, not 5).
+#[cfg(unix)]
 pub(crate) fn signal_guard_interval(since_start: std::time::Duration) -> std::time::Duration {
     if since_start < SIGNAL_GUARD_FAST { std::time::Duration::from_millis(200) } else { std::time::Duration::from_secs(5) }
 }
@@ -126,13 +134,14 @@ pub(crate) fn stopped() -> ExitCode {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::time::Duration;
 
     use super::*;
 
     /// Checks the guard makes in `[from, to)` of its life, following its own schedule.
+    #[cfg(unix)]
     fn guard_checks(from: Duration, to: Duration) -> usize {
         let (mut t, mut n) = (Duration::ZERO, 0);
         while t < to {
@@ -144,6 +153,7 @@ mod tests {
         n
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_signal_guard_checks_often_at_startup_then_rarely() {
         // A handler a library installs during startup is undone within 200 ms.
@@ -157,6 +167,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_second_signal_forces_the_exit_and_a_stuck_stop_overruns() {
         assert_eq!((exit_code(libc::SIGINT), exit_code(libc::SIGTERM), exit_code(libc::SIGHUP)), (130, 143, 129));

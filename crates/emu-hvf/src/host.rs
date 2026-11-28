@@ -1,6 +1,7 @@
 //! Host file and thread operations that std and rustix don't wrap.
 use std::fs::File;
 use std::io;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 
 /// A macOS quality-of-service class for a thread. The scheduler places and clocks threads by it:
@@ -110,6 +111,20 @@ pub fn punch_hole(file: &File, offset: u64, len: u64) -> io::Result<()> {
     }
 }
 
+/// Whether process `pid` exists and hasn't exited.
+#[cfg(windows)]
+pub fn process_alive(pid: u32) -> bool {
+    crate::win::process_alive(pid)
+}
+
+/// Windows has no `fallocate`; a sparse range would take `FSCTL_SET_ZERO_DATA` on a file marked
+/// sparse, which nothing here does yet. Always `Unsupported`, which callers treat as a
+/// filesystem without holes.
+#[cfg(windows)]
+pub fn punch_hole(_file: &File, _offset: u64, _len: u64) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -145,6 +160,16 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn this_process_is_alive_and_an_exited_child_is_not() {
+        assert!(process_alive(std::process::id()));
+        let mut child = std::process::Command::new("cmd").args(["/C", "exit 0"]).spawn().expect("spawn");
+        let pid = child.id();
+        child.wait().expect("wait");
+        assert!(!process_alive(pid), "an exited process is gone even while a handle to it is open");
+    }
+
     #[test]
     fn punched_range_reads_zero_and_keeps_length() {
         let path = std::env::temp_dir().join(format!("emu-hvf-punch-{}", std::process::id()));
@@ -157,7 +182,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         if let Err(e) = punched {
             // tmpfs and some overlay filesystems have no holes; nothing to check there.
+            #[cfg(unix)]
             assert_eq!(e.raw_os_error(), Some(libc::EOPNOTSUPP), "{e}");
+            #[cfg(windows)]
+            assert_eq!(e.kind(), io::ErrorKind::Unsupported, "{e}");
             return;
         }
         assert_eq!(back.len(), 3 * 4096, "length unchanged");

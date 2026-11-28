@@ -3034,6 +3034,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 name = "simee-core"
 version = "0.2.0"
 dependencies = [
+ "getrandom 0.4.3",
  "png 0.18.1",
  "serde",
 ]
