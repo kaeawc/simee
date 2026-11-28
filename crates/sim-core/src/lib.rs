@@ -15,6 +15,7 @@ pub mod fold;
 pub mod form_factor;
 pub mod frame;
 pub mod framebuffer;
+pub mod fuzzy;
 pub mod geometry;
 pub mod gesture;
 pub mod goldfish;

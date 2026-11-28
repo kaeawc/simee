@@ -232,6 +232,12 @@ impl Gate {
         self.pending.is_some() || self.sheet.is_some()
     }
 
+    /// The first device of the check or sheet that's waiting, by name.
+    fn waiting_on(&self) -> Option<&str> {
+        let request = self.pending.as_ref().map(|(r, _)| r).or(self.sheet.as_ref().map(|sh| &sh.request))?;
+        request.devices.first().map(|(_, name)| name.as_str())
+    }
+
     /// Asks about `request`: the decision now (a kind not to ask about, a check run inline, a
     /// thread that wouldn't start), or `None` while the check runs. A request while another
     /// waits is dropped: its sheet, once shown, covers the window.
@@ -294,6 +300,11 @@ pub fn apply(s: &mut State, d: Decision) -> Vec<String> {
 
 /// The boot button: the devices to boot now (none while the check runs or the sheet asks).
 pub fn ask(s: &mut State, info: &DeviceInfo) -> Vec<String> {
+    // Dropped while another check or sheet waits: the status line says so, not silence.
+    if let Some(other) = s.admission.waiting_on() {
+        s.status = Some(format!("{} not booted: the admission check for {other} is still open", info.name));
+        return Vec::new();
+    }
     match s.admission.ask(Request::one(info)) {
         Some(d) => apply(s, d),
         None => Vec::new(),

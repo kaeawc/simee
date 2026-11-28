@@ -6,9 +6,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 #[cfg(target_os = "macos")]
-pub use crate::ios::{Context, Live, boot_async, list};
+pub use crate::ios::{Context, Live, boot, list};
 #[cfg(not(target_os = "macos"))]
-pub use unavailable::{Context, Live, boot_async, list};
+pub use unavailable::{Context, Live, boot, list};
 
 /// Shared between the UI and the capture thread.
 #[derive(Default)]
@@ -65,8 +65,7 @@ impl Shared {
 #[cfg(not(target_os = "macos"))]
 mod unavailable {
     use std::convert::Infallible;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use rune::NativeSurface;
     use sim_core::device::DeviceInfo;
@@ -141,13 +140,9 @@ mod unavailable {
         match ctx.0 {}
     }
 
-    /// Reports at once that nothing can boot here.
-    pub fn boot_async(_: String, done: Arc<AtomicBool>, error: Arc<Mutex<Option<String>>>, waker: rune::Waker) {
-        if let Ok(mut slot) = error.lock() {
-            *slot = Some(REASON.into());
-        }
-        done.store(true, Ordering::Relaxed);
-        waker();
+    /// Nothing can boot here.
+    pub fn boot(_: &str) -> Result<(), String> {
+        Err(REASON.into())
     }
 }
 
