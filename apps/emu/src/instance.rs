@@ -7,7 +7,7 @@
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
 use std::fs::File;
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
@@ -483,7 +483,7 @@ fn port_free(p: u16) -> bool {
 /// Creates `image` as a sparse, empty ext4 filesystem of `size` bytes.
 fn create_userdata(image: &std::path::Path, size: u64) -> Result<()> {
     let mut uuid = [0u8; 16];
-    File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut uuid)).context("reading /dev/urandom")?;
+    sim_core::entropy::fill(&mut uuid).context("reading random bytes from the OS")?;
     uuid[6] = (uuid[6] & 0x0F) | 0x40; // RFC 4122 version 4 (random)
     uuid[8] = (uuid[8] & 0x3F) | 0x80;
     let file = File::options().read(true).write(true).create_new(true).open(image)?;

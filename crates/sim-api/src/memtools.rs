@@ -824,6 +824,8 @@ mod tests {
         assert!(finish(Tool::Heap, 1, &output(0, HEAP, ""), false).expect("heap")["classes"].is_array());
     }
 
+    // Unix only: it runs `/bin/sh` and `/bin/sleep`.
+    #[cfg(unix)]
     #[test]
     fn the_runner_returns_output_and_kills_its_child_at_the_deadline() {
         let out = run("/bin/sh", &["-c".into(), "echo out; echo err >&2; exit 3".into()], Duration::from_secs(10)).expect("run");

@@ -205,9 +205,11 @@ fn installs_from_a_local_archive() {
     // Manifests are fetched once, then served from the cache.
     let mf = work.join("repository2-3.xml");
     std::fs::write(&mf, REPO).expect("write manifest");
-    let url = format!("file://{}", mf.display());
+    // `file:///C:/dir/x.xml` on Windows: a URL has slashes, and an absolute path starts with one.
+    let slashed = |p: &Path| p.display().to_string().replace('\\', "/");
+    let url = format!("file://{}{}", if cfg!(windows) { "/" } else { "" }, slashed(&mf));
     let m = sdk.manifest(&url).expect("manifest");
-    assert_eq!(m.base_url, format!("file://{}/", work.display()));
+    assert_eq!(m.base_url, format!("file://{}{}/", if cfg!(windows) { "/" } else { "" }, slashed(&work)));
     std::fs::remove_file(&mf).expect("rm");
     assert_eq!(sdk.manifest(&url).expect("cached").packages.len(), m.packages.len());
     let _ = std::fs::remove_dir_all(work);
@@ -234,7 +236,7 @@ fn resolves_emulator_for_host() {
 fn the_renderer_comes_from_the_package_this_host_can_load() {
     if cfg!(target_os = "macos") {
         assert_eq!((renderer::host(), renderer::BACKEND), (Host::MACOS_ARM64, "libgfxstream_backend.dylib"));
-    } else {
+    } else if cfg!(target_os = "linux") {
         // Before: every host fetched Apple silicon's archive, whose .dylib Linux can't load.
         assert_eq!((renderer::host(), renderer::BACKEND), (Host::current(), "libgfxstream_backend.so"));
         assert_eq!(renderer::host().os, "linux");
@@ -323,6 +325,7 @@ fn renderer_lookup_preference() {
 /// Whether every host tool a test shells out to is present (an absolute path, or a name looked up
 /// on `PATH`). A missing tool in CI panics, since CI images have them and a broken image must not
 /// read as a pass; elsewhere it prints a `SKIP` line to stderr and returns false.
+#[cfg(unix)]
 fn have_tools(test: &str, tools: &[&str]) -> bool {
     let found = |tool: &str| {
         let path = Path::new(tool);
@@ -341,6 +344,7 @@ fn have_tools(test: &str, tools: &[&str]) -> bool {
 
 /// Zips `<work>/<src>/emulator` with `/usr/bin/zip -y` (symlinks stored as links) and returns its
 /// `Download` for revision `rev`.
+#[cfg(unix)]
 fn zip_emulator(work: &Path, src: &str, rev: &str) -> Download {
     let zip = work.join(format!("emulator-darwin_aarch64-{src}.zip"));
     let _ = std::fs::remove_file(&zip);
@@ -359,6 +363,7 @@ fn zip_emulator(work: &Path, src: &str, rev: &str) -> Download {
 }
 
 /// A tree shaped like the emulator package under `<work>/<src>/emulator`.
+#[cfg(unix)]
 fn fake_emulator_tree(work: &Path, src: &str, backend: bool) {
     let e = work.join(src).join("emulator");
     for d in ["lib64/qt/lib", "lib64/vulkan/layers", "lib64/gles_angle", "lib", "bin64"] {
@@ -391,6 +396,7 @@ fn fake_emulator_tree(work: &Path, src: &str, backend: bool) {
 }
 
 /// Files under `dir`, relative, sorted; symlinks as `name -> target`.
+#[cfg(unix)]
 fn tree(dir: &Path) -> Vec<String> {
     fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
         for e in std::fs::read_dir(dir).expect("ls").flatten() {
@@ -414,7 +420,9 @@ fn tree(dir: &Path) -> Vec<String> {
 
 /// The renderer install path, offline: only lib64 (minus Qt) and the license files are
 /// unpacked, symlinks survive, a marker and `current` are written, the archive is deleted, and a
-/// newer revision replaces the older one.
+/// newer revision replaces the older one. Unix only: it zips with `/usr/bin/zip` and unpacks with
+/// `unzip`, neither on a Windows host.
+#[cfg(unix)]
 #[test]
 fn installs_renderer_from_a_local_archive() {
     if !have_tools("installs_renderer_from_a_local_archive", &["/usr/bin/zip", "curl", "unzip"]) {
@@ -557,6 +565,8 @@ fn write_sparse_skips_zero_blocks_and_keeps_contents() {
 }
 
 /// A system image installs with its disk images sparse and everything else as unzip leaves it.
+/// Unix only: it unpacks with `unzip`, which a Windows host doesn't have.
+#[cfg(unix)]
 #[test]
 fn installs_system_images_with_sparse_disks() {
     if !have_tools("installs_system_images_with_sparse_disks", &["unzip"]) {

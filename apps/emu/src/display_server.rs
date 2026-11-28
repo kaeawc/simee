@@ -660,7 +660,9 @@ fn remove_stale_rings(dir: &Path) {
     }
 }
 
-#[cfg(test)]
+// Unix only: the tests drive the server over real Unix sockets, which Windows has none of yet
+// (`sim_core::net`).
+#[cfg(all(test, unix))]
 mod tests {
     use std::sync::atomic::AtomicUsize;
 

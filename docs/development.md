@@ -40,7 +40,8 @@ equal to the script's.
 
 | Part | On Windows | Where it goes next |
 | --- | --- | --- |
-| `sim-core`, `sim-bundle`, `sim-debug`, `sim-camera`, `sim-mcp`, `emu-ext4`, `emu-fdt`, `emu-sdk` | build and test | |
+| `sim-core`, `sim-bundle`, `sim-debug`, `sim-camera`, `sim-mcp`, `emu-ext4`, `emu-fdt` | build and test | |
+| `emu-sdk` | builds and tests; an install shells out to `curl` and `unzip`, and Windows has no `unzip`, so `-provision` and the install tests that unpack archives are unix only | [#245](https://github.com/kaeawc/simee/issues/245) |
 | `emu-hvf` | guest RAM (`VirtualAlloc`), `SharedMap` (a file mapping) and `host::process_alive`; no hypervisor | [#247](https://github.com/kaeawc/simee/issues/247) |
 | `emu-vmm` | the device models build and test; the NAT (`net::Nat::new`) and the adb bridge (`pipe::adb`) answer `Unsupported`, and no machine runs | [#247](https://github.com/kaeawc/simee/issues/247), [#248](https://github.com/kaeawc/simee/issues/248) |
 | `emu-avd` | builds; the SDK and AVD homes still use the unix defaults, `clone_file` is a plain copy (no clone, holes not kept), the `.ini` cache stores nothing | [#245](https://github.com/kaeawc/simee/issues/245) |

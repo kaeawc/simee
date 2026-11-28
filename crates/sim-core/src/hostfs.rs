@@ -133,13 +133,26 @@ mod windows {
         }
     }
 
+    /// Windows' `seek_read` and `seek_write` move the file's cursor and `pread` and `pwrite` don't;
+    /// callers rely on that (a sequential reader after a positional peek at the header or trailer).
+    /// The cursor is put back afterwards. Two threads using the cursor and positions on one handle
+    /// at once can still disturb each other's cursor, never each other's positional results.
+    fn keeping_cursor<T>(file: &std::fs::File, op: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        use std::io::{Seek, SeekFrom};
+        let mut file = file;
+        let cursor = file.stream_position()?;
+        let done = op();
+        file.seek(SeekFrom::Start(cursor))?;
+        done
+    }
+
     impl FileExt for std::fs::File {
         fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            self.seek_read(buf, offset)
+            keeping_cursor(self, || self.seek_read(buf, offset))
         }
 
         fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
-            self.seek_write(buf, offset)
+            keeping_cursor(self, || self.seek_write(buf, offset))
         }
     }
 }
@@ -150,6 +163,23 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+
+    #[test]
+    fn positional_io_leaves_the_cursor_where_it_was() {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+        let path = std::env::temp_dir().join(format!("hostfs-cursor-{}", std::process::id()));
+        let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).expect("open");
+        f.write_all(b"0123456789").expect("write");
+        f.seek(SeekFrom::Start(2)).expect("seek");
+        let mut tail = [0u8; 3];
+        f.read_exact_at(&mut tail, 7).expect("pread");
+        assert_eq!(&tail, b"789");
+        f.write_all_at(b"ab", 8).expect("pwrite");
+        let mut next = [0u8; 2];
+        f.read_exact(&mut next).expect("sequential");
+        assert_eq!(&next, b"23", "the cursor stayed at 2");
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn a_process_group_request_is_accepted_everywhere() {

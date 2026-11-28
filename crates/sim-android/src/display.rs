@@ -309,6 +309,7 @@ mod tests {
     use sim_core::gesture::Phase;
     #[cfg(unix)]
     use sim_core::net::UnixListener;
+    #[cfg(unix)]
     use std::io::{BufRead, BufReader};
 
     // Sockets under /tmp: Windows has no Unix sockets here yet.
@@ -454,8 +455,10 @@ mod tests {
     }
 
     /// A reader that hands out at most one record header's worth of bytes per read.
+    #[cfg(unix)]
     struct Trickle<R>(R);
 
+    #[cfg(unix)]
     impl<R: Read> Read for Trickle<R> {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             let n = buf.len().min(HEADER_LEN);
@@ -465,6 +468,7 @@ mod tests {
 
     /// A fake emulator announces 120 frames at once (the window was busy): the client reads
     /// only the newest from the ring, once.
+    #[cfg(unix)]
     #[test]
     fn a_backlog_of_notices_reads_only_the_newest_frame() {
         let dir = PathBuf::from("/tmp").join(format!("sa-backlog-{}", std::process::id()));
@@ -533,6 +537,7 @@ mod tests {
         assert_eq!(frames.skipped, 2);
     }
 
+    #[cfg(unix)]
     #[test]
     fn frames_come_from_the_socket_or_the_ring() {
         let dir = PathBuf::from("/tmp").join(format!("sa-frames-{}", std::process::id()));

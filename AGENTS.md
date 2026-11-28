@@ -144,7 +144,8 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   `Frame` and PNG encoding, `mark/` (the simee mark: the cut, its light, colours and motion
   states, a seam-free rasterizer and every file in `assets/brand/`; `docs/design/brand.md`),
   `hostfs.rs` and `net.rs` (the unix-only std calls and Unix sockets, by one name on every host:
-  std's on unix, stand-ins on Windows). No FFI.
+  std's on unix, stand-ins on Windows), `entropy.rs` (OS random bytes: tokens, ids, the guest's
+  rng; Windows has no `/dev/urandom`). No FFI.
 - `crates/sim-coresim` — the service boundary: `Context` (service + device set), `Device`
   (lifecycle, apps, settings, orientation, CarPlay), `Display` (framebuffer surface, capture; main
   or external), `Hid` (touch, buttons, keyboard, the Digital Crown, watch gestures, the Siri

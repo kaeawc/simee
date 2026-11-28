@@ -61,6 +61,8 @@ crc32fast = { version = "1", default-features = false, features = ["std"] }
 # zlib-rs: ~2x miniz_oxide's inflate on a gzip kernel; runtime_detection lets it use the CPU's
 # crc32 instructions.
 flate2 = { version = "1", default-features = false, features = ["zlib-rs", "runtime_detection"] }
+# Host entropy (sim-core's `entropy`): one call on unix and Windows, which has no /dev/urandom.
+getrandom = { version = "0.4", default-features = false }
 libc = { version = "0.2", default-features = false }
 # Safe syscall wrappers (plain fsync: std's sync_data is F_FULLFSYNC on macOS; the adb bridge's
 # non-blocking send).

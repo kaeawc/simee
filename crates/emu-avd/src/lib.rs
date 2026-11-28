@@ -203,6 +203,9 @@ fn held_lock(dir: &Path) -> Option<PathBuf> {
         if matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)) {
             return Some(path);
         }
+        // Held by us now if the lock was free: Windows' locks are mandatory, so reading the file
+        // below by another handle fails until it is let go (unix's are advisory).
+        let _ = f.unlock();
         // A PID lock (stock's filelock: the PID, then NUL) whose process is alive. A stale one
         // from a crash names a dead PID (or, rarely, a reused one: refusing then is safe).
         let pid = std::fs::read(&path).ok().and_then(|b| {

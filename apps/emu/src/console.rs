@@ -536,7 +536,8 @@ fn camera(args: &[&str]) -> String {
 }
 
 fn token_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".emulator_console_auth_token"))
+    // `HOME` on unix, `USERPROFILE` on Windows, as the stock emulator has it.
+    std::env::home_dir().map(|h| h.join(".emulator_console_auth_token"))
 }
 
 /// The auth token, creating one like the stock emulator does when the file is missing.
@@ -550,10 +551,7 @@ fn token_at(path: &std::path::Path) -> Option<String> {
     match std::fs::read_to_string(path) {
         Ok(t) => Some(t.trim().to_string()).filter(|t| !t.is_empty()),
         Err(_) => {
-            let mut raw = [0u8; 12];
-            use std::io::Read;
-            std::fs::File::open("/dev/urandom").ok()?.read_exact(&mut raw).ok()?;
-            let token: String = raw.iter().map(|b| format!("{b:02x}")).collect::<String>()[..16].to_string();
+            let token = sim_core::entropy::hex(12).ok()?[..16].to_string();
             std::fs::write(path, &token).ok()?;
             Some(token)
         }

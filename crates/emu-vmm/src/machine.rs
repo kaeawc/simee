@@ -382,9 +382,7 @@ pub struct Outcome {
 
 fn random_bytes<const N: usize>() -> [u8; N] {
     let mut b = [0u8; N];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut b);
-    }
+    let _ = sim_core::entropy::fill(&mut b);
     b
 }
 

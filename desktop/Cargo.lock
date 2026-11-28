@@ -3653,6 +3653,7 @@ dependencies = [
 name = "simee-core"
 version = "0.2.0"
 dependencies = [
+ "getrandom 0.4.3",
  "png 0.18.1",
  "serde",
 ]
