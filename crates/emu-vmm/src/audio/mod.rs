@@ -14,6 +14,7 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 pub mod host;
+pub mod tap;
 
 /// What the card may do on the host.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -53,6 +54,16 @@ impl Format {
         match self {
             Format::S16 => 2,
             Format::S24 | Format::S32 | Format::F32 => 4,
+        }
+    }
+
+    /// The name the capture status and console use: `s24` is 24 bits in a 32-bit word.
+    pub fn name(self) -> &'static str {
+        match self {
+            Format::S16 => "s16",
+            Format::S24 => "s24",
+            Format::S32 => "s32",
+            Format::F32 => "f32",
         }
     }
 
