@@ -248,8 +248,10 @@ mod tests {
         let gate = fake.gate("info");
         let caller = fake.clone();
         let call = std::thread::spawn(move || caller.call("info", &json!({})));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while fake.called("info").is_empty() {
-            std::thread::yield_now();
+            assert!(std::time::Instant::now() < deadline, "the call never started");
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         // Started but not answered: an answer set now is the one it returns.
         assert_eq!(fake.answered("info"), 0);

@@ -299,6 +299,7 @@ fn a_request_trickled_over_tls_is_cut_off_whether_in_many_records_or_one() {
     // would serve the request when the record was complete. One deadline for the read closes it.
     let mut client = ClientConnection::new(secure.config.clone(), loopback()).expect("client");
     let mut tcp = TcpStream::connect(addr).expect("connect");
+    tcp.set_read_timeout(Some(WAIT)).expect("timeout");
     while client.is_handshaking() {
         client.complete_io(&mut tcp).expect("the handshake");
     }
