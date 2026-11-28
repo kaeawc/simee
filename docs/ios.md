@@ -223,3 +223,54 @@ after the device-wide `setenv`, did not load the hooks.
   duration settings are accepted and ignored; there is no torch or flash, and `formats` is empty.
 - While the shim is active every `AVCaptureSession` in the app is simulated: an audio input added to
   a session records nothing.
+
+## Launchd job profiles
+
+`boot {profile: "slim"}` and `profile {name: "slim"}` turn off a set of the device's launchd jobs
+([farm.md](farm.md#the-slim-profile) has what that does to a farm, and how the disables are written
+before a boot). The set is data, not code: `crates/sim-core/src/launchd_profiles.rs` holds each
+profile as a table, one entry per job:
+
+| field | what it holds |
+| --- | --- |
+| `label` | the launchd label in the device's `system` domain |
+| `why` | what the job does, and why a test device runs without it |
+| `saves` | what turning it off was measured to save, with where; empty when it hasn't been measured on its own |
+| `breaks` | what stops working without it: the safety note |
+
+Beside it, `KEPT` lists the jobs no profile turns off and what needs each: every job a simee
+method reaches in the device (a test per method pins them), what AutoMobile reads the screen
+through, and what common app flows need though a slim clone still spends CPU on them
+(AuthenticationServicesAgent, donotdisturbd, diagnosticd, sleepd and others). A check runs on the
+table at compile time and rejects an entry that isn't an Apple launchd label (`com.apple.` and a
+name), one listed twice, one on the keep list, and one with no `why` or no `breaks`. The profile's
+labels are the table's, in order; `sim-api` reads them from it.
+
+An entry is added only with evidence: its cost measured on its own, and the app flows a test needs
+(launch, the keyboard, push, the photos picker, the AutoMobile harness) checked on a device
+without it. `scripts/bench/ios-slim.sh` measures the cost. It makes a device set of its own,
+creates a template there, boots it once and clones it, and boots the clone once. Then each round
+it reboots the clone once stock and once per candidate with that one job disabled (`launchctl
+disable system/<label>` inside the clone, enabled again after), 5 rounds by default, the order
+reversed on even rounds, and records per boot:
+
+- the settle time and CPU-s to settle (`simee boot --settle`'s own);
+- the CPU of the clone's launchd_sim tree over the 60 s after it settled (`--idle`), and its
+  footprint and process count then;
+- whether the disable held (listed disabled and not running after the boot).
+
+The result JSON (`bench/results/ios-slim-<time>.json`, with a host record beside it) has each
+arm's median and spread per measure; `python3 -I scripts/bench/summarize.py check` says whether it
+may be published. The arms are warm reboots of one clone, not first boots: they show what a job
+costs on every boot of a farm device, not a clone's one-time first-boot work. A candidate is a
+name or a label: a bare name (`GSSCred`) resolves against the clone's `launchctl list` to the one
+label it ends in, and one that isn't a job in that runtime is reported and skipped. The default
+candidates are the jobs #199's research saw in a stock iOS 27.2 boot that the profile doesn't
+turn off (remotemanagementd and its device-management subscribers, AppSSODaemon, GSSCred,
+healthcontentd, finhealthd, STExtractionService) and AuthenticationServicesAgent, the biggest job
+kept on purpose. `--candidates` takes others, the table's own entries included, to fill a `saves`
+left empty. `scripts/bench/test-ios-slim.sh` tests the script against a fake simee, ps and
+footprint.
+
+Not yet measured: the per-job numbers. A device run after this lands fills them in, one on iOS
+27.2 and one on iOS 18.6 (`--runtime`), on a quiet host.
