@@ -756,6 +756,8 @@ fn stale_note(emu: &Path, checkout: &Path) -> Option<String> {
 /// slower on a busy host.
 pub const ROTATE_SETTLE: Duration = Duration::from_secs(3);
 const ROTATE_POLL: Duration = Duration::from_millis(200);
+/// The most the read before the turn may take: it delays the turn itself.
+const ROTATE_BEFORE: Duration = Duration::from_secs(1);
 
 /// What a [`Device::rotate`] did to the guest's display.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1286,25 +1288,30 @@ impl Device {
     fn rotate_within(&self, android: &Android, settle: Duration) -> Result<Rotated, String> {
         self.running()?;
         let adb = self.adb(android).ok();
-        let read = |adb: &apps::Adb| {
-            let text = adb.shell("dumpsys window displays", adb.deadlines.query).ok()?;
+        // Each read is bounded by what is left of the wait (and the before read, which delays
+        // the turn itself, by ROTATE_BEFORE), so a wedged adbd can't stretch a rotate past
+        // ROTATE_BEFORE + settle plus one poll's floor.
+        let read = |adb: &apps::Adb, limit: Duration| {
+            let text = adb.shell("dumpsys window displays", limit.min(adb.deadlines.query)).ok()?;
             Some(sim_core::window::WindowState::parse(&text)).filter(|s| s.rotation.is_some())
         };
-        let before = adb.as_ref().and_then(read);
+        let before = adb.as_ref().and_then(|adb| read(adb, ROTATE_BEFORE));
         self.console(&["rotate".into()])?;
         let (Some(adb), Some(before)) = (adb, before) else { return Ok(Rotated::default()) };
         let deadline = Instant::now() + settle;
         let mut last = before.clone();
         loop {
             sleep(ROTATE_POLL.min(settle));
-            if let Some(now) = read(&adb) {
+            let left = deadline.saturating_duration_since(Instant::now()).max(ROTATE_POLL);
+            if let Some(now) = read(&adb, left) {
                 last = now;
             }
             if last.rotation != before.rotation || Instant::now() >= deadline {
                 break;
             }
         }
-        Ok(Rotated { rotation: last.rotation, note: sim_core::window::stayed_note(&before, &last) })
+        let waited = settle.as_secs_f64();
+        Ok(Rotated { rotation: last.rotation, note: sim_core::window::stayed_note(&before, &last, waited) })
     }
 
     fn require(&self, input: InputMethod, what: &str) -> Result<(), String> {
