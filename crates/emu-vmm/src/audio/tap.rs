@@ -89,6 +89,14 @@ struct Shared {
     /// Bytes queued and not yet written.
     queued: AtomicUsize,
     state: Mutex<Written>,
+    /// Set by `stop`: when the writer must be done. Past it, what is still queued is dropped.
+    deadline: Mutex<Option<Instant>>,
+}
+
+impl Shared {
+    fn past_deadline(&self) -> bool {
+        self.deadline.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|d| Instant::now() >= d)
+    }
 }
 
 #[derive(Default)]
@@ -168,12 +176,14 @@ impl Tap {
         Ok(())
     }
 
-    /// Ends the capture: everything queued is written and a WAV's sizes are finished. The final
+    /// Ends the capture: what is queued is written and a WAV's sizes are finished, within
+    /// [`STOP_BUDGET`] (a reader that has stalled gets the rest dropped and counted). The final
     /// status, or None when nothing was running.
     pub fn stop(&self) -> Option<Status> {
         let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
         let r = running.take()?;
         self.active.store(false, Ordering::Release);
+        *r.shared.deadline.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + STOP_BUDGET);
         // Dropping the sender ends the writer once the queue is empty.
         *self.feed.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let _ = r.writer.join();
@@ -266,6 +276,10 @@ pub fn wav_header(f: PcmFormat, data_len: u32) -> Vec<u8> {
 /// finalized (a kill, a crash) still opens with at most this much audio missing.
 const PATCH_EVERY: Duration = Duration::from_secs(1);
 
+/// How long `stop` lets the writer drain what is queued before it drops the rest. One overall
+/// bound, whatever the reader does; a write already in flight adds at most the socket's timeout.
+pub const STOP_BUDGET: Duration = Duration::from_secs(2);
+
 /// How many times in a row a stream may stall in the middle of a frame before the capture gives up.
 const MID_FRAME_STALLS: u32 = 3;
 
@@ -275,9 +289,11 @@ fn is_stall(e: &std::io::Error) -> bool {
 
 /// Writes `bytes` to a stream whose writes may time out, and returns how many were written. A
 /// timeout at a `unit` boundary (a whole frame) ends the write there: the rest is the caller's to
-/// drop. A timeout inside a unit retries, because half a frame would shift every sample after it.
-/// Only a real error (a closed peer) is an Err.
-fn write_stream(w: &mut dyn Write, bytes: &[u8], unit: usize) -> std::io::Result<usize> {
+/// drop. A timeout inside a unit retries, because half a frame would shift every sample after it;
+/// `None` is one unit that must finish (a header). Retries stop after `MID_FRAME_STALLS`, or once
+/// `give_up` says the capture's stop deadline has passed. Only a real error (a closed peer, or
+/// those) is an Err.
+fn write_stream(w: &mut dyn Write, bytes: &[u8], unit: Option<usize>, give_up: &dyn Fn() -> bool) -> std::io::Result<usize> {
     let (mut done, mut stalls) = (0, 0);
     while done < bytes.len() {
         match w.write(&bytes[done..]) {
@@ -285,11 +301,11 @@ fn write_stream(w: &mut dyn Write, bytes: &[u8], unit: usize) -> std::io::Result
             Ok(n) => (done, stalls) = (done + n, 0),
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
             Err(e) if is_stall(&e) => {
-                if done % unit == 0 {
+                if unit.is_some_and(|u| done % u == 0) {
                     break;
                 }
                 stalls += 1;
-                if stalls >= MID_FRAME_STALLS {
+                if stalls >= MID_FRAME_STALLS || give_up() {
                     return Err(e);
                 }
             }
@@ -340,7 +356,7 @@ fn write_capture(rx: Receiver<Chunk>, mut sink: Sink, container: Container, shar
         let len = chunk.data.len();
         let frame = chunk.format.frame_bytes();
         let frames = (len / frame) as u64;
-        if format.is_some_and(|f| f != chunk.format) {
+        if shared.past_deadline() || format.is_some_and(|f| f != chunk.format) {
             shared.dropped.fetch_add(frames, Ordering::Relaxed);
         } else {
             let mut res = Ok(());
@@ -352,7 +368,7 @@ fn write_capture(rx: Receiver<Chunk>, mut sink: Sink, container: Container, shar
                     res = match &mut sink {
                         Sink::Seekable(w) => w.write_all(&header),
                         // The header is not droppable: a stall in it retries.
-                        Sink::Stream(w) => write_stream(w.as_mut(), &header, header.len() + 1).map(|_| ()),
+                        Sink::Stream(w) => write_stream(w.as_mut(), &header, None, &|| shared.past_deadline()).map(|_| ()),
                     };
                 }
             }
@@ -360,7 +376,7 @@ fn write_capture(rx: Receiver<Chunk>, mut sink: Sink, container: Container, shar
                 if container == Container::Wav { wav_samples(chunk.format.format, &chunk.data) } else { Cow::Borrowed(&chunk.data[..]) };
             let written = res.and_then(|()| match &mut sink {
                 Sink::Seekable(w) => w.write_all(&samples).map(|()| samples.len()),
-                Sink::Stream(w) => write_stream(w.as_mut(), &samples, frame),
+                Sink::Stream(w) => write_stream(w.as_mut(), &samples, Some(frame), &|| shared.past_deadline()),
             });
             match written {
                 Ok(n) => {
@@ -372,8 +388,12 @@ fn write_capture(rx: Receiver<Chunk>, mut sink: Sink, container: Container, shar
                 }
                 Err(e) => {
                     fail(e);
-                    // Dropping the receiver makes every later offer count as dropped.
+                    // Dropping the receiver makes every later offer count as dropped; what is
+                    // already queued is counted here.
                     shared.dropped.fetch_add(frames, Ordering::Relaxed);
+                    while let Ok(c) = rx.try_recv() {
+                        shared.dropped.fetch_add((c.data.len() / c.format.frame_bytes()) as u64, Ordering::Relaxed);
+                    }
                     return;
                 }
             }
@@ -739,5 +759,62 @@ mod tests {
         assert_eq!(live, [wav_header(S16, 16), pcm.to_vec()].concat(), "readable without a stop");
         tap.stop();
         assert_eq!(file.bytes(), live);
+    }
+
+    #[test]
+    fn stop_is_bounded_behind_a_reader_that_never_reads() {
+        /// Every write times out after a pause, like a socket whose reader is suspended.
+        struct Never;
+        impl Write for Never {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(200));
+                Err(ErrorKind::TimedOut.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let tap = Tap::default();
+        tap.start(Sink::Stream(Box::new(Never)), Container::Raw).expect("start");
+        for _ in 0..100 {
+            tap.offer(S16, &[0; 8]); // 100 chunks: 20 s of timeouts if each had to be tried
+        }
+        let began = Instant::now();
+        let status = tap.stop().expect("running");
+        assert!(began.elapsed() < STOP_BUDGET + Duration::from_secs(2), "stop took {:?}", began.elapsed());
+        assert_eq!((status.captured_frames, status.dropped_frames, status.error), (0, 200, None), "all counted");
+    }
+
+    #[test]
+    fn a_wav_header_that_stalls_on_a_stream_is_retried_not_dropped() {
+        let tap = Tap::default();
+        let out = Mem::default();
+        tap.start(Sink::Stream(Box::new(Stalling { out: out.clone(), stalls: 1, partial_first: None })), Container::Wav).expect("start");
+        tap.offer(S16, &[4; 8]);
+        let status = tap.stop().expect("running");
+        assert_eq!(status.error, None);
+        assert_eq!(out.bytes(), [wav_header(S16, u32::MAX), vec![4; 8]].concat());
+    }
+
+    #[test]
+    fn a_failed_writer_counts_what_was_queued_behind_it() {
+        struct Slow;
+        impl Write for Slow {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(300));
+                Err(ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let tap = Tap::default();
+        tap.start(Sink::Stream(Box::new(Slow)), Container::Raw).expect("start");
+        for _ in 0..5 {
+            tap.offer(S16, &[0; 8]);
+        }
+        let status = tap.stop().expect("running");
+        assert!(status.error.is_some());
+        assert_eq!(status.dropped_frames, 10, "no frame goes uncounted");
     }
 }

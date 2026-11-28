@@ -518,7 +518,7 @@ fn audio(info: &ConsoleInfo, words: &[&str]) -> String {
             let open = || {
                 let sink = if socket {
                     sim_core::net::UnixStream::connect(path).map(|s| {
-                        // A reader that stops reading drops frames (counted); it never holds `stop` for long.
+                        // A reader that stops reading drops frames (counted); `stop` waits for it at most a couple of seconds.
                         let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(2)));
                         Sink::Stream(Box::new(s))
                     })

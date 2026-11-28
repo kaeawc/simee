@@ -535,7 +535,7 @@ one atomic load. With one running it is copied into a 1 MiB queue that a writer 
 the guest never waits for it, and frames the queue can't take (a slow socket) are dropped and
 counted. A capture holds what the guest plays, not wall-clock time: silence the guest doesn't
 queue isn't in it. A stream that changes format mid-capture has its new frames dropped and
-counted. A socket reader that pauses (a write that times out after 2 s) costs the frames it didn't take, counted as dropped; the capture ends only when the peer closes. A file's WAV sizes are filled in on `stop`, when emu exits (power-off, `kill`, SIGINT/SIGTERM) and once a second while capturing, so a file from an emu that was killed hard opens with at most about a second of audio missing, plus whatever was still queued; a socket's say "unknown". Software mode
+counted. A socket reader that pauses (a write that times out after 2 s) costs the frames it didn't take, counted as dropped; the capture ends when the peer closes, or when it stays paused for more than about 6 s in the middle of a frame. `stop` and emu's exit wait at most about 2 s for a stalled reader, then drop and count what is still queued. A file's WAV sizes are filled in on `stop`, when emu exits (power-off, `kill`, SIGINT/SIGTERM) and once a second while capturing, so a file from an emu that was killed hard opens with at most about a second of audio missing, plus whatever was still queued; a socket's say "unknown". Software mode
 (QEMU) has no tap. Not yet: the `audio_capture_start`/`audio_capture_stop` API methods for
 Android (#265).
 
