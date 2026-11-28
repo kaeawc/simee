@@ -163,6 +163,8 @@ emu -provision 36 -dry-run                              # resolve only: URL, siz
 emu -provision 36 -no-renderer                          # skip the renderer (boots without graphics)
 emu -provision 34 -tag android-automotive               # no plain 34 image: picks the newest, 34-ext9
 emu -provision-renderer                                 # install or update just the renderer
+emu -provision-dhu -dry-run                             # Android Auto's Desktop Head Unit: URL, size, sha1, license
+emu -provision-dhu -accept-licenses [-dhu-beta]         # install it into <sdk>/extras/google/auto
 emu -create-avd NAME -sysdir system-images/android-36/google_apis/arm64-v8a -lcd 720x1280@320
 emu -create-avd NAME -sysdir ... -no-golden             # a pristine first boot: no golden user data
 emu -create-avd NAME -sysdir ... -profile software-lite # a phone for software mode: 540x960, 30 Hz (below)
@@ -173,6 +175,18 @@ system image: the first AVD of an image boots once to the launcher and is stoppe
 AVD of that image starts from a copy-on-write clone of it, skipping the first boot's extra minutes
 (apexd decompressing the image's compressed APEX files, `system_server`'s first-boot work). How it
 is keyed, locked and invalidated, and what it saves, is in [farm-android.md](farm-android.md#golden-user-data-per-system-image).
+
+`-provision-dhu` fetches Google's Android Auto Desktop Head Unit (`extras;google;auto`) only when
+asked. It is under the `android-sdk-license` terms, which don't allow redistribution, so simee
+never bundles it and refuses to install it without `-accept-licenses`; `-dry-run` needs no
+acceptance. The archive is chosen per host (macOS arm64 and x64, Linux x64, Windows x64; any other
+host is told which have one), stable (r2.0) by default and `-dhu-beta` for r2.1, checked against
+the manifest's size and sha1, unpacked beside its final name, `desktop-head-unit` made executable
+and the directory moved in whole (the replaced copy is set aside under `.downloads`). Archive members
+that are absolute or contain `..` are refused, and so is a program that is a symlink. It lands in the
+SDK's own `extras/google/auto`, so an install by Android Studio's SDK Manager is reused when it is
+the requested revision. simee records the revision and channel it installed in `.simee-dhu`; a
+newer revision, or `-dhu-beta` over a stable install (or the reverse), installs over it.
 
 `crates/emu-sdk` reads Google's repository manifests (`repository2-3.xml`, and
 `sys-img/<tag>/sys-img2-3.xml` per tag), picks the newest stable archive for the host
