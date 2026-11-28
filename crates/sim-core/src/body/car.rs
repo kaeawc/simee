@@ -12,6 +12,10 @@ use super::table::Spec;
 /// Car head units have no body yet ([`super::has_body`]).
 pub(super) const ENABLED: bool = false;
 
+/// Whether the generic body's screen is drawn at the dpi simee reports for the Android reference
+/// profile (a head unit is sized at the dpi the AVD reports; its lane may change this). When false, the shared test checks only the aspect.
+pub(super) const SIZES_BY_DPI: bool = true;
+
 /// The head-unit rows of the table (read only while [`ENABLED`]).
 pub(super) fn rows() -> Vec<Body> {
     Vec::new()
