@@ -41,7 +41,48 @@ device type of the iOS 27.1 and `iOS-27-2-iPhone19-4` runtimes), `simee boot`, w
 2. The guest connects the car display (SpringBoard logs `Car[2-3]` at 800×480) and taps and
    screenshots reach it, but on this host it stays black on every runtime. Not yet compared with
    Simulator.app's CarPlay window on the same host.
-3. `carplay` refuses iOS 27 runtimes: Apple renders CarPlay black there.
+3. `carplay` refuses iOS 27 runtimes: Apple renders CarPlay black there ([CarPlay, per Xcode
+   release](#carplay-per-xcode-release)).
+
+## CarPlay, per Xcode release
+
+On Xcode 27 CarPlay moved to Device Hub, whose documentation asks for an iPhone connected over USB
+and lists "iOS Simulator is not supported for CarPlay" as a known issue; a feedback report
+(FB24785359, open when read on 2026-11-28) says Device Hub's CarPlay plugin asks for an
+internal-only entitlement. `sim_core::carplay::runtime_supports` therefore refuses iOS 27 runtimes,
+and its message points at an iOS 26 runtime and at kaeawc/simee#441, which stays open (label
+`upstream`) until Apple restores simulated CarPlay or documents it as removed. simee has no
+real-iPhone path: a cable and a physical device are another product.
+
+**Run the check on each new Xcode release** (and when a new iOS runtime installs), on a quiet host:
+
+```bash
+scripts/bench/carplay-check.sh                 # every installed iOS 26+ runtime, in a device set of its own
+```
+
+For each runtime it creates an iPhone (the first iPhone type for a runtime that has no `iPhone 17`,
+such as the Duo-only ones) with `simee --set`, boots it, calls `carplay on`, takes
+`screenshot --display carplay` and calls it rendered when over 1% of the pixels are lit; it prints
+the rows below and deletes everything it created. It sets `SIMEE_CARPLAY_UNGATED=1` for the
+`carplay` call so iOS 27 runtimes are tried despite the gate, which is the thing under test. Paste
+the rows into the table and record the Xcode build. When an iOS 27 runtime renders, drop the gate
+in `runtime_supports` and update its tests (`carplay.rs`), `docs/form-factors.md` and the table
+above. Pass `CARPLAY_BOOT_WRAP="<boot gate> --"` on a shared host.
+
+| Date | Xcode | Runtime | `carplay on` | Renders |
+| --- | --- | --- | --- | --- |
+| 2026-11-28 | 26.6 (17F113) | iOS 26.5 (23F77), iPhone 17 | ok | no (screenshot all black) |
+| 2026-11-28 | 26.6 (17F113) | iOS 27.0 (24A434), iPhone 17 | refused: `Unsupported Mode: 800x480@60hz` | no (no external display) |
+| 2026-11-28 | 26.6 (17F113) | iOS 27.1 (24A94401), iPhone Duo | refused: `Unsupported Mode: 800x480@60hz` | no (no external display) |
+| 2026-11-28 | 26.6 (17F113) | iOS 27.2 (24B8117), iPhone 17 | refused: `Unsupported Mode: 800x480@60hz` | no (no external display) |
+| 2026-11-28 | 26.6 (17F113) | iOS 27.2 (24B91016s), iPhone Duo | refused: `Unsupported Mode: 800x480@60hz` | no (no external display) |
+| not run | 27 | | | Xcode 27 is not installed on this host (the iOS 27 runtimes above are installed under Xcode 26.6) |
+
+Reading it: on iOS 27 the guest itself rejects the CarPlay screen mode, so the gate isn't hiding a
+working path. On iOS 26.5 the attach works and touches reach the car display, but its framebuffer
+stays black on this host, as footnote 2 says; it has not been compared with Simulator.app's CarPlay
+window, so the message's "use an iOS 26 runtime" is the better of the two, not a promise of a
+picture. The screenshots and logs: `bench/results/carplay-<date>/`.
 
 ## iPhone Duo
 
