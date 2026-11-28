@@ -1312,9 +1312,18 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The middle sample, or NaN for none: a bench whose client got no frames on a busy host
+    /// (`cadence_bench` stops reading after a second without one) reports "0/n" and NaN.
     fn median(mut v: Vec<f64>) -> f64 {
         v.sort_by(f64::total_cmp);
-        v[v.len() / 2]
+        v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
+    }
+
+    #[test]
+    fn a_median_of_nothing_is_nan() {
+        assert!(median(Vec::new()).is_nan());
+        assert_eq!(median(vec![3.0, 1.0, 2.0]), 2.0);
+        assert_eq!(median(vec![1.0]), 1.0);
     }
 
     fn ms(d: Duration) -> f64 {
