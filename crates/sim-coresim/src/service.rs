@@ -454,12 +454,23 @@ impl Context {
 
     /// Creates a device. `device_type` and `runtime` match by identifier or name.
     pub fn create(&self, name: &str, device_type: &str, runtime: &str) -> Result<Device> {
-        let matches = |obj: &AnyObject, q: &str| {
-            rt::string_prop(obj, sel!(identifier)).eq_ignore_ascii_case(q) || rt::string_prop(obj, sel!(name)).eq_ignore_ascii_case(q)
-        };
+        self.create_where(name, device_type, runtime, |r| matches(r, runtime))
+    }
+
+    /// Creates a device on the runtime with identifier `runtime` and build `build` exactly (a
+    /// bundle's), never another build listed under the same identifier.
+    pub fn create_on_build(&self, name: &str, device_type: &str, runtime: &str, build: &str) -> Result<Device> {
+        self.create_where(name, device_type, &format!("{runtime} ({build})"), |r| {
+            rt::string_prop(r, sel!(identifier)).eq_ignore_ascii_case(runtime) && rt::string_prop(r, sel!(buildVersionString)) == build
+        })
+    }
+
+    /// Creates a device of `device_type` (identifier or name) on the first runtime `pick` takes
+    /// (`wanted` names it in the error when none does).
+    fn create_where(&self, name: &str, device_type: &str, wanted: &str, pick: impl Fn(&AnyObject) -> bool) -> Result<Device> {
         let ty =
             self.device_type_objects()?.into_iter().find(|t| matches(t, device_type)).ok_or_else(|| Error::NotFound(device_type.into()))?;
-        let rt_obj = self.runtime_objects()?.into_iter().find(|r| matches(r, runtime)).ok_or_else(|| Error::NotFound(runtime.into()))?;
+        let rt_obj = self.runtime_objects()?.into_iter().find(|r| pick(r)).ok_or_else(|| Error::NotFound(wanted.into()))?;
         rt::require(&self.set, sel!(createDeviceWithType:runtime:name:error:))?;
         // SAFETY: the method exists (checked) and takes (SimDeviceType, SimRuntime, NSString, NSError**).
         let created: std::result::Result<Obj, Retained<NSError>> =
@@ -486,6 +497,11 @@ impl Context {
         let done: std::result::Result<(), Retained<NSError>> = unsafe { msg_send![&*self.set, deleteDevice: &*device.obj, error: _] };
         done.map_err(|e| rt::service_error("delete", &e))
     }
+}
+
+/// Whether a device type or runtime is `q`, by identifier or name.
+fn matches(obj: &AnyObject, q: &str) -> bool {
+    rt::string_prop(obj, sel!(identifier)).eq_ignore_ascii_case(q) || rt::string_prop(obj, sel!(name)).eq_ignore_ascii_case(q)
 }
 
 fn runtime_info(r: &AnyObject) -> RuntimeInfo {
