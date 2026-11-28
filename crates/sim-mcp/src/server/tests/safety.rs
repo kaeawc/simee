@@ -455,6 +455,20 @@ fn a_stream_is_judged_by_the_device_it_shows() {
 }
 
 #[test]
+fn a_capture_is_stopped_only_by_the_client_that_started_it() {
+    let rig = rig(devices_only(&["ci-*"]));
+    rig.fake.answer("audio_capture_start", Ok(json!({"capture_id": "cap-1", "started": {}})));
+    assert!(!is_error(&call(&rig, "audio_capture_start", json!({"device": "ci-2"}))));
+    // Another client's capture (the ids are a counter) isn't this client's to stop.
+    let other = call_as(&rig, "another-agent", json!({}), "audio_capture_stop", json!({"capture_id": "cap-1"}));
+    assert!(is_error(&other) && text(&other).contains("didn't start"), "{other}");
+    assert!(is_error(&call(&rig, "audio_capture_stop", json!({"capture_id": "cap-2"}))));
+    assert!(rig.fake.called("audio_capture_stop").is_empty());
+    assert!(!is_error(&call(&rig, "audio_capture_stop", json!({"capture_id": "cap-1"}))));
+    assert!(is_error(&call(&rig, "audio_capture_stop", json!({"capture_id": "cap-1"}))), "stopped: it isn't there to stop again");
+}
+
+#[test]
 fn a_cursor_is_the_clients_own_and_its_next_page_is_judged_again() {
     let (rig, world) = rig_world(devices_only(&[crate::policy::CREATED]), None);
     rig.fake.answer("processes", Ok(json!([1, 2, 3, 4, 5])));

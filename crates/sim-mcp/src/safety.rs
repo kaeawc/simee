@@ -82,6 +82,9 @@ struct Client {
     created: BTreeSet<String>,
     /// UDIDs of the devices it booted: ones that weren't running when it asked.
     booted: BTreeSet<String>,
+    /// Ids of the audio captures it started: `audio_capture_stop` names one by id, and the ids are
+    /// a counter, so a client with a device list may stop only its own.
+    captures: BTreeSet<String>,
 }
 
 impl Default for Safety {
@@ -251,6 +254,16 @@ impl Safety {
                 let device = if tool == "import" { &result["device"] } else { result };
                 if let Some(udid) = device["udid"].as_str() {
                     state.created.insert(udid.to_owned());
+                }
+            }
+            "audio_capture_start" => {
+                if let Some(id) = result["capture_id"].as_str() {
+                    state.captures.insert(id.to_owned());
+                }
+            }
+            "audio_capture_stop" => {
+                if let Some(id) = args["capture_id"].as_str() {
+                    state.captures.remove(id);
                 }
             }
             "delete" => {
@@ -602,6 +615,15 @@ impl Guard {
         }
         for query in queries {
             self.permit(method, &query)?;
+        }
+        // A capture is named by its id, which says no device: it is the client's own to stop or not.
+        if method == "audio_capture_stop" {
+            let id = params.get("capture_id").and_then(Value::as_str).unwrap_or("");
+            if !self.safety.clients().get(&self.client).is_some_and(|c| c.captures.contains(id)) {
+                return Err(format!(
+                    "{REFUSED}`{method}` names a capture this client didn't start, and a client with a device list may stop only its own"
+                ));
+            }
         }
         // A stream is named by its id, and the device it shows isn't in the call.
         if matches!(method, "stream_status" | "stream_stop")

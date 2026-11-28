@@ -129,8 +129,8 @@ How `devices` is applied:
   `camera_back` and `camera_front` can be `device:<name or UDID>[:x,y,w,h]`, which shows another
   device's screen on the camera: that device is checked too, however the source id is spelt. A
   stream (`stream_status`, `stream_stop`) is named by its id, and is judged by the device it shows.
-  (An `audio_capture_stop` capture id isn't tied to a device here: ids are the server's, and the
-  call stops only a capture this process started.)
+  A capture (`audio_capture_stop`) is named by an id that is a counter and says no device, so a
+  client with a device list may stop only the captures it started.
 - The check is in the backend every tool, resource and subscription reads through, so
   `simee://devices/...` resources and change notifications hide a device the same way `devices` does.
 - A long list a client pages through (`processes`, `logs`, `connections`, `devices_usage`) is
