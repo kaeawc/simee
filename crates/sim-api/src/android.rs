@@ -545,7 +545,15 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             d.console(&commands).map(|lines| json!(lines))
         }
         "rotate" => match crate::params::opt_orientation(p)? {
-            None => null(d.rotate()),
+            // `rotation`: degrees the guest's display turned to (null without adb); `note`: why
+            // it stayed where it was, when it didn't follow the turn.
+            None => d.rotate(&android).map(|r| {
+                let mut out = json!({"rotation": r.rotation.map(sim_core::rotation::Rotation::degrees)});
+                if let Some(note) = r.note {
+                    out["note"] = json!(note);
+                }
+                out
+            }),
             Some(_) => Err("Android's rotate turns 90° clockwise per call; `orientation` is iOS-only".into()),
         },
         "fold" => fold(&d, p),

@@ -751,6 +751,23 @@ fn stale_note(emu: &Path, checkout: &Path) -> Option<String> {
     })
 }
 
+/// How long [`Device::rotate`] waits for the guest to follow the turn before it says it stayed:
+/// the guest's orientation listener settles on the new gravity first (a fraction of a second),
+/// slower on a busy host.
+pub const ROTATE_SETTLE: Duration = Duration::from_secs(3);
+const ROTATE_POLL: Duration = Duration::from_millis(200);
+
+/// What a [`Device::rotate`] did to the guest's display.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Rotated {
+    /// The guest's display rotation after it (as screenshots and touches follow it); None when
+    /// it couldn't be read (no adb).
+    pub rotation: Option<Rotation>,
+    /// Why the guest didn't turn: "the guest stayed upright: the app in front (`<package>`)
+    /// doesn't rotate". None when it turned or couldn't be read.
+    pub note: Option<String>,
+}
+
 /// One AVD, running or not.
 #[derive(Clone, Debug)]
 pub struct Device {
@@ -1268,9 +1285,37 @@ impl Device {
         self.console(&[format!("geo fix {longitude} {latitude}")]).map(drop)
     }
 
-    /// Rotates the device 90° clockwise.
-    pub fn rotate(&self) -> Result<(), String> {
-        self.console(&["rotate".into()]).map(drop)
+    /// Rotates the device 90° clockwise (the virtual accelerometer) and reports what the guest
+    /// did: its display's rotation once it turned, or after [`ROTATE_SETTLE`] without turning,
+    /// with why it stayed (the app in front fixes its orientation, auto-rotate is off, or the
+    /// turn is upside down). Read with `dumpsys window displays` over adb: without adb, or when
+    /// the guest's window manager doesn't answer, the rotate is sent and nothing is reported.
+    pub fn rotate(&self, android: &Android) -> Result<Rotated, String> {
+        self.rotate_within(android, ROTATE_SETTLE)
+    }
+
+    fn rotate_within(&self, android: &Android, settle: Duration) -> Result<Rotated, String> {
+        self.running()?;
+        let adb = self.adb(android).ok();
+        let read = |adb: &apps::Adb| {
+            let text = adb.shell("dumpsys window displays", adb.deadlines.query).ok()?;
+            Some(sim_core::window::WindowState::parse(&text)).filter(|s| s.rotation.is_some())
+        };
+        let before = adb.as_ref().and_then(read);
+        self.console(&["rotate".into()])?;
+        let (Some(adb), Some(before)) = (adb, before) else { return Ok(Rotated::default()) };
+        let deadline = Instant::now() + settle;
+        let mut last = before.clone();
+        loop {
+            sleep(ROTATE_POLL.min(settle));
+            if let Some(now) = read(&adb) {
+                last = now;
+            }
+            if last.rotation != before.rotation || Instant::now() >= deadline {
+                break;
+            }
+        }
+        Ok(Rotated { rotation: last.rotation, note: sim_core::window::stayed_note(&before, &last) })
     }
 
     fn require(&self, input: InputMethod, what: &str) -> Result<(), String> {
@@ -1964,7 +2009,7 @@ mod tests {
         let f = fixture("stopped");
         f.android.create("watch", "system-images;android-34;android-wear;arm64-v8a", None).expect("watch");
         let d = f.android.device("watch").expect("watch");
-        assert_eq!(d.rotate(), Err("watch isn't running; boot it first".into()));
+        assert_eq!(d.rotate(&f.android), Err("watch isn't running; boot it first".into()));
         assert_eq!(d.touch(1.0, 1.0, Phase::Down), Err("watch isn't running; boot it first".into()), "not a socket error");
         assert_eq!(d.rotary(1), Err("watch isn't running; boot it first".into()));
         assert!(d.fold(90.0).expect_err("not a foldable").starts_with("folding needs a device with Hinge; watch is Wear OS · Watch"));
@@ -1988,7 +2033,7 @@ mod tests {
         d.button(Button::Back, Direction::Up).expect("back up");
         d.key(0x28, Direction::Down).expect("return");
         d.set_location(37.5, -122.25).expect("geo");
-        d.rotate().expect("rotate");
+        assert_eq!(d.rotate_within(&f.android, Duration::ZERO), Ok(Rotated::default()), "no adb: nothing to report");
         d.fold(90.0).expect("fold");
         assert_eq!(
             wait_for(&fake.console, 10)[2..],
@@ -2031,6 +2076,54 @@ mod tests {
             let (w, h, png) = r.expect("each screenshot succeeds");
             assert_eq!((w, h, sim_core::frame::png_size(&png)), (2, 1, Some((2, 1))));
         }
+    }
+
+    /// A fake `adb` whose `dumpsys window displays` answers `before` the first time and `after`
+    /// from then on (each with the focused app and its orientation, as an API 35 guest dumps them).
+    fn fake_dumpsys(f: &Fixture, before: (&str, &str, i32, u32), after: (&str, &str, i32, u32)) {
+        let dir = f.root.join("sdk/platform-tools");
+        std::fs::create_dir_all(&dir).expect("platform-tools");
+        let dump = |(package, activity, orientation, rotation): (&str, &str, i32, u32)| {
+            format!(
+                "  mFocusedApp=ActivityRecord{{9a3b2c1 u0 {package}/{activity} t3}}\n  DisplayRotation\n    mLastOrientation={orientation}\n    mRotation={rotation} mDeferredRotationPauseCount=0\n    mUserRotationMode=USER_ROTATION_FREE mUserRotation=ROTATION_0\n"
+            )
+        };
+        std::fs::write(dir.join("before.txt"), dump(before)).expect("before");
+        std::fs::write(dir.join("after.txt"), dump(after)).expect("after");
+        let script = r#"d="$(dirname "$0")"
+case "$*" in
+  *"shell dumpsys window displays")
+    if [ -e "$d/asked" ]; then cat "$d/after.txt"; else touch "$d/asked"; cat "$d/before.txt"; fi;;
+  *) echo 1;;
+esac
+"#;
+        crate::testing::write_script(&dir.join("adb"), script);
+    }
+
+    #[test]
+    fn rotate_says_when_the_guest_stayed_upright_and_where_it_turned_to() {
+        const LAUNCHER: (&str, &str, i32, u32) = ("com.google.android.apps.nexuslauncher", ".NexusLauncherActivity", 5, 0);
+        let f = fixture("rotlauncher");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("phone");
+        let fake = fake_emulator(&f.android, "phone");
+        fake_dumpsys(&f, LAUNCHER, LAUNCHER);
+        let d = f.android.device("phone").expect("phone");
+        let r = d.rotate_within(&f.android, Duration::from_millis(300)).expect("rotate");
+        assert_eq!(r.rotation, Some(Rotation::Deg0));
+        assert_eq!(
+            r.note.as_deref(),
+            Some("the guest stayed upright: the app in front (`com.google.android.apps.nexuslauncher`) doesn't rotate")
+        );
+        assert_eq!(wait_for(&fake.console, 1), ["rotate"]);
+
+        let f = fixture("rotsettings");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("phone");
+        let _fake = fake_emulator(&f.android, "phone");
+        // The guest turns with its top to the right: ROTATION_270, a quarter turn clockwise.
+        fake_dumpsys(&f, ("com.android.settings", ".Settings", -1, 0), ("com.android.settings", ".Settings", -1, 3));
+        let d = f.android.device("phone").expect("phone");
+        let r = d.rotate_within(&f.android, Duration::from_secs(5)).expect("rotate");
+        assert_eq!(r, Rotated { rotation: Some(Rotation::Deg90), note: None });
     }
 
     /// Adds an installed system image under the fixture's SDK.

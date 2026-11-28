@@ -1427,8 +1427,17 @@
       "name": "rotate",
       "outputSchema": {
         "properties": {
+          "note": {
+            "type": "string"
+          },
           "orientation": {
             "type": "string"
+          },
+          "rotation": {
+            "type": [
+              "number",
+              "null"
+            ]
           }
         },
         "type": "object"

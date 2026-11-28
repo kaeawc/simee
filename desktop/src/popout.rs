@@ -852,7 +852,15 @@ fn perform_action(w: &mut Window, action: Action, t: f64, tx: &mut Tx) {
         Action::Button(b) => press(w, b, t, tx),
         Action::Rotate => match w.device.as_mut().and_then(|d| d.live.as_mut()) {
             Some(live) => live.rotate(),
-            None => console(w, sim_android::Device::rotate),
+            // The status line gets the note when the guest stayed upright.
+            None => {
+                if let Some(d) = w.device.as_ref()
+                    && let Some(sc) = d.screen.as_ref()
+                {
+                    let backend = d.backend.clone().unwrap_or_default();
+                    sc.console(move |dev| dev.rotate(&backend).map(|r| r.note));
+                }
+            }
         },
         Action::ToggleAppearance => {
             if let Some(live) = w.device.as_mut().and_then(|d| d.live.as_mut()) {

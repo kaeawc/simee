@@ -17,7 +17,7 @@
 //!
 //! The objects are open (a result may grow a key before its schema does), and a key is required
 //! only where every platform always sets it. A method's result that differs by platform is the
-//! union of them (`rotate`: `{orientation}` on iOS, `null` on Android).
+//! union of them (`rotate`: `{orientation}` on iOS, `{rotation, note?}` on Android).
 
 use serde_json::{Map, Value, json};
 
@@ -288,7 +288,7 @@ pub const OUTPUTS: &[(&str, &str)] = &[
     ("camera_links", "[@camera_link]"),
     ("network_env", "{*: string}"),
     ("console", "[string]"),
-    ("rotate", "null|{orientation: string}"),
+    ("rotate", "{orientation?: string, rotation?: number|null, note?: string}"),
     (
         "fold",
         "{angle?: number|null, posture?: string, folded?: boolean, display?: string, width?: number, height?: number, postures?: [string]}",
@@ -530,8 +530,8 @@ mod tests {
         );
         assert_eq!(parse("{*: string}"), Ok(json!({"type": "object", "additionalProperties": {"type": "string"}})));
         let rotate = output_schema("rotate").expect("rotate");
-        assert_eq!(rotate["type"], json!(["object", "null"]));
-        assert_eq!(rotate["required"], json!(["orientation"]));
+        assert_eq!(rotate["type"], "object");
+        assert!(rotate.get("required").is_none(), "iOS sets `orientation`, Android `rotation` and `note`");
         let vehicle = output_schema("vehicle").expect("vehicle");
         assert_eq!(vehicle["anyOf"].as_array().map(Vec::len), Some(3));
         let leaks = output_schema("mem_leaks").expect("mem_leaks");
