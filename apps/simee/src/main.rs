@@ -450,7 +450,8 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<mcp_install::McpAction>,
         /// Serve Streamable HTTP on ADDR (default 127.0.0.1:8377). Every request needs a bearer
-        /// token (see `--token-file`); a non-loopback ADDR also needs `--insecure-remote`.
+        /// token (see `--token-file`); a non-loopback ADDR also needs TLS (`--tls-cert` and
+        /// `--tls-key`, or `--tls-self-signed`) or `--insecure-remote`.
         #[arg(long, value_name = "ADDR", num_args = 0..=1, default_missing_value = sim_mcp::http::DEFAULT_ADDR)]
         http: Option<String>,
         /// Bearer tokens, one per line, in a file of your own that only you can read, in a
@@ -463,10 +464,12 @@ enum Cmd {
         /// a reverse proxy on this host forwards, can then drive the devices.
         #[arg(long, requires = "http", conflicts_with = "token_file")]
         no_auth: bool,
-        /// Serve a non-loopback ADDR over plain HTTP (there is no TLS: the token crosses the network
-        /// in the clear; use a trusted network or a TLS proxy).
-        #[arg(long, requires = "http")]
+        /// Serve a non-loopback ADDR over plain HTTP: the token crosses the network in the clear,
+        /// so use a trusted network or a TLS proxy. Not needed with TLS.
+        #[arg(long, alias = "insecure", requires = "http")]
         insecure_remote: bool,
+        #[command(flatten)]
+        tls: McpTls,
     },
     /// Run a program inside the device (e.g. `defaults`, `log`, `launchctl`, `notifyutil`, `heap`).
     #[command(disable_help_flag = true)]
@@ -529,14 +532,36 @@ enum CameraCmd {
     },
 }
 
+/// `simee mcp --http`'s TLS flags. They need a build with the `tls` feature (`cargo build -p simee
+/// --features tls`); without it the server says so and doesn't start.
+#[derive(clap::Args, Clone, Debug, Default, PartialEq, Eq)]
+struct McpTls {
+    /// Serve HTTPS (TLS 1.3) with this PEM certificate chain, leaf first.
+    #[arg(long, value_name = "PATH", requires_all = ["tls_key", "http"], conflicts_with = "tls_self_signed")]
+    tls_cert: Option<std::path::PathBuf>,
+    /// The PEM private key of `--tls-cert`.
+    #[arg(long, value_name = "PATH", requires = "tls_cert")]
+    tls_key: Option<std::path::PathBuf>,
+    /// For development: serve HTTPS with a self-signed certificate, made on first use and kept in
+    /// simee's state directory (a file only you can read). The server prints the certificate's
+    /// SHA-256 fingerprint: pin that in the client.
+    #[arg(long, requires = "http")]
+    tls_self_signed: bool,
+    /// A host name or address the self-signed certificate must also name (repeatable), besides
+    /// `localhost`, the loopback addresses and the address bound.
+    #[arg(long, value_name = "NAME", requires = "tls_self_signed")]
+    tls_name: Vec<String>,
+}
+
 /// `simee mcp --http`'s settings: the address (`host:port`, a name resolved to its first address),
-/// the token file (or none, `--no-auth`), the toolsets `SIMEE_MCP_TOOLSETS` names and the screen
+/// the token file (or none, `--no-auth`), TLS, the toolsets `SIMEE_MCP_TOOLSETS` names and the screen
 /// subscription pace `SIMEE_MCP_SCREEN_FPS` sets.
 fn mcp_http_config(
     addr: &str,
     token_file: Option<std::path::PathBuf>,
     no_auth: bool,
     insecure_remote: bool,
+    tls: &McpTls,
 ) -> Result<sim_mcp::http::Config> {
     use std::net::ToSocketAddrs as _;
     let addr = addr
@@ -548,6 +573,11 @@ fn mcp_http_config(
     config.token_file = token_file;
     config.no_auth = no_auth;
     config.insecure_remote = insecure_remote;
+    config.tls = match (&tls.tls_cert, &tls.tls_key) {
+        (Some(cert), Some(key)) => Some(sim_mcp::http::Tls::Files { cert: cert.clone(), key: key.clone() }),
+        _ if tls.tls_self_signed => Some(sim_mcp::http::Tls::SelfSigned { dir: None, names: tls.tls_name.clone() }),
+        _ => None,
+    };
     config.toolsets = sim_mcp::Toolsets::from_env().map_err(anyhow::Error::msg)?;
     config.timing = sim_mcp::server::Timing::from_env().map_err(anyhow::Error::msg)?;
     Ok(config)
@@ -576,8 +606,8 @@ fn main() -> Result<()> {
             served?;
             return Ok(());
         }
-        Cmd::Mcp { http: Some(addr), token_file, no_auth, insecure_remote, .. } => {
-            let config = mcp_http_config(addr, token_file.clone(), *no_auth, *insecure_remote)?;
+        Cmd::Mcp { http: Some(addr), token_file, no_auth, insecure_remote, tls, .. } => {
+            let config = mcp_http_config(addr, token_file.clone(), *no_auth, *insecure_remote, tls)?;
             mcp_shutdown_on_signal()?;
             let served = sim_mcp::http::serve(std::sync::Arc::new(sim_mcp::ApiBackend::new()), config);
             sim_api::stop_streams();
@@ -1641,12 +1671,9 @@ mod tests {
     #[test]
     fn mcp_is_a_subcommand_that_runs_no_device_command() {
         let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
-        assert!(matches!(
-            parse(&["mcp"]),
-            Ok(Cmd::Mcp { action: None, http: None, token_file: None, no_auth: false, insecure_remote: false })
-        ));
+        assert!(matches!(parse(&["mcp"]), Ok(Cmd::Mcp { http: None, token_file: None, no_auth: false, insecure_remote: false, .. })));
         let mut transport = Transport::local();
-        let stdio = Cmd::Mcp { action: None, http: None, token_file: None, no_auth: false, insecure_remote: false };
+        let stdio = Cmd::Mcp { action: None, http: None, token_file: None, no_auth: false, insecure_remote: false, tls: McpTls::default() };
         let e = run(stdio, &mut transport, &mut Vec::new(), &mut Vec::new()).expect_err("served by main, not run");
         assert!(e.to_string().contains("`mcp` don't run through a transport"));
     }
@@ -1663,13 +1690,12 @@ mod tests {
     #[test]
     fn mcp_http_takes_an_address_a_token_file_and_an_acknowledgement() {
         let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
-        let Ok(Cmd::Mcp { action: None, http: Some(addr), token_file: None, no_auth: false, insecure_remote: false }) =
-            parse(&["mcp", "--http"])
+        let Ok(Cmd::Mcp { http: Some(addr), token_file: None, no_auth: false, insecure_remote: false, .. }) = parse(&["mcp", "--http"])
         else {
             panic!("--http alone")
         };
         assert_eq!(addr, sim_mcp::http::DEFAULT_ADDR);
-        let Ok(Cmd::Mcp { action: None, http: Some(addr), token_file: Some(path), no_auth: false, insecure_remote: true }) =
+        let Ok(Cmd::Mcp { http: Some(addr), token_file: Some(path), no_auth: false, insecure_remote: true, .. }) =
             parse(&["mcp", "--http", "0.0.0.0:9000", "--token-file", "/tmp/t", "--insecure-remote"])
         else {
             panic!("every flag")
@@ -1681,11 +1707,36 @@ mod tests {
         assert!(parse(&["mcp", "--insecure-remote"]).is_err(), "so does the acknowledgement");
         assert!(parse(&["mcp", "--no-auth"]).is_err(), "and --no-auth");
         // With no flag, authentication is on (the state directory's token file).
-        let config = mcp_http_config("127.0.0.1:0", None, false, false).expect("config");
-        assert!(config.addr.ip().is_loopback() && config.token_file.is_none() && !config.no_auth);
-        assert!(mcp_http_config("127.0.0.1:0", None, true, false).expect("config").no_auth);
-        assert!(mcp_http_config("localhost:8377", None, false, false).expect("a name resolves").addr.ip().is_loopback());
-        assert!(mcp_http_config("nonsense", None, false, false).is_err());
+        let plain = McpTls::default();
+        let config = mcp_http_config("127.0.0.1:0", None, false, false, &plain).expect("config");
+        assert!(config.addr.ip().is_loopback() && config.token_file.is_none() && !config.no_auth && config.tls.is_none());
+        assert!(mcp_http_config("127.0.0.1:0", None, true, false, &plain).expect("config").no_auth);
+        assert!(mcp_http_config("localhost:8377", None, false, false, &plain).expect("a name resolves").addr.ip().is_loopback());
+        assert!(mcp_http_config("nonsense", None, false, false, &plain).is_err());
+        // The acknowledgement is also spelled `--insecure`.
+        assert!(matches!(parse(&["mcp", "--http", "0.0.0.0:9000", "--insecure"]), Ok(Cmd::Mcp { insecure_remote: true, .. })));
+    }
+
+    #[test]
+    fn mcp_http_takes_a_certificate_and_key_or_a_self_signed_one() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
+        let Ok(Cmd::Mcp { tls, .. }) = parse(&["mcp", "--http", "0.0.0.0:9000", "--tls-cert", "c.pem", "--tls-key", "k.pem"]) else {
+            panic!("a certificate and key")
+        };
+        let config = mcp_http_config("127.0.0.1:0", None, false, false, &tls).expect("config");
+        assert!(matches!(&config.tls, Some(sim_mcp::http::Tls::Files { cert, key }) if cert.ends_with("c.pem") && key.ends_with("k.pem")));
+        let Ok(Cmd::Mcp { tls, .. }) = parse(&["mcp", "--http", "--tls-self-signed", "--tls-name", "box.lan", "--tls-name", "10.0.0.5"])
+        else {
+            panic!("self-signed")
+        };
+        let config = mcp_http_config("127.0.0.1:0", None, false, false, &tls).expect("config");
+        assert!(matches!(&config.tls, Some(sim_mcp::http::Tls::SelfSigned { dir: None, names }) if names == &["box.lan", "10.0.0.5"]));
+        assert!(parse(&["mcp", "--http", "--tls-cert", "c.pem"]).is_err(), "a certificate needs its key");
+        assert!(parse(&["mcp", "--http", "--tls-key", "k.pem"]).is_err(), "and a key its certificate");
+        assert!(parse(&["mcp", "--http", "--tls-self-signed", "--tls-cert", "c.pem", "--tls-key", "k.pem"]).is_err(), "not both");
+        assert!(parse(&["mcp", "--http", "--tls-name", "box.lan"]).is_err(), "a name is for the self-signed certificate");
+        assert!(parse(&["mcp", "--tls-self-signed"]).is_err(), "TLS needs --http");
+        assert!(parse(&["mcp", "--tls-cert", "c.pem", "--tls-key", "k.pem"]).is_err(), "so does a certificate");
     }
 
     #[test]

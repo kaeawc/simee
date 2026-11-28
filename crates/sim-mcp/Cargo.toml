@@ -15,8 +15,16 @@ include = ["/Cargo.toml", "/LICENSE", "/src"]
 [lib]
 doctest = false
 
+[features]
+# TLS for the HTTP transport (`simee mcp --http --tls-cert/--tls-key`, `--tls-self-signed`): rustls
+# with the ring provider, TLS 1.3 only. Off by default: it adds a C build (ring).
+tls = ["dep:rustls", "dep:rcgen", "dep:ring"]
+
 [dependencies]
 serde_json.workspace = true
+rustls = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+ring = { workspace = true, optional = true }
 sim-api.workspace = true
 
 # The HTTP transport's token file: opened without following links, its owner checked against the

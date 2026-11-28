@@ -111,17 +111,16 @@ impl Bezel {
                 // rest of the gesture later instead of squeezing it into a burst (a fling).
                 let mut prev: Option<(Instant, Instant)> = None;
                 for sample in rx {
-                    if let (Some((made, sent)), false) = (prev, sample.phase == Phase::Down) {
-                        let due = sent + sample.at.saturating_duration_since(made);
-                        let now = Instant::now();
-                        if due > now {
-                            std::thread::sleep(due - now);
-                        }
+                    let now = Instant::now();
+                    if let Some(due) = due_at(prev, sample.at, sample.phase).filter(|d| *d > now) {
+                        std::thread::sleep(due - now);
                     }
-                    let sent = Instant::now();
                     if let Err(e) = call(&mut session, "touch", &sample.params) {
                         outbox.post(format!("edge swipe: {e}"));
                     }
+                    // Stamped after the call: a slow call (the connect) is part of getting this
+                    // sample out, and the next one keeps its gap after it.
+                    let sent = Instant::now();
                     prev = (sample.phase != Phase::Up).then_some((sample.at, sent));
                     pending.fetch_sub(1, Ordering::Release);
                 }
@@ -136,6 +135,14 @@ impl Bezel {
             }
         }
     }
+}
+
+/// When a sample made at `at` may go out: its gap after the previous sample of the gesture
+/// (`prev` is when that one was made and when it went out). `None` for a touch-down, which
+/// starts a gesture, or when there is no previous sample.
+fn due_at(prev: Option<(Instant, Instant)>, at: Instant, phase: Phase) -> Option<Instant> {
+    let (made, sent) = prev.filter(|_| phase != Phase::Down)?;
+    Some(sent + at.saturating_duration_since(made))
 }
 
 /// The edge of `screen` (`[x, y, w, h]`) whose bezel a press at `p` (same coordinates) lands
@@ -292,6 +299,21 @@ mod tests {
         assert_eq!(lines, ["edge swipe: device went away"]);
     }
 
+    #[test]
+    fn a_sample_is_due_its_made_gap_after_the_previous_one_went_out() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        // Made 30 ms apart, the first delivered 150 ms late (the connect): the second is due 30 ms
+        // after the first went out, not at once.
+        assert_eq!(due_at(Some((t0, t0 + ms(150))), t0 + ms(30), Phase::Move), Some(t0 + ms(180)));
+        // Made back to back stays back to back, whatever the clock did around it.
+        assert_eq!(due_at(Some((t0, t0 + ms(150))), t0, Phase::Up), Some(t0 + ms(150)));
+        assert_eq!(due_at(Some((t0, t0 + ms(5))), t0 + ms(30), Phase::Move), Some(t0 + ms(35)));
+        // A touch-down starts a gesture; the first sample has nothing to follow.
+        assert_eq!(due_at(Some((t0, t0 + ms(5))), t0 + ms(30), Phase::Down), None);
+        assert_eq!(due_at(None, t0, Phase::Move), None);
+    }
+
     static ORDER: Mutex<Vec<(String, Instant, Option<String>)>> = Mutex::new(Vec::new());
 
     fn slow_first_call(_: &mut Session, _: &str, params: &Value) -> Result<Value, String> {
@@ -310,13 +332,18 @@ mod tests {
         let bezel = Bezel::with_call(slow_first_call);
         assert!(!bezel.busy());
         let edge = Some(ScreenEdge::Bottom);
-        bezel.send("U1", (10.0, 2751.0), Phase::Down, edge);
-        for y in [2500.0, 2200.0, 1900.0] {
-            std::thread::sleep(Duration::from_millis(30));
-            bezel.send("U1", (10.0, y), Phase::Move, edge);
+        // Bounds on the gaps the samples were made at: the sample is stamped inside `send`, so
+        // its stamp lies between the test's clock before and after the call.
+        let mut bounds = Vec::new();
+        for (y, phase) in [(2751.0, Phase::Down), (2500.0, Phase::Move), (2200.0, Phase::Move), (1900.0, Phase::Move), (1700.0, Phase::Up)]
+        {
+            if phase != Phase::Down {
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            let before = Instant::now();
+            bezel.send("U1", (10.0, y), phase, edge);
+            bounds.push((before, Instant::now()));
         }
-        std::thread::sleep(Duration::from_millis(30));
-        bezel.send("U1", (10.0, 1700.0), Phase::Up, edge);
         assert!(bezel.busy(), "the first call is still connecting");
         bezel.send("U1", (500.0, 500.0), Phase::Down, None);
         bezel.send("U1", (500.0, 500.0), Phase::Up, None);
@@ -327,10 +354,13 @@ mod tests {
         let seen = ORDER.lock().expect("order").clone();
         let order: Vec<_> = seen.iter().map(|(p, _, e)| (p.as_str(), e.is_some())).collect();
         assert_eq!(order, [("down", true), ("move", true), ("move", true), ("move", true), ("up", true), ("down", false), ("up", false)]);
-        // The swipe's samples were 30 ms apart when made; they are not delivered back to back.
-        for pair in seen[1..5].windows(2) {
+        // Delivered no closer than they were made, however loaded the runner: the least the made
+        // gap can be is from the end of one `send` to the start of the next. (A loaded runner may
+        // squeeze that to nothing, so this is a floor, never a fixed number of milliseconds.)
+        for (i, pair) in seen[..5].windows(2).enumerate() {
             let gap = pair[1].1.duration_since(pair[0].1);
-            assert!(gap >= Duration::from_millis(20), "delivered in a burst: {gap:?}");
+            let made_at_least = bounds[i + 1].0.saturating_duration_since(bounds[i].1);
+            assert!(gap >= made_at_least, "delivered in a burst: {gap:?} < {made_at_least:?}");
         }
     }
 }

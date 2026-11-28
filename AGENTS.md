@@ -211,7 +211,10 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   non-macOS hosts `ios_unavailable.rs`), the Android backend's methods (`android.rs`), server
   and client (`lib.rs`). The CLI, the socket and the
   desktop panel all go through it; add a capability here once and every surface gets it.
-- `crates/sim-mcp` — the MCP server behind `simee mcp` (stdio only; no FFI, no new dependencies):
+- `crates/sim-mcp` — the MCP server behind `simee mcp` (stdio, and Streamable HTTP in `http.rs`; no
+  FFI; its one optional dependency set is the off-by-default `tls` feature: rustls on the ring
+  provider, rcgen, ring; `http/conn.rs` is what a connection reads and writes through, plain or
+  TLS, with reads bounded by one deadline, and `http/tls.rs` the certificates and handshake):
   `rpc.rs` (messages, versions, error codes), `server.rs` (which request does what; the current
   revision statelessly, `initialize` for older clients), `tools.rs` (one tool per `METHODS` entry,
   annotations, results, which methods are tasks), `resources.rs` (`simee://` URIs), `tasks.rs` (the

@@ -822,6 +822,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("ok"), before);
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_refuses_then_forces_and_keeps_permissions() {
         use std::os::unix::fs::PermissionsExt;
@@ -856,6 +857,7 @@ mod tests {
         Ok(String::from_utf8(out).expect("ok"))
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_new_file_is_private() {
         use std::os::unix::fs::PermissionsExt;
@@ -865,6 +867,7 @@ mod tests {
         assert_eq!(std::fs::metadata(&fresh).expect("ok").permissions().mode() & 0o777, 0o600);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlink_is_written_through_and_stays_a_symlink() {
         let dir = Dir::new();
@@ -879,6 +882,7 @@ mod tests {
         assert_eq!(v["mcpServers"]["keep"]["command"], "k");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_dangling_symlink_is_refused_and_left_a_symlink() {
         let dir = Dir::new();
@@ -954,6 +958,7 @@ mod tests {
         assert_eq!(Client::Codex.config_path(Scope::User, &host(Os::Linux)).expect("ok"), PathBuf::from("/home/u/.codex/config.toml"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_invoked_symlink_is_kept_over_its_resolved_target() {
         let dir = Dir::new();

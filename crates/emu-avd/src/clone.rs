@@ -20,6 +20,7 @@
 use std::fs::File;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{Error, Result};
 
@@ -60,13 +61,26 @@ pub fn clone_file(from: &Path, to: &Path) -> Result<CloneKind> {
 
 /// [`clone_file`] for a file that must never be seen half-written, even if the process is killed
 /// mid-copy (`encryptionkey.img`: the guest boots with whatever is at the final name). The copy is
-/// made under `.<name>.partial` beside `to`, then renamed into place.
+/// made under a name unique to this call beside `to` (`.<name>.partial-<pid>-<n>`, created with
+/// `O_EXCL` like every clone target), flushed to disk, then renamed into place.
+///
+/// The name is unique because `-read-only` boots skip the instance lock: two of them can run this
+/// for one AVD at once, and a shared temporary name would let one rename the other's half-written
+/// copy into place (#431). Each call now installs only its own whole file; of two racing calls the
+/// later rename wins, and both files are complete.
 ///
 /// `to` must not exist, and a symlink there, dangling or not, counts as existing: it is refused
 /// with an error that says so, never written through (what `std::fs::copy` did) nor replaced by
-/// the rename. A `.partial` left by an earlier killed run is removed first. Callers hold the
-/// device's instance lock, so nothing else makes `to` between the check and the rename.
+/// the rename. A leftover of the old fixed `.partial` name is removed first; a killed run's
+/// unique partial is not (nothing knows it is dead), it is just an unused sparse file.
 pub fn clone_file_atomic(from: &Path, to: &Path) -> Result<CloneKind> {
+    clone_atomic_with(from, to, reflink, copy_data, copy_metadata)
+}
+
+/// [`clone_file_atomic`] with the clone steps given, so tests can stall or fail a copy after its
+/// partial file exists.
+fn clone_atomic_with(from: &Path, to: &Path, reflink: Reflink, copy: CopyData, meta: CopyMeta) -> Result<CloneKind> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     if let Ok(meta) = to.symlink_metadata() {
         return Err(if meta.is_symlink() {
             Error::Config(format!(
@@ -79,14 +93,27 @@ pub fn clone_file_atomic(from: &Path, to: &Path) -> Result<CloneKind> {
         });
     }
     let name = to.file_name().ok_or_else(|| Error::Config(format!("{} has no file name", to.display())))?;
-    let tmp = to.with_file_name(format!(".{}.partial", name.to_string_lossy()));
-    // The name is ours: whatever is there is a killed run's leftover (or a link to remove, not follow).
-    let _ = std::fs::remove_file(&tmp);
-    let kind = clone_file(from, &tmp)?;
-    std::fs::rename(&tmp, to).map_err(|e| {
+    let name = name.to_string_lossy();
+    // The fixed name an earlier version used: remove its leftover (a link is removed, not followed).
+    let _ = std::fs::remove_file(to.with_file_name(format!(".{name}.partial")));
+    let tmp = to.with_file_name(format!(".{name}.partial-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+    let io = |p: &Path, e| Error::Io(p.to_path_buf(), e);
+    // `clone_with` refuses an existing `tmp` and creates it exclusively; a failure removes it.
+    let kind = clone_with(from, &tmp, reflink, copy, meta)?;
+    let installed = File::open(&tmp)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| io(&tmp, e))
+        .and_then(|()| std::fs::rename(&tmp, to).map_err(|e| io(to, e)));
+    if let Err(e) = installed {
         let _ = std::fs::remove_file(&tmp);
-        Error::Io(to.to_path_buf(), e)
-    })?;
+        return Err(e);
+    }
+    // Make the rename itself durable; best effort (a directory can't always be opened or synced).
+    if let Some(dir) = to.parent().filter(|d| !d.as_os_str().is_empty())
+        && let Ok(d) = File::open(dir)
+    {
+        let _ = d.sync_all();
+    }
     Ok(kind)
 }
 
@@ -618,9 +645,32 @@ mod tests {
         let leftover = dir.join(".key.img.partial");
         std::fs::write(&leftover, b"half a key from a killed run").expect("leftover");
         clone_file_atomic(&src, &dst).expect("clone");
-        assert!(!leftover.exists(), "no temporary name is left behind");
+        assert!(!leftover.exists(), "the old fixed temporary name is cleared");
+        assert!(partials(&dir).is_empty(), "no temporary name is left behind");
         assert_eq!(std::fs::read(&src).expect("src"), std::fs::read(&dst).expect("dst"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The temporary files an atomic clone of `key.img` left in `dir`.
+    fn partials(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".key.img.partial"))
+            .collect()
+    }
+
+    /// A data copy that writes half of `src`, then fails: the partial file exists by then.
+    fn copy_half_then_fail(src: &File, dst: &File, _: &Path, to: &Path) -> Result<()> {
+        let mut half = vec![0; 8];
+        src.read_exact_at(&mut half, 0).expect("read");
+        dst.write_all_at(&half, 0).expect("write");
+        assert!(to.exists(), "the partial file is on disk when the copy fails");
+        Err(Error::Io(to.to_path_buf(), io::Error::other("disk full")))
+    }
+
+    fn unsupported_reflink(_: &File, _: &Path) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
     }
 
     #[test]
@@ -629,7 +679,78 @@ mod tests {
         let dst = dir.join("key.img");
         assert!(clone_file_atomic(&dir.join("missing.img"), &dst).is_err());
         assert!(dst.symlink_metadata().is_err());
-        assert!(!dir.join(".key.img.partial").exists());
+        assert!(partials(&dir).is_empty());
+        // Failing after the partial file was written: still no key, and the partial is removed.
+        let src = dir.join("src.img");
+        std::fs::write(&src, b"0123456789abcdef").expect("src");
+        let err = clone_atomic_with(&src, &dst, unsupported_reflink, copy_half_then_fail, copy_metadata).expect_err("disk full");
+        assert!(err.to_string().contains("disk full"), "{err}");
+        assert!(dst.symlink_metadata().is_err(), "a half-written key is never installed");
+        assert!(partials(&dir).is_empty(), "{:?}", partials(&dir));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A data copy that writes `src` in two halves with a pause between them, so a racing clone
+    /// runs while this one's partial file holds half a key.
+    fn copy_slowly(src: &File, dst: &File, _: &Path, _: &Path) -> Result<()> {
+        let len = src.metadata().expect("meta").len();
+        let mut all = vec![0; len as usize];
+        src.read_exact_at(&mut all, 0).expect("read");
+        dst.set_len(len).expect("len");
+        let (first, second) = all.split_at(all.len() / 2);
+        dst.write_all_at(first, 0).expect("write");
+        // The 'A' writer is quick and the 'B' writer slow: with a shared temporary name, A's
+        // rename would install B's half-written file.
+        std::thread::sleep(std::time::Duration::from_millis(if all[0] == b'A' { 30 } else { 300 }));
+        dst.write_all_at(second, first.len() as u64).expect("write");
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_atomic_clones_never_install_a_partial_key() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tmp("atomic-race");
+        let dst = dir.join("key.img");
+        let len = 4096;
+        let (a, b) = (dir.join("a.img"), dir.join("b.img"));
+        std::fs::write(&a, vec![b'A'; len]).expect("a");
+        std::fs::write(&b, vec![b'B'; len]).expect("b");
+        let done = AtomicBool::new(false);
+        let seen = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|s| {
+            // Whatever is at the final name, whenever it is read, is one whole key.
+            s.spawn(|| {
+                while !done.load(Ordering::Relaxed) {
+                    if let Ok(bytes) = std::fs::read(&dst) {
+                        seen.lock().expect("seen").push(bytes);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+            let writers: Vec<_> = [&a, &b]
+                .into_iter()
+                .enumerate()
+                .map(|(i, src)| {
+                    let dst = &dst;
+                    s.spawn(move || {
+                        // B starts while A's partial file exists.
+                        std::thread::sleep(std::time::Duration::from_millis(10 * i as u64));
+                        clone_atomic_with(src, dst, unsupported_reflink, copy_slowly, copy_metadata)
+                    })
+                })
+                .collect();
+            for w in writers {
+                // The loser of the rename race may see the winner's file: either way no half key.
+                let _ = w.join().expect("writer");
+            }
+            done.store(true, Ordering::Relaxed);
+        });
+        let installed = std::fs::read(&dst).expect("a key is installed");
+        assert!(installed == vec![b'A'; len] || installed == vec![b'B'; len], "the installed key is one whole key");
+        for bytes in seen.into_inner().expect("seen") {
+            assert!(bytes == vec![b'A'; len] || bytes == vec![b'B'; len], "a partial key was visible: {} bytes", bytes.len());
+        }
+        assert!(partials(&dir).is_empty(), "no temporary file is left: {:?}", partials(&dir));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -643,7 +764,7 @@ mod tests {
         assert!(msg.contains("symlink") && msg.contains("elsewhere.img") && msg.contains("remove it"), "{msg}");
         assert!(!target.exists(), "nothing is written through the link");
         assert_eq!(std::fs::read_link(&dst).expect("still a link"), target, "the link is not replaced");
-        assert!(!dir.join(".key.img.partial").exists());
+        assert!(partials(&dir).is_empty());
         // A link to a real file is refused as well, and that file keeps its content.
         std::fs::write(&target, b"theirs").expect("target");
         assert!(clone_file_atomic(&src, &dst).is_err());

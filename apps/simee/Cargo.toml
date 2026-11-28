@@ -20,6 +20,8 @@ path = "src/main.rs"
 workspace = true
 
 [features]
+# `simee mcp --http` over TLS (`--tls-cert`, `--tls-key`, `--tls-self-signed`); see docs/mcp.md.
+tls = ["sim-mcp/tls"]
 # `stream_start` on Linux: OpenH264, built from its C++ source (needs a C++ compiler; `nasm` makes
 # it several times faster on x86_64). Off by default; macOS streams with VideoToolbox without it.
 openh264 = ["sim-api/openh264"]
