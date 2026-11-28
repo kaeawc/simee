@@ -141,7 +141,7 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   privacy service names, geometry,
   gesture planning, HID usages and buttons (per form factor: the Siri Remote, crown steps, watch
   gestures, orientations and the Purple orientation message), `carplay.rs` (StarkConfig, runtime
-  gate), `goldfish.rs` (stock emulator key names, the `qwerty2` key set, sensor masks), `xr.rs`
+  gate), `goldfish.rs` (stock emulator key names, the `qwerty2` key set, sensor masks), `console.rs` (what console commands end or delete, whose names emu's console parser shares), `xr.rs`
   (Android XR commands and the `xr_service` messages), `vhal.rs` (the vehicle HAL's
   `EmulatorMessage` codec, property names and values), `network.rs` (the stock console's
   `network speed|delay` presets, parsing and `network status` report), `framebuffer.rs` (which
@@ -236,7 +236,9 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   annotations, results, which methods are tasks), `resources.rs` (`simee://` URIs), `tasks.rs` (the
   Tasks extension), `watch.rs` (polled change notifications), `app.rs` + `app.html` (the device
   view, an MCP App), `backend.rs` (`Backend`: `sim-api` in production, a fake in tests; worker
-  threads). Parameter schemas come from `sim-api`'s `schema.rs`. Docs: `docs/mcp.md`.
+  threads). Agent safety (docs/mcp-safety.md): `safety.rs` (confirmations,
+  the policy's guarded backend, which devices a call names), `policy.rs`, `audit.rs`, `drain.rs` (stop
+  taking calls on SIGINT/SIGTERM and wait for those in flight). Parameter schemas come from `sim-api`'s `schema.rs`. Docs: `docs/mcp.md`.
 - `apps/simee` — CLI: argument parsing and output formatting over `sim-api`'s methods;
   `tests/e2e.rs` runs against a booted iOS device when `SIMEE_E2E_UDID` is set,
   `tests/e2e_android.rs` against a running AVD when `SIMEE_E2E_AVD` is; `tests/mcp.rs` runs

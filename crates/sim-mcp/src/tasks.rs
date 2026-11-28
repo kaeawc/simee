@@ -176,8 +176,8 @@ pub fn iso8601(t: SystemTime) -> String {
     format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
-/// An unguessable task id: 128 random bits as hex.
-fn new_id() -> String {
+/// A random 128-bit id as 32 hex digits: a task's, a page snapshot's. Nobody can guess another's.
+pub(crate) fn new_id() -> String {
     let mut bytes = [0u8; 16];
     if sim_core::entropy::fill(&mut bytes).is_err() {
         // No OS entropy: mix the clock and the process's random hash keys instead.

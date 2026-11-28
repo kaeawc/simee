@@ -10,6 +10,7 @@ pub const LEGACY: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26"];
 
 pub const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
 pub const META_CLIENT_CAPS: &str = "io.modelcontextprotocol/clientCapabilities";
+pub const META_CLIENT_INFO: &str = "io.modelcontextprotocol/clientInfo";
 pub const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 pub const META_SUBSCRIPTION: &str = "io.modelcontextprotocol/subscriptionId";
 
@@ -85,6 +86,21 @@ pub fn parse(line: &str) -> Result<Incoming, RpcError> {
         Some(id @ (Value::String(_) | Value::Number(_))) => Ok(Incoming::Request { id, method, params }),
         Some(_) => Err(RpcError::new(INVALID_REQUEST, "`id` is a string or a number")),
         None => Ok(Incoming::Notification { method, params }),
+    }
+}
+
+/// Reads a client's response (to a request this server sent): its id, and the result or the error.
+/// `None` for anything else.
+pub fn parse_response(line: &str) -> Option<(Value, Result<Value, Value>)> {
+    let Value::Object(mut msg) = serde_json::from_str(line).ok()? else { return None };
+    if msg.get("jsonrpc").and_then(Value::as_str) != Some("2.0") || msg.contains_key("method") {
+        return None;
+    }
+    let id = msg.remove("id").filter(|id| id.is_string() || id.is_number())?;
+    match (msg.remove("result"), msg.remove("error")) {
+        (Some(result), None) => Some((id, Ok(result))),
+        (None, Some(error)) => Some((id, Err(error))),
+        _ => None,
     }
 }
 

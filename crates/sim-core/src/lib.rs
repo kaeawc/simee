@@ -3,6 +3,7 @@
 
 pub mod body;
 pub mod carplay;
+pub mod console;
 pub mod contrast;
 pub mod debug;
 pub mod device;

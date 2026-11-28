@@ -108,9 +108,10 @@ did:
 - A call cancelled at a safe point undoes what it made: a `create` or `clone` that finishes
   during the drain is deleted, and a `boot` waiting for admission boots nothing.
 
-`simee mcp` stops its streams and exits the same way, without waiting for its calls; a watched
-`boot` that launched its device for a call in flight may shut that device down as it is
-cancelled. `emu` stops its guest as the console's `kill` does and exits 130 or 143 too.
+`simee mcp` shuts down the same way, over stdio and over HTTP: see "Stopping the server" in
+[mcp-safety.md](mcp-safety.md). A watched `boot` that launched its device for a call in flight may shut that
+device down as it is cancelled. `emu` stops its guest as the console's `kill` does and exits 130
+or 143 too.
 
 Relative `path` arguments (`screenshot`, `install`) are made absolute before they are sent.
 
