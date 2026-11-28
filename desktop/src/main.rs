@@ -833,6 +833,14 @@ fn android_action(s: &State, f: impl FnOnce(&sim_android::Device) -> Result<(), 
     }
 }
 
+/// Rotates the Android device on the console worker; the status line gets the rotate's note when
+/// the guest didn't follow the turn.
+fn android_rotate(s: &State) {
+    if let (Some(sc), Some(backend)) = (&s.screen, s.android_backend.clone()) {
+        sc.console(move |d| d.rotate(&backend).map(|r| r.note));
+    }
+}
+
 /// Keeps only the newest of each run of pointer moves queued between two polls: a frame's worth
 /// of moves is one sample (iOS drops moves under ~16 ms apart anyway, so sending them all could
 /// lose the last one), and downs, ups and keys keep their order.
@@ -931,7 +939,8 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             }
             Action::Rotate => match s.live.as_mut() {
                 Some(live) => live.rotate(),
-                None => android_action(s, sim_android::Device::rotate),
+                // Says why when the guest stayed upright (the app in front is portrait-locked).
+                None => android_rotate(s),
             },
             Action::Fold(posture) => match s.live.as_ref().map(|l| l.udid.clone()) {
                 Some(udid) => apple_fold(s, udid, posture),

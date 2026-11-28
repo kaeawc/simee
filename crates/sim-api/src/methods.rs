@@ -1992,7 +1992,7 @@ pub(crate) mod tests {
         ok(&mut s, "button", json!({"device": "fold", "button": "home"}));
         ok(&mut s, "key", json!({"device": "fold", "usage": 0x28}));
         ok(&mut s, "location", json!({"device": "fold", "latitude": 37.5, "longitude": -122.25}));
-        ok(&mut s, "rotate", json!({"device": "fold"}));
+        assert_eq!(ok(&mut s, "rotate", json!({"device": "fold"})), json!({"rotation": null}), "no adb: the guest's turn is unknown");
         assert_eq!(ok(&mut s, "fold", json!({"device": "fold", "posture": "half-opened"}))["posture"], "half-opened");
         assert_eq!(ok(&mut s, "fold", json!({"device": "fold", "angle": 170}))["angle"], 170.0);
         assert_eq!(ok(&mut s, "console", json!({"device": "fold", "command": "ping"})), json!(["I am alive!"]));

@@ -1078,6 +1078,12 @@ fn run(command: Cmd, transport: &mut Transport, out: &mut dyn Write, err: &mut d
             if let Some(o) = r["orientation"].as_str() {
                 writeln!(out, "{o}")?;
             }
+            // Android: why the guest didn't follow the turn, else where it turned to.
+            if let Some(note) = r["note"].as_str() {
+                writeln!(out, "{note}")?;
+            } else if let Some(degrees) = r["rotation"].as_u64() {
+                writeln!(out, "rotation: {degrees}")?;
+            }
         }
         Cmd::Fold { device, posture } => {
             let params = match (posture.as_str(), posture.parse::<f64>()) {
