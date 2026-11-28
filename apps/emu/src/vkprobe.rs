@@ -195,7 +195,7 @@ fn run(mut probe: Command, timeout: Duration) -> Verdict {
 /// it) are in emu's shader cache before the first boot: the probe's init (a GL backend, as API 31
 /// to 35 guests get), then, when MoltenVK works, an API 36 guest's (no GL, Vulkan composition),
 /// which compiles about another 0.9 s the probe's doesn't. Records the MoltenVK verdict too, and
-/// KosmicKrisp's where the renderer ships it, so the first API 34 or 35 boot doesn't probe.
+/// KosmicKrisp's where the renderer ships it, so the first API 35 boot doesn't probe.
 /// Returns whether Vulkan came up, whether the API 36 init ran to the end (false when Vulkan
 /// didn't come up or that child failed), and how long the children took.
 pub fn warm(lib64: &Path) -> (bool, bool, std::time::Duration) {

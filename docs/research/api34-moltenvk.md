@@ -10,8 +10,10 @@ vertex input format is a float format, while the shader reads that input as `uve
 allows this; the values are just undefined. Metal refuses to compile it, so MoltenVK fails the
 pipeline and the draw is lost. No MoltenVK setting and no gfxstream feature changes that.
 KosmicKrisp, Mesa's Vulkan on Metal, which the SDK ships beside MoltenVK, compiles the same
-pipeline. So emu now runs these guests on KosmicKrisp. API 36 and newer, and API 30 to 33, stay
-on MoltenVK.
+pipeline. So emu ran these guests on KosmicKrisp (#476). On API 34, though, KosmicKrisp leaves
+the screen blank (#495, below), so emu now runs only API 35 on KosmicKrisp. API 34 is back on
+MoltenVK, with the #412 errors, until that is understood. API 36 and newer, and API 30 to 33,
+stay on MoltenVK.
 
 ## The log
 
@@ -101,15 +103,15 @@ feature that rewrites the vertex input of a guest pipeline. gfxstream passes
 `-gpu host` (and `auto`, the default) picks the host-GPU driver per guest stack. The pure choice
 is `emu_gfxstream::gpu_icd`, and `host_gpu_icd` in `apps/emu/src/instance.rs` feeds it the AVD:
 
-- an API 34 or 35 guest on ANGLE (bootconfig image, guest GLES `angle`) whose image doesn't
-  advertise `VulkanVirtualQueue` (so HWUI is Skia GL) runs on KosmicKrisp. These are API 34 and
-  35 phones, Google TV 34, Automotive 34/35 and google-xr 34. The renderer's `lib64/vulkan` must
-  ship `libkosmickrisp_icd.json`, and the `emu -probe-kosmickrisp` child must bring Vulkan up.
-  `-verbose` says so once.
-- everything else stays on MoltenVK: API 30 to 33, API 36 and newer (Wear OS 36 too, although
-  its image has no `VulkanVirtualQueue`: unchecked on a device), `EMU_GUEST_EGL=emulation`, and a
-  renderer without KosmicKrisp. If KosmicKrisp fails its probe, the boot uses MoltenVK and
-  prints a notice.
+- an API 35 guest on ANGLE (bootconfig image, guest GLES `angle`) whose image doesn't
+  advertise `VulkanVirtualQueue` (so HWUI is Skia GL) runs on KosmicKrisp. These are API 35
+  phones and Automotive 35. The renderer's `lib64/vulkan` must ship `libkosmickrisp_icd.json`,
+  and the `emu -probe-kosmickrisp` child must bring Vulkan up. `-verbose` says so once. #476
+  gave API 34 the same (phones, Google TV 34, Automotive 34, google-xr 34); #495 took it back.
+- everything else stays on MoltenVK: API 30 to 33, API 34 (#495), API 36 and newer (Wear OS 36
+  too, although its image has no `VulkanVirtualQueue`: unchecked on a device),
+  `EMU_GUEST_EGL=emulation`, and a renderer without KosmicKrisp. If KosmicKrisp fails its probe,
+  the boot uses MoltenVK and prints a notice.
 - `ANDROID_EMU_VK_ICD=moltenvk` or `=kosmickrisp` picks the driver outright; KosmicKrisp is used
   only where it ships.
 
@@ -143,19 +145,19 @@ The probes (`apps/emu/src/vkprobe.rs`):
 Tests: `gpu_icd`, `Icd::from_name`, the environment per driver, and the environment gfxstream
 sees for each driver over a user's `ANDROID_EMU_VK_ICD` in `emu-gfxstream`. In `apps/emu`: the
 choice per API (30, 33, 34, 35, 36, TV 34, Wear 36, Automotive 34, google-xr 34, the encoder,
-the override, a renderer without KosmicKrisp), the fallback when KosmicKrisp's probe fails or is
+the override both ways, `=kosmickrisp` on API 34 included, a renderer without KosmicKrisp), the fallback when KosmicKrisp's probe fails or is
 unclear, and the probe against fake children that hang, crash, are killed or exit cleanly, the
 environment a probe child sees, and the cache key and file.
 
 ## Caveats
 
 - `emu -provision-renderer` warms MoltenVK's Metal shaders and runs KosmicKrisp's probe, not
-  an API 34 boot's whole init. The first API 34 or 35 boot on a cold cache may still compile
+  an API 35 boot's whole init. The first API 35 boot on a cold cache may still compile
   KosmicKrisp's shaders during the renderer's init. #355 measured 2.6 s cold for that init with
   ANGLE on SwiftShader, against 1.5 s on MoltenVK.
 - Concurrent first boots on one renderer build each run their own probe (no lock); each writes
   the same verdict.
-- A KosmicKrisp probe that hangs on every boot costs each API 34 or 35 boot its 60 s before
+- A KosmicKrisp probe that hangs on every boot costs each API 35 boot its 60 s before
   MoltenVK; one that always crashes costs about 1 s. Neither is cached, by design.
 - #355 saw two slow warm boots on KosmicKrisp with ANGLE on SwiftShader on API 36 (9.5 and
   10.8 s, against 3.7 to 4.1 s). The cause is unexplained (its footnote 1). Watch API 34's warm
@@ -165,7 +167,64 @@ environment a probe child sees, and the cache key and file.
 - API 36's apps that draw with their own GLES still go through the guest's ANGLE on MoltenVK.
   Its launcher, Gboard and Settings draw with Skia on Vulkan and were clean.
 
+## 2026-11-28: API 34 draws nothing on KosmicKrisp (#495)
+
+The post-merge device check of #476 on main (`5736695`, M3 Max, macOS 26.6.2) ran a fresh
+`-no-golden` API 34 `google_apis` arm64 phone (1080x2400@420, 4 vCPUs, 3 GB) on the new default:
+
+| Check | API 34, KosmicKrisp | API 34, `=moltenvk` | API 35, KosmicKrisp | API 36, MoltenVK |
+| --- | --- | --- | --- | --- |
+| Boot log | `host Vulkan is KosmicKrisp`, `Graphics Adapter Vendor KosmicKrisp`, renderer init 479 ms, 0 `mvk-error`, no `kk_`/`mesa`/`VK_ERROR` | `[mvk-error] ... Render pipeline compile failed` (#412) | as intended | 0 `mvk-error`, 33 s fresh boot |
+| Home screen, guest `screencap` | 1 colour, all white (3 of 3, two boots) | 212 colours | 29,240 colours | 28,885 colours |
+| Home screen, `simee screenshot` | 1 colour, all black | drawn | drawn | drawn |
+| Gboard up (`mInputShown=true`) | 1 colour, all white | not measured | 145 colours, dominant share 0.52 | not measured |
+| #351 bench, 60 taps | 60 missed, 0 changed frames; guest kernel event to present median 25.07 ms, p99 81.61 ms | `no-boot` (second arm) | 60 of 60 seen, median 31.65 ms | not run |
+
+`sys.boot_completed` came at 56 s (155 s on the very first boot). So on KosmicKrisp the API 34
+guest boots and presents, and nothing it draws reaches either capture. On MoltenVK it draws,
+minus the pipelines Metal refuses. That is worse than #412, so emu runs API 34 on MoltenVK
+again. API 35 stays on KosmicKrisp. `ANDROID_EMU_VK_ICD=kosmickrisp` still runs API 34 there,
+for working on this. Google TV 34 and the Automotive and google-xr 34 images weren't checked.
+They draw their UI on the same stack, so they go back to MoltenVK with the phone.
+
+**Open question: why is API 34 blank on KosmicKrisp when API 35 draws?** It is not answered
+here. What the code says:
+
+- emu configures the two the same. `host_gpu_icd` (`apps/emu/src/instance.rs:1020`) treated API
+  34 and 35 alike. `guest_graphics` (`apps/emu/src/instance.rs:1187`) gives API 34 and 35 phones
+  only `androidboot.hardwareegl=angle`: no `hwui.renderer`, no `renderengine.backend` and no
+  `exposeN*` ANGLE overrides, because neither image advertises `VulkanVirtualQueue` or
+  `GuestAngle`. `renderer_features` (`crates/emu-vmm/src/machine.rs:147`) gives both the same
+  feature string, and both run the renderer without GL (`GuestVulkanOnly`,
+  `crates/emu-vmm/src/machine.rs:197`). So the difference is in the guest image: its ANGLE build,
+  its gfxstream Vulkan driver, or its SurfaceFlinger. API 35 hard-codes RenderEngine to
+  `skiaglthreaded`. API 34's RenderEngine backend comes from the image's own default, and it
+  wasn't read on the device.
+- Hypothesis (unverified): the frames are presented, but their contents never land in the color
+  buffers that both captures read. The guest's `screencap` reads a color buffer by DMA into
+  shared-slot host memory (`GlDirectMem` with `HasSharedSlotsHostMemoryAllocator`,
+  `crates/emu-vmm/src/machine.rs:148` and `:162`). The host frame comes from the direct Vulkan
+  readback. Both see a uniform buffer. That points at the memory the guest renders into (an
+  import or host-visible mapping that API 34's guest Vulkan driver uses and API 35's doesn't),
+  or at a pipeline that KosmicKrisp creates without error but draws nothing with. It does not
+  point at a compile error: KosmicKrisp logged none.
+- An extension or feature that API 34's ANGLE needs and KosmicKrisp doesn't expose is the other
+  candidate. ANGLE would then fall back to another path, or fail without a message. Nothing in
+  emu filters the extensions the host driver offers, so this would be KosmicKrisp's own list.
+
+To narrow it down on a device, run API 34 with `ANDROID_EMU_VK_ICD=kosmickrisp`, then:
+`EMU_RENDERER_GL=1`, to read host frames through GL instead of the direct Vulkan readback;
+`dumpsys SurfaceFlinger | grep -i renderengine` and `getprop ro.hardware.vulkan` on 34 against 35;
+`VK_LOADER_DEBUG=driver` together with KosmicKrisp's `MESA_DEBUG`/`MESA_VK_*` logging; and, when
+the guest GLES path is in doubt, a `screencap` of a single app that draws with plain GLES.
+
 ## Device check (on main, after merge)
+
+After #495, steps 1 to 4 apply to API 35 only. On API 34, expect `Graphics Adapter Vendor`
+MoltenVK, no `host Vulkan is KosmicKrisp` line, the #412 `mvk-error` lines, and a home screen
+drawn (about 200 colours or more, against 1 on KosmicKrisp). Step 7's TV 34 now expects MoltenVK,
+and step 9 on API 34 prints `gfxstream gets moltenvk`.
+
 
 On an API 34 `google_apis` arm64 phone (1080x2400@420), and then the same on API 35:
 
