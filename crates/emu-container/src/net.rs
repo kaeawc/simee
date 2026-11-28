@@ -220,6 +220,60 @@ pub fn host_routes(view: &dyn HostView) -> Vec<(u32, u32)> {
     routes
 }
 
+fn is_main(table: &str) -> bool {
+    matches!(table, "main" | "254")
+}
+
+/// The tables with a default route that `ip rule` consults before the main table, for any
+/// traffic (a rule with no selector but `from all`): what an exit node or a full-tunnel VPN does
+/// (Tailscale's table 52). A veth pair's traffic would leave through such a table, whatever /30
+/// it has. `route_text` is `ip -4 route show table all` (lines say `table <id>`); `only` names
+/// the table when the text is one table's listing, which doesn't say.
+pub fn early_default_tables(rule_text: &str, route_text: &str, only: Option<&str>) -> Vec<String> {
+    let mut rules: Vec<(u32, &str)> = Vec::new();
+    for l in rule_text.lines() {
+        let Some((prio, rest)) = l.split_once(':') else { continue };
+        let Ok(prio) = prio.trim().parse::<u32>() else { continue };
+        let t: Vec<&str> = rest.split_whitespace().collect();
+        if t.len() == 4 && t[..3] == ["from", "all", "lookup"] {
+            rules.push((prio, t[3]));
+        }
+    }
+    let main_prio = rules.iter().filter(|(_, t)| is_main(t)).map(|&(p, _)| p).min().unwrap_or(32766);
+    let mut found: Vec<String> = Vec::new();
+    for l in route_text.lines() {
+        let mut t = l.split_whitespace().peekable();
+        if t.peek() == Some(&"throw") {
+            continue;
+        }
+        t.next_if(|w| ["unicast", "blackhole", "unreachable", "prohibit"].contains(w));
+        if t.next() != Some("default") {
+            continue;
+        }
+        let table = l.split_whitespace().skip_while(|w| *w != "table").nth(1).or(only);
+        let Some(table) = table else { continue };
+        let early = rules.iter().any(|&(prio, t)| t == table && prio < main_prio);
+        if early && !is_main(table) && !found.iter().any(|f| f == table) {
+            found.push(table.to_string());
+        }
+    }
+    found
+}
+
+/// The tables `ip rule` consults before main that hold a default route ([`early_default_tables`]),
+/// read from `view`.
+fn host_early_defaults(view: &dyn HostView) -> Vec<String> {
+    let rules = view.ip(&["-4", "rule", "show"]).unwrap_or_default();
+    match view.ip(&["-4", "route", "show", "table", "all"]) {
+        Some(all) => early_default_tables(&rules, &all, None),
+        None => parse_ip_rules(&rules)
+            .1
+            .iter()
+            .flat_map(|id| early_default_tables(&rules, &view.ip(&["-4", "route", "show", "table", id]).unwrap_or_default(), Some(id)))
+            .collect(),
+    }
+}
+
 /// Whether `/30` block `block` overlaps a route: they agree on the bits both fix.
 fn routed(block: u32, routes: &[(u32, u32)]) -> bool {
     let block_mask = !0u32 << (32 - u32::from(VETH_PREFIX));
@@ -399,7 +453,15 @@ impl NetPlan {
     pub fn for_host(view: &dyn HostView, adb_port: u16) -> Result<NetPlan> {
         let uplink = Uplink::choose(view).map_err(|m| Error::Net(format!("{} (fix: {})", m.why, m.fix)))?;
         // Routes are only read for a pair: the other uplinks don't take an address from the host.
-        let routes = if uplink == Uplink::Veth { host_routes(view) } else { Vec::new() };
+        let mut routes = Vec::new();
+        if uplink == Uplink::Veth {
+            if let Some(table) = host_early_defaults(view).first() {
+                return Err(Error::Net(format!(
+                    "the host routes all traffic through table {table} (a default route there, which `ip rule` consults before the main table: an exit node or a full-tunnel VPN), so a veth pair's traffic would leave through it; turn that off, or install pasta or slirp4netns (with /dev/net/tun) to avoid the pair"
+                )));
+            }
+            routes = host_routes(view);
+        }
         NetPlan::new(uplink, adb_port, &routes, &Reservations::new(view.reservations_dir()))
     }
 
@@ -952,6 +1014,39 @@ fe80::/64 dev eth0 proto kernel metric 256 pref medium\n";
         let rule_only = view(&["ip"], true, 0).file("/proc/net/route", ROUTES).ip_output("-4 rule show", IP_RULES);
         let routes = host_routes(&rule_only);
         assert!(routes.contains(&(u32::from(Ipv4Addr::new(10, 234, 0, 0)), 0xFFFF_0000)), "{routes:?}");
+    }
+
+    #[test]
+    fn an_exit_nodes_default_route_in_an_earlier_table_refuses_the_pair() {
+        // Table 52 with a default route (Tailscale's exit node), looked up at 5270, before main at 32766.
+        let exit = "default dev tailscale0 table 52\n100.100.100.100 dev tailscale0 table 52\n";
+        let routes = format!("default via 192.168.0.1 dev eth0 proto dhcp metric 100\n{exit}");
+        let host = view(&["ip"], true, 0)
+            .file("/proc/net/route", ROUTES)
+            .ip_output("-4 rule show", IP_RULES)
+            .ip_output("-4 route show table all", &routes);
+        let e = NetPlan::for_host(&host, 5557).expect_err("refused").to_string();
+        assert!(e.contains("table 52") && e.contains("exit node") && e.contains("pasta or slirp4netns"), "{e}");
+        // Read table by table, the same.
+        let by_table = view(&["ip"], true, 0)
+            .file("/proc/net/route", ROUTES)
+            .ip_output("-4 rule show", IP_RULES)
+            .ip_output("-4 route show table 52", exit);
+        assert!(NetPlan::for_host(&by_table, 5557).is_err());
+        // Pins: no default in table 52 (IP_ROUTES), a default in main only, a default in a table
+        // looked up after main, a rule with a selector, a throw default: all plan.
+        assert_eq!(early_default_tables(IP_RULES, IP_ROUTES, None), Vec::<String>::new());
+        assert!(early_default_tables(IP_RULES, "default via 192.168.0.1 dev eth0\n", None).is_empty());
+        assert!(early_default_tables(IP_RULES, "default dev x table default\n", None).is_empty());
+        assert!(early_default_tables(IP_RULES, "default dev x table 77\n", None).is_empty(), "77 is selected by destination only");
+        assert!(
+            early_default_tables("100: from all fwmark 0x1 lookup 9\n32766: from all lookup main\n", "default dev x table 9\n", None)
+                .is_empty()
+        );
+        assert!(early_default_tables(IP_RULES, "throw default table 52\n", None).is_empty());
+        // A user-mode uplink never looks.
+        let pasta = view(&["ip", "pasta"], true, 1000).ip_output("-4 rule show", IP_RULES).ip_output("-4 route show table all", &routes);
+        assert_eq!(NetPlan::for_host(&pasta, 5557).expect("plan").veth, None);
     }
 
     #[test]

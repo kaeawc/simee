@@ -584,7 +584,7 @@ pub(crate) mod fake {
         pub binderfs: Option<Vec<String>>,
         /// Canned `ip` output, keyed by its arguments joined with spaces.
         pub ip_outputs: BTreeMap<String, String>,
-        /// Where reservations go; a per-process temp directory when unset.
+        /// Where reservations go; [`FakeView::container_host`] gives each host its own.
         pub reservations: Option<std::path::PathBuf>,
     }
 
@@ -617,7 +617,11 @@ pub(crate) mod fake {
         /// A host where everything a container needs is there, as an Ubuntu 24.04 cloud VM with
         /// `linux-modules-extra` loaded: root, binderfs registered, unified cgroups.
         pub fn container_host() -> Self {
+            // Hosts in different tests must not share claims: exact-address asserts would race.
+            static HOSTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = HOSTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             FakeView {
+                reservations: Some(std::env::temp_dir().join(format!("simee-fake-veth-{}-{n}", std::process::id()))),
                 memfd: true,
                 arch: "x86_64".into(),
                 binderfs: Some(["binder", "hwbinder", "vndbinder"].map(String::from).to_vec()),

@@ -477,7 +477,7 @@ so far, and what it doesn't:
   ranges `ip -4 rule` selects on), so Tailscale's table 52 counts: not Tailscale's 100.64.0.0/10,
   behind which a tailnet peer could be hidden. Each /30 is held in a file under `/run/simee/veth`
   while its plan or container lives, claimed under a host-wide `flock`, so containers planned at
-  once never share a subnet; a claim whose process is gone is taken over. Refused with the list
+  once never share a subnet; a claim whose process is gone is taken over. A host whose `ip rule` consults a table with a default route before main (a Tailscale exit node's table 52, a full-tunnel VPN) is refused the pair, with the fix, because the pair's traffic would leave through that table. Refused with the list
   when every candidate is routed or held; a proxy thread on the loopback port). Root prefers pasta to the veth pair because it gives the guest an uplink without changing
   the host's routing or firewall. The veth pair has no uplink (the guest reaches the host's end of
   the pair and nothing further; services the host binds on all addresses are reachable from it
