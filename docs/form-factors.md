@@ -29,7 +29,9 @@ Error: device type `iPhone 17` is a phone, not a foldable
 `auto` means different things on each side, and the labels say which: on Apple it is **CarPlay**,
 the car display an iPhone simulator projects onto; on Android it is **Android Automotive OS**, the
 OS running on the head unit itself (what the emulator's automotive images are). Android Auto, which
-projects from a phone, isn't an emulator image.
+projects from a phone, isn't an emulator image. Linking a car to a phone (Android Auto's head unit,
+Automotive over Bluetooth, CarPlay's display) is researched in
+[research/car-pairing.md](research/car-pairing.md).
 
 `vision` is a headset on both sides: **visionOS** on Apple, **Android XR** on Android. Google
 publishes arm64 Android XR images that run on Apple silicon, from the `google_xr` repository site
