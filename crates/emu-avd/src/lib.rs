@@ -442,6 +442,26 @@ pub const SOFTWARE_LITE_LCD: (u32, u32, u32) = (540, 960, 240);
 /// The software-lite profile's refresh rate, `hw.lcd.vsync`.
 pub const SOFTWARE_LITE_VSYNC_HZ: u32 = 30;
 
+/// Whether profile `name` ([`PROFILES`]) can shape an AVD of an image with tag `tag` (`default`,
+/// `google_apis`, `android-tv`, ...), with the reason when it can't. It needs no image, so
+/// `emu -provision` asks before it downloads one.
+pub fn check_profile(name: &str, tag: &str) -> Result<()> {
+    match name {
+        "software-lite" => {
+            let kind = android_profile(|k| (k == "tag.id").then(|| tag.to_owned())).kind;
+            if kind.form_factor == FormFactor::Phone {
+                Ok(())
+            } else {
+                Err(Error::Config(format!(
+                    "profile software-lite shrinks a phone's screen; '{tag}' images are a {:?} with a screen of their own",
+                    kind.form_factor
+                )))
+            }
+        }
+        other => Err(Error::Config(format!("unknown AVD profile '{other}' (profiles: {})", PROFILES.join(", ")))),
+    }
+}
+
 /// What `create_avd` writes. Defaults favour cheap, fast boots: a small screen boots markedly
 /// faster than a large one, and more than 2 GB of RAM makes cold boots slower, not faster.
 #[derive(Clone, Debug)]
@@ -489,22 +509,16 @@ impl NewAvd {
     /// RAM and vCPUs stay as they were (docs/android.md "Software mode" has what it saves). Only
     /// phone images have a screen to shrink: the other form factors are refused.
     pub fn with_profile(mut self, name: &str) -> Result<NewAvd> {
+        let tag = self.sysdir.trim_matches('/').split('/').nth(2).unwrap_or_default().to_owned();
+        check_profile(name, &tag)?;
         match name {
             "software-lite" => {
-                let tag = self.sysdir.trim_matches('/').split('/').nth(2).unwrap_or_default().to_owned();
-                let kind = android_profile(|k| (k == "tag.id").then(|| tag.clone())).kind;
-                if kind.form_factor != FormFactor::Phone {
-                    return Err(Error::Config(format!(
-                        "profile software-lite shrinks a phone's screen; '{tag}' images are a {:?} with a screen of their own",
-                        kind.form_factor
-                    )));
-                }
                 self.lcd = SOFTWARE_LITE_LCD;
                 self.extra.retain(|(k, _)| k != "hw.lcd.vsync");
                 self.extra.push(("hw.lcd.vsync".to_owned(), SOFTWARE_LITE_VSYNC_HZ.to_string()));
                 Ok(self)
             }
-            other => Err(Error::Config(format!("unknown AVD profile '{other}' (profiles: {})", PROFILES.join(", ")))),
+            other => unreachable!("check_profile accepts only PROFILES, not '{other}'"),
         }
     }
 
@@ -1304,6 +1318,15 @@ mod tests {
         let shape = |a: &Avd| golden::SHAPE_KEYS.map(|k| a.get(k).map(str::to_owned));
         assert_ne!(shape(&plain), shape(&lite));
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn a_profile_is_checked_against_the_tag_alone() {
+        assert!(check_profile("software-lite", "default").is_ok());
+        assert!(check_profile("software-lite", "google_apis_playstore").is_ok());
+        let err = check_profile("software-lite", "android-tv").expect_err("tv").to_string();
+        assert!(err.contains("android-tv") && err.contains("software-lite"), "{err}");
+        assert!(check_profile("fast", "default").expect_err("unknown").to_string().contains("software-lite"));
     }
 
     #[test]

@@ -2,7 +2,8 @@
 # Android software mode (Linux without KVM): a smaller screen and a 30 Hz display, alone and
 # together, on one AVD.
 #
-#   scripts/bench/software-profile.sh --qemu QEMU (or EMU_QEMU) [--image DIR] [--arms "default lcd540 vsync30 lite"]
+#   scripts/bench/software-profile.sh --qemu QEMU (or EMU_QEMU) [--image DIR]
+#                                     [--arms "default lcd540 vsync30 lite shipped"]
 #                                     [--memory MB] [--settle S] [--window S] [--port N]
 #                                     [--rounds N] [--quick] [--out DIR]
 #
@@ -13,13 +14,19 @@
 #   lcd540   540x960 at 240 dpi, 60 Hz
 #   vsync30  720x1280 at 320 dpi, hw.lcd.vsync=30
 #   lite     540x960 at 240 dpi, hw.lcd.vsync=30 (the software-lite profile)
+#   shipped  an AVD of its own made by `emu -create-avd -profile software-lite` as users run it:
+#            its screen is its own golden user data's (so a 6 minute boot builds that golden on
+#            the first run: <avd home>/.simee-golden keeps it, and later runs clone it), and its
+#            config.ini is never rewritten. Not in the default arms: it adds boots (--arms adds it).
 # Boots use -no-window -no-audio -no-boot-anim -no-snapshot-save. Per boot: seconds from launch
-# until sys.boot_completed and until the launcher has focus; the device then sits --settle s (240)
-# and idle host CPU is the emulator's process tree's CPU time over the next --window s (60), in
-# cores; then two runs of scripts/android-jank.sh (10 launcher swipes up and down over adb): the
-# frames the launcher drew, frames per second of the run, janky frames, frame time percentiles
-# and host cores while swiping; last, the process tree's proportional set size (shared guest RAM
-# counted once) and its peak resident size sampled during the boot.
+# until sys.boot_completed and until the launcher has focus; the idle window then starts
+# --settle s (240) after sys.boot_completed (the same offset for every arm; later only when the
+# launcher took longer than that to take focus) and idle host CPU is the emulator's process tree's
+# CPU time over --window s (60), in cores; then two runs of scripts/android-jank.sh (10 launcher
+# swipes up and down over adb): the frames the launcher drew, frames per second of the run,
+# janky frames, frame time percentiles and host cores while swiping; last, the process tree's
+# proportional set size (shared guest RAM counted once) and its peak resident size sampled during
+# the boot.
 #
 # Needs an x86_64 Linux host with no /dev/kvm, QEMU 11 or newer (--qemu), the renderer
 # (`emu -provision-renderer`) and the API 36 default x86_64 image (--image, default
@@ -135,17 +142,47 @@ swipe_run() {
   bench_sample "$a" "$label: host cores while swiping" "$(awk -v c="${cpu:-0}" 'BEGIN { printf "%.2f", c / 100 }')"
 }
 
+# warm_up AVD LOG: the AVD's first boot after it was made, then a minute settling; not counted.
+warm_up() {
+  android_boot "$qemu_env" "$1" "$port" "$2" || bench_die "$1's first boot failed; see $2"
+  bench_log "$1: first boot ${BOOT_S}s (not counted)"
+  sleep 60
+  android_stop "$BOOT_PID" "$port"
+}
+
+read -r -a arm_list <<<"$arms"
+for a in "${arm_list[@]}"; do
+  case $a in
+    default | lcd540 | vsync30 | lite | shipped) ;;
+    *) bench_die "arm $a: expected default, lcd540, vsync30, lite or shipped" ;;
+  esac
+done
+# Only the arms that run are recorded (--quick runs two).
+arm_csv=${arm_list[0]}
+for a in "${arm_list[@]:1}"; do arm_csv+=",$a"; done
 avd="bench-profile-$$"
 avd_create "$avd" "$IMAGE_DIR" -cores 4 -memory "$memory" -lcd 720x1280@320
 qemu_env="emu:EMU_QEMU=$qemu"
 BENCH_ROUND=0
 apply_arm default
-android_boot "$qemu_env" "$avd" "$port" "$BENCH_WORK/first-boot.log" || bench_die "the AVD's first boot failed; see $BENCH_WORK/first-boot.log"
-bench_log "first boot ${BOOT_S}s (not counted)"
-sleep 60
-android_stop "$BOOT_PID" "$port"
+warm_up "$avd" "$BENCH_WORK/first-boot.log"
+shipped_avd=""
+for a in "${arm_list[@]}"; do
+  if [ "$a" = shipped ]; then
+    # As a user runs it: -create-avd builds (or clones) the golden user data of this screen size.
+    shipped_avd="bench-profile-shipped-$$"
+    env ANDROID_HOME="$BENCH_SDK" ANDROID_SDK_ROOT="$BENCH_SDK" ${ANDROID_AVD_HOME:+ANDROID_AVD_HOME="$ANDROID_AVD_HOME"} \
+      EMU_QEMU="$qemu" "$BENCH_EMU" -create-avd "$shipped_avd" -sysdir "$IMAGE_DIR" -cores 4 -memory "$memory" \
+      -profile software-lite >"$BENCH_WORK/create-shipped.log" 2>&1 || {
+      cat "$BENCH_WORK/create-shipped.log" >&2
+      bench_die "emu -create-avd -profile software-lite failed"
+    }
+    bench_on_exit avd_delete "$shipped_avd"
+    bench_log "created $shipped_avd: $(grep '^golden:' "$BENCH_WORK/create-shipped.log" | tail -1)"
+    warm_up "$shipped_avd" "$BENCH_WORK/first-boot-shipped.log"
+  fi
+done
 
-read -r -a arm_list <<<"$arms"
 for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
   order=("${arm_list[@]}")
   if [ $((BENCH_ROUND % 2)) = 0 ]; then
@@ -153,22 +190,25 @@ for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
     for ((i = ${#arm_list[@]} - 1; i >= 0; i--)); do order+=("${arm_list[i]}"); done
   fi
   for a in "${order[@]}"; do
-    apply_arm "$a"
+    boot_avd=$avd
+    if [ "$a" = shipped ]; then boot_avd=$shipped_avd; else apply_arm "$a"; fi
     t0=$(now)
-    if ! android_boot "$qemu_env" "$avd" "$port" "$BENCH_WORK/boot-$BENCH_ROUND-$a.log"; then
+    if ! android_boot "$qemu_env" "$boot_avd" "$port" "$BENCH_WORK/boot-$BENCH_ROUND-$a.log"; then
       bench_sample "$a" "warm boot: launch until sys.boot_completed, s" never
       android_stop "$BOOT_PID" "$port"
       continue
     fi
+    booted=$(now)
     bench_sample "$a" "warm boot: launch until sys.boot_completed, s" "$BOOT_S"
     bench_sample "$a" "warm boot: launch until the launcher has focus, s" "$(launcher_s "emulator-$port" "$t0" 120)"
-    sleep "$settle"
+    # The window starts $settle s after sys.boot_completed, whatever the launcher took.
+    sleep "$(awk -v spent="$(since "$booted" 3)" -v settle="$settle" 'BEGIN { r = settle - spent; print (r > 0 ? r : 0) }')"
     c0=$(cpu_s "$BOOT_PID")
     w0=$(now)
     sleep "$window"
     c1=$(cpu_s "$BOOT_PID")
     w=$(since "$w0" 3)
-    bench_sample "$a" "idle host cores (${settle} s after boot, over ${window} s)" \
+    bench_sample "$a" "idle host cores (${settle} s after sys.boot_completed, over ${window} s)" \
       "$(awk -v a="$c0" -v b="$c1" -v w="$w" 'BEGIN { printf "%.2f", (b - a) / w }')"
     swipe_run "swipes, first run"
     swipe_run "swipes, second run"
@@ -177,4 +217,4 @@ for BENCH_ROUND in $(seq 1 "$BENCH_ROUNDS"); do
     android_stop "$BOOT_PID" "$port"
   done
 done
-bench_finish "default,lcd540,vsync30,lite" "Image: $IMAGE_DIR, AVD 4 vCPUs, $memory MB; warm boots (one uncounted first boot) with -no-window -no-audio -no-boot-anim -no-snapshot-save; QEMU $("$qemu" --version | head -1)."
+bench_finish "$arm_csv" "Image: $IMAGE_DIR, AVD 4 vCPUs, $memory MB; warm boots (one uncounted first boot) with -no-window -no-audio -no-boot-anim -no-snapshot-save; QEMU $("$qemu" --version | head -1)."
