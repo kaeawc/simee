@@ -15,7 +15,7 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpListe
 
 use super::host::{self, Resolver};
 use super::packet::{self, Frame, Link};
-use super::shape::{self, Bucket, Downlink};
+use super::shape::{self, Bucket, Downlink, Loss};
 use sim_core::network::Conditions;
 
 use super::{Config, Shared, TO_GUEST, lock};
@@ -255,6 +255,9 @@ pub struct Engine {
     /// The shaping those conditions set; none when they set none, and then nothing here
     /// touches it.
     shaping: Option<Shaping>,
+    /// `network loss`, shaped or not: the guest's IP packets dropped as they cross the NAT,
+    /// from the guest before it acts on them and for the guest as they reach its queue.
+    loss: Loss,
 }
 
 /// How often an unshaped engine looks at the console's conditions (a shaped one looks every
@@ -289,6 +292,7 @@ impl Engine {
         // Accept segments to any destination: each flow's smoltcp socket stands in for it.
         iface.set_any_ip(true);
         Engine {
+            loss: Loss::new(cfg.loss_seed.unwrap_or_else(shape::clock_seed)),
             resolver: Resolver::new(cfg.dns.clone()),
             out: Emitter { gateway_mac: cfg.gateway_mac, guest_mac: None, ip_id: 0, frames: Vec::new() },
             cfg,
@@ -482,9 +486,10 @@ impl Engine {
             if self.wire.tx.is_empty() && !self.wire.blocked {
                 return;
             }
-            let any = !self.wire.tx.is_empty();
             let mut q = lock(&self.shared.to_guest);
-            q.extend(self.wire.tx.drain(..));
+            let (before, loss) = (q.len(), &mut self.loss);
+            q.extend(self.wire.tx.drain(..).filter(|f| !loss.drop_down(f)));
+            let any = q.len() > before;
             if self.wire.blocked {
                 if q.len() <= TO_GUEST / 2 {
                     self.again = true;
@@ -514,9 +519,12 @@ impl Engine {
         }
         let mut any = false;
         let mut q = lock(&self.shared.to_guest);
+        // Lost past the bottleneck: a dropped frame spent its share of the rate.
         while let Some(f) = s.down.pop_due(now) {
-            q.push_back(f);
-            any = true;
+            if !self.loss.drop_down(&f) {
+                q.push_back(f);
+                any = true;
+            }
         }
         // Blocked by the shaper's room: its next due frame wakes the thread, not the guest.
         if self.wire.blocked && !self.wire.by_shaper {
@@ -544,6 +552,7 @@ impl Engine {
             return;
         }
         self.applied = c;
+        self.loss.set(c.upload_loss_pct, c.download_loss_pct);
         self.shared.shaped.store(shapes(&c), Ordering::Relaxed);
         if shapes(&c) {
             let s = self.shaping.get_or_insert_with(|| Shaping { up: Bucket::new(), down: Downlink::new(), up_due: None });
@@ -582,6 +591,10 @@ impl Engine {
     fn input(&mut self, frame: Vec<u8>) {
         if let Some(m) = packet::src_mac(&frame) {
             self.out.guest_mac = Some(m);
+        }
+        // Lost on the way out, after the upload's rate took its share.
+        if self.loss.drop_up(&frame) {
+            return;
         }
         match packet::parse(&frame) {
             Frame::Arp { request, target } => {

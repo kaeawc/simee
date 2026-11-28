@@ -1472,7 +1472,7 @@ mod tests {
 
     #[test]
     fn a_device_with_no_body_stays_flat_and_says_so() {
-        let mut rt = polled_runtime(tv_scene);
+        let mut rt = polled_runtime(auto_scene);
         rt.on_key = Some(on_key);
         rt.state.view3d.supported = true;
         rt.key(cmd('3'));
