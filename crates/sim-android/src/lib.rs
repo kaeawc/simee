@@ -13,6 +13,7 @@ pub mod apps;
 pub mod audio;
 pub mod console;
 pub mod display;
+pub mod files;
 pub mod host;
 pub mod listing;
 pub mod procs;
