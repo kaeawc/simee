@@ -492,17 +492,41 @@ pub struct Sampler {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Where the sampler's readings come from: the live host in production, a fixture in tests.
+trait Source: Send {
+    /// One host snapshot.
+    fn sample(&mut self) -> Snapshot;
+    /// One pass over the host's processes (`None` where they can't be read).
+    fn observe(&mut self) -> Option<usage::Observation>;
+}
+
+/// The live host: sysctls or procfs, and libproc.
+#[derive(Default)]
+struct Live(usage::Reader);
+
+impl Source for Live {
+    fn sample(&mut self) -> Snapshot {
+        sample()
+    }
+    fn observe(&mut self) -> Option<usage::Observation> {
+        self.0.observe()
+    }
+}
+
 impl Sampler {
     /// Takes the first sample on the calling thread (so a report is available at once), then
     /// samples every `interval` on a thread named `simee-host`.
     pub fn start(interval: Duration) -> Sampler {
+        Sampler::start_with(interval, Live::default())
+    }
+
+    fn start_with(interval: Duration, mut source: impl Source + 'static) -> Sampler {
         let began = Instant::now();
-        let first = sample();
+        let first = source.sample();
         let mut ring = Ring::default();
         ring.push(point(0.0, &first));
-        let mut reader = usage::Reader::default();
         let mut tracker = usage::Tracker::new(first.cpus);
-        if let Some(o) = reader.observe() {
+        if let Some(o) = source.observe() {
             tracker.update(o);
         }
         let state = State { ring, latest: Some(first), usage: tracker, stopped: false };
@@ -518,8 +542,8 @@ impl Sampler {
                         return;
                     }
                     drop(guard);
-                    let s = sample();
-                    let o = reader.observe();
+                    let s = source.sample();
+                    let o = source.observe();
                     let Ok(mut st) = worker.state.lock() else { return };
                     st.ring.push(point(began.elapsed().as_secs_f64(), &s));
                     st.latest = Some(s);
@@ -612,8 +636,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A fixed healthy host: no test below depends on the machine it runs on.
+    fn fixture() -> Snapshot {
+        Snapshot {
+            at_unix_ms: 0,
+            cpus: 4,
+            load: Some(Load { one: 0.5, five: 0.5, fifteen: 0.5 }),
+            memory: Some(Memory {
+                total_bytes: 8 << 30,
+                available_bytes: Some(4 << 30),
+                free_percent: Some(50.0),
+                level: Level::Normal,
+                level_reason: "plenty free".into(),
+                pressure_level: Some(1),
+                swap_total_bytes: 0,
+                swap_used_bytes: 0,
+                compressor_bytes: None,
+                psi: None,
+            }),
+            disk: Some(Disk { path: "/".into(), total_bytes: 100 << 30, free_bytes: 50 << 30 }),
+            thermal: Thermal {
+                available: true,
+                state: Some(ThermalState::Nominal),
+                reason: None,
+                zones: vec![],
+                freq_ratio: None,
+                freq_cap_ratio: None,
+                throttle_count: None,
+            },
+            power: Power {
+                source: PowerSource::Ac,
+                has_battery: false,
+                charge_percent: None,
+                charging: None,
+                minutes_remaining: None,
+                low_power: None,
+                profile: None,
+                governor: None,
+                energy_preference: None,
+                energy_mode: None,
+                summary: "ac".into(),
+            },
+            findings: vec![],
+        }
+    }
+
+    /// A fake host: every read succeeds at once, and each observation is 10 ms later with the
+    /// host's CPU half busy.
+    #[derive(Default)]
+    struct Fake {
+        n: u32,
+    }
+
+    impl Source for Fake {
+        fn sample(&mut self) -> Snapshot {
+            fixture()
+        }
+        fn observe(&mut self) -> Option<usage::Observation> {
+            self.n += 1;
+            Some(usage::Observation {
+                at_ns: u64::from(self.n) * 10_000_000,
+                host_ticks: Some([self.n * 5, 0, self.n * 5, 0]),
+                ..usage::Observation::default()
+            })
+        }
+    }
+
     fn snap(thermal: Option<ThermalState>) -> Snapshot {
-        let mut s = sample();
+        let mut s = fixture();
         s.thermal =
             Thermal { available: thermal.is_some(), state: thermal, reason: thermal.map(|t| format!("it is {}", t.as_str())), ..s.thermal };
         s
@@ -643,11 +733,11 @@ mod tests {
 
     #[test]
     fn the_sampler_fills_the_ring() {
-        let s = Sampler::start(Duration::from_millis(10));
-        // Wait for 3 samples rather than a fixed 120 ms: a loaded CI runner took only 2 in that
-        // time. The deadline still fails a sampler that never fills.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while s.ring().len() < 3 && std::time::Instant::now() < deadline {
+        let s = Sampler::start_with(Duration::from_millis(10), Fake::default());
+        // The fake never blocks, so only the sampler thread's scheduling is in play: wait for 3
+        // samples with a deadline generous enough for a heavily loaded host.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while s.ring().len() < 3 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         let ring = s.ring();
@@ -656,12 +746,26 @@ mod tests {
         assert!(r.averages[0].samples >= 3);
         let u = s.usage();
         assert_eq!(u.available, usage::AVAILABLE);
-        assert!(!u.available || (u.samples >= 3 && u.host.cpu_pct.s1.is_some()), "{u:?}");
-        assert!(u.host.memory_total_bytes.is_some());
+        assert!(u.samples >= 3 && u.host.cpu_pct.s1.is_some(), "{u:?}");
+        assert_eq!(u.host.memory_total_bytes, Some(8 << 30));
         drop(s);
     }
 
+    /// The live host through the real sampler: load-sensitive, so it only runs on request.
     #[test]
+    #[ignore = "reads the live host; run with --ignored"]
+    fn the_live_sampler_runs() {
+        let s = Sampler::start(Duration::from_millis(10));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while s.ring().len() < 3 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(s.ring().len() >= 3);
+        assert!(s.usage().host.memory_total_bytes.is_some());
+    }
+
+    #[test]
+    #[ignore = "reads the live host; run with --ignored"]
     fn the_live_host_reads_sane_values() {
         let s = sample();
         assert!(s.cpus >= 1);
@@ -686,6 +790,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "reads the live host; run with --ignored"]
     fn the_machine_names_its_chip_and_release() {
         let m = machine();
         println!("{m:?}");
