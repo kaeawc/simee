@@ -105,6 +105,8 @@ case $platform in
     ;;
   *) bench_die "--platform $platform: expected ios or android" ;;
 esac
+# A device named with --udid or --avd is the user's, booted for this run: not foreign to the gate.
+bench_target ${udid:+"$udid"} ${avd:+"$avd"}
 bench_start encode
 bench_log "building the encode_bench example"
 (cd "$BENCH_REPO" && cargo build -q --release -p simee-encode --example encode_bench) || bench_die "cargo build --example encode_bench failed"
