@@ -70,7 +70,7 @@ pub const DUPLICATED_IDENTITY: &str = "every AVD made from a golden is the same 
      live in the copied, encrypted user data";
 
 /// How a disk was copied, and the one function that copies them (`clone.rs`).
-pub use crate::clone::{CloneKind, clone_file};
+pub use crate::clone::{CloneKind, clone_file, clone_file_atomic};
 
 /// What a golden is keyed by.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -356,11 +356,13 @@ fn publish(env: &Env, key: &GoldenKey, avd: &Avd) -> Result<CloneKind> {
     }
 }
 
+/// The slower of two ways a disk was copied: a reflink beats a sparse copy, which beats a full
+/// copy (it writes the holes out).
 fn worst(a: CloneKind, b: CloneKind) -> CloneKind {
     let rank = |k| match k {
         CloneKind::Reflink => 0,
-        CloneKind::Copy => 1,
-        CloneKind::Sparse => 2,
+        CloneKind::Sparse => 1,
+        CloneKind::Copy => 2,
     };
     if rank(b) > rank(a) { b } else { a }
 }
@@ -698,6 +700,23 @@ mod tests {
         File::options().write(true).open(&system).expect("open").set_modified(mtime).expect("mtime back");
         assert_ne!(env.golden_key(&a).expect("edited").image, first.image);
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn the_worst_copy_is_the_slowest_one() {
+        use CloneKind::{Copy, Reflink, Sparse};
+        for (a, b, want) in [
+            (Reflink, Reflink, Reflink),
+            (Reflink, Sparse, Sparse),
+            (Sparse, Reflink, Sparse),
+            (Sparse, Copy, Copy),
+            (Copy, Sparse, Copy),
+            (Reflink, Copy, Copy),
+            (Copy, Reflink, Copy),
+            (Copy, Copy, Copy),
+        ] {
+            assert_eq!(worst(a, b), want, "{a:?} then {b:?}");
+        }
     }
 
     #[test]

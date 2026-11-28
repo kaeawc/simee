@@ -833,9 +833,12 @@ holding the AVD's `hardware-qemu.ini.lock`). Linux, 4-vCPU Xeon @ 2.20 GHz VM, 7
 Medians over 5 rounds of the p50 and p95 of 100 calls, the build before and after alternating.
 "Kept" is one connection to a `simee serve` that has been up a second; "one-shot" is a fresh
 `simee` process with no server on the socket, so it includes the process's start (`--version` is
-the floor: 4.7 ms). The one-shot taps fail once the device is resolved, before any network I/O: a
-stopped AVD isn't running, and a stand-in is a stock emulator, which refuses input over the
-display socket. That failure is what is timed. Reproduce:
+the floor: 4.7 ms). The calls fail, and the failure is what is timed, at different points:
+`tap` of an exact name fails after the device is resolved and before any network I/O (a stopped
+AVD isn't running, and a stand-in is a stock emulator, which refuses input over the display
+socket); `booted` fails inside resolution, with no running device ("no device matches `booted`")
+or, with 2 running, because it "matches several devices", so no device is picked and nothing
+after the lookup runs (`info booted` and `tap booted` in the 2-running column). Reproduce:
 `python3 -I scripts/bench/android-resolve.py --baseline <before build>`.
 
 | Call | none running, before → after (ms) | 2 running, before → after (ms) |
@@ -857,8 +860,27 @@ and `config.ini` are parsed once and then validated by one `stat` (path, mtime, 
 exact name is one `stat` of its pointer instead of listing the home; `booted` loads only the
 running AVDs' configs.
 
-What is left, measured: `devices` lists and loads all 44 AVDs (about 0.6–1 ms in the server, plus
-an 11 KB reply the client parses), so it is not under 1 ms. A cold one-shot `list` or fuzzy name
+What is left, measured. Kept `devices` is still about 2 ms (p50 2.01 ms with nothing running and
+1.93 with 2 running, p95 2.4 and 2.6; 2.01 and 2.20 on the build before the listing work below,
+which is no difference at this sample size: the per-round p50s of the same build range over
+0.5–2.3 ms, so none of the kept-connection rows moved by more than noise). Where the time goes in
+the server process on the same VM, p50 over 1000 calls, from the `listing_cost` test
+(`python3 -I scripts/bench/android-resolve.py --make-home DIR`, wait 3 s, then
+`SIMEE_BENCH_SDK=DIR/sdk SIMEE_BENCH_AVD_HOME=DIR/avd cargo test --release -p simee-android
+listing_cost -- --ignored --nocapture`): listing the home 0.005 ms, resolving each of the 44 AVDs'
+pointer and directory 0.11 ms, each one's lock 0.07 ms, describing each (config `stat`, image
+`stat`, the profile and the `DeviceInfo`) 0.23 ms, the whole `devices` 0.44 ms. The same test cut
+to `list_avds` and `devices` on the build before (`main` at #383, a copy of the test) gives 0.05–0.10
+and 0.59–0.62 ms, so the listing work is worth about 0.15 ms in the server. The rest of the 2 ms
+is the 10.7 KB reply: a call that does the same work and returns `[]` (`devices` with `booted`)
+takes 0.6–0.7 ms over the socket, and `help`, which computes in 0.1 ms, takes ~0.9 ms to arrive on
+this VM. So the listing is under 1 ms of server work and the call is not; getting the call under
+1 ms here is a matter of the connection's reply path (`crates/sim-api/src/lib.rs`), which was not
+changed. The listing's floor with exact validation is 5 system calls per AVD (pointer, directory,
+config, image, lock). The remembered listing of the home is not used when a pointer is a link or
+any read failed. `devices` with `booted` is 0.63 / 0.74 ms (none / 2 running) and `info` of
+`booted` 0.44 / 0.35 ms, also within noise of the build before.
+A cold one-shot `list` or fuzzy name
 reads every AVD's two files (about 700 system calls for 44 AVDs, ~5 ms over the floor); an on-disk
 cache would still `stat` each file, and wasn't built. With nothing running, the one-shot exact-name
 `tap` is within 1.7 ms of `--version`.

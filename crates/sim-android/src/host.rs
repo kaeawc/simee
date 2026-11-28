@@ -26,18 +26,10 @@ impl Host for Native {
     }
 }
 
-/// The argument vector of a `KERN_PROCARGS2` record (`argc` as a native-endian `i32`, the
-/// executable path, NUL padding, `argc` NUL-terminated strings, then the environment) as the
-/// command line `ps` prints: the words joined by spaces.
+/// A `KERN_PROCARGS2` record's argv as the command line `ps` prints: the words joined by spaces.
 #[cfg(any(target_os = "macos", test))]
 fn procargs_line(buf: &[u8]) -> Option<String> {
-    let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?);
-    let rest = &buf[4..];
-    // The executable path, then the padding NULs before argv[0].
-    let rest = &rest[rest.iter().position(|&b| b == 0)?..];
-    let rest = &rest[rest.iter().position(|&b| b != 0)?..];
-    let words: Vec<&[u8]> = rest.split(|&b| b == 0).take(usize::try_from(argc).ok()?).collect();
-    let line = words.iter().map(|w| String::from_utf8_lossy(w)).collect::<Vec<_>>().join(" ");
+    let line = sim_host::usage::argv_from_procargs(buf).join(" ");
     let line = line.trim_end();
     (!line.is_empty()).then(|| line.to_owned())
 }
@@ -214,7 +206,8 @@ mod tests {
         }
     }
 
-    /// A process that has exited, once reaped, is nothing to the host: not a stale answer.
+    /// A process that has exited, once reaped, is nothing to the host: not a stale answer. Its PID
+    /// may be handed to another process meanwhile, which is a different process by its start time.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn a_gone_process_reads_as_nothing() {
@@ -226,10 +219,13 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "the child never exec'd sleep: {:?}", Native.args(pid));
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(Native.start(pid).is_some());
+        let started = Native.start(pid).expect("start");
         child.kill().expect("kill");
         child.wait().expect("wait");
-        assert_eq!((Native.start(pid), Native.args(pid), Native.listening(pid)), (None, None, Vec::new()));
+        match Native.start(pid) {
+            None => assert_eq!((Native.args(pid), Native.listening(pid)), (None, Vec::new())),
+            Some(now) => assert_ne!(now, started, "the PID was reused: another process, started later"),
+        }
     }
 
     /// A stock qemu end to end through the real host: a process whose command line is a qemu's
@@ -245,7 +241,6 @@ mod tests {
         let dir = root.join("lane.avd");
         std::fs::create_dir_all(&dir).expect("avd dir");
         std::fs::write(root.join("lane.ini"), format!("path={}\n", dir.display())).expect("pointer");
-        let env = emu_avd::Env { sdk_root: None, avd_home: root.clone() };
         // `sh -c 'read x' qemu-fake -avd lane -port 5900` blocks on its stdin with those words in
         // its command line.
         let mut qemu = Command::new("sh")
@@ -255,10 +250,10 @@ mod tests {
             .expect("sh");
         std::fs::write(dir.join("hardware-qemu.ini.lock"), format!("{}\0", qemu.id())).expect("lock");
         let stock = crate::listing::StockCache::new(std::sync::Arc::new(Native));
-        let names = ["lane".to_owned()];
+        let avds = [("lane", dir.as_path())];
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let found = loop {
-            let found = stock.instances(&env, &names, &[]);
+            let found = stock.instances(avds, &[]);
             if !found.is_empty() || std::time::Instant::now() > deadline {
                 break found;
             }
@@ -268,10 +263,10 @@ mod tests {
             found.iter().map(|r| (r.avd_name.as_str(), r.console_port, r.adb_port, r.pid)).collect::<Vec<_>>(),
             [("lane", 5900, 5901, qemu.id() as i32)]
         );
-        assert_eq!(stock.instances(&env, &names, &[]), found, "and again, from memory");
+        assert_eq!(stock.instances(avds, &[]), found, "and again, from memory");
         qemu.stdin.take().expect("stdin").write_all(b"\n").ok();
         qemu.wait().expect("wait");
-        assert!(stock.instances(&env, &names, &[]).is_empty(), "an exited process isn't listed");
+        assert!(stock.instances(avds, &[]).is_empty(), "an exited process isn't listed");
         std::fs::remove_dir_all(root).ok();
     }
 

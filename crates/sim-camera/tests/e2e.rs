@@ -516,13 +516,33 @@ fn a_swap_stops_the_old_capture() {
     let is_qr = |g: &Got| shows(g, Some(&qr)) == Shows::Still;
     let any = |_: &Got| true;
     on_both(&mut cams, |cam| swap_to(cam, generation, &any, &is_qr));
-    let started = Instant::now();
-    loop {
-        let now: Vec<String> = hub.active().into_iter().map(|a| a.source).collect();
-        if now == [qr.to_string()] {
-            break;
+    // The readers keep draining while the old capture winds down: the feed drops a reader that
+    // stops reading for its write timeout, which would end the new capture too. No wall-clock
+    // bound beyond the suite's own GUARD.
+    let done = AtomicBool::new(false);
+    thread::scope(|s| {
+        let done = &done;
+        for cam in cams.iter_mut() {
+            s.spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    let _ = next(cam);
+                }
+            });
         }
-        assert!(started.elapsed() < GUARD, "the test card's capture is still running: {now:?}");
-        thread::sleep(Duration::from_millis(10));
-    }
+        let started = Instant::now();
+        let stopped = loop {
+            let now: Vec<String> = hub.active().into_iter().map(|a| a.source).collect();
+            if now == [qr.to_string()] {
+                break Ok(());
+            }
+            if started.elapsed() >= GUARD {
+                break Err(format!("the test card's capture is still running: {now:?}"));
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        done.store(true, Ordering::Relaxed);
+        if let Err(m) = stopped {
+            panic!("{m}");
+        }
+    });
 }

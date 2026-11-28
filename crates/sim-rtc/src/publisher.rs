@@ -24,9 +24,9 @@
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -187,6 +187,35 @@ impl Publisher {
         on_event: impl FnMut(PublisherEvent) + Send + 'static,
     ) -> Result<Publisher> {
         Self::open(config, Some(input), Box::new(on_event))
+    }
+
+    /// [`connect_with_input`](Self::connect_with_input), except that a server which refuses the
+    /// data channel is offered the stream again without it: MediaMTX answers an offer with an
+    /// `m=application` section `406 unsupported media 'application'`. Only that answer to the
+    /// POST (a 406 whose body names `application`) is retried, once; any other error, and the
+    /// retry's own, is returned as it is. The second value is why the channel was dropped
+    /// (`None`: the channel is in the offer the server accepted).
+    pub fn connect_with_input_or_without(
+        config: PublisherConfig,
+        input: InputSession,
+        on_event: impl FnMut(PublisherEvent) + Send + 'static,
+    ) -> Result<(Publisher, Option<String>)> {
+        let on_event = Arc::new(Mutex::new(on_event));
+        let forward = || -> Box<dyn FnMut(PublisherEvent) + Send> {
+            let on_event = on_event.clone();
+            Box::new(move |event| {
+                if let Ok(mut f) = on_event.lock() {
+                    f(event);
+                }
+            })
+        };
+        match Self::open(config.clone(), Some(input), forward()) {
+            Err(Error::Status { status: 406, method: "POST", body }) if body.contains("application") => {
+                let note = format!("the WHIP server refused the input data channel (406 {})", body.trim());
+                Self::open(config, None, forward()).map(|p| (p, Some(note)))
+            }
+            other => other.map(|p| (p, None)),
+        }
     }
 
     fn open(config: PublisherConfig, input: Option<InputSession>, on_event: Box<dyn FnMut(PublisherEvent) + Send>) -> Result<Publisher> {

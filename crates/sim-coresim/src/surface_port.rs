@@ -467,7 +467,13 @@ mod tests {
         let name = inbox.name().to_owned();
         drop(inbox);
         assert!(outbox.send(&a, 3).is_err(), "the port is dead");
-        assert!(SurfaceOutbox::look_up(&name).is_err(), "the name went with its port");
+        // launchd releases the name a moment after the port dies, not in the same instant: poll
+        // for it, up to a deadline that only a name launchd never releases outlasts.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while SurfaceOutbox::look_up(&name).is_ok() {
+            assert!(std::time::Instant::now() < deadline, "the name went with its port");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

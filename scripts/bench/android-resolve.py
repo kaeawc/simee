@@ -3,6 +3,7 @@
 
     python3 -I scripts/bench/android-resolve.py [--avds N] [--running N] [--calls N] [--baseline SIMEE]
         [--simee BIN] [--rounds N] [--quick] [--out DIR]
+    python3 -I scripts/bench/android-resolve.py --make-home DIR [--avds N]
 
 Builds a private SDK and AVD home with --avds AVDs (default 44: phones, tablets, watches, TVs and
 cars, each with the config.ini avdmanager writes), and with --running of them (default 2) held
@@ -18,10 +19,18 @@ emulators:
   kept       over one `simee serve` connection: `devices`, `devices` with booted, `info` of an exact
              AVD name, `info` of `booted`
   one-shot   `simee list`, `simee list --booted`, `simee tap NAME 1 1` and `simee tap booted 1 1`
-             as a fresh process each (no server on the socket). The taps fail once the device is
-             resolved, before any network I/O: a stopped AVD isn't running, and a stand-in is a
-             stock emulator, which refuses input over the display socket. That is what is timed.
+             as a fresh process each (no server on the socket). The failure is what is timed:
+             a tap of a name fails after the device is resolved, before any network I/O (a stopped
+             AVD isn't running; a stand-in is a stock emulator, which refuses input over the
+             display socket). `booted` fails inside resolution: "no device matches" when nothing
+             runs, "matches several devices" with 2 running, so no device is picked then (the kept
+             `info` of `booted` likewise).
 A one-shot call includes the process's start; `simee --version` is timed too, as its floor.
+
+--make-home DIR only builds the home (aged, nothing running) and prints the two paths the
+in-process breakdown takes: wait 3 s (a file changed in the last 2 s is never remembered), then
+`SIMEE_BENCH_SDK=DIR/sdk SIMEE_BENCH_AVD_HOME=DIR/avd cargo test --release -p simee-android
+listing_cost -- --ignored --nocapture` prints p50 and p95 over 1000 calls of each part of a listing.
 
 Reproduces docs/benchmarks.md "Android device resolution".
 """
@@ -231,8 +240,14 @@ def main():
     p.add_argument('--simee')
     p.add_argument('--rounds', type=int, default=3)
     p.add_argument('--quick', action='store_true')
+    p.add_argument('--make-home')
     p.add_argument('--out', default=os.path.join(REPO, 'bench', 'results'))
     a = p.parse_args()
+    if a.make_home:
+        os.makedirs(a.make_home)
+        sdk, avd, _ = make_home(a.make_home, a.avds)
+        print(f'SIMEE_BENCH_SDK={sdk} SIMEE_BENCH_AVD_HOME={avd}')
+        return 0
     rounds = 1 if a.quick else a.rounds
     n = 10 if a.quick else a.calls
     host_start = summarize.host()

@@ -54,7 +54,7 @@ static uint32_t StripSeq(CVPixelBufferRef pixels) {
     _status.numberOfLines = 0;
     _status.textColor = UIColor.whiteColor;
     _status.backgroundColor = [UIColor colorWithWhite:0 alpha:0.72];
-    _status.font = [UIFont monospacedSystemFontOfSize:15 weight:UIFontWeightSemibold];
+    _status.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightSemibold];
     [self.view addSubview:_status];
     _frames = dispatch_queue_create("dev.simee.camerafixture.frames", DISPATCH_QUEUE_SERIAL);
     [AVCaptureDevice requestAccessForMediaType:AVMediaTypeVideo completionHandler:^(BOOL granted) {
@@ -71,7 +71,11 @@ static uint32_t StripSeq(CVPixelBufferRef pixels) {
     [super viewDidLayoutSubviews];
     _preview.frame = self.view.bounds;
     CGRect b = self.view.bounds;
-    _status.frame = CGRectMake(12, b.size.height - self.view.safeAreaInsets.bottom - 190, b.size.width - 24, 180);
+    // Kept inside the bottom fifth of the screen, below the camera bench's centre box (the middle 60%
+    // of each axis, where its --point must fall), so the label never darkens a pixel the bench reads.
+    CGFloat top = b.size.height * 0.8 + 2;
+    _status.frame = CGRectMake(12, top, b.size.width - 24, b.size.height - self.view.safeAreaInsets.bottom - top - 2);
+    _status.clipsToBounds = YES;
 }
 
 - (void)start {

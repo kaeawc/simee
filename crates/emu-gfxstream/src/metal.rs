@@ -187,17 +187,30 @@ pub struct Capabilities {
     pub metal3: bool,
     /// Placement heaps (`supportsFamily:` Apple2 or Mac2): what gfxstream's color buffers are.
     pub placement_heaps: bool,
-    /// The paravirtualized GPU of a macOS VM ("Apple Paravirtual device"), which forwards Metal
-    /// to the host's.
-    pub paravirtual: bool,
+    /// This Mac is a virtual machine's guest (`kern.hv_vmm_present`), so its GPU is a virtual one
+    /// whatever it is called.
+    pub virtual_machine: bool,
+    /// The device's name says it is the paravirtualized GPU of a macOS VM ("Apple Paravirtual
+    /// device"), which forwards Metal to the host's.
+    pub paravirtual_name: bool,
 }
 
 /// Whether the present path may run on a device with `caps`, decided before any heap is aliased:
 /// `Err` says why not, and frames are then read back. Aliasing another API's placement heap with
 /// a texture of our own description is outside what Metal promises; real Apple GPUs keep the
 /// image's bytes there, and a VM's paravirtual GPU faults (CI's `macos-26` runner, PR #379).
+///
+/// A VM's GPU is told apart by the host, not by the device: Metal has no property that marks a
+/// virtual GPU, and the families the gate checks don't separate it from a real one. Properties
+/// such as `location`, `isRemovable` or the registry class were not checked against one (that
+/// needs a VM), so the gate doesn't rely on them; `kern.hv_vmm_present` is the kernel's own flag
+/// for running under a hypervisor, and covers a virtual GPU under any name. The name check
+/// stays as the fallback for a VM where that flag can't be read.
 pub fn present_gate(caps: &Capabilities) -> Result<(), &'static str> {
-    if caps.paravirtual {
+    if caps.virtual_machine {
+        return Err("this Mac is a virtual machine, whose GPU faults when the renderer's heaps are aliased");
+    }
+    if caps.paravirtual_name {
         return Err("a paravirtual GPU (a macOS VM's): aliasing the renderer's heaps faults there");
     }
     if !caps.placement_heaps {
@@ -402,8 +415,22 @@ mod imp {
         super::Capabilities {
             metal3: family(FAMILY_METAL3),
             placement_heaps: family(FAMILY_APPLE2) || family(FAMILY_MAC2),
-            paravirtual: name.contains("Paravirtual"),
+            virtual_machine: hypervisor_present(),
+            paravirtual_name: name.contains("Paravirtual"),
         }
+    }
+
+    /// Whether this Mac runs under a hypervisor: `kern.hv_vmm_present`, which the kernel sets in a
+    /// virtual machine's guest (false when it can't be read).
+    pub(crate) fn hypervisor_present() -> bool {
+        let mut present: i32 = 0;
+        let mut len = std::mem::size_of::<i32>();
+        // SAFETY: a NUL-terminated name, an int-sized buffer with its length in `len`, and no new
+        // value (null, 0); the kernel writes at most `len` bytes.
+        let rc = unsafe {
+            libc::sysctlbyname(c"kern.hv_vmm_present".as_ptr(), (&raw mut present).cast(), &raw mut len, std::ptr::null_mut(), 0)
+        };
+        rc == 0 && present != 0
     }
 
     /// [`super::present_gate`] for the system's default Metal device, the one the renderer runs on:
@@ -1028,13 +1055,22 @@ mod tests {
 
     #[test]
     fn the_present_path_is_refused_up_front_on_a_gpu_that_cant_alias_heaps() {
-        let apple = Capabilities { metal3: true, placement_heaps: true, paravirtual: false };
+        let apple = Capabilities { metal3: true, placement_heaps: true, virtual_machine: false, paravirtual_name: false };
         assert_eq!(present_gate(&apple), Ok(()));
         let why = |caps| present_gate(&caps).expect_err("refused");
-        assert!(why(Capabilities { paravirtual: true, ..apple }).contains("paravirtual"), "a VM's GPU");
+        assert!(why(Capabilities { paravirtual_name: true, ..apple }).contains("virtual"), "a VM's GPU, by its name");
         assert!(why(Capabilities { placement_heaps: false, ..apple }).contains("placement heaps"));
         assert!(why(Capabilities { metal3: false, ..apple }).contains("Metal 3"));
         assert!(present_gate(&Capabilities::default()).is_err(), "nothing known: refused");
+    }
+
+    #[test]
+    fn a_virtual_machines_gpu_is_refused_whatever_it_is_called() {
+        // A VM's GPU that reports everything a real one does and isn't named "Paravirtual".
+        let renamed = Capabilities { metal3: true, placement_heaps: true, virtual_machine: true, paravirtual_name: false };
+        assert!(present_gate(&renamed).expect_err("refused").contains("virtual machine"));
+        let named = Capabilities { paravirtual_name: true, ..renamed };
+        assert!(present_gate(&named).is_err(), "both signals: refused");
     }
 
     #[test]
@@ -1103,6 +1139,14 @@ mod tests {
         /// Set in the child that runs the copy test with the gate off ([`probe_with_the_gate_off`]).
         const PROBE: &str = "SIMEE_METAL_PROBE";
         const COPY_TEST: &str = "metal::tests::on_metal::a_color_buffer_heap_is_copied_into_a_bgra_surface_byte_for_byte";
+
+        /// How long the probe may run before it stops itself, and how long the test waits for it:
+        /// both inside the 30 s the default nextest profile gives a test, and the child's bound on
+        /// its own, so a parent killed while it waits leaves no hung child behind.
+        const PROBE_SELF_BOUND: Duration = Duration::from_secs(15);
+        const PROBE_WAIT: Duration = Duration::from_secs(20);
+        /// What the probe prints when it stops itself (not a step, so the last step stays).
+        const PROBE_GAVE_UP: &str = "metal probe hung and stopped itself";
 
         fn probing() -> bool {
             std::env::var_os(PROBE).is_some()
@@ -1175,7 +1219,7 @@ mod tests {
                 out
             });
             // Only a bound on a hung probe (a copy never completing); nothing is timed.
-            let deadline = Instant::now() + Duration::from_secs(60);
+            let deadline = Instant::now() + PROBE_WAIT;
             let status = loop {
                 match child.try_wait() {
                     Ok(Some(s)) => break s.to_string(),
@@ -1188,12 +1232,21 @@ mod tests {
                 }
             };
             let out = reader.join().unwrap_or_default();
+            let status = if out.contains(PROBE_GAVE_UP) { "hung, stopped".into() } else { status };
             let last = out.lines().rev().find_map(|l| l.strip_prefix("metal probe: ")).unwrap_or("none").to_owned();
             format!("with the gate off the copy {status}; the last step it reached: {last}")
         }
 
         #[test]
         fn a_color_buffer_heap_is_copied_into_a_bgra_surface_byte_for_byte() {
+            if probing() {
+                // A copy that never completes must not outlive the test that started the probe.
+                std::thread::spawn(|| {
+                    std::thread::sleep(PROBE_SELF_BOUND);
+                    eprintln!("{PROBE_GAVE_UP}");
+                    std::process::abort();
+                });
+            }
             // SAFETY: returns a +1 device or null without a GPU.
             let device = unsafe { MTLCreateSystemDefaultDevice() };
             if device.is_null() {
@@ -1251,6 +1304,32 @@ mod tests {
             let again = p.present(5, w, h).expect("copied again");
             assert_eq!(again.with_bgra(|px, stride| bgra_matches_rgba(px, stride, &rgba, w, h)), Some(true));
             release(device);
+        }
+
+        /// `kern.hv_vmm_present` as `sysctl` prints it: an independent read of the flag.
+        fn sysctl_says_virtual_machine() -> bool {
+            let out = std::process::Command::new("/usr/sbin/sysctl").args(["-n", "kern.hv_vmm_present"]).output().expect("sysctl");
+            String::from_utf8_lossy(&out.stdout).trim() == "1"
+        }
+
+        #[test]
+        fn this_macs_gpu_is_allowed_unless_this_mac_is_a_virtual_machine() {
+            // SAFETY: returns a +1 device or null without a GPU.
+            let device = unsafe { MTLCreateSystemDefaultDevice() };
+            if device.is_null() {
+                eprintln!("no Metal device: skipped");
+                return;
+            }
+            let caps = pooled(|| capabilities(device));
+            release(device);
+            let vm = sysctl_says_virtual_machine();
+            assert_eq!(caps.virtual_machine, vm, "{caps:?}");
+            if vm {
+                assert!(present_gate(&caps).is_err(), "a VM's GPU: {caps:?}");
+            } else {
+                // Outside a VM, the Macs this runs on have Metal 3 GPUs with placement heaps.
+                assert_eq!(present_gate(&caps), Ok(()), "{caps:?}");
+            }
         }
 
         #[test]

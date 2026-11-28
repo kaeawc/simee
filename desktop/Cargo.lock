@@ -3587,6 +3587,7 @@ dependencies = [
  "simee-core",
  "simee-coresim",
  "simee-emu-avd",
+ "simee-host",
 ]
 
 [[package]]

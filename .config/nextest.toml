@@ -3,6 +3,13 @@
 fail-fast = true
 slow-timeout = { period = "10s", terminate-after = 3 }
 
+# The Metal copy test passes on a GPU emu refuses (a macOS VM's, like CI's) and says on stderr why,
+# and where the copy fails there with the gate off: show that output when it passes too. Overrides
+# in the default profile apply to every profile.
+[[profile.default.overrides]]
+filter = 'package(simee-emu-gfxstream) & test(=metal::tests::on_metal::a_color_buffer_heap_is_copied_into_a_bgra_surface_byte_for_byte)'
+success-output = "immediate"
+
 [profile.ci]
 fail-fast = false
 retries = 1
