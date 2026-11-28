@@ -51,7 +51,8 @@ options:
   -no-boot-anim     skip the boot animation
   -accel MODE       software mode (x86_64 Linux): auto (default: KVM when /dev/kvm is usable,
                     else QEMU's TCG), on (KVM or fail), off (TCG); -no-accel is -accel off
-  -disk-cache MODE  unsafe (default: guest flushes stay in the host page cache) or fsync
+  -disk-cache MODE  unsafe (default: guest flushes stay in the host page cache; the disks
+                    sync once when the machine stops) or fsync
   -gpu MODE         rendering mode, default auto (host GPU through MoltenVK):
                       auto, host     host GPU through MoltenVK, software if that fails
                       lavapipe, swangle, angle_indirect
