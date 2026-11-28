@@ -199,9 +199,10 @@ reverse):
 | `camera_sources` | Android, iOS (the host's cameras and the synthetic sources; needs no device) |
 | `camera_link`, `camera_unlink`, `camera_links` | Android, iOS (iOS: device-wide shim injection, needs `simee serve`; see [camera.md](camera.md)) |
 | `prefs_stores`, `prefs_read`, `prefs_write`, `prefs_delete`, `prefs_batch`, `prefs_watch` | Android, iOS (iOS is implemented; Android answers "not yet available") |
+| `connections`, `traffic`, `network_shape`, `network_state`, `network_clear` | Android, iOS (Android: the emulator console's `network speed` and `network delay`, airplane mode for offline, and the guest's socket tables and per-uid counters over adb; loss, rules, proxy and inject are iOS's) |
 | `erase`, `status_bar`, `clear_status_bar`, `increase_contrast`, `hardware_keyboard`, `memory_warning` | Android, iOS (Android: SystemUI's demo mode, settings and `am send-trim-memory` over adb; `erase` on the AVD's disks) |
 | `containers`, `ls`, `read`, `write`, `rm`, `du`, `clear_container` | Android, iOS (Android: in an app's container, through `run-as` for a debuggable app, root otherwise; `adb root` only with `root: true`, `pm clear` only with `pm_clear: true`) |
-| `appearance`, `privacy`, `push`, `content_size`, `dynamic_island`, `backlight`, `keyboard_language`, `ca_debug`, `ca_debug_state`, `reset_keychain`, `notify`, `biometric`, `logs`, `connections`, `traffic`, `defaults_read`, `defaults_write`, `crash_reports`, `network_shape`, `network_state`, `network_flows`, `network_clear`, `network_env`, `audio_state`, `audio_volume`, `audio_route`, `audio_capture_start`, `audio_capture_stop`, `audio_mute`, `watch_gesture`, `remote_swipe`, `pointer`, `carplay` | iOS |
+| `appearance`, `privacy`, `push`, `content_size`, `dynamic_island`, `backlight`, `keyboard_language`, `ca_debug`, `ca_debug_state`, `reset_keychain`, `notify`, `biometric`, `logs`, `defaults_read`, `defaults_write`, `crash_reports`, `network_flows`, `network_env`, `audio_state`, `audio_volume`, `audio_route`, `audio_capture_start`, `audio_capture_stop`, `audio_mute`, `watch_gesture`, `remote_swipe`, `pointer`, `carplay` | iOS |
 | `mem_leaks`, `mem_heap`, `mem_vmmap`, `mem_history` | iOS (the host's memory tools on one app; Android answers that they aren't available there) |
 
 A test keeps this page honest: it fails if a tool isn't named here.

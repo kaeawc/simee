@@ -19,6 +19,7 @@
 
 mod android;
 mod android_files;
+mod android_net;
 mod android_state;
 mod camera;
 #[cfg_attr(not(unix), allow(dead_code))]
