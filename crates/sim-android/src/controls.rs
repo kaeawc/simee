@@ -326,8 +326,27 @@ impl CallAction {
             CallAction::Incoming => "call",
             other => other.name(),
         };
-        Ok(format!("gsm {verb} {number}"))
+        check_command(format!("gsm {verb} {number}"))
     }
+}
+
+/// The longest console command simee sends from a typed control, in bytes. The stock console
+/// starts a new line after 4095 bytes of one, so a longer text would run its remainder as a
+/// command of its own; an SMS part is at most 160 characters, and this leaves room for the rest.
+pub const MAX_COMMAND: usize = 1024;
+
+/// Refuses a console command with a control character or a line too long for one: see
+/// [`MAX_COMMAND`]. Every typed control's formatted line goes through it.
+pub fn check_command(command: String) -> Result<String, String> {
+    if command.chars().any(char::is_control) {
+        return Err(
+            "the console command has a control character (a line break, CR, NUL, tab, ESC): the console reads those as separators".into()
+        );
+    }
+    if command.len() > MAX_COMMAND {
+        return Err(format!("the console command is {} bytes, over the {MAX_COMMAND} one line may carry", command.len()));
+    }
+    Ok(command)
 }
 
 /// A phone number as the modem takes one: digits, `*` and `#`, after an optional `+`, at most 40.
@@ -388,7 +407,17 @@ pub fn sms_command(from: &str, text: &str) -> Result<String, String> {
     if text.contains(['\r', '\n']) {
         return Err("the SMS text has a line break, which the console can't carry: send each line as its own SMS".into());
     }
-    Ok(format!("sms send {from} {}", text.split_whitespace().collect::<Vec<_>>().join(" ")))
+    if text.chars().any(char::is_control) {
+        return Err("the SMS text has a control character (NUL, tab, ESC, ...), which the console can't carry".into());
+    }
+    let line = format!("sms send {from} {}", text.split_whitespace().collect::<Vec<_>>().join(" "));
+    if line.len() > MAX_COMMAND {
+        return Err(format!(
+            "the SMS is {} bytes on the console line, over the {MAX_COMMAND} one line may carry: shorten the text (an SMS part is 160 characters)",
+            line.len()
+        ));
+    }
+    check_command(line)
 }
 
 /// The sensors the console sets, with how many values each takes (emu's and stock's console
@@ -411,7 +440,7 @@ pub fn sensor_set_command(name: &str, values: &[f64]) -> Result<String, String> 
     if let Some(v) = values.iter().find(|v| !v.is_finite()) {
         return Err(format!("sensor value {v} isn't a finite number"));
     }
-    Ok(format!("sensor set {name} {}", values.iter().map(f64::to_string).collect::<Vec<_>>().join(":")))
+    check_command(format!("sensor set {name} {}", values.iter().map(f64::to_string).collect::<Vec<_>>().join(":")))
 }
 
 /// Reads `sensor get`'s `acceleration = 0:9.80665:0`.
@@ -515,23 +544,40 @@ impl Device {
     }
 
     /// Shakes the device: the accelerometer swings along x for `shake.duration`, over one console
-    /// session, then reads what it read before. The rest value is put back even when a swing fails.
-    pub fn shake(&self, shake: &Shake) -> Result<(), String> {
-        let mut session = console::Session::open(self.running()?.console_port)?;
+    /// session, then reads what it read before. `cancelled` is asked before each swing; true stops
+    /// the shake with an error. The rest value is put back whatever happens (a failed swing, a
+    /// cancel), over a fresh console connection when the session itself failed; a restore that
+    /// fails too is part of the error.
+    pub fn shake(&self, shake: &Shake, cancelled: &dyn Fn() -> bool) -> Result<(), String> {
+        let port = self.running()?.console_port;
+        let mut session = console::Session::open(port)?;
         let rest = parse_sensor("acceleration", &session.command("sensor get acceleration")?)?;
         let rest: [f64; 3] = rest.try_into().map_err(|v: Vec<f64>| format!("the accelerometer reads {} values, not 3", v.len()))?;
         let swings = shake.plan(rest)?;
-        let set = |s: &mut console::Session, a: &[f64; 3]| s.command(&sensor_set_command("acceleration", a)?).map(drop);
+        let restore = sensor_set_command("acceleration", &rest)?;
         let mut result = Ok(());
         for a in &swings {
-            result = set(&mut session, a);
+            if cancelled() {
+                result = Err("cancelled: shake was cancelled".to_owned());
+                break;
+            }
+            result = session.command(&sensor_set_command("acceleration", a)?).map(drop);
             if result.is_err() {
                 break;
             }
             std::thread::sleep(SHAKE_SWING);
         }
-        let restored = set(&mut session, &rest);
-        result.and(restored)
+        let mut restored = session.command(&restore).map(drop);
+        if restored.is_err() {
+            drop(session);
+            restored = console::send(port, std::slice::from_ref(&restore)).map(drop);
+        }
+        match (result, restored) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Err(e)) => Err(format!("the shake ran, but putting the accelerometer back failed: {e}")),
+            (Err(e), Ok(())) => Err(e),
+            (Err(e), Err(r)) => Err(format!("{e}; and putting the accelerometer back failed: {r}")),
+        }
     }
 }
 
@@ -641,13 +687,33 @@ mod tests {
 
     #[test]
     fn sms_senders_and_texts() {
-        assert_eq!(sms_command("+15551234567", "Your  code is\t1234"), Ok("sms send +15551234567 Your code is 1234".into()));
+        assert_eq!(sms_command("+15551234567", "Your  code   is 1234"), Ok("sms send +15551234567 Your code is 1234".into()));
         assert_eq!(sms_command("MyBank", "hi"), Ok("sms send MyBank hi".into()));
         for bad in ["", "My Bank", "VeryLongBankName", "+", &"1".repeat(21)] {
             assert!(sms_command(bad, "hi").expect_err(bad).contains("bad SMS sender"), "{bad}");
         }
         assert!(sms_command("1", " ").expect_err("empty").contains("empty"));
         assert!(sms_command("1", "a\nb").expect_err("newline").contains("line break"));
+    }
+
+    #[test]
+    fn sms_refuses_control_characters_and_lines_past_the_cap() {
+        for c in ['\0', '\x1b', '\t', '\r', '\x7f', '\u{85}', '\u{9f}'] {
+            let text = format!("a{c}b");
+            assert!(sms_command("1", &text).is_err(), "{c:?}");
+        }
+        // The exploit: a text that fills the console's 4095-byte line, then `kill`.
+        let exploit = format!("{}kill", "a".repeat(4084));
+        assert!(sms_command("1", &exploit).expect_err("4084").contains("over the 1024"));
+        let exact = "a".repeat(MAX_COMMAND - "sms send 1 ".len());
+        assert_eq!(sms_command("1", &exact).expect("at the cap").len(), MAX_COMMAND);
+        assert!(sms_command("1", &format!("{exact}a")).is_err());
+        assert!(check_command("a\0b".into()).is_err());
+        assert!(check_command("x".repeat(MAX_COMMAND + 1)).is_err());
+        // The longest a sensor line formats to fits.
+        let big = sensor_set_command("acceleration", &[f64::MAX, f64::MIN, f64::MAX]).expect("max values");
+        assert!(big.len() <= MAX_COMMAND, "{}", big.len());
+        assert!(CallAction::Incoming.command(&"1".repeat(40)).is_ok());
     }
 
     #[test]

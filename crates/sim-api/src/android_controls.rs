@@ -40,7 +40,7 @@ pub(crate) fn call(d: &Device, method: &str, p: &Value) -> Result<Value, String>
             (None, Some(_)) => Err("give the sensor's `name` to set its `values`".into()),
             (Some(name), v) => d.sensor(name, v.as_deref()).map(|values| json!({"name": name, "values": values})),
         },
-        _ => d.shake(&shake_options(p)?).map(|()| Value::Null),
+        _ => d.shake(&shake_options(p)?, &crate::call_cancelled).map(|()| Value::Null),
     }
 }
 
@@ -326,6 +326,46 @@ mod tests {
             let err = run(&mut f, "shake", p.clone()).expect_err(&p.to_string());
             assert!(err.contains(says), "{p}: {err}");
         }
+        assert!(console(&f).is_empty());
+    }
+
+    #[test]
+    fn a_cancelled_shake_puts_the_accelerometer_back_and_returns_promptly() {
+        let mut f = fixture("shakecancel");
+        run(&mut f, "sensor", json!({"name": "acceleration", "values": [0, 9.5, 1]})).expect("rest");
+        console(&f);
+        let asked = std::cell::Cell::new(0);
+        let hooks = crate::CallHooks {
+            cancelled: Box::new(move || {
+                asked.set(asked.get() + 1);
+                asked.get() > 3
+            }),
+            progress: Box::new(|_| {}),
+        };
+        let started = std::time::Instant::now();
+        let err =
+            crate::with_call_hooks(hooks, || run(&mut f, "shake", json!({"duration_ms": 60000, "intensity": 20}))).expect_err("cancelled");
+        assert!(err.starts_with("cancelled"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+        assert_eq!(
+            console(&f),
+            [
+                "sensor get acceleration",
+                "sensor set acceleration 20:9.5:1",
+                "sensor set acceleration -20:9.5:1",
+                "sensor set acceleration 20:9.5:1",
+                "sensor set acceleration 0:9.5:1",
+            ]
+        );
+    }
+
+    #[test]
+    fn sms_refuses_a_text_that_would_cross_the_consoles_line() {
+        let mut f = fixture("smscap");
+        let text = format!("{}kill", "a".repeat(4084));
+        let err = run(&mut f, "sms", json!({"from": "1", "text": text})).expect_err("long");
+        assert!(err.contains("over the 1024"), "{err}");
+        assert!(run(&mut f, "sms", json!({"from": "1", "text": "a\u{0}kill"})).is_err());
         assert!(console(&f).is_empty());
     }
 
