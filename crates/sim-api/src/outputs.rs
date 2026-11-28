@@ -197,8 +197,8 @@ pub const OUTPUTS: &[(&str, &str)] = &[
         "[{pid: number, ppid: number, cpu: number, rss_kb: number, elapsed: string, name: string, path: string, package?: string|null}]",
     ),
     ("kill", "null"),
-    ("connections", "[{pid: number, process: string, protocol: string, local: string, remote: string, state: string}]"),
-    ("traffic", "[{pid: number, process: string, bytes_in: number, bytes_out: number}]"),
+    ("connections", "[{pid: number|null, process: string, protocol: string, local: string, remote: string, state: string, uid?: number}]"),
+    ("traffic", "[{pid: number|null, process: string, bytes_in: number, bytes_out: number, uid?: number}]"),
     (
         "mem_leaks",
         "{...@mem, leak_count: number, stacks: boolean, leaks: [object], nodes?: number|null, malloced_bytes?: number|null,
@@ -241,9 +241,10 @@ pub const OUTPUTS: &[(&str, &str)] = &[
     ),
     (
         "network_shape",
-        r#"{profile: @shape, proxy_port: number|null, injected: boolean, inject_mode: "none"|"launchd"|"boot", profile_path: string}"#,
+        r#"{profile: @shape, proxy_port: number|null, injected: boolean, inject_mode: "none"|"launchd"|"boot", profile_path?: string,
+            commands?: [string]}"#,
     ),
-    ("network_state", "{profile: @shape, proxy_port: number|null, injected: boolean, boot_injected: boolean}"),
+    ("network_state", "{profile: @shape, proxy_port: number|null, injected: boolean, boot_injected: boolean, network_status?: [string]}"),
     (
         "network_flows",
         "[{started: number, method: string, host: string, port: number, outcome: string, bytes_up: number, bytes_down: number,

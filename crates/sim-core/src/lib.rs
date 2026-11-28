@@ -22,6 +22,7 @@ pub mod hostfs;
 pub mod idle;
 pub mod indigo;
 pub mod launchd;
+pub mod launchd_profiles;
 pub mod logcat;
 pub mod mark;
 pub mod net;
