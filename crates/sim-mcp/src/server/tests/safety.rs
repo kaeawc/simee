@@ -10,6 +10,7 @@ use crate::rpc::META_CLIENT_INFO;
 
 const CI_1: &str = "UDID-CI-1";
 const CI_2: &str = "UDID-CI-2";
+const CI_2_B: &str = "UDID-CI-2-B";
 const PROD: &str = "UDID-PROD";
 
 /// Devices that answer `info` and `devices` as the API does (the fake answers a method the same way
@@ -51,6 +52,10 @@ impl Backend for World {
         match method {
             "info" => {
                 let devices = self.devices.lock().expect("devices");
+                // In the set `B` ci-2 has another UDID.
+                if params["set"] == "B" && query == "ci-2" {
+                    return Ok(json!({"device": device(CI_2_B, "ci-2", "Booted")}));
+                }
                 found(&devices).map(|d| json!({"device": d})).ok_or_else(|| format!("no device matches `{query}`"))
             }
             "devices" => Ok(Value::Array(self.devices.lock().expect("devices").clone())),
@@ -617,6 +622,25 @@ fn a_client_unlinks_only_links_whose_devices_it_may_touch() {
 }
 
 #[test]
+fn unlink_and_status_by_device_judge_the_partners_in_the_calls_set() {
+    let rig = rig(devices_only(&["ci-*"]));
+    let member =
+        |udid: &str, name: &str, role: &str| json!({"device": udid, "name": name, "platform": "ios", "role": role, "running": true});
+    // In set B, the allowed phone ci-2 (another UDID there) is paired with the forbidden prod-1.
+    rig.fake.answer(
+        "links",
+        Ok(json!([{"id": "PAIR-B", "kind": "watch-phone", "members": [member(CI_2_B, "ci-2", "phone"), member(PROD, "prod-1", "watch")]}])),
+    );
+    for (tool, extra) in [("unlink", json!({"confirm": true})), ("link_status", json!({}))] {
+        let mut args = json!({"device": "ci-2", "set": "B"});
+        args.as_object_mut().expect("object").extend(extra.as_object().expect("object").clone());
+        let refused = call(&rig, tool, args.clone());
+        assert!(is_error(&refused) && text(&refused).contains("may not touch") && text(&refused).contains("prod-1"), "{tool}: {refused}");
+    }
+    assert!(rig.fake.called("unlink").is_empty() && rig.fake.called("link_status").is_empty());
+}
+
+#[test]
 fn links_leaves_out_a_link_with_a_device_the_client_may_not_see() {
     let rig = rig(devices_only(&["ci-*"]));
     answer_links(&rig);
@@ -649,7 +673,9 @@ fn unlink_needs_a_confirmation_since_coresimulator_may_erase_the_watch() {
     assert!(text(&call(&rig, "unlink", json!({"device": "ci-2"}))).contains("every link of `ci-2` (UDID-CI-2)"));
     // A client that can be asked is asked, whatever `confirm` says.
     let (ask, _) = input_required(&call_as(&rig, "agent", asks(), "unlink", json!({"link": "PAIR-CI", "confirm": true})));
-    assert!(ask["message"].as_str().is_some_and(|m| m.contains("unlink `PAIR-CI`")), "{ask}");
+    let message = ask["message"].as_str().unwrap_or_default();
+    assert!(message.contains("unlink `PAIR-CI`"), "{ask}");
+    assert!(message.contains("watch `ci-1`") && message.contains("phone `ci-2`"), "names the pair's devices: {ask}");
     assert!(rig.fake.called("unlink").is_empty());
     assert!(crate::safety::may_confirm("unlink"));
 }

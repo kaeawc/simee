@@ -243,9 +243,9 @@ fn pair_devices(host: &mut dyn PairHost, p: &Value) -> Result<(Pair, bool), Stri
     match link::existing_pair(&watch.udid, &phone.udid, &pairs) {
         Ok(Some(same)) => return Ok((same.clone(), false)),
         Ok(None) => {}
-        Err(other) => {
-            let holder = host.device(&other.phone)?.map_or_else(|| other.phone.clone(), |s| s.name);
-            return Err(format!("{} is already paired with {holder} (link {}); `unlink` it first", watch.name, other.id));
+        Err(_) => {
+            // Neither the holder's name nor the link id: the caller may not be allowed to see that phone.
+            return Err(format!("{} is already paired to another phone; `unlink` it first", watch.name));
         }
     }
     host.can_pair(&watch.udid, &phone.udid)?;
@@ -593,7 +593,8 @@ mod tests {
         let first = link_of(&mut set, &[WATCH, PHONE], json!({})).expect("first");
         let e = link_of(&mut set, &[WATCH, PHONE2], json!({})).expect_err("already paired");
         let id = first["id"].as_str().expect("id");
-        assert_eq!(e, format!("Apple Watch Series 11 is already paired with iPhone 17 (link {id}); `unlink` it first"));
+        assert_eq!(e, "Apple Watch Series 11 is already paired to another phone; `unlink` it first");
+        assert!(!e.contains("iPhone 17") && !e.contains(id), "names neither the phone nor the link: {e}");
         assert_eq!(set.changes().len(), 1, "only the first pair was made");
     }
 

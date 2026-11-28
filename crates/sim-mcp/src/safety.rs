@@ -159,7 +159,7 @@ impl Safety {
     /// Whether `client` may touch every member of the links a link method acts on beyond the
     /// devices it names ([`linked_members`]), as the refusal that says why not.
     fn permit_links(&self, backend: &dyn Backend, client: &str, policy: &ClientPolicy, method: &str, params: &Value) -> Result<(), String> {
-        for member in linked_members(backend, method, params).map_err(|e| unresolved_refusal(method, &e))? {
+        for (member, _) in linked_members(backend, method, params).map_err(|e| unresolved_refusal(method, &e))? {
             if !self.may_touch(client, policy, &member) {
                 return Err(device_refusal(policy, method, &member.udid, Some(&member)));
             }
@@ -229,7 +229,9 @@ impl Safety {
                 return Verdict::Go(prepared);
             }
         }
-        let what = what_it_does(tool, args, &resolved, sometimes);
+        // The pair an `unlink {link}` removes, by its members' names (the id alone says nothing).
+        let pair = if tool == "unlink" { linked_members(backend, tool, args).unwrap_or_default() } else { Vec::new() };
+        let what = what_it_does(tool, args, &resolved, sometimes, &pair);
         let sent = prepared.args.as_ref().unwrap_or(args);
         let state = self.seal_state(client, tool, sent);
         Verdict::Confirm(Confirmation { tool: tool.to_owned(), message: format!("An agent asks to {what}."), state, what }, prepared)
@@ -417,7 +419,17 @@ struct Resolved {
 
 /// The device `query` names (a UDID, a name, `booted`), by the API's own lookup.
 fn resolve(backend: &dyn Backend, query: &str) -> Result<Resolved, String> {
-    let info = backend.call("info", &json!({"device": query}))?;
+    resolve_in(backend, query, None)
+}
+
+/// [`resolve`] in the device set `set` (a device has a different UDID in each set); `None` is the
+/// default lookup.
+fn resolve_in(backend: &dyn Backend, query: &str, set: Option<&Value>) -> Result<Resolved, String> {
+    let mut params = json!({"device": query});
+    if let Some(set) = set {
+        params["set"] = set.clone();
+    }
+    let info = backend.call("info", &params)?;
     let device = &info["device"];
     let udid = device["udid"].as_str().ok_or_else(|| format!("`info` doesn't say which device `{query}` is"))?;
     let state = device["state"].as_str().unwrap_or("");
@@ -483,7 +495,7 @@ fn named_devices(tool: &str, args: &Value) -> Vec<String> {
 /// id) names, and for `unlink` and `link_status` by `device`, every link of that device (an `unlink`
 /// removes them all, and a status shows the other member). They are read from `links` in the call's
 /// set, since an id says no device. An id that isn't among them can't be checked, so it is an error.
-fn linked_members(backend: &dyn Backend, method: &str, params: &Value) -> Result<Vec<Resolved>, String> {
+fn linked_members(backend: &dyn Backend, method: &str, params: &Value) -> Result<Vec<(Resolved, String)>, String> {
     if !matches!(method, "link" | "unlink" | "link_status") {
         return Ok(Vec::new());
     }
@@ -493,7 +505,8 @@ fn linked_members(backend: &dyn Backend, method: &str, params: &Value) -> Result
         return Ok(Vec::new());
     }
     let mut query = json!({});
-    if let Some(set) = params.get("set").filter(|s| !s.is_null()) {
+    let set = params.get("set").filter(|s| !s.is_null());
+    if let Some(set) = set {
         query["set"] = set.clone();
     }
     let listed = backend.call("links", &query)?;
@@ -510,7 +523,8 @@ fn linked_members(backend: &dyn Backend, method: &str, params: &Value) -> Result
             found
         }
         (None, Some(query)) => {
-            let udid = resolve(backend, query)?.udid;
+            // In the call's set, where the links were read: a device has another UDID in each set.
+            let udid = resolve_in(backend, query, set)?.udid;
             rows.iter().filter(|r| member_ids(r).contains(&udid)).collect()
         }
         (None, None) => Vec::new(),
@@ -521,13 +535,20 @@ fn linked_members(backend: &dyn Backend, method: &str, params: &Value) -> Result
         .filter_map(|m| {
             let udid = m["device"].as_str()?.to_owned();
             let name = m["name"].as_str().map_or_else(|| udid.clone(), str::to_owned);
-            Some(Resolved { udid, name, running: m["running"] == true })
+            let role = m["role"].as_str().unwrap_or("device").to_owned();
+            Some((Resolved { udid, name, running: m["running"] == true }, role))
         })
         .collect())
 }
 
 /// `tool`'s effect on its devices, as a clause the user reads: `erase iPhone 17 (UDID)`.
-fn what_it_does(tool: &str, args: &Value, targets: &[(String, Result<Resolved, String>)], sometimes: Option<Destructive>) -> String {
+fn what_it_does(
+    tool: &str,
+    args: &Value,
+    targets: &[(String, Result<Resolved, String>)],
+    sometimes: Option<Destructive>,
+    pair: &[(Resolved, String)],
+) -> String {
     let label = |q: &str, r: &Result<Resolved, String>| match r {
         Ok(d) if d.name != d.udid => format!("`{}` ({})", d.name, d.udid),
         Ok(d) => format!("`{}`", d.udid),
@@ -548,7 +569,11 @@ fn what_it_does(tool: &str, args: &Value, targets: &[(String, Result<Resolved, S
         "reset_keychain" => format!("delete every keychain item on {on}"),
         "shutdown" => format!("shut down {on}, which this client didn't boot"),
         "unlink" => match args.get("link").and_then(Value::as_str) {
-            Some(id) => format!("unlink `{id}`: CoreSimulator may shut its watch down and erase it"),
+            Some(id) => {
+                let members = pair.iter().map(|(d, role)| format!("{role} `{}`", d.name)).collect::<Vec<_>>().join(" and ");
+                let named = if members.is_empty() { format!("`{id}`") } else { format!("`{id}` ({members})") };
+                format!("unlink {named}: CoreSimulator may shut its watch down and erase it")
+            }
             None => format!("unlink every link of {on}: CoreSimulator may shut each watch down and erase it"),
         },
         "rm" => format!("remove `{}` from the data of {on}: files are deleted", text("path")),

@@ -93,7 +93,7 @@ impl Backend for Linked {
 #[test]
 fn a_link_by_id_or_by_device_names_every_member_of_the_links_it_touches() {
     let udids = |method: &str, params: Value| -> Result<Vec<String>, String> {
-        linked_members(&Linked, method, &params).map(|m| m.into_iter().map(|d| d.udid).collect())
+        linked_members(&Linked, method, &params).map(|m| m.into_iter().map(|d| d.0.udid).collect())
     };
     assert_eq!(udids("unlink", json!({"link": "pair-a"})), Ok(vec!["U-CI-2".to_owned(), "U-CI-1".to_owned()]), "ids in any case");
     assert_eq!(udids("link", json!({"link": "PAIR-B", "devices": ["ci-1"]})).expect("by id").len(), 2);
