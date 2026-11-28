@@ -55,6 +55,9 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         // boot, boot_many, create and clone's admission, and admission_check (#275)
         "admission" => Str,
         "admission_timeout_s" | "count" => Int,
+        // Android's kill and exec (#414)
+        "force" => Bool,
+        "max_bytes" => Int,
         // stream_* (#266)
         "whip_url" | "token" | "stream_id" => Str,
         "fps" | "max_size" | "bitrate" => Int,
