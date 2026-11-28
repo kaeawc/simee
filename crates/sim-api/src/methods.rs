@@ -239,7 +239,13 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("memory_warning", "device", "Simulate a memory warning"),
     ("notify", "device, name, state?", "Post a Darwin notification (optionally setting its state)"),
     ("biometric", "device, action(match|nomatch|enroll|unenroll), face?", "Touch ID / Face ID"),
-    ("exec", "device, program, args?, env?", "Run a program inside the device; returns stdout/stderr"),
+    (
+        "exec",
+        "device, program, args?, env?; Android: timeout_s?, max_bytes?",
+        "Run a program inside the device; returns stdout/stderr. Android: over adb as the shell user, the argv passed through \
+         unchanged (quoted, so nothing in it is expanded), with exit_code; past timeout_s (30) it is stopped and the call fails, \
+         and a stream that reaches max_bytes (8 MiB) is cut there and the program stopped (truncated true, exit_code null)",
+    ),
     (
         "logs",
         "device, last?, predicate?, stream?(false)",
@@ -249,8 +255,19 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          minutes or a reboot. It omits launchd_sim's lines, signpost state dumps and `Last log repeated` lines (iOS 27.2: 12% of a \
          settled device's lines, 1% of a just-booted one's), and its timestamps are often 1 ms later",
     ),
-    ("processes", "device", "Device processes with CPU and memory"),
-    ("kill", "device, pid, signal?", "Signal a device process"),
+    (
+        "processes",
+        "device",
+        "Device processes with CPU and memory. Android: the guest's `ps -A` (cpu is CPU time over the process's life), each app \
+         process with its package",
+    ),
+    (
+        "kill",
+        "device, pid | bundle_id, signal?; Android: force?",
+        "Signal a device process (default 15, SIGTERM). iOS takes pid only. Android: bundle_id stops the app instead (`am \
+         force-stop`); a process the shell user may not signal is signalled as root (`su 0`, on google_apis images); init, zygote \
+         and system_server are refused unless force",
+    ),
     ("connections", "device", "Open sockets of device processes"),
     ("traffic", "device", "Bytes in/out per device process"),
     // Memory tools on one app (#183): the host's leaks, heap, vmmap and malloc_history on its pid.
@@ -511,6 +528,10 @@ const ALL_PLATFORMS: &[&str] = &[
     "launch",
     "terminate",
     "apps",
+    // Over adb on Android (#414).
+    "processes",
+    "kill",
+    "exec",
     "location",
     "info",
     "rotate",
@@ -2923,6 +2944,7 @@ pub(crate) mod tests {
         ("delete", "refuses a running device before it reads parameters"),
         ("create", "its required parameters depend on `platform`, and it creates a device"),
         ("clone", "creates a device from a golden that has booted"),
+        ("kill", "the probe's pid is 1, init, which kill refuses without force (its own tests read its parameters)"),
     ];
 
     /// The parameters an iOS dispatcher arm reads with `need_*` or reports missing, found in its

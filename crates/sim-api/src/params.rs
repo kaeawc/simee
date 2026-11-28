@@ -58,14 +58,10 @@ pub fn need_bool(p: &Value, key: &str) -> Result<bool, String> {
     p.get(key).and_then(Value::as_bool).ok_or_else(|| format!("missing boolean parameter `{key}`"))
 }
 
-// Only iOS methods read this so far.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn strings(p: &Value, key: &str) -> Vec<String> {
     p.get(key).and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default()
 }
 
-// Only iOS methods read this so far.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn pairs(p: &Value, key: &str) -> Vec<(String, String)> {
     p.get(key)
         .and_then(Value::as_object)

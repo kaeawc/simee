@@ -175,7 +175,9 @@ pub fn wait_for(lines: &Mutex<Vec<String>>, n: usize) -> Vec<String> {
 /// `pidof` exits 1, as toybox's does), `com.example.late`'s process shows up on the third
 /// `pidof`, `com.example.leaky` has two launcher activities (LeakCanary's alias second), and
 /// `am force-stop com.example.hang` never returns (it writes its PID to `hang.pid` beside the
-/// script first).
+/// script first). `ps` lists a guest's processes (init, zygote, system_server, apps); `kill`
+/// succeeds (logged only: no host process is signalled) except on pid 520, which needs `su 0`
+/// (present for `-9`, missing for `-15`); and an `exec` line runs on the host's `sh`.
 pub fn fake_adb(android: &Android) -> FakeAdb {
     let dir = android.env.sdk_root.as_ref().expect("sdk root").join("platform-tools");
     std::fs::create_dir_all(&dir).expect("platform-tools");
@@ -223,6 +225,21 @@ impl FakeAdb {
 
 const FAKE_ADB: &str = r#"echo "$*" >> "$(dirname "$0")/adb.log"
 [ "$1" = "-s" ] && shift 2
+# What an API 36 guest's toybox `ps -A -o PID,PPID,%CPU,RSS,ETIME,NAME,CMDLINE` prints (trimmed).
+ps_rows() {
+  printf '%s\n' \
+'  PID  PPID %CPU    RSS ELAPSED NAME                    CMDLINE' \
+'    1     0  0.0  11304   15:02 init                    /system/bin/init second_stage' \
+'    2     0  0.0      0   15:02 [kthreadd]              [kthreadd]' \
+'  310     1  0.1   2620   14:58 zygote64                zygote64' \
+'  311     1  0.0   2100   14:58 zygote                  zygote' \
+'  612   310  3.2 301520   14:50 system_server           system_server' \
+'  520     1  0.4  20480   14:58 surfaceflinger          /system/bin/surfaceflinger --flag' \
+'  900   310  1.5 180224   14:40 com.android.systemui    com.android.systemui' \
+' 4321   310  7.9 120332   00:42 com.example.app         com.example.app' \
+' 4400   310  7.9  60112   00:40 com.example.app:remote  com.example.app:remote' \
+' 4500   310  0.0  50000   00:30 com.google.android.gms.persistent com.google.android.gms.persistent'
+}
 case "$1" in
 install)
   case "$*" in
@@ -257,6 +274,16 @@ shell)
     "pidof -s "*) exit 1;;
     "am force-stop com.example.hang") echo $$ > "$(dirname "$0")/hang.pid"; exec sleep 10;;
     "am force-stop "*) ;;
+    "ps -A -o PID,PPID,%CPU,RSS,ETIME,NAME,CMDLINE") ps_rows;;
+    "ps -A -o PID,PPID,%CPU,RSS,ETIME,NAME,CMDLINE; echo @packages; pm list packages")
+      ps_rows; echo @packages; printf 'package:android\npackage:com.android.systemui\npackage:com.example.app\n';;
+    "kill -9 520"|"kill -15 520") echo "/system/bin/sh: kill: 520: Operation not permitted" >&2; exit 1;;
+    "su 0 kill -9 520") ;;
+    "su 0 kill -15 520") echo "/system/bin/sh: su: inaccessible or not found" >&2; exit 127;;
+    # Every other signal succeeds, and is only logged: the fake never signals a host process.
+    "kill -"*) ;;
+    # exec's argv line runs on the host's sh, as the guest's would run it.
+    "echo simee-exec-pid:"*) exec /bin/sh -c "$2";;
     *) echo "fake adb: unhandled: $2" >&2; exit 2;;
   esac;;
 *) echo "fake adb: unhandled: $*" >&2; exit 2;;

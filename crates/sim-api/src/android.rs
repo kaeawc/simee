@@ -118,6 +118,54 @@ fn app(android: &Android, d: &sim_android::Device, method: &str, p: &Value) -> R
     }
 }
 
+/// `processes`, `kill` and `exec`, over adb, in iOS's shapes: `processes` rows with each app
+/// process's `package` too, nothing for `kill` (a signal to `pid`, or with `bundle_id` an app stop:
+/// `am force-stop`), and `exec`'s `{pid, stdout, stderr}` with `exit_code` and `truncated`.
+fn debug(android: &Android, d: &sim_android::Device, method: &str, p: &Value) -> Result<Value, String> {
+    match method {
+        "processes" => Ok(d
+            .adb(android)?
+            .processes()?
+            .into_iter()
+            .map(|r| {
+                json!({"pid": r.pid, "ppid": r.ppid, "cpu": r.cpu, "rss_kb": r.rss_kb, "elapsed": r.elapsed, "name": r.name,
+                    "path": r.path, "package": r.package})
+            })
+            .collect()),
+        "kill" => {
+            let pid = match p.get("pid") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(v.as_i64().ok_or("pid must be an integer")?),
+            };
+            let force = opt_bool(p, "force")?.unwrap_or(false);
+            match (pid, str_param(p, "bundle_id")) {
+                (Some(_), Some(_)) => Err("give `pid` or `bundle_id`, not both".into()),
+                (None, Some(package)) => d.adb(android)?.terminate(package).map(|()| Value::Null),
+                (Some(pid), None) => {
+                    let signal = p.get("signal").and_then(Value::as_i64).unwrap_or(15);
+                    d.adb(android)?.kill(pid, signal, force).map(|()| Value::Null)
+                }
+                (None, None) => Err("give `pid` (a signal) or `bundle_id` (an app stop)".into()),
+            }
+        }
+        _ => {
+            let program = need_str(p, "program")?;
+            let (args, env) = (crate::params::strings(p, "args"), crate::params::pairs(p, "env"));
+            let defaults = sim_android::procs::ExecLimits::default();
+            let at_least_1 = |key: &str| match opt_u64(p, key) {
+                Some(0) => Err(format!("{key} must be at least 1")),
+                n => Ok(n),
+            };
+            let limits = sim_android::procs::ExecLimits {
+                timeout: at_least_1("timeout_s")?.map_or(defaults.timeout, Duration::from_secs),
+                max_bytes: at_least_1("max_bytes")?.map_or(defaults.max_bytes, |n| usize::try_from(n).unwrap_or(usize::MAX)),
+            };
+            let out = d.adb(android)?.exec(program, &args, &env, limits)?;
+            Ok(json!({"pid": out.pid, "stdout": out.stdout, "stderr": out.stderr, "exit_code": out.exit_code, "truncated": out.truncated}))
+        }
+    }
+}
+
 /// `fold`: `folded` (the console's `fold` or `unfold`), a hinge `angle`, or a `posture` (stock's
 /// names or ids: closed, half-opened, opened, flipped, tent); a `null` one is absent. Answers
 /// with the hinge as simee's emulator then has it (angle, posture, whether folded, the display
@@ -347,6 +395,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             null(d.key(usage, Direction::Up))
         }
         "install" | "uninstall" | "launch" | "terminate" | "apps" | "open_url" => app(&android, &d, method, p),
+        "processes" | "kill" | "exec" => debug(&android, &d, method, p),
         "location" => {
             let (lat, lon) = (crate::params::need_f64(p, "latitude")?, crate::params::need_f64(p, "longitude")?);
             null(d.set_location(lat, lon))
@@ -525,6 +574,73 @@ mod tests {
         // Asking for nothing is fine.
         run(&mut s, "launch", json!({"bundle_id": "com.example.app", "args": [], "env": {}, "shaped": false})).expect("empty");
         assert_eq!(adb.calls().len(), 3, "only the last call ran adb");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn processes_kill_and_exec_work_on_both_platforms() {
+        let help = call(&mut Session::default(), "help", &Value::Null).expect("help");
+        for method in ["processes", "kill", "exec"] {
+            let row = help.as_array().and_then(|a| a.iter().find(|x| x["method"] == method)).expect(method);
+            assert_eq!(row["platforms"], json!(["android", "ios"]), "{method}");
+        }
+    }
+
+    #[test]
+    fn processes_answers_with_ios_rows_and_each_apps_package() {
+        let (mut s, root, _adb, _emulator) = session("procs");
+        let rows = run(&mut s, "processes", json!({})).expect("processes");
+        let rows = rows.as_array().expect("rows");
+        assert_eq!(
+            rows[0],
+            json!({"pid": 4321, "ppid": 310, "cpu": 7.9, "rss_kb": 120_332, "elapsed": "00:42", "name": "com.example.app",
+                "path": "com.example.app", "package": "com.example.app"})
+        );
+        let sf = rows.iter().find(|r| r["pid"] == 520).expect("surfaceflinger");
+        assert_eq!((&sf["path"], &sf["package"]), (&json!("/system/bin/surfaceflinger"), &Value::Null));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn kill_signals_stops_an_app_and_guards_the_essential_processes() {
+        let (mut s, root, adb, _emulator) = session("kill");
+        assert_eq!(run(&mut s, "kill", json!({"pid": 4321})), Ok(Value::Null));
+        assert_eq!(run(&mut s, "kill", json!({"pid": 4400, "signal": 9})), Ok(Value::Null));
+        let err = run(&mut s, "kill", json!({"pid": 612})).expect_err("system_server");
+        assert!(err.contains("system_server") && err.contains("force"), "{err}");
+        assert_eq!(run(&mut s, "kill", json!({"pid": 612, "force": true})), Ok(Value::Null));
+        // An app stop rather than a signal.
+        assert_eq!(run(&mut s, "kill", json!({"bundle_id": "com.example.app"})), Ok(Value::Null));
+        let signals: Vec<String> = adb.calls().into_iter().filter(|c| !c.starts_with("shell ps ")).collect();
+        assert_eq!(signals, ["shell kill -15 4321", "shell kill -9 4400", "shell kill -15 612", "shell am force-stop com.example.app"]);
+        assert_eq!(
+            run(&mut s, "kill", json!({"pid": 4321, "bundle_id": "com.example.app"})),
+            Err("give `pid` or `bundle_id`, not both".into())
+        );
+        assert_eq!(run(&mut s, "kill", json!({})), Err("give `pid` (a signal) or `bundle_id` (an app stop)".into()));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn exec_runs_an_argv_with_a_timeout_and_a_cap() {
+        let (mut s, root, _adb, _emulator) = session("exec");
+        let out =
+            run(&mut s, "exec", json!({"program": "sh", "args": ["-c", "echo \"$1\"; echo e >&2; exit 4", "sh", "a 'b'"]})).expect("exec");
+        assert!(out["pid"].as_i64().is_some_and(|p| p > 0), "{out}");
+        assert_eq!(
+            (&out["stdout"], &out["stderr"], &out["exit_code"], &out["truncated"]),
+            (&json!("a 'b'\n"), &json!("e\n"), &json!(4), &json!(false))
+        );
+        let env = run(&mut s, "exec", json!({"program": "sh", "args": ["-c", "echo $SIMEE_Y"], "env": {"SIMEE_Y": "z"}})).expect("env");
+        assert_eq!(env["stdout"], "z\n");
+        let capped = run(&mut s, "exec", json!({"program": "yes", "max_bytes": 10})).expect("capped");
+        assert_eq!(
+            (&capped["stdout"], &capped["truncated"], &capped["exit_code"]),
+            (&json!("y\ny\ny\ny\ny\n"), &json!(true), &Value::Null)
+        );
+        let err = run(&mut s, "exec", json!({"program": "sleep", "args": ["5"], "timeout_s": 1})).expect_err("timeout");
+        assert!(err.starts_with("`sleep` timed out after 1s"), "{err}");
+        assert_eq!(run(&mut s, "exec", json!({})), Err("missing string parameter `program`".into()));
         std::fs::remove_dir_all(root).ok();
     }
 
