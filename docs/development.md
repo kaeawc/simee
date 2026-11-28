@@ -14,6 +14,53 @@
 - Rust 1.99.1 (pinned in `rust-toolchain.toml`).
 - On Linux the shared core, the API, the CLI and the desktop window build and test (CI runs them
   there); there are no devices to run, since both runtimes need macOS.
+- On Windows (`x86_64-pc-windows-msvc`) the workspace builds, lints and runs its device-free tests;
+  see [Windows](#windows).
+
+## Windows
+
+The workspace builds for `x86_64-pc-windows-msvc` and CI's `windows` job
+(`.github/workflows/windows.yml`, on `windows-latest`) builds it, lints it with
+`clippy -D warnings` and runs its tests. This is the first step of
+[#243](https://github.com/kaeawc/simee/issues/243): the target for Windows is Android devices
+only (iOS stays on macOS), and a device can't boot there yet, so everything that needs one is
+compiled to a clear "not on Windows yet" answer instead of being left out of the build.
+
+Check it from any host, without Windows: `rustup target add x86_64-pc-windows-msvc`, then
+`cargo install cargo-xwin` (it fetches the MSVC headers and libraries; no Visual Studio) and
+`cargo xwin clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings`.
+`cargo check --target x86_64-pc-windows-msvc` alone stops at the C dependencies' build scripts,
+which need an MSVC-compatible compiler. Tests only run on Windows (CI): a runtime failure a
+cross-check can't see shows up there.
+
+`scripts/check.sh` is bash and stays the macOS and Linux path. `cargo xtask check [--quick|--all]`
+(`xtask/`) runs the same steps with the same names on any host, with no bash: it is what the
+Windows job runs, and what a Windows contributor runs before pushing. A test keeps its step names
+equal to the script's.
+
+| Part | On Windows | Where it goes next |
+| --- | --- | --- |
+| `sim-core`, `sim-bundle`, `sim-debug`, `sim-camera`, `sim-mcp`, `emu-ext4`, `emu-fdt` | build and test | |
+| `emu-sdk` | builds and tests; an install shells out to `curl` and `unzip`, and Windows has no `unzip`, so `-provision` and the install tests that unpack archives are unix only | [#245](https://github.com/kaeawc/simee/issues/245) |
+| `emu-hvf` | guest RAM (`VirtualAlloc`), `SharedMap` (a file mapping) and `host::process_alive`; no hypervisor | [#247](https://github.com/kaeawc/simee/issues/247) |
+| `emu-vmm` | the device models build and test; the NAT (`net::Nat::new`) and the adb bridge (`pipe::adb`) answer `Unsupported`, and no machine runs | [#247](https://github.com/kaeawc/simee/issues/247), [#248](https://github.com/kaeawc/simee/issues/248) |
+| `emu-avd` | builds; the SDK and AVD homes still use the unix defaults, `clone_file` is a plain copy (no clone, holes not kept), the `.ini` cache stores nothing | [#245](https://github.com/kaeawc/simee/issues/245) |
+| `sim-api`, `simee`, `sim-android` | build; `sim_core::net`'s `UnixStream` and `UnixListener` there can't be built (`ErrorKind::Unsupported`), so no server or client connects (`serve` and `shutdown::watch` answer `Unsupported`), and the tests that use a fake emulator (a Unix socket, `/bin/sh` scripts) are compiled out | [#246](https://github.com/kaeawc/simee/issues/246) |
+| `emu` | builds; lists, creates and provisions AVDs like on any host that can't boot; the stop request is the console's control events (`apps/emu/src/host_windows.rs`, in place of `on_signal.rs`'s `sigwait`; `tests/signals` sends real signals and is unix only) | [#245](https://github.com/kaeawc/simee/issues/245), [#247](https://github.com/kaeawc/simee/issues/247) |
+| `emu-container` | empty: the container backend needs a Linux host (the crate is `cfg(unix)`) | |
+| `emu-gfxstream` | not built: no renderer loads | [#249](https://github.com/kaeawc/simee/issues/249) |
+| iOS crates (`sim-coresim`, `sim-netshape`, `sim-audio`) | macOS only, as before | |
+| `desktop/` | not built | [#250](https://github.com/kaeawc/simee/issues/250) |
+
+Where std has no Windows spelling of a unix call, `sim_core::hostfs` (positional file I/O,
+`stat` fields, permission modes, process groups) and `sim_core::net` (Unix sockets) name the type
+once: std's own on unix, and on Windows a stand-in whose limits are written on it. Code that must
+compile on Windows imports those instead of `std::os::unix`.
+
+The Windows job restores `rust-cache` and never saves it: the repository's Actions cache is over
+its limit, so a Windows entry would evict the Linux and macOS ones, and each run builds its
+dependencies cold (about as long as the Linux job's cold build). Allow `main` to save it
+(`save-if` in `windows.yml`) when there is room.
 
 ## Support matrix
 

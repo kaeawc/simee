@@ -14,10 +14,10 @@ mod manifest;
 mod store;
 mod tar;
 
+use sim_core::hostfs::{FileExt, allocated_bytes};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufReader, BufWriter};
-use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -223,7 +223,7 @@ pub fn export(mut manifest: Manifest, contents: &Contents, to: &Path, opts: &Opt
     let mut summary = Summary { form: if is_archive(to) { "tar" } else { "dir" }.into(), ..Summary::default() };
     for ((_, file), d) in contents.disks.iter().zip(&manifest.disks) {
         summary.disk_bytes += d.size;
-        summary.allocated_bytes += fs::metadata(file).map(|m| m.blocks() * 512).unwrap_or(0);
+        summary.allocated_bytes += fs::metadata(file).map(|m| allocated_bytes(&m)).unwrap_or(0);
         for e in &d.extents {
             if e.zero {
                 summary.zero_bytes += e.len;

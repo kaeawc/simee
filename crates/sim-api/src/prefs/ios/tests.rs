@@ -430,7 +430,9 @@ fn the_observer_is_given_each_stores_domain_and_container() {
     let app = app.display().to_string();
     let want: Vec<String> =
         [APP, &app, "group.com.example", &group, "group.unentitled", &app, "other.domain", &app].map(str::to_owned).into();
-    assert_eq!(tracker.observer_args(), want);
+    // The same paths whatever joined them (`join("a/b")` keeps the `/`, two joins put a `\` there on Windows).
+    let slashed = |v: Vec<String>| v.into_iter().map(|s| s.replace('\\', "/")).collect::<Vec<_>>();
+    assert_eq!(slashed(tracker.observer_args()), slashed(want));
     std::fs::remove_dir_all(root).ok();
 }
 
