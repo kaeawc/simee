@@ -368,6 +368,7 @@ impl Body {
 
 /// Whether the generic body of a form factor is drawn at the dpi simee reports (`SIZES_BY_DPI` of
 /// its module); the shared reference-body test consults it.
+#[cfg(test)]
 pub(super) fn sizes_by_dpi(form_factor: FormFactor) -> bool {
     match form_factor {
         FormFactor::Phone | FormFactor::Tablet | FormFactor::Foldable => true,
