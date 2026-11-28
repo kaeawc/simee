@@ -59,6 +59,7 @@ icons! {
     SELECT = "select", r#"<g fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="3" fill="currentColor"/></g>"#;
     PEN = "pen", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15.5 4.5 19.5 8.5 8.5 19.5H4.5v-4L15.5 4.5Z"/><path d="m13 7 4 4"/></g>"#;
     ISLAND = "island", r#"<g fill="none" stroke="currentColor" stroke-width="1.8"><rect x="6" y="2.5" width="12" height="19" rx="3"/><rect x="9.5" y="4.8" width="5" height="1.8" rx="0.9" fill="currentColor"/></g>"#;
+    CAR = "car", r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 11 7 6h10l2 5"/><rect x="3" y="11" width="18" height="6" rx="1.5"/><path d="M6 17v2M18 17v2"/><circle cx="7.5" cy="14" r="0.8" fill="currentColor"/><circle cx="16.5" cy="14" r="0.8" fill="currentColor"/></g>"#;
 }
 
 /// Every icon, for tests that check each one renders.
@@ -109,4 +110,5 @@ pub static ALL: &[&Icon] = &[
     &CHEVRON_RIGHT,
     &SELECT,
     &PEN,
+    &CAR,
 ];
