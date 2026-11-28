@@ -879,7 +879,8 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   bounds read from the turned layout and sent in that window maps with the old turn; a caller
   that rotates then taps should read `rotation` (the console, or `simee screen`) until it shows
   the new turn. `simee rotate` (the API's `rotate`, the desktop's Rotate) reads the guest's
-  `dumpsys window displays` over adb before and after the turn, for up to 3 s: it returns the
+  `dumpsys window displays` over adb before the turn (at most 1 s) and after it, for up to 3 s
+  in all: it returns the
   rotation the guest turned to, or says why it stayed ("the guest stayed upright: the app in
   front (`<package>`) doesn't rotate", auto-rotate off, or a turn upside down;
   `sim_core::window`), which the desktop shows in its status line. The two tags add little log: on an API 36 phone (720x1280, 2026-11-26, this Mac at load 19 to 62), 4.3 KB in 17 lines from boot to boot complete, nothing in 2 minutes idle, and 11.4 KB in 50 lines over four rotations and five Settings launches (2 rotation lines each), against 1.9 MB in 10,385 lines that the guest logged under all tags in the same window (`adb logcat -d -s WindowManager:I ActivityTaskManager:I`; one run, not a benchmark). API 29 and 30 aren't followed: their filter

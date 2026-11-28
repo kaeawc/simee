@@ -759,6 +759,8 @@ fn stale_note(emu: &Path, checkout: &Path) -> Option<String> {
 /// slower on a busy host.
 pub const ROTATE_SETTLE: Duration = Duration::from_secs(3);
 const ROTATE_POLL: Duration = Duration::from_millis(200);
+/// The most the read before the turn may take (within [`ROTATE_SETTLE`]): it delays the turn itself.
+const ROTATE_BEFORE: Duration = Duration::from_secs(1);
 
 /// What a [`Device::rotate`] did to the guest's display.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1300,25 +1302,43 @@ impl Device {
     fn rotate_within(&self, android: &Android, settle: Duration) -> Result<Rotated, String> {
         self.running()?;
         let adb = self.adb(android).ok();
-        let read = |adb: &apps::Adb| {
-            let text = adb.shell("dumpsys window displays", adb.deadlines.query).ok()?;
+        // One deadline covers every read, the one before the turn included: a wedged adbd can't
+        // stretch a rotate past `settle`. Each read gets what is left (the one before the turn,
+        // which delays the turn itself, at most ROTATE_BEFORE and a third of the wait).
+        let deadline = Instant::now() + settle;
+        let read = |adb: &apps::Adb, limit: Duration| {
+            let text = adb.shell("dumpsys window displays", limit.min(adb.deadlines.query)).ok()?;
             Some(sim_core::window::WindowState::parse(&text)).filter(|s| s.rotation.is_some())
         };
-        let before = adb.as_ref().and_then(read);
+        let before = adb.as_ref().and_then(|adb| read(adb, ROTATE_BEFORE.min(settle / 3)));
         self.console(&["rotate".into()])?;
         let (Some(adb), Some(before)) = (adb, before) else { return Ok(Rotated::default()) };
-        let deadline = Instant::now() + settle;
-        let mut last = before.clone();
+        // The guest won't follow the turn when the app in front fixes its orientation or the
+        // user locked auto-rotate: its rotation is known now, one more read confirms it.
+        let refused = before.app_fixed() || before.user_locked;
+        let mut last = None;
         loop {
-            sleep(ROTATE_POLL.min(settle));
-            if let Some(now) = read(&adb) {
-                last = now;
-            }
-            if last.rotation != before.rotation || Instant::now() >= deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
                 break;
             }
+            sleep(ROTATE_POLL.min(left));
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            if let Some(now) = read(&adb, left) {
+                let done = refused || now.rotation != before.rotation;
+                last = Some(now);
+                if done {
+                    break;
+                }
+            }
         }
-        Ok(Rotated { rotation: last.rotation, note: sim_core::window::stayed_note(&before, &last) })
+        // No read after the turn answered in time: the guest's rotation is unknown.
+        let Some(last) = last else { return Ok(Rotated::default()) };
+        let waited = settle.as_secs_f64();
+        Ok(Rotated { rotation: last.rotation, note: sim_core::window::stayed_note(&before, &last, waited) })
     }
 
     fn require(&self, input: InputMethod, what: &str) -> Result<(), String> {
@@ -2127,6 +2147,49 @@ esac
         let d = f.android.device("phone").expect("phone");
         let r = d.rotate_within(&f.android, Duration::from_secs(5)).expect("rotate");
         assert_eq!(r, Rotated { rotation: Some(Rotation::Deg90), note: None });
+    }
+
+    #[test]
+    fn rotate_returns_within_its_wait_when_adbd_hangs() {
+        let f = fixture("rothang");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("phone");
+        let fake = fake_emulator(&f.android, "phone");
+        let dir = f.root.join("sdk/platform-tools");
+        std::fs::create_dir_all(&dir).expect("platform-tools");
+        crate::testing::write_script(&dir.join("adb"), "case \"$*\" in\n  *dumpsys*) exec sleep 30;;\n  *) echo 1;;\nesac\n");
+        let d = f.android.device("phone").expect("phone");
+        let started = Instant::now();
+        let r = d.rotate_within(&f.android, Duration::from_millis(900)).expect("rotate");
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(2500), "bounded by the one deadline, took {took:?}");
+        assert_eq!(r, Rotated::default(), "nothing could be read");
+        assert_eq!(wait_for(&fake.console, 1), ["rotate"], "the turn was still sent");
+    }
+
+    #[test]
+    fn rotate_returns_at_once_when_the_app_in_front_refuses_it() {
+        const LAUNCHER: (&str, &str, i32, u32) = ("com.google.android.apps.nexuslauncher", ".NexusLauncherActivity", 5, 0);
+        let f = fixture("rotearly");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("phone");
+        let _fake = fake_emulator(&f.android, "phone");
+        fake_dumpsys(&f, LAUNCHER, LAUNCHER);
+        let d = f.android.device("phone").expect("phone");
+        let started = Instant::now();
+        let r = d.rotate_within(&f.android, Duration::from_secs(30)).expect("rotate");
+        assert!(started.elapsed() < Duration::from_secs(5), "known from the first read, not after the wait");
+        assert!(r.note.expect("note").contains("doesn't rotate"));
+    }
+
+    #[test]
+    fn rotate_from_upright_says_a_slow_guest_may_only_be_late() {
+        let f = fixture("rotslow");
+        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("phone");
+        let _fake = fake_emulator(&f.android, "phone");
+        let settings = ("com.android.settings", ".Settings", -1, 0);
+        fake_dumpsys(&f, settings, settings);
+        let d = f.android.device("phone").expect("phone");
+        let note = d.rotate_within(&f.android, Duration::from_millis(600)).expect("rotate").note.expect("note");
+        assert!(note.contains("didn't turn within 0.6 s"), "{note}");
     }
 
     /// Adds an installed system image under the fixture's SDK.
