@@ -592,8 +592,14 @@ impl Streams {
     fn start(&self, p: &Value, lookup: &mut Lookup<'_>) -> Result<Value, String> {
         let options = options(p)?;
         self.media.available()?;
-        // Linux sizes emu's frames from the screen, so it asks for it without input too.
-        let target = lookup(p, options.settings.input || cfg!(target_os = "linux"))?;
+        // Linux sizes emu's frames from the screen, so a capped stream asks for it without input
+        // too; when it can't be had, the stream goes without the hint (full frames, scaled on the
+        // CPU) and says so.
+        let hint = cfg!(target_os = "linux") && options.settings.max_size.is_some() && !options.settings.input;
+        let (target, screen_note) = match lookup(p, options.settings.input || hint) {
+            Err(e) if hint => (lookup(p, false)?, Some(format!("no screen size for sizing frames ({e}): frames are scaled on the CPU"))),
+            found => (found?, None),
+        };
         if target.state != DeviceState::Booted {
             return Err(format!("{} isn't booted ({:?}): boot it before streaming it", target.name, target.state));
         }
@@ -685,6 +691,9 @@ impl Streams {
                     "lease_ttl_s": self.ttl.as_secs(),
                     "device": target.udid,
                 });
+                if let Some(note) = screen_note {
+                    started["screen_note"] = json!(note);
+                }
                 if options.settings.input {
                     let note = shared.lock().input_note.clone();
                     started["input"] = json!(note.is_none());
@@ -1503,6 +1512,27 @@ pub(crate) mod tests {
     }
 
     const URL: &str = "http://127.0.0.1:8889/sim/whip";
+
+    /// A capped stream on Linux asks for the screen to size emu's frames; when that fails the
+    /// stream still starts, with a note, and a stream that needs no hint never asks.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failing_screen_lookup_costs_the_size_hint_not_the_stream() {
+        let f = fixture();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let mut lookup = |p: &Value, screen: bool| {
+            asked.borrow_mut().push(screen);
+            if screen { Err("screen: not answering".to_owned()) } else { devices(p, screen) }
+        };
+        let started = f.streams.call("stream_start", &json!({"device": "pixel", "whip_url": URL}), &mut lookup).expect("starts");
+        assert_eq!(*asked.borrow(), [true, false]);
+        assert!(started["screen_note"].as_str().is_some_and(|n| n.contains("not answering") && n.contains("CPU")), "{started}");
+        asked.borrow_mut().clear();
+        let uncapped = json!({"device": "pixel", "whip_url": "http://127.0.0.1:8889/other/whip", "max_size": 0});
+        let started = f.streams.call("stream_start", &uncapped, &mut lookup).expect("starts");
+        assert_eq!(*asked.borrow(), [false], "full size needs no screen");
+        assert!(started.get("screen_note").is_none());
+    }
 
     /// A WHIP session that appends its DELETE to a file another process reads (`shutdown`'s
     /// tests), or, `wedged`, never finishes it.

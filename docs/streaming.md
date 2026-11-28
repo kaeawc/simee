@@ -416,7 +416,7 @@ for again.
   reused between pictures, so a steady stream allocates nothing per frame.
   On Linux the stream first asks emu for frames at that size (`hello` with the width whose whole
   shrink factor brings the longest side under `max_size`, resent when a rotation changes it), so the
-  box filter only runs when emu ignores the request or a whole factor overshoots.
+  box filter only finishes the exact size (emu shrinks by the whole factor that leaves the longest side at or over `max_size`, never under it, since a picture can't be scaled back up) or runs in full when emu ignores the request.
 - *Size.* OpenH264 stops at 3840x2160 (either way up); a larger picture without `max_size` is
   `Error::Unsupported`. Scaling up isn't supported.
 - *No hardware.* VA-API, NVENC and V4L2 are not wired (see "Not yet").

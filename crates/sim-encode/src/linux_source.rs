@@ -7,7 +7,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Instant;
 
-use sim_core::pixels::hello_width_for;
+use sim_core::pixels::{downscale_factor, downscaled_size, hello_width_for};
 use sim_core::stream::Input;
 
 use crate::android_frames::FrameReader;
@@ -26,7 +26,19 @@ pub struct AndroidSource {
     /// The stream's longest side and the `hello` width last sent for it, when frames are asked
     /// for at that size ([`AndroidSource::connect_fitted`]).
     fit: Option<Fit>,
+    /// After a new request on a running stream: the size its frames will have, and how many more
+    /// frames to hold back while emu still sends the old shape's.
+    hold: Option<Hold>,
 }
+
+#[derive(Clone, Copy)]
+struct Hold {
+    expected: (u32, u32),
+    left: u32,
+}
+
+/// Frames held back after a new request at most, for an emu that ignores it.
+const HOLD_FRAMES: u32 = 15;
 
 #[derive(Clone, Copy)]
 struct Fit {
@@ -38,7 +50,14 @@ impl AndroidSource {
     /// Connects to the AVD in `avd_dir` and asks for frames at most `max_width` pixels wide (0:
     /// full size; emu shrinks by a whole factor, `ceil(width / max_width)`).
     pub fn connect(avd_dir: &Path, max_width: u32) -> Result<AndroidSource> {
-        Ok(AndroidSource { reader: FrameReader::connect(avd_dir, max_width)?, current: None, taken_at: None, unreported: 0, fit: None })
+        Ok(AndroidSource {
+            reader: FrameReader::connect(avd_dir, max_width)?,
+            current: None,
+            taken_at: None,
+            unreported: 0,
+            fit: None,
+            hold: None,
+        })
     }
 
     /// Connects and asks emu for frames whose longest side is at most `max_size`, so the encoder
@@ -72,15 +91,18 @@ impl AndroidSource {
 
 impl AndroidSource {
     /// Sends a new `hello` width when the display's shape (known from the device's size and the
-    /// frame's orientation) needs one.
-    fn refit(&mut self, portrait: bool) {
-        let (Some(fit), Some((w, h))) = (self.fit, self.reader.device_size()) else { return };
+    /// frame's orientation) needs one, and returns the size the frames will have once emu
+    /// applies it.
+    fn refit(&mut self, portrait: bool) -> Option<(u32, u32)> {
+        let (Some(fit), Some((w, h))) = (self.fit, self.reader.device_size()) else { return None };
         let (short, long) = (w.min(h), w.max(h));
         let upright = if portrait { (short, long) } else { (long, short) };
         let hello = hello_width_for(upright, fit.max_size);
-        if hello != fit.hello && self.reader.input(&Input::Hello { max_width: hello }).is_ok() {
-            self.fit = Some(Fit { hello, ..fit });
+        if hello == fit.hello || self.reader.input(&Input::Hello { max_width: hello }).is_err() {
+            return None;
         }
+        self.fit = Some(Fit { hello, ..fit });
+        Some(downscaled_size(upright.0, upright.1, downscale_factor(upright.0, hello)))
     }
 }
 
@@ -93,13 +115,29 @@ impl Source for AndroidSource {
 
     fn picture(&mut self) -> Result<Option<&Picture>> {
         if let Some(frame) = self.reader.take() {
-            self.unreported = frame.unreported;
-            self.taken_at = Some(frame.at);
             let (width, height) = (frame.width, frame.height);
             if frame.rgba.len() != width as usize * height as usize * 4 {
                 return Err(Error::Source(format!("a {width}x{height} frame of {} bytes", frame.rgba.len())));
             }
-            self.refit(width <= height);
+            if let Some(hold) = self.hold.as_mut() {
+                if (width, height) != hold.expected && hold.left > 0 {
+                    // Still the old shape's size: the encoder restarts once, at the new one.
+                    hold.left -= 1;
+                    self.reader.recycle(frame.rgba);
+                    return Ok(self.current.as_ref());
+                }
+                self.hold = None;
+            } else if let Some(expected) = self.refit(width <= height) {
+                // This frame is the old shape's too. With nothing shown yet there is nothing to
+                // restart, so it goes out.
+                if self.current.is_some() {
+                    self.hold = Some(Hold { expected, left: HOLD_FRAMES });
+                    self.reader.recycle(frame.rgba);
+                    return Ok(self.current.as_ref());
+                }
+            }
+            self.unreported = frame.unreported;
+            self.taken_at = Some(frame.at);
             let picture = Picture::new(width, height, PixelOrder::Rgba, frame.rgba);
             if let Some(old) = self.current.replace(picture) {
                 self.reader.recycle(old.data);
@@ -251,15 +289,30 @@ mod tests {
     }
 
     #[test]
-    fn a_rotation_changes_the_request() {
+    fn a_rotation_changes_the_request_and_the_encoder_sees_the_new_size_once() {
         let landscape = (128, 64);
-        let emu = Emu::new(true, vec![(PHONE, PHONE), (landscape, landscape)]);
+        let emu = Emu::new(true, vec![(PHONE, PHONE), (landscape, landscape), (landscape, landscape)]);
         let mut source = AndroidSource::connect_fitted(&emu.dir, 64, Some(PHONE)).expect("connect");
         assert_eq!(emu.next_picture(&mut source), (32, 64));
-        // The device turned: the frame is upright landscape, shrunk by the portrait request, and
-        // the next request is for the landscape width (64: factor 2).
-        assert_eq!(emu.next_picture(&mut source), (32, 16), "shrunk by the factor the portrait hello asked for: 128 / 4");
+        // The device turned: emu's next frame is upright landscape, shrunk by the portrait
+        // request (128 / 4 = 32 wide), which is nobody's size. It is held back, the picture stays
+        // the last one, and the request for the landscape width goes out.
+        assert_eq!(emu.next_picture(&mut source), (32, 64), "the in-between size never reaches the encoder");
         assert_eq!(emu.hellos_at_least(2), ["hello 32", "hello 64"]);
+        assert_eq!(emu.next_picture(&mut source), (64, 32), "then the new shape's own size");
+    }
+
+    #[test]
+    fn an_emu_that_ignores_the_request_after_a_rotation_gets_its_frames_through_in_the_end() {
+        let landscape = (128, 64);
+        let mut script = vec![(PHONE, PHONE)];
+        script.extend(vec![(landscape, landscape); HOLD_FRAMES as usize + 2]);
+        let emu = Emu::new(false, script);
+        let mut source = AndroidSource::connect_fitted(&emu.dir, 64, Some(PHONE)).expect("connect");
+        assert_eq!(emu.next_picture(&mut source), PHONE);
+        let sizes: Vec<_> = (0..HOLD_FRAMES + 2).map(|_| emu.next_picture(&mut source)).collect();
+        assert_eq!(sizes.last(), Some(&landscape), "frames flow again after {HOLD_FRAMES} held");
+        assert_eq!(sizes.iter().filter(|&&s| s == PHONE).count(), HOLD_FRAMES as usize + 1, "held ones keep the last picture");
     }
 
     #[test]
