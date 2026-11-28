@@ -1113,6 +1113,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_listing_with_a_link_or_a_failed_read_is_not_cacheable() {
         let tmp = std::env::temp_dir().join(format!("emu-avd-readavds-{}", std::process::id()));

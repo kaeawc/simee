@@ -474,6 +474,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_open_file_limit_is_raised_toward_the_hard_limit_and_never_lowered() {
         use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};

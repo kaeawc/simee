@@ -285,6 +285,7 @@ pub fn stop_streams() {
 
 /// How long a shutdown gives the calls in flight to finish, or to stop at a safe point, before it
 /// stops the streams and exits anyway.
+#[cfg(unix)]
 const DRAIN: Duration = Duration::from_secs(10);
 
 /// Listens on `path` (replacing a stale socket) and serves connections until SIGINT or SIGTERM
@@ -297,13 +298,21 @@ const DRAIN: Duration = Duration::from_secs(10);
 ///
 /// Once a signal arrives, [`call_cancelled`] is true for every call in this process, as a watched
 /// caller's cancel is for its own call.
+#[cfg(unix)]
 pub fn serve(path: &Path) -> std::io::Result<i32> {
     serve_until_signal(path, Arc::new(methods::Session::default), DRAIN, || ())
+}
+
+/// The API socket is a Unix socket, and Windows has none here yet ([`sim_core::net`]).
+#[cfg(not(unix))]
+pub fn serve(_path: &Path) -> std::io::Result<i32> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "the API socket isn't implemented on Windows yet"))
 }
 
 /// [`serve`]'s loop and shutdown, with each connection's session made by `make` and `drain` for
 /// how long the calls in flight get; `ready` is called once the socket is bound and the signals
 /// are watched.
+#[cfg(unix)]
 fn serve_until_signal(path: &Path, make: MakeSession, drain: Duration, ready: impl FnOnce()) -> std::io::Result<i32> {
     let listener = bind(path)?;
     // Held until the shutdown has removed the file: a socket still bound keeps its inode.
@@ -328,6 +337,7 @@ fn serve_until_signal(path: &Path, make: MakeSession, drain: Duration, ready: im
 
 /// [`serve`]'s shutdown: the calls in flight get `drain`, then the streams stop and the sockets
 /// are removed.
+#[cfg(unix)]
 fn shut_down(drain: Duration) {
     if !shutdown::drain(drain) {
         shutdown::say!("simee: calls still running after {} s: stopping anyway", drain.as_secs());
@@ -337,6 +347,7 @@ fn shut_down(drain: Duration) {
 }
 
 /// Serves the connections `listener` (non-blocking) accepts until `done` is readable.
+#[cfg(unix)]
 fn accept_until_done(listener: &UnixListener, done: &UnixStream, threads: &Arc<Threads>) -> std::io::Result<()> {
     use rustix::event::{PollFd, PollFlags, poll};
     loop {
