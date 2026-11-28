@@ -543,7 +543,9 @@ fn gpu(spec: &Gpu, area: vfio_user::AreaHandle, ram: vfio_user::AreaHandle) -> a
 
     use crate::display::DisplaySink;
     let dir = spec.lib64.parent().ok_or_else(|| anyhow::anyhow!("{} has no parent", spec.lib64.display()))?;
-    emu_gfxstream::configure_environment(dir, spec.icd);
+    for n in emu_gfxstream::configure_environment(dir, spec.icd) {
+        eprintln!("{n}");
+    }
     let r = Arc::new(Renderer::load(&spec.lib64)?);
     let ticker = crate::display::PostTicker::start(
         spec.display.clone(),

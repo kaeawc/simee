@@ -70,6 +70,11 @@ argue with measured numbers against the stock tools, so keep the numbers current
   it doesn't have.
 - A change that moves a published number updates its row in the same PR. A performance PR with
   no row to update adds one, or says in its description why the win isn't user-visible.
+- Publish only a result the quiet-host protocol calls publishable: every `scripts/bench/` script
+  waits for a quiet host (`scripts/bench/quiet.sh`) and writes a host record beside its results;
+  `python3 -I scripts/bench/summarize.py check <result.json>` says whether a run may enter a table
+  (gate passed, 3 or more rounds, no measure over its noise budget). `--no-quiet-gate` is for
+  smoke runs. See `docs/research/bench-protocol.md`.
 - Compare like with like: the same AVD or device type, host and day, both tools cold or both
   warm, median of at least 3 runs. Say what was run (`scripts/android-bench.sh`, `hyperfine`, a
   `--ignored` bench). A number measured on a different machine (a Linux VM bench) is labelled so.
@@ -211,7 +216,10 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   non-macOS hosts `ios_unavailable.rs`), the Android backend's methods (`android.rs`), server
   and client (`lib.rs`). The CLI, the socket and the
   desktop panel all go through it; add a capability here once and every surface gets it.
-- `crates/sim-mcp` — the MCP server behind `simee mcp` (stdio only; no FFI, no new dependencies):
+- `crates/sim-mcp` — the MCP server behind `simee mcp` (stdio, and Streamable HTTP in `http.rs`; no
+  FFI; its one optional dependency set is the off-by-default `tls` feature: rustls on the ring
+  provider, rcgen, ring; `http/conn.rs` is what a connection reads and writes through, plain or
+  TLS, with reads bounded by one deadline, and `http/tls.rs` the certificates and handshake):
   `rpc.rs` (messages, versions, error codes), `server.rs` (which request does what; the current
   revision statelessly, `initialize` for older clients), `tools.rs` (one tool per `METHODS` entry,
   annotations, results, which methods are tasks), `resources.rs` (`simee://` URIs), `tasks.rs` (the

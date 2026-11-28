@@ -285,7 +285,8 @@ pub enum Appearance {
     Dark,
 }
 
-/// A connection to the simulator service and its default device set.
+/// A connection to the simulator service and one device set: the default set, or another
+/// directory of devices ([`Context::open`]).
 pub struct Context {
     context: Obj,
     set: Obj,
@@ -293,8 +294,25 @@ pub struct Context {
 }
 
 impl Context {
-    /// Connects to the service for the active developer directory.
+    /// Connects to the service for the active developer directory, on the default device set.
     pub fn new() -> Result<Self> {
+        Self::open(None)
+    }
+
+    /// Connects to the service on the device set at `set` (an absolute directory that exists), or
+    /// on the default set (`~/Library/Developer/CoreSimulator/Devices`) for `None` (#409).
+    /// Simulator.app opens a window for each device of the default set that boots; a device of
+    /// another set (as `simctl --set` makes) boots with no window.
+    pub fn open(set: Option<&str>) -> Result<Self> {
+        if let Some(path) = set {
+            if !path.starts_with('/') {
+                return Err(Error::Invalid(format!("a device set is an absolute path, not `{path}`")));
+            }
+            // Opening a set makes nothing: a caller that creates devices makes its directory first.
+            if !std::path::Path::new(path).is_dir() {
+                return Err(Error::Invalid(format!("the device set {path} doesn't exist: `create` a device in it to make it")));
+            }
+        }
         let dir = developer_dir()?;
         Library::open(CORE_SIMULATOR)?;
         let kit = open_simulator_kit(&dir)?;
@@ -306,14 +324,29 @@ impl Context {
         let context: std::result::Result<Obj, Retained<NSError>> =
             unsafe { msg_send![cls, sharedServiceContextForDeveloperDir: &*rt::nsstring(&dir), error: _] };
         let context = context.map_err(|e| rt::service_error("connect", &e))?;
-        rt::require(&context, sel!(defaultDeviceSetWithError:))?;
-        // SAFETY: the method exists (checked) and takes NSError**, returning the device set.
-        let set: std::result::Result<Obj, Retained<NSError>> = unsafe { msg_send![&*context, defaultDeviceSetWithError: _] };
+        let set: std::result::Result<Obj, Retained<NSError>> = match set {
+            None => {
+                rt::require(&context, sel!(defaultDeviceSetWithError:))?;
+                // SAFETY: the method exists (checked) and takes NSError**, returning the device set.
+                unsafe { msg_send![&*context, defaultDeviceSetWithError: _] }
+            }
+            Some(path) => {
+                rt::require(&context, sel!(deviceSetWithPath:error:))?;
+                // SAFETY: the method exists (checked) and takes (NSString, NSError**), returning the
+                // device set at that path (nil with the error set on failure).
+                unsafe { msg_send![&*context, deviceSetWithPath: &*rt::nsstring(path), error: _] }
+            }
+        };
         let set = set.map_err(|e| rt::service_error("open device set", &e))?;
         Ok(Self { context, set, kit })
     }
 
-    /// All devices in the default set, sorted by runtime then name.
+    /// The directory of this connection's device set.
+    pub fn set_path(&self) -> String {
+        rt::string_prop(&self.set, sel!(setPath))
+    }
+
+    /// All devices in the set, sorted by runtime then name.
     pub fn devices(&self) -> Result<Vec<Device>> {
         let mut devices = self.unsorted_devices()?;
         devices.sort_by_cached_key(|d| {

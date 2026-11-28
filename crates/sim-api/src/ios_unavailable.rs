@@ -11,6 +11,16 @@ pub const REASON: &str = "iOS simulator devices need a macOS host with Xcode";
 #[derive(Default)]
 pub struct Session;
 
+impl Session {
+    /// No device set is opened on this host.
+    pub(crate) fn use_set(&mut self, _: Result<Option<String>, String>) {}
+
+    /// The default set: there is no other here.
+    pub(crate) fn set(&self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+}
+
 /// No HID input is sent on this host.
 pub fn track_input() {}
 
