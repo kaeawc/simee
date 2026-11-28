@@ -3,8 +3,16 @@
 //! runs each command the way the guest would: `run-as <package>` only for a debuggable package,
 //! `su 0` and `adb root` only when the image allows them, the shell's own uid kept out of the apps'
 //! data dirs, and the rest run by the host's `sh` with the device's paths mapped into that
-//! directory. `stat` (toybox's `-c` formats), `chown` and `restorecon` are stand-ins too: `stat`
-//! answers every file's owner and mode from [`FakeFiles::set_owner`].
+//! directory. `stat` (toybox's `-c` and `-L`), `chown`, `restorecon`, `chmod`, `cat`, `mv` and
+//! `realpath` are stand-ins too: `stat` answers every file's owner and mode from
+//! [`FakeFiles::set_owner`] (a symlink's own mode is 777, as Linux has it); `mv` is toybox's,
+//! with `-T` unless [`FakeFiles::old_toybox`] (API 29's has none); the rest pass through to the
+//! host's tools, and are where the hostile app's moves ([`FakeFiles::late_swap_temp_files`] and
+//! the like) happen. As a real device's `adb exec-in`, the fake's carries back no exit status.
+//!
+//! The hostile app owns its data dir, so it can rename, remove and plant any entry in it, but
+//! not touch what is inside a directory root made there with mode 0700: the fake leaves alone
+//! whatever is inside a `.simee-write-*` dir.
 //!
 //! The device has two third-party apps: `com.example.app`, debuggable, with `files/notes.txt`
 //! (`hello`), `shared_prefs/a.xml`, `cache/c.bin`, a `lib` dir (as the system leaves one) and
@@ -80,7 +88,19 @@ pub fn fake_files_adb(android: &Android, root: Root) -> FakeFiles {
     std::fs::write(tools.join("debuggable"), "com.example.app\n").expect("debuggable");
     std::fs::write(tools.join("owner"), "10123:10123:660\n").expect("owner");
     let _ = std::fs::remove_file(tools.join("rooted"));
-    for state in ["adb.log", "chown.log", "restorecon.log", "attack", "chown-fails"] {
+    for state in [
+        "adb.log",
+        "chown.log",
+        "restorecon.log",
+        "attack",
+        "attack-late",
+        "attack-mv",
+        "attack-target",
+        "swap-after-guard",
+        "old-toybox",
+        "upload-fails",
+        "chown-fails",
+    ] {
         let _ = std::fs::remove_file(tools.join(state));
     }
     std::fs::write(tools.join("root"), root.name()).expect("root");
@@ -89,6 +109,10 @@ pub fn fake_files_adb(android: &Android, root: Root) -> FakeFiles {
     write_script(&bin.join("stat"), FAKE_STAT);
     write_script(&bin.join("chown"), FAKE_CHOWN);
     write_script(&bin.join("restorecon"), FAKE_RESTORECON);
+    write_script(&bin.join("chmod"), FAKE_CHMOD);
+    write_script(&bin.join("cat"), FAKE_CAT);
+    write_script(&bin.join("mv"), FAKE_MV);
+    write_script(&bin.join("realpath"), FAKE_REALPATH);
     write_script(&tools.join("adb"), FAKE_ADB);
     FakeFiles { tools, device, outside }
 }
@@ -127,10 +151,47 @@ impl FakeFiles {
         text.lines().map(|l| l.replace(&device, "")).collect()
     }
 
-    /// From now on a hostile app swaps each temp file a write makes for a symlink to
-    /// `outside/victim`, as soon as `exec-in` has written it.
+    /// From now on a hostile app swaps what each write leaves for its finish as soon as
+    /// `exec-in` has written it: a temp file in its dir for a symlink to `outside/victim`, a temp
+    /// dir for a symlink to `outside` (the dir itself moved aside, to `<name>.moved`).
     pub fn swap_temp_files(&self) {
         std::fs::write(self.tools.join("attack"), "swap").expect("attack");
+    }
+
+    /// From now on a hostile app swaps a temp file in its dir for a symlink to `outside/victim`
+    /// after every check, just before `chmod` sets its mode.
+    pub fn late_swap_temp_files(&self) {
+        std::fs::write(self.tools.join("attack-late"), "swap").expect("attack-late");
+    }
+
+    /// The next time `mv` moves a temp file over its target, a hostile app first replaces the
+    /// target with a symlink to the `outside` dir.
+    pub fn swap_target_in_mv(&self) {
+        std::fs::write(self.tools.join("attack-mv"), "swap").expect("attack-mv");
+    }
+
+    /// The next `exec-in` is followed by a hostile app replacing `path` (the device's) with a
+    /// symlink to the `outside` dir: after the write's checks, before its finish.
+    pub fn swap_for_outside_link_after_upload(&self, path: &str) {
+        std::fs::write(self.tools.join("attack-target"), path.trim_start_matches('/')).expect("attack-target");
+    }
+
+    /// The next time a `verb` (`shell`, `exec-out`) command's guard resolves `checked` (the
+    /// device's path), a hostile app then moves `dir` aside and puts a symlink to `outside` in
+    /// its place: after the guard, before what follows it.
+    pub fn swap_after_guard(&self, verb: &str, checked: &str, dir: &str) {
+        let line = format!("{verb}|{}|{}\n", checked.trim_start_matches('/'), dir.trim_start_matches('/'));
+        std::fs::write(self.tools.join("swap-after-guard"), line).expect("swap-after-guard");
+    }
+
+    /// From now on `mv` is API 29's toybox's, which has no `-T`.
+    pub fn old_toybox(&self) {
+        std::fs::write(self.tools.join("old-toybox"), "").expect("old-toybox");
+    }
+
+    /// From now on what `exec-in` runs fails to write (`cat`: no space left on device).
+    pub fn fail_upload(&self) {
+        std::fs::write(self.tools.join("upload-fails"), "").expect("upload-fails");
     }
 
     /// From now on `chown` fails.
@@ -144,17 +205,77 @@ impl FakeFiles {
     }
 }
 
-const FAKE_STAT: &str = r#"[ "$1" = -c ] || { echo "fake stat: -c only" >&2; exit 2; }
+const FAKE_STAT: &str = r#"L=; [ "$1" = -L ] && { L=1; shift; }
+[ "$1" = -c ] || { echo "fake stat: -c only" >&2; exit 2; }
 fmt=$2; shift 2; rc=0
 IFS=: read -r ou og om < "$(dirname "$0")/../owner"
 for f in "$@"; do
-  if [ -L "$f" ]; then t="symbolic link"; s=$(readlink "$f" | tr -d '\n' | wc -c | tr -d ' ')
+  m=$om
+  if [ -L "$f" ] && [ -z "$L" ]; then t="symbolic link"; s=$(readlink "$f" | tr -d '\n' | wc -c | tr -d ' '); m=777
   elif [ -d "$f" ]; then t=directory; s=4096
   elif [ -e "$f" ]; then t="regular file"; s=$(wc -c < "$f" | tr -d ' ')
   else echo "stat: '$f': No such file or directory" >&2; rc=1; continue; fi
-  printf '%s\n' "$fmt" | sed -e "s|%F|$t|g" -e "s|%s|$s|g" -e "s|%u|$ou|g" -e "s|%g|$og|g" -e "s|%a|$om|g" -e "s|%n|$f|g"
+  printf '%s\n' "$fmt" | sed -e "s|%F|$t|g" -e "s|%s|$s|g" -e "s|%u|$ou|g" -e "s|%g|$og|g" -e "s|%a|$m|g" -e "s|%n|$f|g"
 done
 exit $rc
+"#;
+
+/// The host's `chmod`, after the hostile app's late swap ([`FakeFiles::late_swap_temp_files`]).
+const FAKE_CHMOD: &str = r#"here=$(cd "$(dirname "$0")/.." && pwd)
+if [ -e "$here/attack-late" ]; then
+  for f in "$@"; do
+    case "$(basename "$f")" in .simee-write-*) ;; *) continue;; esac
+    d=$(cd "$(dirname "$f")" && pwd -P)
+    case "$(basename "$d")" in .simee-write-*) continue;; esac
+    rm -f "$f"; ln -s "$here/outside/victim" "$f"
+  done
+fi
+PATH=${PATH#*fakebin:} exec chmod "$@"
+"#;
+
+/// The host's `cat`, failing to write in what `exec-in` runs after [`FakeFiles::fail_upload`].
+const FAKE_CAT: &str = r#"here=$(cd "$(dirname "$0")/.." && pwd)
+if [ "$SIMEE_FAKE_VERB" = exec-in ] && [ -e "$here/upload-fails" ]; then
+  echo "cat: xwrite: No space left on device" >&2; exit 1
+fi
+PATH=${PATH#*fakebin:} exec cat "$@"
+"#;
+
+/// toybox's `mv SOURCE DEST`: without `-T` a DEST that is a directory, or a symlink to one,
+/// takes SOURCE in; with it, rename(2): a symlink at DEST is replaced, never followed. API 29's
+/// toybox has no `-T` ([`FakeFiles::old_toybox`]).
+const FAKE_MV: &str = r#"here=$(cd "$(dirname "$0")/.." && pwd)
+real() { PATH=${PATH#*fakebin:} command mv "$@"; }
+t=
+while :; do
+  case "$1" in
+  -*) case "$1" in *T*) [ -e "$here/old-toybox" ] && { echo "mv: Unknown option 'T'" >&2; exit 1; }; t=1;; esac; shift;;
+  *) break;;
+  esac
+done
+src=$1; dst=$2
+case "$(basename "$src")" in .simee-write-*)
+  if [ -e "$here/attack-mv" ]; then rm -f "$here/attack-mv"; rm -rf "$dst"; ln -s "$here/outside" "$dst"; fi;;
+esac
+if [ -n "$t" ]; then
+  if [ -d "$dst" ] && [ ! -L "$dst" ]; then echo "mv: '$dst': Is a directory" >&2; exit 1; fi
+  [ -L "$dst" ] && rm -f "$dst"
+fi
+real -f "$src" "$dst"
+"#;
+
+/// The host's `realpath`, after which the hostile app may swap a dir ([`FakeFiles::swap_after_guard`]).
+const FAKE_REALPATH: &str = r#"here=$(cd "$(dirname "$0")/.." && pwd)
+out=$(PATH=${PATH#*fakebin:} realpath "$@") || exit $?
+printf '%s\n' "$out"
+if [ -f "$here/swap-after-guard" ]; then
+  IFS='|' read -r verb checked dir < "$here/swap-after-guard"
+  if [ "$verb" = "$SIMEE_FAKE_VERB" ] && [ "$out" = "$(PATH=${PATH#*fakebin:} realpath "$here/device/$checked")" ]; then
+    rm -f "$here/swap-after-guard"
+    PATH=${PATH#*fakebin:} mv "$here/device/$dir" "$here/device/$dir.orig"
+    ln -s "$here/outside" "$here/device/$dir"
+  fi
+fi
 "#;
 
 /// Logs what it changes to `chown.log`: with `-h` the link itself, otherwise what it points at.
@@ -181,7 +302,7 @@ exit $rc
 "#;
 
 const FAKE_ADB: &str = r#"here=$(dirname "$0")
-echo "$*" >> "$here/adb.log"
+printf '%s\n' "$*" >> "$here/adb.log"
 [ "$1" = "-s" ] && shift 2
 dev="$here/device"
 mode=$(cat "$here/root")
@@ -233,10 +354,19 @@ esac
 # Every device path the client sends is quoted: map those (and only those, not the `/data/` in
 # `/sdcard/Android/data/`) into the device's directory.
 cmd=$(printf '%s' "$cmd" | sed -e "s#'/data/#'$dev/data/#g" -e "s#'/sdcard/#'$dev/sdcard/#g" -e "s#'/storage/emulated/0/#'$dev/sdcard/#g")
-if [ "$verb" = exec-in ] && [ -e "$here/attack" ]; then
-  PATH="$here/fakebin:$PATH" sh -c "$cmd"; rc=$?
-  find "$dev" -name '.simee-write-*' ! -type l | while read -r t; do rm -f "$t"; ln -s "$here/outside/victim" "$t"; done
-  exit $rc
+export SIMEE_FAKE_VERB="$verb"
+if [ "$verb" = exec-in ]; then
+  # adb exec-in carries back neither the command's output nor its exit status.
+  PATH="$here/fakebin:$PATH" sh -c "$cmd" > /dev/null 2>&1
+  if [ -e "$here/attack" ]; then
+    find "$dev" -name '.simee-write-*' ! -type l ! -name '*.moved' ! -path '*/.simee-write-*/*' | while read -r t; do
+      if [ -d "$t" ]; then mv "$t" "$t.moved"; ln -s "$here/outside" "$t"; else rm -f "$t"; ln -s "$here/outside/victim" "$t"; fi
+    done
+  fi
+  if [ -f "$here/attack-target" ]; then
+    t="$dev/$(cat "$here/attack-target")"; rm -f "$here/attack-target"; rm -rf "$t"; ln -s "$here/outside" "$t"
+  fi
+  exit 0
 fi
 PATH="$here/fakebin:$PATH" exec sh -c "$cmd"
 "#;

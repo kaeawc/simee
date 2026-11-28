@@ -21,15 +21,23 @@
 //!   apart.
 //! - **Writes** make the parent dirs one at a time (as root, each new one gets the container's
 //!   owner with `chown -h` and its context with `restorecon`), then go through `adb exec-in` into
-//!   a temp file with a random name beside the target, made with `O_EXCL` (`set -C`) under the
-//!   file's mode (`umask`). The finish step checks that the temp file is still the regular file
-//!   it made and of the right size; as root, a data-dir file gets the owner the file had (or the
-//!   container's, new) and its context, on the temp file and never through a symlink; then one
-//!   `mv` within the dir renames it over the target. Any failure removes the temp file and leaves
-//!   the target as it was. Through `run-as` the app's uid wrote it, so owner and context are the
-//!   app's already, and on external storage they are its FUSE daemon's. Every step works from the
-//!   target's dir, entered with `cd -P` and checked to be in the container, so a parent swapped
-//!   for a symlink afterwards can't move it.
+//!   a temp file in a temp dir with a random name beside the target. The dir is made with mode
+//!   0700, so as root nothing the app runs can change what is in it, and the file in it with
+//!   `O_EXCL` (`set -C`) under the mode of the file the target is or points at (`umask`). adb
+//!   carries back no exit status from `exec-in`, so the upload leaves a mark and its errors in
+//!   the dir. The finish step enters the dir and checks it is the one made there, that the upload
+//!   finished, and that the temp file is the regular file it made and of the right size; as
+//!   root, a data-dir file gets the owner the file had (or the container's, new) and its context,
+//!   on the temp file, with the execute and special bits `chmod` sets. Then one rename within
+//!   the target's dir puts it there: `mv -T` (rename(2), which replaces a symlink at the target
+//!   rather than following it into a directory); API 29's toybox `mv` has no `-T`, so there a
+//!   directory or a symlink to one at the target is refused just before the move, which narrows
+//!   that window but can't close it. Any failure removes the temp dir and leaves the target as it
+//!   was. Through `run-as` the app's uid wrote it, so owner and context are the app's already,
+//!   and on external storage they are its FUSE daemon's.
+//! - Every command works from the dir it acts in, entered with `cd -P` after the guard and
+//!   checked to be in the container, and names paths relative to it, so a parent swapped for a
+//!   symlink after the guard can't move what it reads, lists, sizes or changes.
 //! - **Clearing** a container empties it in place; `pm clear --user <n>` runs instead only with
 //!   [`Allow::pm_clear`], as it also stops the app, wipes its external dir and resets its
 //!   runtime permissions.
@@ -40,7 +48,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use crate::apps::{Adb, failure, io_within, package_name, shell_quote};
+use crate::apps::{Adb, Captured, capture, failure, package_name, shell_quote};
 
 #[cfg(any(test, feature = "testing"))]
 pub mod fake;
@@ -52,6 +60,8 @@ const ESCAPE_EXIT: u8 = 3;
 const NO_CONTAINER: &str = "no such container";
 /// The largest file `read` returns: the caller holds it, its base64 and its text at once.
 pub const MAX_READ: usize = 128 << 20;
+/// What is kept of a stream that only says what went wrong.
+const ERR_CAP: usize = 64 << 10;
 
 /// What a file call may do beyond reaching the files. The default: nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -105,6 +115,16 @@ impl Location {
         self.path.rsplit_once('/').map_or(&self.path, |(_, name)| name)
     }
 
+    /// The dir a command on the path works from (quoted) and the path from it (quoted): the
+    /// parent and `./<name>`, or the container and `.`.
+    fn working_dir(&self) -> (String, String) {
+        if self.is_root() {
+            (shell_quote(&self.root), ".".to_owned())
+        } else {
+            (shell_quote(self.parent()), shell_quote(&format!("./{}", self.name())))
+        }
+    }
+
     /// The components between the container and the path's parent, outermost first.
     fn dirs(&self) -> Vec<&str> {
         let below = self.parent().strip_prefix(&self.root).unwrap_or("");
@@ -141,12 +161,13 @@ pub fn locate(path: &str) -> Result<Location, String> {
              sdcard/Android/data/<package>, or the APK directory `containers` lists)"
         )
     };
-    let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    // A user id as Android writes it: `0`, `10`, never `010` (which `pm --user` would read as 10).
+    let user = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && (s == "0" || !s.starts_with('0'));
     let (kind, len) = match parts.as_slice() {
         ["data", "data", _, ..] => (Kind::Data, 3),
-        ["data", "user", n, _, ..] if number(n) => (Kind::Data, 4),
+        ["data", "user", n, _, ..] if user(n) => (Kind::Data, 4),
         ["sdcard", "Android", "data", _, ..] => (Kind::External, 4),
-        ["storage", "emulated", n, "Android", "data", _, ..] if number(n) => (Kind::External, 6),
+        ["storage", "emulated", n, "Android", "data", _, ..] if user(n) => (Kind::External, 6),
         // API 30+: /data/app/~~<random>/<package>-<random>; before: /data/app/<package>-<n>.
         ["data", "app", dir, _, ..] if dir.starts_with("~~") => (Kind::Bundle, 4),
         ["data", "app", _, ..] => (Kind::Bundle, 3),
@@ -354,30 +375,43 @@ impl Adb {
         }
     }
 
-    /// `adb exec-out <command>`: its output, byte for byte.
-    fn exec_out(&self, command: &str) -> Result<Vec<u8>, String> {
+    /// `adb exec-out <command>`: its output, byte for byte, failing once it is more than `cap`
+    /// bytes.
+    fn exec_out(&self, command: &str, cap: usize) -> Result<Vec<u8>, String> {
         let what = format!("adb -s {} exec-out", self.serial);
         let mut adb = Command::new(&self.adb);
         adb.args(["-s", &self.serial, "exec-out", command]);
-        match io_within(&mut adb, None, self.deadlines.install, &what)? {
-            (true, out, _) => Ok(out),
-            (false, out, err) => {
-                Err(failure("adb exec-out", &format!("{}{}", String::from_utf8_lossy(&err), String::from_utf8_lossy(&out))))
-            }
+        let ran = self.io(&mut adb, None, [cap, ERR_CAP], &what)?;
+        if ran.truncated {
+            return Err(format!("`{what}` printed more than the {cap} bytes it was to read; stopped it"));
+        }
+        match ran.code {
+            Some(0) => Ok(ran.stdout),
+            _ => Err(failure("adb exec-out", &format!("{}{}", String::from_utf8_lossy(&ran.stderr), String::from_utf8_lossy(&ran.stdout)))),
         }
     }
 
-    /// `adb exec-in <command>` with `bytes` as its input.
+    /// `adb exec-in <command>` with `bytes` as its input. adb doesn't carry the command's exit
+    /// status, or its output, back: this fails only when adb itself does.
     fn exec_in(&self, command: &str, bytes: &[u8]) -> Result<(), String> {
         let what = format!("adb -s {} exec-in", self.serial);
         let mut adb = Command::new(&self.adb);
         adb.args(["-s", &self.serial, "exec-in", command]);
-        match io_within(&mut adb, Some(bytes.to_vec()), self.deadlines.install, &what)? {
-            (true, ..) => Ok(()),
-            (false, out, err) => {
-                Err(failure("adb exec-in", &format!("{}{}", String::from_utf8_lossy(&err), String::from_utf8_lossy(&out))))
-            }
+        let ran = self.io(&mut adb, Some(bytes.to_vec()), [ERR_CAP; 2], &what)?;
+        match ran.code {
+            Some(0) => Ok(()),
+            _ => Err(failure("adb exec-in", &format!("{}{}", String::from_utf8_lossy(&ran.stderr), String::from_utf8_lossy(&ran.stdout)))),
         }
+    }
+
+    /// [`capture`] within the install deadline, failing when it runs past it.
+    fn io(&self, adb: &mut Command, stdin: Option<Vec<u8>>, caps: [usize; 2], what: &str) -> Result<Captured, String> {
+        let limit = self.deadlines.install;
+        let ran = capture(adb, stdin, limit, caps, what)?;
+        if ran.timed_out {
+            return Err(format!("`{what}` timed out after {limit:?}; stopped it"));
+        }
+        Ok(ran)
     }
 
     /// Every third-party app's data dir (user 0's) and APK dir, sorted by package; with `sizes`,
@@ -417,12 +451,12 @@ impl Adb {
         let loc = locate(path)?;
         let access = self.access(&loc, allow)?;
         let p = shell_quote(&loc.path);
-        let listed = shell_quote(&format!("{}/", loc.path));
         let body = format!(
-            "{}; {}; [ -d {p} ] || {{ echo 'Not a directory' >&2; exit 1; }}; \
-             find {listed} -mindepth 1 -maxdepth 1 -exec stat -c '%F|%s|%n' {{}} +",
+            "{}; {}; [ -d {p} ] || {{ echo 'Not a directory' >&2; exit 1; }}; {}; \
+             find . -mindepth 1 -maxdepth 1 -exec stat -c '%F|%s|%n' {{}} +",
             guard(&loc, &loc.path),
-            exists(&p)
+            exists(&p),
+            enter(&p)
         );
         Ok(parse_entries(&self.script(&access, &loc, &body)?))
     }
@@ -431,11 +465,11 @@ impl Adb {
     pub fn read_file(&self, path: &str, allow: Allow) -> Result<Vec<u8>, String> {
         let loc = locate(path)?;
         let access = self.access(&loc, allow)?;
-        let p = shell_quote(&loc.path);
+        let (dir, name) = loc.working_dir();
+        // The guard, then the dir entered: what follows names the file from it.
+        let at = format!("{}; {}; {}", guard(&loc, &loc.path), exists(&shell_quote(&loc.path)), enter(&dir));
         let body = format!(
-            "{}; {}; [ -f {p} ] || {{ echo 'Not a file' >&2; exit 1; }}; [ -r {p} ] || {{ echo 'Permission denied' >&2; exit 1; }}; wc -c < {p}",
-            guard(&loc, &loc.path),
-            exists(&p)
+            "{at}; [ -f {name} ] || {{ echo 'Not a file' >&2; exit 1; }}; [ -r {name} ] || {{ echo 'Permission denied' >&2; exit 1; }}; wc -c < {name}"
         );
         let size = self.script(&access, &loc, &body)?;
         let want: usize = last_line(&size).parse().map_err(|_| format!("{}: no size in `{}`", loc.given, size.trim()))?;
@@ -443,7 +477,7 @@ impl Adb {
             return Err(format!("{}: {want} bytes, more than `read` returns ({} MiB)", loc.given, MAX_READ >> 20));
         }
         // The guard again, in the same script as the read: what was checked is what is read.
-        let read = self.exec_out(&access.wrap(&format!("{}; cat {p} 2>/dev/null", guard(&loc, &loc.path))));
+        let read = self.exec_out(&access.wrap(&format!("{at}; cat {name} 2>/dev/null")), want + ERR_CAP);
         let escaped = |text: &[u8]| String::from_utf8_lossy(text).contains(ESCAPE);
         match read {
             Err(e) if e.contains(ESCAPE) => Err(format!("path escapes the container: {}", loc.given)),
@@ -480,7 +514,12 @@ impl Adb {
                 if restore { format!(" && chown -h \"$o\" {d} && restorecon \"$(pwd -P)\"/{}", shell_quote(dir)) } else { String::new() };
             prepare.push_str(&format!("; if [ ! -d {d} ]; then mkdir {d}{own} || exit 1; fi; {}", enter(&d)));
         }
-        prepare.push_str(&format!("; if [ -e {name} ] || [ -L {name} ]; then stat -c '%u:%g:%a' {name}; else echo \"$o:\"; fi"));
+        // The owner is the entry's own; the mode is what it points at, never a symlink's 777
+        // (none for a dangling one).
+        prepare.push_str(&format!(
+            "; if [ -e {name} ] || [ -L {name} ]; then i=$(stat -c '%u:%g' {name}) || exit 1; \
+             m=$(stat -L -c %a {name} 2>/dev/null); echo \"$i:$m\"; else echo \"$o:\"; fi"
+        ));
         let owner = self.script(&access, &loc, &prepare)?;
         let (ids, mode) = owner_of(last_line(&owner));
         if restore && ids.is_none() {
@@ -490,21 +529,37 @@ impl Adb {
         // app's own files are.
         let mode = mode.as_deref().and_then(|m| u32::from_str_radix(m, 8).ok()).filter(|m| *m <= 0o7777).unwrap_or(0o600);
         let dir = shell_quote(loc.parent());
-        // Hex only, so it needs no quoting, even inside the trap's.
-        let tmp_name = format!(".simee-write-{}", random_hex());
-        let tmp = format!("./{tmp_name}");
-        let here = format!("{}; {}", guard(&loc, loc.parent()), enter(&dir));
-        // Made with O_EXCL (`set -C`): never through anything already there, a symlink included.
-        let made = self.exec_in(&access.wrap(&format!("{here}; set -C; umask {:03o}; cat > {tmp}", !mode & 0o777)), bytes);
-        if let Err(e) = made {
-            let _ = self.script(&access, &loc, &format!("{here}; rm -f {tmp}"));
+        let up = shell_quote(&format!("../{}", loc.name()));
+        // Hex only, so it needs no quoting, even inside the trap's. The temp dir and the temp file
+        // in it have the same name.
+        let sub = format!(".simee-write-{}", random_hex());
+        let tmp = format!("./{sub}");
+        let here = format!("{}; {}; h=$(pwd -P)", guard(&loc, loc.parent()), enter(&dir));
+        // Into the temp dir, refusing one that isn't the dir made there (moved aside, a symlink or
+        // another dir in its place); from inside, `..` is the target's dir, since a dir can't be
+        // moved to another parent by anyone who can't write to it.
+        let inside = format!(
+            "{{ cd -P {tmp} 2>/dev/null && [ \"$(pwd -P)\" = \"$h/{sub}\" ]; }} || \
+             {{ echo 'the temp dir simee made is gone or was replaced (or the upload failed before it was made)' >&2; exit 1; }}"
+        );
+        let clean = format!("rm -f {tmp} ./.done ./.err ./.probe ./.probed; rmdir ../{sub}");
+        // The dir 0700, the file in it made with O_EXCL (`set -C`); `.done` marks an upload that
+        // finished, and `.err` keeps what it said, since adb carries neither back.
+        let upload = format!(
+            "{here}; umask 077; mkdir {tmp} || exit 1; {inside}; set -C; {{ umask {:03o}; cat > {tmp} && : > ./.done; }} 2> ./.err",
+            !mode & 0o777
+        );
+        if let Err(e) = self.exec_in(&access.wrap(&upload), bytes) {
+            let _ = self.script(&access, &loc, &format!("{here}; {inside}; {clean}"));
             return Err(e);
         }
         let len = bytes.len();
-        // From here every failure removes the temp file, and the target changes only by the
-        // last step's rename.
+        // From here every failure removes the temp dir, and the target changes only by the last
+        // step's rename.
         let mut finish = format!(
-            "{here}; trap 'rm -f {tmp}' EXIT; {{ [ -f {tmp} ] && [ ! -L {tmp} ] && [ -O {tmp} ]; }} || \
+            "{here}; {inside}; trap '{clean} 2>/dev/null' EXIT; \
+             [ -e ./.done ] || {{ echo \"the upload failed on the device: $(tr '\\n' ' ' < ./.err 2>/dev/null)\" >&2; exit 1; }}; \
+             {{ [ -f {tmp} ] && [ ! -L {tmp} ] && [ -O {tmp} ]; }} || \
              {{ echo 'the temp file simee made is gone or was replaced' >&2; exit 1; }}; \
              n=$(wc -c < {tmp}) || exit 1; [ \"$n\" -eq {len} ] || {{ echo \"wrote $n of {len} bytes\" >&2; exit 1; }}"
         );
@@ -513,9 +568,14 @@ impl Adb {
             finish.push_str(&format!("; chmod {mode:o} {tmp} || exit 1"));
         }
         if let (true, Some(ids)) = (restore, ids) {
-            finish.push_str(&format!("; restorecon \"$(pwd -P)\"/{tmp_name} && chown -h {ids} {tmp} || exit 1"));
+            finish.push_str(&format!("; restorecon \"$(pwd -P)\"/{sub} && chown -h {ids} {tmp} || exit 1"));
         }
-        finish.push_str(&format!("; mv -f {tmp} {name} || exit 1; trap - EXIT"));
+        // rename(2) through `mv -T` where toybox has it (API 30 on; the probe is in the temp dir,
+        // where nothing else can touch it); without it, a directory at the target is refused here.
+        finish.push_str(&format!(
+            "; [ -d {up} ] && {{ echo 'Is a directory' >&2; exit 1; }}; : > ./.probe; \
+             if mv -T ./.probe ./.probed 2>/dev/null; then mv -fT {tmp} {up}; else mv -f {tmp} {up}; fi || exit 1"
+        ));
         self.script(&access, &loc, &finish).map(|_| ())
     }
 
@@ -542,8 +602,13 @@ impl Adb {
     }
 
     fn du_at(&self, access: &Access, loc: &Location) -> Result<u64, String> {
-        let p = shell_quote(&loc.path);
-        let body = format!("{}; [ -e {p} ] || exit 0; find {p} -type f -exec stat -c %s {{}} +", guard(loc, &loc.path));
+        let (dir, name) = loc.working_dir();
+        let body = format!(
+            "{}; [ -e {} ] || exit 0; {}; find {name} -type f -exec stat -c %s {{}} +",
+            guard(loc, &loc.path),
+            shell_quote(&loc.path),
+            enter(&dir)
+        );
         self.script(access, loc, &body).map(|out| sum_sizes(&out))
     }
 
@@ -822,15 +887,15 @@ mod tests {
         assert_eq!(std::fs::read(f.fake.on_device(RELEASE)).expect("file"), b"changed");
         let calls = f.fake.calls();
         let made = calls.iter().find(|c| c.starts_with("exec-in ")).expect("exec-in");
-        assert!(made.contains("set -C; umask 117; cat > ./.simee-write-"), "made with its mode, 660: {made}");
+        assert!(made.contains("set -C; { umask 117; cat > ./.simee-write-"), "made with its mode, 660: {made}");
         // The temp file gets its context and owner, never through a symlink, and only then
-        // replaces the file.
+        // replaces the file, by one rename within its dir (the temp dir is in it).
         let last = calls.last().expect("calls");
-        let tmp = last.split("mv -f ").nth(1).and_then(|r| r.split(' ').next()).expect("mv's source");
+        let tmp = last.split("mv -fT ").nth(1).and_then(|r| r.split(' ').next()).expect("mv's source");
         assert!(tmp.starts_with("./.simee-write-"), "{last}");
         let restorecon = last.find(&format!("restorecon \"$(pwd -P)\"/{}", &tmp[2..])).expect("restorecon the temp file");
         let chown = last.find(&format!("chown -h 10123:10123 {tmp}")).expect("chown the temp file to the file's owner");
-        let mv = last.find(&format!("mv -f {tmp} '\\''./r.txt'\\''")).expect("one rename within the dir");
+        let mv = last.find(&format!("mv -fT {tmp} '\\''../r.txt'\\''")).expect("one rename within the dir");
         assert!(restorecon < chown && chown < mv && !last.contains("chmod"), "before the rename: {last}");
         assert_eq!(f.fake.chowns().last().map(|c| c.contains(".simee-write-")), Some(true), "{:?}", f.fake.chowns());
 
@@ -1014,13 +1079,18 @@ mod tests {
         std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).expect("mode");
         f.fake.swap_temp_files();
         let err = f.adb.write_file(RELEASE, b"hostile", NONE).expect_err("refused");
-        assert!(err.contains("temp file"), "{err}");
+        assert!(err.contains("the temp dir simee made is gone or was replaced"), "{err}");
         assert_eq!(std::fs::read(f.fake.on_device(RELEASE)).expect("file"), b"release", "the file is as it was");
         assert_eq!(std::fs::read(&victim).expect("victim"), b"victim!");
         assert_eq!(std::fs::symlink_metadata(&victim).expect("victim").permissions().mode() & 0o777, 0o644, "not chmodded");
         assert!(f.fake.chowns().iter().all(|c| !c.contains("outside")), "nothing outside is chowned: {:?}", f.fake.chowns());
-        let left = std::fs::read_dir(f.fake.on_device("data/data/com.example.release/files")).expect("dir").flatten();
-        assert!(left.filter(|e| e.file_name().to_string_lossy().starts_with(".simee-")).count() == 0, "no temp file is left");
+        // What is left is the app's doing: the temp dir it moved aside and the link it put in its
+        // place. The temp file in that dir was never reached.
+        let dir = f.fake.on_device("data/data/com.example.release/files");
+        let left = names(&dir);
+        assert_eq!(left.len(), 3, "{left:?}");
+        assert!(left[0].starts_with(".simee-write-") && left[1] == format!("{}.moved", left[0]) && left[2] == "r.txt", "{left:?}");
+        assert!(std::fs::symlink_metadata(dir.join(&left[0])).expect("link").file_type().is_symlink());
     }
 
     // Finding 3: the temp file is made with O_EXCL (`set -C`) under a name nobody can guess.
@@ -1115,5 +1185,144 @@ mod tests {
             let pwned = std::fs::read_dir(cwd).expect("cwd").flatten().any(|e| e.file_name().to_string_lossy().starts_with("pwned"));
             assert!(!pwned, "{tag}: nothing ran");
         }
+    }
+
+    /// The names in a host dir, sorted.
+    fn names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> =
+            std::fs::read_dir(dir).expect("dir").flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    // Review of #470 (second pass), finding 1: a root write's `chmod` never follows a temp file
+    // the app swaps after the checks: the temp file is in a dir of root's own, mode 0700.
+    #[test]
+    fn a_root_write_never_follows_a_temp_file_swapped_after_its_checks() {
+        let f = fixture("lateswap", Root::Adbd);
+        let victim = f.fake.outside.join("victim");
+        std::fs::write(&victim, b"victim!").expect("victim");
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).expect("mode");
+        // A mode umask can't give, so chmod runs.
+        f.fake.set_owner("10123:10123:770");
+        f.fake.late_swap_temp_files();
+        let wrote = f.adb.write_file(RELEASE, b"hostile", NONE);
+        assert_eq!(std::fs::symlink_metadata(&victim).expect("victim").permissions().mode() & 0o7777, 0o644, "not chmodded");
+        assert_eq!(std::fs::read(&victim).expect("victim"), b"victim!");
+        assert!(f.fake.chowns().iter().all(|c| !c.contains("outside")), "nothing outside is chowned: {:?}", f.fake.chowns());
+        assert_eq!(wrote, Ok(()));
+        let target = f.fake.on_device(RELEASE);
+        assert!(std::fs::symlink_metadata(&target).expect("file").file_type().is_file());
+        assert_eq!(std::fs::read(&target).expect("file"), b"hostile");
+        let calls = f.fake.calls();
+        let made = calls.iter().find(|c| c.starts_with("exec-in ")).expect("exec-in");
+        assert!(made.contains("umask 077; mkdir ./.simee-write-"), "a temp dir of root's own: {made}");
+        assert_eq!(names(target.parent().expect("dir")), ["r.txt"], "the temp dir is gone");
+    }
+
+    // Finding 1: a write to a symlink takes the mode of what it points at, never the link's 777.
+    #[test]
+    fn a_write_through_a_symlink_takes_the_mode_of_what_it_points_at() {
+        let f = fixture("linkmode", Root::Adbd);
+        let target = f.fake.on_device(RELEASE);
+        let other = target.with_file_name("other.txt");
+        std::fs::write(&other, b"other").expect("other");
+        std::fs::remove_file(&target).expect("rm");
+        std::os::unix::fs::symlink("other.txt", &target).expect("link");
+        f.adb.write_file(RELEASE, b"x", NONE).expect("write");
+        let calls = f.fake.calls();
+        let made = calls.iter().find(|c| c.starts_with("exec-in ")).expect("exec-in");
+        assert!(made.contains("umask 117"), "660, not the link's 777: {made}");
+        assert!(calls.iter().all(|c| !c.contains("chmod 777")), "{calls:?}");
+        // The link is replaced; what it pointed at stays as it was.
+        assert!(std::fs::symlink_metadata(&target).expect("file").file_type().is_file());
+        assert_eq!(std::fs::read(&target).expect("file"), b"x");
+        assert_eq!(std::fs::read(&other).expect("other"), b"other");
+    }
+
+    // Finding 2: a symlink to a directory swapped in at the target is replaced (`mv -T`), never
+    // moved into.
+    #[test]
+    fn a_write_replaces_a_symlink_swapped_in_at_its_target() {
+        let f = fixture("mvswap", Root::Adbd);
+        f.fake.swap_target_in_mv();
+        f.adb.write_file(RELEASE, b"mine", NONE).expect("write");
+        let target = f.fake.on_device(RELEASE);
+        assert!(std::fs::symlink_metadata(&target).expect("file").file_type().is_file(), "the link was replaced");
+        assert_eq!(std::fs::read(&target).expect("file"), b"mine");
+        assert_eq!(names(&f.fake.outside), ["secret.txt"], "nothing was moved outside");
+        assert!(f.fake.calls().last().expect("calls").contains("mv -fT "), "{:?}", f.fake.calls());
+    }
+
+    // Finding 2: API 29's toybox has no `mv -T`: there a directory (or a symlink to one) at the
+    // target is refused just before the move.
+    #[test]
+    fn without_mv_t_a_write_refuses_a_directory_at_its_target() {
+        let f = fixture("mvold", Root::Adbd);
+        f.fake.old_toybox();
+        f.fake.swap_for_outside_link_after_upload(RELEASE);
+        let err = f.adb.write_file(RELEASE, b"mine", NONE).expect_err("refused");
+        assert!(err.contains("Is a directory"), "{err}");
+        assert_eq!(names(&f.fake.outside), ["secret.txt"], "nothing was moved outside");
+        assert_eq!(names(f.fake.on_device(RELEASE).parent().expect("dir")), ["r.txt"], "no temp dir is left");
+        // With nothing swapped in it writes, through `mv` without `-T`.
+        let f = fixture("mvold2", Root::Adbd);
+        f.fake.old_toybox();
+        f.adb.write_file(RELEASE, b"mine", NONE).expect("write");
+        assert_eq!(std::fs::read(f.fake.on_device(RELEASE)).expect("file"), b"mine");
+    }
+
+    // Finding 5: `adb exec-in` carries no exit status back, so an upload that fails on the
+    // device says why from the finish step, not as a short or missing temp file.
+    #[test]
+    fn a_write_whose_upload_fails_says_why() {
+        for (tag, root, path) in [("upfailroot", Root::Adbd, RELEASE), ("upfailrunas", Root::None, NOTES)] {
+            let f = fixture(tag, root);
+            let before = std::fs::read(f.fake.on_device(path)).expect("file");
+            f.fake.fail_upload();
+            let err = f.adb.write_file(path, b"changed", NONE).expect_err("no space");
+            assert!(err.contains("No space left on device"), "{tag}: {err}");
+            assert_eq!(std::fs::read(f.fake.on_device(path)).expect("file"), before, "{tag}: not replaced");
+            let left = names(f.fake.on_device(path).parent().expect("dir"));
+            assert!(left.iter().all(|n| !n.starts_with(".simee-")), "{tag}: no temp dir is left: {left:?}");
+        }
+    }
+
+    // Finding 4: what runs after the guard names paths from a dir it entered and checked, so a
+    // parent swapped for a symlink after the guard is refused, not followed out of the container.
+    #[test]
+    fn reads_never_follow_a_dir_swapped_after_the_guard() {
+        let files = "data/data/com.example.app/files";
+        let escape = |p: &str| format!("path escapes the container: {p}");
+        let f = fixture("guardread", Root::None);
+        std::fs::write(f.fake.outside.join("notes.txt"), b"stole").expect("same size as notes.txt");
+        f.fake.swap_after_guard("exec-out", NOTES, files);
+        assert_eq!(f.adb.read_file(NOTES, NONE), Err(escape(NOTES)));
+        let f = fixture("guardls", Root::None);
+        f.fake.swap_after_guard("shell", files, files);
+        assert_eq!(f.adb.ls(files, NONE), Err(escape(files)));
+        let f = fixture("guarddu", Root::None);
+        std::fs::write(f.fake.outside.join("notes.txt"), b"stole").expect("outside");
+        f.fake.swap_after_guard("shell", NOTES, files);
+        assert_eq!(f.adb.du(NOTES, NONE), Err(escape(NOTES)));
+        // A pin: with nothing swapped, each still answers, the container itself included.
+        let f = fixture("guardpin", Root::None);
+        assert_eq!(f.adb.read_file(NOTES, NONE).as_deref(), Ok(&b"hello"[..]));
+        assert_eq!(f.adb.ls(files, NONE).map(|e| e.len()), Ok(2));
+        assert_eq!(f.adb.du(files, NONE), Ok(5));
+        assert_eq!(f.adb.du("data/data/com.example.app", NONE), Ok(15));
+        assert!(f.adb.read_file("data/data/com.example.app", NONE).expect_err("a dir").contains("Not a file"));
+    }
+
+    // Finding 6: a user is a number as Android writes it, so `pm clear --user` gets no `010`.
+    #[test]
+    fn a_user_with_a_leading_zero_is_refused() {
+        for path in ["data/user/010/com.example.release", "storage/emulated/00/Android/data/com.example.app"] {
+            assert!(locate(path).expect_err(path).starts_with("path is outside every app container"), "{path}");
+        }
+        assert!(locate("data/user/0/com.example.app").is_ok() && locate("data/user/10/com.example.app").is_ok());
+        let f = fixture("pmuser010", Root::None);
+        assert!(f.adb.clear_container("data/user/010/com.example.release", PM_CLEAR).is_err());
+        assert!(f.fake.calls().iter().all(|c| !c.contains("pm clear")), "{:?}", f.fake.calls());
     }
 }

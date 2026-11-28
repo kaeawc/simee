@@ -7,17 +7,23 @@
 #                              [--rounds N] [--quick] [--out DIR]
 #
 # Arms (host Vulkan under gfxstream + the renderer's host GLES, ANGLE):
-#   mvk-metal     MoltenVK + ANGLE on Metal       -gpu host, ANGLE_DEFAULT_PLATFORM=metal
-#   mvk-swangle   MoltenVK + SwANGLE              -gpu host, ANGLE_DEFAULT_PLATFORM=swiftshader
+#   mvk-metal     MoltenVK + ANGLE on Metal       -gpu host, ANDROID_EMU_VK_ICD=moltenvk,
+#                                                 ANGLE_DEFAULT_PLATFORM=metal
+#   mvk-swangle   MoltenVK + SwANGLE              -gpu host, ANDROID_EMU_VK_ICD=moltenvk,
+#                                                 ANGLE_DEFAULT_PLATFORM=swiftshader
 #   kk-metal      KosmicKrisp + ANGLE on Metal    -gpu host, ANDROID_EMU_VK_ICD=kosmickrisp and
 #                                                 VK_DRIVER_FILES/VK_ICD_FILENAMES at the renderer's
 #                                                 lib64/vulkan/libkosmickrisp_icd.json
 #   kk-swangle    KosmicKrisp + SwANGLE
 #   lavapipe      -gpu lavapipe (software Vulkan; host GLES as emu picks it)
 #   swiftshader   -gpu swiftshader (software Vulkan; host GLES as emu picks it)
-# emu's own configure_environment (crates/emu-gfxstream/src/lib.rs) sets each of those variables
-# only when it is unset, so the environment picks the driver; gfxstream itself points the loader
-# at the manifest ANDROID_EMU_VK_ICD names (VK_LOADER_DEBUG=driver shows which). An arm whose ICD
+# Under -gpu host, ANDROID_EMU_VK_ICD=moltenvk or =kosmickrisp picks emu's driver (without it,
+# API 34 and 35 run KosmicKrisp, #412), and emu's configure_environment
+# (crates/emu-gfxstream/src/lib.rs) then sets ANDROID_EMU_VK_ICD, VK_DRIVER_FILES and
+# VK_ICD_FILENAMES to that driver whatever they held, printing a notice when it overrides one.
+# The other variables (ANGLE_DEFAULT_PLATFORM, MVK_*) are set only when unset, so the arm's win.
+# `emu -warm-renderer` initializes on the driver ANDROID_EMU_VK_ICD names. gfxstream points the
+# loader at the manifest ANDROID_EMU_VK_ICD names (VK_LOADER_DEBUG=driver shows which). An arm whose ICD
 # the renderer doesn't ship is skipped, never downloaded.
 #
 # Per API (--api, default "36 30"; 33 and 34 also known, google_apis arm64 images), one AVD
@@ -302,8 +308,8 @@ label() {
 arm_env() {
   local kk="$lib64/vulkan/libkosmickrisp_icd.json"
   case $1 in
-    mvk-metal) echo "ANGLE_DEFAULT_PLATFORM=metal" ;;
-    mvk-swangle) echo "ANGLE_DEFAULT_PLATFORM=swiftshader" ;;
+    mvk-metal) echo "ANDROID_EMU_VK_ICD=moltenvk,ANGLE_DEFAULT_PLATFORM=metal" ;;
+    mvk-swangle) echo "ANDROID_EMU_VK_ICD=moltenvk,ANGLE_DEFAULT_PLATFORM=swiftshader" ;;
     kk-metal) echo "ANDROID_EMU_VK_ICD=kosmickrisp,VK_DRIVER_FILES=$kk,VK_ICD_FILENAMES=$kk,ANGLE_DEFAULT_PLATFORM=metal" ;;
     kk-swangle) echo "ANDROID_EMU_VK_ICD=kosmickrisp,VK_DRIVER_FILES=$kk,VK_ICD_FILENAMES=$kk,ANGLE_DEFAULT_PLATFORM=swiftshader" ;;
     *) echo "" ;;

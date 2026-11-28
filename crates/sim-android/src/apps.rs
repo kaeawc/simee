@@ -211,21 +211,45 @@ impl Adb {
 /// never one reusing its PID) and the error names `what`. Output is read as it comes, so the
 /// call returns once the command exits even when a process it started still holds its pipes.
 fn output_within(command: &mut Command, limit: Duration, what: &str) -> Result<(bool, String, String), String> {
-    let (ok, stdout, stderr) = io_within(command, None, limit, what)?;
-    let [stdout, stderr] = [stdout, stderr].map(|b| String::from_utf8_lossy(&b).into_owned());
-    Ok((ok, stdout, stderr))
+    let ran = capture(command, None, limit, [usize::MAX; 2], what)?;
+    if ran.timed_out {
+        return Err(format!("`{what}` timed out after {limit:?}; stopped it"));
+    }
+    let [stdout, stderr] = [ran.stdout, ran.stderr].map(|b| String::from_utf8_lossy(&b).into_owned());
+    Ok((ran.code == Some(0), stdout, stderr))
 }
 
-/// [`output_within`] as bytes, with `stdin` (when given) written to the command's input from a
-/// thread of its own (so a command that writes before it reads can't stall it) and then closed.
-pub(crate) fn io_within(
+/// What [`capture`] collected.
+#[derive(Debug, Default)]
+pub(crate) struct Captured {
+    /// The exit status; `None` when it was stopped (past its time or its cap) or died of a signal.
+    pub code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    /// A stream reached its cap and was cut there.
+    pub truncated: bool,
+    /// It ran past its time.
+    pub timed_out: bool,
+    /// It was stopped, at a cap or past its time, while it still ran: it never exited by itself.
+    pub stopped: bool,
+}
+
+/// [`output_within`]'s run, keeping at most `caps` bytes of stdout and of stderr: a stream that
+/// reaches its cap while the command runs stops it (`truncated`, `stopped`), as running past `limit`
+/// does (`timed_out`, `stopped`). One that reaches it in what is read after the command exited is
+/// only cut (`truncated`), the command's status kept. `stdin`, when given, is written to the
+/// command's input from a thread of its own (so a command that writes before it reads can't stall
+/// it) and then closed; without it the input is null.
+pub(crate) fn capture(
     command: &mut Command,
     stdin: Option<Vec<u8>>,
     limit: Duration,
+    caps: [usize; 2],
     what: &str,
-) -> Result<(bool, Vec<u8>, Vec<u8>), String> {
+) -> Result<Captured, String> {
     /// How often a quiet command is checked for having exited.
     const TICK: Duration = Duration::from_millis(20);
+    let deadline = Instant::now().checked_add(limit).ok_or_else(|| format!("`{what}`: a time limit of {limit:?} is too long"))?;
     let mut child = command
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
@@ -238,7 +262,6 @@ pub(crate) fn io_within(
             let _ = input.write_all(&bytes);
         });
     }
-    let deadline = Instant::now() + limit;
     let (tx, rx) = mpsc::channel::<(usize, Option<Vec<u8>>)>();
     let pipes: [Option<Box<dyn Read + Send>>; 2] = [
         child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>),
@@ -263,13 +286,23 @@ pub(crate) fn io_within(
         });
     }
     drop(tx);
+    let mut ran = Captured::default();
     let mut out = [Vec::new(), Vec::new()];
+    // Keeps what fits of `bytes` under stream `i`'s cap; whether any didn't fit.
+    let keep = |out: &mut [Vec<u8>; 2], i: usize, bytes: &[u8]| {
+        let room = caps[i].saturating_sub(out[i].len());
+        out[i].extend_from_slice(&bytes[..bytes.len().min(room)]);
+        bytes.len() > room
+    };
     let status = loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if open > 0 && !left.is_zero() {
             match rx.recv_timeout(left.min(TICK)) {
                 Ok((i, Some(bytes))) => {
-                    out[i].extend(bytes);
+                    if keep(&mut out, i, &bytes) {
+                        ran.truncated = true;
+                        break None;
+                    }
                     continue;
                 }
                 Ok((_, None)) => {
@@ -284,26 +317,31 @@ pub(crate) fn io_within(
             sleep(left.min(Duration::from_millis(1)));
         }
         if let Some(status) = child.try_wait().map_err(|e| format!("`{what}`: {e}"))? {
-            break status;
+            break Some(status);
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("`{what}` timed out after {limit:?}; stopped it"));
+            ran.timed_out = true;
+            break None;
         }
     };
-    // It exited: what it wrote last may still be on its way from the readers. A process it left
-    // holding the pipes gets a moment, not the deadline.
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        ran.stopped = true;
+    }
+    // What it wrote last, or before it was stopped, may still be on its way from the readers. A
+    // process it left holding the pipes gets a moment, not the deadline.
     let grace = Instant::now() + Duration::from_millis(100);
     while open > 0 {
         match rx.recv_timeout(grace.saturating_duration_since(Instant::now())) {
-            Ok((i, Some(bytes))) => out[i].extend(bytes),
+            Ok((i, Some(bytes))) => ran.truncated |= keep(&mut out, i, &bytes),
             Ok((_, None)) => open -= 1,
             Err(_) => break,
         }
     }
-    let [stdout, stderr] = out;
-    Ok((status.success(), stdout, stderr))
+    ran.code = status.and_then(|s| s.code());
+    [ran.stdout, ran.stderr] = out;
+    Ok(ran)
 }
 
 /// `name` if it is a package name: dot-separated segments of letters, digits and underscores,
@@ -373,7 +411,7 @@ fn parse_pid(out: &str) -> Option<u32> {
 }
 
 /// The names in `pm list packages`'s `package:<name>` lines, sorted.
-fn parse_packages(out: &str) -> Vec<String> {
+pub(crate) fn parse_packages(out: &str) -> Vec<String> {
     let mut names: Vec<String> = out.lines().filter_map(|l| l.trim().strip_prefix("package:")).map(str::to_owned).collect();
     names.sort();
     names.dedup();
