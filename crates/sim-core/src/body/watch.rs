@@ -300,16 +300,16 @@ fn straps(body: &Body, band: f32) -> Vec<Block> {
     out
 }
 
-// Its one test pins raw f32 mesh fingerprints, which differ by platform: macOS only. Tests that
-// hold on every platform go outside this gate.
-#[cfg(all(test, target_os = "macos"))]
-mod tests {
+// What holds on every platform: screens, shapes, strap clearances. The fingerprint pins are in
+// `tests`, macOS only.
+#[cfg(test)]
+mod checks {
     use super::*;
     use crate::form_factor::Kind;
 
     /// The bodies the pins and checks below run over: the table's watches, the generic Wear OS
     /// shapes, a small round Wear OS and an Apple Watch the table doesn't list.
-    fn watch_bodies() -> Vec<Arc<Body>> {
+    pub(super) fn watch_bodies() -> Vec<Arc<Body>> {
         let watch = Kind::new(Platform::Android, FormFactor::Watch).expect("Wear OS").profile();
         let with_shape = |shape| {
             let mut p = watch.clone();
@@ -336,48 +336,6 @@ mod tests {
         ]);
         bodies
     }
-
-    /// FNV-1a over a body's every field (its `Debug`, which prints f32s exactly). Not the mesh's
-    /// bits, as `super::super::tests::fingerprint` also takes: those come out of libm's sin and
-    /// cos and differ between hosts (the shared phone pin fails on Linux), where these fields
-    /// come from IEEE arithmetic and `sqrt` and are the same everywhere. The shared mesh tests
-    /// cover the triangles.
-    fn fingerprint(b: &Body) -> u64 {
-        format!("{b:?}").bytes().fold(0xcbf2_9ce4_8422_2325, |h: u64, x| (h ^ u64::from(x)).wrapping_mul(0x0100_0000_01b3))
-    }
-
-    /// Every watch body's fields. #500 pinned these (with their meshes) as the code moved out of
-    /// `table.rs`; straps, the round side button and the new rows (#501) changed them on purpose,
-    /// so a change here is a change to a watch's look: update the values with the change.
-    #[test]
-    fn watch_body_fingerprints() {
-        let got: Vec<(String, u64)> = watch_bodies().iter().map(|b| (b.id.clone(), fingerprint(b))).collect();
-        let want: Vec<(String, u64)> = PINS.iter().map(|&(id, f)| (id.to_owned(), f)).collect();
-        assert_eq!(got, want, "{got:#x?}");
-    }
-
-    const PINS: [(&str, u64); 20] = [
-        ("Apple-Watch-Series-10-46mm", 0x1e2102c687fee9d7),
-        ("Apple-Watch-Series-10-42mm", 0x1a1354b6604826ad),
-        ("Apple-Watch-Series-11-46mm", 0x17105339f5aba925),
-        ("Apple-Watch-Series-11-42mm", 0x48806a2ce251ead3),
-        ("Apple-Watch-Ultra-2-49mm", 0xfe8de8448803fd8e),
-        ("Apple-Watch-Ultra-3-49mm", 0x7a470c620895395f),
-        ("Apple-Watch-SE-3-44mm", 0x3d545b906f49fc37),
-        ("Apple-Watch-SE-3-40mm", 0x22601089ea9208ba),
-        ("Apple-Watch-SE-44mm-2nd-generation", 0x5fcc2241020c67c9),
-        ("Apple-Watch-SE-40mm-2nd-generation", 0xf3a59e228acb74b8),
-        ("wearos_small_round", 0xb1fcca58a7d784cd),
-        ("wearos_large_round", 0x56cde642c0cd94b0),
-        ("wearos_xl_round", 0x38f30ffb063d5ea5),
-        ("wearos_square", 0xa725ae73ecd04e2f),
-        ("wearos_rect", 0x5661742e90cc714c),
-        ("android-watch-454x454-320dpi-round", 0x17a3a1eabfbaaef4),
-        ("android-watch-454x454-320dpi-rectangle", 0x1ee7750fb78fb58a),
-        ("android-watch-454x454-320dpi-rounded", 0x83af56423f766794),
-        ("android-watch-384x384-320dpi-round", 0xb95deac366b2288b),
-        ("ios-watch-416x496-2x-rounded", 0xc6260618e088fc59),
-    ];
 
     fn box_xy(x: f32, y: f32, w: f32, h: f32) -> [f32; 4] {
         [x - w / 2.0, x + w / 2.0, y - h / 2.0, y + h / 2.0]
@@ -537,4 +495,54 @@ mod tests {
             assert!(get(id).is_some(), "{id}");
         }
     }
+}
+
+// Raw f32 fingerprints differ between platform libms: its pins are macOS only (update them on a
+// Mac; anything that should hold everywhere goes in `checks`).
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::checks::watch_bodies;
+    use super::*;
+
+    /// FNV-1a over a body's every field (its `Debug`, which prints f32s exactly). Not the mesh's
+    /// bits, as `super::super::tests::fingerprint` also takes: those come out of libm's sin and
+    /// cos and differ between hosts (the shared phone pin fails on Linux), where these fields
+    /// come from IEEE arithmetic and `sqrt` and are the same everywhere. The shared mesh tests
+    /// cover the triangles.
+    fn fingerprint(b: &Body) -> u64 {
+        format!("{b:?}").bytes().fold(0xcbf2_9ce4_8422_2325, |h: u64, x| (h ^ u64::from(x)).wrapping_mul(0x0100_0000_01b3))
+    }
+
+    /// Every watch body's fields. #500 pinned these (with their meshes) as the code moved out of
+    /// `table.rs`; straps, the round side button and the new rows (#501) changed them on purpose,
+    /// so a change here is a change to a watch's look: update the values with the change.
+    #[test]
+    fn watch_body_fingerprints() {
+        let got: Vec<(String, u64)> = watch_bodies().iter().map(|b| (b.id.clone(), fingerprint(b))).collect();
+        let want: Vec<(String, u64)> = PINS.iter().map(|&(id, f)| (id.to_owned(), f)).collect();
+        assert_eq!(got, want, "{got:#x?}");
+    }
+
+    const PINS: [(&str, u64); 20] = [
+        ("Apple-Watch-Series-10-46mm", 0x1e2102c687fee9d7),
+        ("Apple-Watch-Series-10-42mm", 0x1a1354b6604826ad),
+        ("Apple-Watch-Series-11-46mm", 0x17105339f5aba925),
+        ("Apple-Watch-Series-11-42mm", 0x48806a2ce251ead3),
+        ("Apple-Watch-Ultra-2-49mm", 0xfe8de8448803fd8e),
+        ("Apple-Watch-Ultra-3-49mm", 0x7a470c620895395f),
+        ("Apple-Watch-SE-3-44mm", 0x3d545b906f49fc37),
+        ("Apple-Watch-SE-3-40mm", 0x22601089ea9208ba),
+        ("Apple-Watch-SE-44mm-2nd-generation", 0x5fcc2241020c67c9),
+        ("Apple-Watch-SE-40mm-2nd-generation", 0xf3a59e228acb74b8),
+        ("wearos_small_round", 0xb1fcca58a7d784cd),
+        ("wearos_large_round", 0x56cde642c0cd94b0),
+        ("wearos_xl_round", 0x38f30ffb063d5ea5),
+        ("wearos_square", 0xa725ae73ecd04e2f),
+        ("wearos_rect", 0x5661742e90cc714c),
+        ("android-watch-454x454-320dpi-round", 0x17a3a1eabfbaaef4),
+        ("android-watch-454x454-320dpi-rectangle", 0x1ee7750fb78fb58a),
+        ("android-watch-454x454-320dpi-rounded", 0x83af56423f766794),
+        ("android-watch-384x384-320dpi-round", 0xb95deac366b2288b),
+        ("ios-watch-416x496-2x-rounded", 0xc6260618e088fc59),
+    ];
 }
