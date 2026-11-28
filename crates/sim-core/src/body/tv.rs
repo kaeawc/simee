@@ -18,6 +18,7 @@ pub(super) const ENABLED: bool = true;
 
 /// A TV's generic body is a nominal 55 inch set whatever density simee reports ([`super::has_body`]'s
 /// sibling check in `tests.rs`): its screen is drawn by diagonal, not by dpi.
+#[cfg(test)]
 pub(super) const SIZES_BY_DPI: bool = false;
 
 /// The nominal panel diagonal, inches: the SDK's TV definitions (`tv.xml`) are all 55".

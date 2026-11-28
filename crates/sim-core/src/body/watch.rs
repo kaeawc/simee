@@ -12,6 +12,7 @@ pub(super) const ENABLED: bool = true;
 
 /// Whether the generic body's screen is drawn at the dpi simee reports for the Android reference
 /// profile (a watch is sized at the dpi simee reports). When false, the shared test checks only the aspect.
+#[cfg(test)]
 pub(super) const SIZES_BY_DPI: bool = true;
 
 const APPLE_WATCH: &str = "Apple tech specs: case size and display area; corner radii, crown, sensor dome and button positions estimated";
