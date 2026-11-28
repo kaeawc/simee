@@ -333,6 +333,27 @@ fn screenshot_does_not_take_a_host_path() {
 }
 
 #[test]
+fn wait_idle_returns_its_still_screen_as_an_image_and_takes_no_host_path() {
+    let tools = all();
+    let wait = tool(&tools, "wait_idle");
+    assert_eq!(wait["inputSchema"]["properties"].get("path"), None);
+    assert!(!wait["description"].as_str().expect("description").contains("path"));
+    assert_eq!(wait["inputSchema"]["properties"]["quiet_ms"]["default"], 300);
+    assert_eq!(wait["outputSchema"]["properties"].get("png"), None, "the PNG is an image block");
+    let fake = Fake::default();
+    let err = run_plain(&fake, "wait_idle", &json!({"device": "d", "screenshot": true, "path": "/home/me/.zshrc"})).expect_err("refused");
+    assert!(err.contains("`path` isn't available through MCP"), "{err}");
+    assert!(fake.called("wait_idle").is_empty(), "never reaches the API");
+    let still = json!({"waited_ms": 300, "frames": 0, "width": 2, "height": 1, "png": "iVBOR"});
+    let out = result("wait_idle", Ok(still), Era::Modern);
+    assert_eq!(out["content"][0], json!({"type": "image", "data": "iVBOR", "mimeType": "image/png"}));
+    assert_eq!(out["structuredContent"], json!({"waited_ms": 300, "frames": 0, "width": 2, "height": 1}));
+    let plain = result("wait_idle", Ok(json!({"waited_ms": 300, "frames": 4})), Era::Modern);
+    assert_eq!(plain["structuredContent"], json!({"waited_ms": 300, "frames": 4}), "without screenshot, just the wait");
+    assert_eq!(misfit(&output_schema("wait_idle", Era::Modern), &out["structuredContent"], "wait_idle"), None);
+}
+
+#[test]
 fn the_docs_name_every_tool_and_resource() {
     // docs/mcp.md lives at the repository root, outside the published crate: in the
     // workspace a missing doc fails, from an unpacked .crate the test has nothing to check.
