@@ -159,3 +159,9 @@ with resources for devices and their screens, tasks for boots, and a device view
 methods in its own process, like `--in-process`; configure it in the agent as the command `simee
 mcp`. It serves the `core` toolset (about twenty tools) unless `SIMEE_MCP_TOOLSETS` names others
 (`core,debug`, or `all`): see [toolsets](mcp.md#toolsets).
+
+Destructive tools ask a person first, boots go through the host's admission check, and every call is
+logged. `--read-only`, `--allow-device PATTERN`, `--created-devices-only`, `--policy FILE`,
+`--admission ignore` and `--audit-log PATH` (or `--no-audit-log`) set what a client may do;
+`simee mcp-audit` reads the log back (`--tool`, `--client`, `--status`, `--limit`, `--json`). See
+[MCP safety](mcp-safety.md).

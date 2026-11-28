@@ -7,14 +7,17 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
+use crate::audit::{self, Entry};
 use crate::backend::{Backend, Executor};
 use crate::rpc::{self, Ctx, EXT_TASKS, Era, INTERNAL_ERROR, Incoming, LEGACY, MODERN, RpcError};
+use crate::safety::{self, Answer, Confirmation, Prepared, Safety, Verdict};
 use crate::tasks::{Ctl, Sink, Tasks};
 use crate::tools::{self, Pages, Toolsets};
 use crate::watch::{self, Emit, Pace, Spec, Watcher};
@@ -29,6 +32,12 @@ Resources under simee://devices carry each device's info, screen (shrunk for you
 `device_view` opens a live, clickable view of a device. \
 The tools listed are the toolsets this server was started with (SIMEE_MCP_TOOLSETS, default `core`); calling one that isn't listed \
 says which toolset has it. `processes`, `logs`, `connections` and `devices_usage` page with `limit` and `cursor`.";
+
+/// How long a question to the user may wait for its answer.
+pub const ELICIT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How often a question waiting for its answer looks at whether the call was cancelled.
+const ELICIT_POLL: Duration = Duration::from_millis(100);
 
 /// How often a call that blocks reports that it is still running, to a client that gave a progress token.
 const HEARTBEAT: Duration = Duration::from_secs(2);
@@ -84,8 +93,20 @@ struct Inner {
     toolsets: Toolsets,
     /// Snapshots of long lists, for their next pages.
     pages: Arc<Pages>,
-    /// The capabilities a legacy client sent in `initialize` and the revision agreed, once one has.
-    legacy: Mutex<Option<(Value, &'static str)>>,
+    /// The confirmations, device policy and audit log every call goes through.
+    safety: Arc<Safety>,
+    /// Who the transport says the client is (a token's name), which a client's own `clientInfo`
+    /// can't override.
+    identity: Mutex<Option<String>>,
+    /// How long to wait for a user's answer to a question sent to a client of an earlier revision
+    /// (`None`: this connection can't carry one, so the client is not asked).
+    elicit_timeout: Mutex<Option<Duration>>,
+    /// Questions sent to the client and not yet answered, by request id.
+    asked: Mutex<HashMap<String, Sender<Result<Value, Value>>>>,
+    next_question: AtomicU64,
+    /// The capabilities a legacy client sent in `initialize`, the revision agreed and the client's
+    /// name, once there has been one.
+    legacy: Mutex<Option<(Value, &'static str, Option<String>)>>,
     /// Requests being worked on, by id: set to true to say the client no longer wants the answer.
     inflight: Mutex<HashMap<String, Arc<AtomicBool>>>,
     running: Mutex<usize>,
@@ -113,6 +134,12 @@ impl Server {
     }
 
     pub fn with_timing(backend: Arc<dyn Backend>, sink: Sink, timing: Timing, toolsets: Toolsets) -> Server {
+        Server::with_safety(backend, sink, timing, toolsets, Safety::shared())
+    }
+
+    /// A server whose calls go through `safety` (the default, [`Safety::shared`], is what
+    /// `simee mcp` installed, or confirmations and admission alone).
+    pub fn with_safety(backend: Arc<dyn Backend>, sink: Sink, timing: Timing, toolsets: Toolsets, safety: Arc<Safety>) -> Server {
         Server {
             inner: Arc::new(Inner {
                 backend,
@@ -122,6 +149,11 @@ impl Server {
                 timing,
                 toolsets,
                 pages: Arc::default(),
+                safety,
+                identity: Mutex::new(None),
+                elicit_timeout: Mutex::new(None),
+                asked: Mutex::default(),
+                next_question: AtomicU64::new(0),
                 legacy: Mutex::new(None),
                 inflight: Mutex::default(),
                 running: Mutex::new(0),
@@ -132,9 +164,27 @@ impl Server {
         }
     }
 
+    /// Names the client from what the transport knows (an authenticated token's owner), over the
+    /// `clientInfo` the client declares: that is the client's own word, and a policy keyed on it is
+    /// only as good as the client's honesty.
+    pub fn set_identity(&self, name: &str) {
+        *lock(&self.inner.identity) = Some(name.to_owned());
+    }
+
+    /// Lets this server ask a client of an earlier revision to confirm a call, as a request of its
+    /// own that the client answers with a response on the same line stream. Only a transport that
+    /// hands the client's responses to [`Server::handle_line`] may turn this on (stdio does); the
+    /// current revision's clients are asked in the result of the call itself, on any transport.
+    pub fn ask_clients_to_confirm(&self, wait: Duration) {
+        *lock(&self.inner.elicit_timeout) = Some(wait);
+    }
+
     /// Handles one line from the client. Requests are answered on other threads.
     pub fn handle_line(&self, line: &str) {
         let inner = &self.inner;
+        if inner.answer_question(line) {
+            return;
+        }
         match rpc::parse(line) {
             Err(error) => inner.reply(&Value::Null, Err(error), None),
             Ok(Incoming::Notification { method, params }) => inner.notification(&method, &params),
@@ -309,6 +359,66 @@ fn heartbeat_noting(
     Heartbeat { report }
 }
 
+/// One `tools/call` on its way through [`Safety`].
+struct Call {
+    client: String,
+    name: String,
+    args: Value,
+    /// A retried request's `inputResponses` and `requestState`.
+    retry: Value,
+    started: Instant,
+}
+
+/// What came of asking for a call's confirmation.
+enum Approval {
+    Yes,
+    /// Refused, with the message the agent reads.
+    No(String),
+    /// The client must be asked: the result that does so.
+    Ask(Value),
+}
+
+impl Call {
+    /// Files this call in the audit log, if there is one, as it ended.
+    fn file(&self, safety: &Safety, status: &'static str, detail: Option<String>, admission: Option<String>) {
+        if safety.audits() {
+            safety.record(&self.entry(status, detail, admission));
+        }
+    }
+
+    fn entry(&self, status: &'static str, detail: Option<String>, admission: Option<String>) -> Entry {
+        Entry {
+            client: self.client.clone(),
+            tool: self.name.clone(),
+            args: self.args.clone(),
+            status,
+            duration_ms: self.started.elapsed().as_millis() as u64,
+            detail,
+            admission,
+        }
+    }
+
+    /// The result of a call that was refused, which the audit log files as such.
+    fn refused(&self, safety: &Safety, message: String, era: Era) -> Value {
+        self.file(safety, audit::status::REFUSED, Some(message.clone()), None);
+        tools::result(&self.name, Err(message), era)
+    }
+
+    /// Runs the call as prepared on the client's guarded backend, then keeps what it changed and files it.
+    fn run(&self, safety: &Arc<Safety>, backend: Arc<dyn Backend>, pages: &tools::Pages, prepared: &Prepared, era: Era) -> Value {
+        let guarded = safety.guard(backend, &self.client);
+        let ran = tools::run(&*guarded, pages, &self.name, prepared.args(&self.args));
+        if let Ok(value) = &ran {
+            safety.done(&self.client, &self.name, prepared, value);
+        }
+        if safety.audits() {
+            let (status, detail, admission) = safety::outcome(&ran);
+            self.file(safety, status, detail, admission);
+        }
+        tools::result(&self.name, ran, era)
+    }
+}
+
 impl Inner {
     fn say(&self, message: &Value) {
         (self.sink)(message.to_string());
@@ -348,7 +458,7 @@ impl Inner {
             Some(other) => Err(rpc::unsupported_version(other)),
             None if method == "server/discover" => Ok(Ctx { era: Era::Modern, version: MODERN, caps: Value::Null, progress_token }),
             None => match &*lock(&self.legacy) {
-                Some((caps, version)) => Ok(Ctx { era: Era::Legacy, version, caps: caps.clone(), progress_token }),
+                Some((caps, version, _)) => Ok(Ctx { era: Era::Legacy, version, caps: caps.clone(), progress_token }),
                 None => Err(RpcError::invalid_params(format!(
                     "`{method}` needs `_meta[\"{}\"]` (\"{MODERN}\"); or open with `initialize`, or probe with `server/discover`",
                     rpc::META_VERSION
@@ -374,7 +484,8 @@ impl Inner {
     fn initialize(&self, params: &Value) -> Value {
         let requested = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
         let version = LEGACY.iter().find(|v| **v == requested).unwrap_or(&LEGACY[0]);
-        *lock(&self.legacy) = Some((params.get("capabilities").cloned().unwrap_or(Value::Null), version));
+        let client = params["clientInfo"]["name"].as_str().map(str::to_owned);
+        *lock(&self.legacy) = Some((params.get("capabilities").cloned().unwrap_or(Value::Null), version, client));
         json!({"protocolVersion": version,
             "capabilities": {"tools": {}, "resources": {"subscribe": true}, "prompts": {"listChanged": false}},
             "serverInfo": server_info(), "instructions": INSTRUCTIONS})
@@ -405,24 +516,31 @@ impl Inner {
             Err(error) => return self.reply(&id, Err(error), None),
         };
         let reply = |outcome: Result<Value, RpcError>| self.reply(&id, outcome, Some(&ctx));
+        // What this client is shown: the server's toolsets within its own, and a backend that
+        // leaves out the devices it may not touch.
+        let client = self.client(&ctx, &params);
+        if method == "tools/call" {
+            return self.tools_call(id.clone(), &params, &ctx, client);
+        }
+        let toolsets = self.safety.policy_for(&client).toolsets(&self.toolsets);
+        let backend = self.safety.guard(self.backend.clone(), &client);
         match method {
             "server/discover" => reply(Ok(self.discover())),
-            "tools/list" => reply(Ok(cacheable(json!({"tools": tools::list(&self.toolsets, &ctx)}), STATIC_TTL_MS, "public"))),
+            "tools/list" => reply(Ok(cacheable(json!({"tools": self.listed_tools(&client, &toolsets, &ctx)}), STATIC_TTL_MS, "public"))),
             "resources/templates/list" => {
-                reply(Ok(cacheable(json!({"resourceTemplates": resources::templates(&self.toolsets)}), STATIC_TTL_MS, "public")));
+                reply(Ok(cacheable(json!({"resourceTemplates": resources::templates(&toolsets)}), STATIC_TTL_MS, "public")));
             }
-            "tools/call" => self.tools_call(id.clone(), &params, &ctx),
             "prompts/list" => reply(prompts::list(&params, &ctx).map(|page| cacheable(page, STATIC_TTL_MS, "public"))),
-            "prompts/get" => reply(prompts::get(&params, &self.toolsets)),
-            "resources/list" => self.offload(id.clone(), ctx.clone(), |i| {
-                Ok(cacheable(json!({"resources": resources::list(&*i.backend, &i.toolsets)}), 0, "private"))
+            "prompts/get" => reply(prompts::get(&params, &toolsets)),
+            "resources/list" => self.offload(id.clone(), ctx.clone(), move |_| {
+                Ok(cacheable(json!({"resources": resources::list(&*backend, &toolsets)}), 0, "private"))
             }),
             "resources/read" => match params.get("uri").and_then(Value::as_str) {
                 Some(uri) => {
                     let uri = uri.to_owned();
                     let era = ctx.era;
-                    self.offload(id.clone(), ctx.clone(), move |i| {
-                        resources::read(&*i.backend, &i.toolsets, &uri)
+                    self.offload(id.clone(), ctx.clone(), move |_| {
+                        resources::read(&*backend, &toolsets, &uri)
                             .map(|contents| cacheable(json!({"contents": contents}), 0, "private"))
                             .map_err(|error| rpc::for_era(error, era))
                     });
@@ -431,11 +549,13 @@ impl Inner {
             },
             "tasks/get" | "tasks/update" | "tasks/cancel" if ctx.modern() => reply(self.task_request(method, &params)),
             "subscriptions/listen" if ctx.modern() => {
-                if let Err(error) = self.listen(&id, &params, &ctx) {
+                if let Err(error) = self.listen(&id, &params, &ctx, &toolsets, backend) {
                     reply(Err(error));
                 }
             }
-            "resources/subscribe" | "resources/unsubscribe" if !ctx.modern() => reply(self.legacy_subscription(method, &params)),
+            "resources/subscribe" | "resources/unsubscribe" if !ctx.modern() => {
+                reply(self.legacy_subscription(method, &params, &toolsets, backend));
+            }
             other => reply(Err(RpcError::new(rpc::METHOD_NOT_FOUND, format!("Method not found: {other}")))),
         }
     }
@@ -467,39 +587,176 @@ impl Inner {
         });
     }
 
-    fn tools_call(self: &Arc<Self>, id: Value, params: &Value, ctx: &Ctx) {
-        let (name, args) = match tools::parse_call(params, &self.toolsets) {
-            Ok(call) => call,
-            Err(error) => return self.reply(&id, Err(error), Some(ctx)),
+    /// `tools/call`. Everything a call has to pass is decided on the worker that serves it, since
+    /// resolving a device or waiting for the user's answer blocks: [`Safety::check`] first, then the
+    /// confirmation it asks for, then the call itself on the policy's guarded backend, then the audit log.
+    fn tools_call(self: &Arc<Self>, id: Value, params: &Value, ctx: &Ctx, client: String) {
+        let policy = self.safety.policy_for(&client);
+        let parsed = match &policy.toolsets {
+            None => tools::parse_call(params, &self.toolsets),
+            Some(_) => tools::parse_call(params, &policy.toolsets(&self.toolsets)),
         };
-        if tools::as_task(&name, ctx) {
-            let (backend, pages, tool) = (self.backend.clone(), self.pages.clone(), name.clone());
+        let (name, args) = match parsed {
+            Ok(call) => call,
+            Err(error) => {
+                // A call for a tool that doesn't exist or isn't served to this client is still a call.
+                let entry = Entry {
+                    client,
+                    tool: params.get("name").and_then(Value::as_str).unwrap_or("?").to_owned(),
+                    args: params.get("arguments").cloned().unwrap_or(Value::Null),
+                    status: audit::status::REFUSED,
+                    duration_ms: 0,
+                    detail: Some(error.message.clone()),
+                    admission: None,
+                };
+                self.safety.record(&entry);
+                return self.reply(&id, Err(error), Some(ctx));
+            }
+        };
+        // What a retried request adds (the answer to a question, and which one): nothing else of
+        // the request is needed after it is parsed.
+        let retry = ["requestState", "inputResponses"].iter().filter_map(|k| params.get(*k).map(|v| ((*k).to_owned(), v.clone())));
+        let call = Call { client, name, args, retry: Value::Object(retry.collect()), started: Instant::now() };
+        let progress = ctx.progress_token.clone().filter(|_| tools::LONG_RUNNING.contains(&call.name.as_str()));
+        let ctx_for_work = ctx.clone();
+        self.offload_with(id, ctx.clone(), move |inner, ctl| inner.run_call(call, &ctx_for_work, progress, ctl));
+    }
+
+    fn run_call(&self, call: Call, ctx: &Ctx, progress: Option<Value>, ctl: &Ctl) -> Result<Value, RpcError> {
+        let era = ctx.era;
+        let verdict = self.safety.check(&*self.backend, &call.client, &call.name, &call.args);
+        let prepared = match verdict {
+            Verdict::Go(prepared) => prepared,
+            Verdict::Refuse(message) => return Ok(call.refused(&self.safety, message, era)),
+            Verdict::Confirm(confirmation, prepared) => match self.confirmation(&confirmation, &call, ctx, ctl) {
+                Approval::Yes => prepared,
+                Approval::No(message) => return Ok(call.refused(&self.safety, message, era)),
+                Approval::Ask(result) => {
+                    call.file(&self.safety, audit::status::INPUT_REQUIRED, None, None);
+                    return Ok(result);
+                }
+            },
+        };
+        if tools::as_task(&call.name, ctx) {
+            let (backend, pages, safety) = (self.backend.clone(), self.pages.clone(), self.safety.clone());
+            let name = call.name.clone();
             let created = self.tasks.create_with(&name, move |ctl| {
-                sim_api::with_call_hooks(ctl.hooks(), || tools::result(&tool, tools::run(&*backend, &pages, &tool, &args), Era::Modern))
+                sim_api::with_call_hooks(ctl.hooks(), || call.run(&safety, backend, &pages, &prepared, Era::Modern))
             });
             let result = match created {
                 Ok(mut handle) => {
                     handle["resultType"] = "task".into();
                     handle
                 }
-                Err(message) => tools::result(&name, Err(message), ctx.era),
+                Err(message) => tools::result(&name, Err(message), era),
             };
-            return self.reply(&id, Ok(result), Some(ctx));
+            return Ok(result);
         }
-        let progress = ctx.progress_token.clone().filter(|_| tools::LONG_RUNNING.contains(&name.as_str()));
-        let era = ctx.era;
-        self.offload_with(id, ctx.clone(), move |inner, ctl| {
-            let beat = progress.map(|token| heartbeat(inner.sink.clone(), token, name.clone(), inner.timing.heartbeat, ctl.clone()));
-            // The call's own steps are sent as it reaches them, before its response (the beat is
-            // dropped, and stops, before this returns).
-            let ctl = match &beat {
-                Some(beat) => ctl.clone().on_step(beat.steps()),
-                None => ctl.clone(),
+        let beat = progress.map(|token| heartbeat(self.sink.clone(), token, call.name.clone(), self.timing.heartbeat, ctl.clone()));
+        // The call's own steps are sent as it reaches them, before its response (the beat is
+        // dropped, and stops, before this returns).
+        let ctl = match &beat {
+            Some(beat) => ctl.clone().on_step(beat.steps()),
+            None => ctl.clone(),
+        };
+        let result = sim_api::with_call_hooks(ctl.hooks(), || call.run(&self.safety, self.backend.clone(), &self.pages, &prepared, era));
+        drop(beat);
+        Ok(result)
+    }
+
+    /// The user's agreement to `call`, as far as this client can give it: asked in the result of the
+    /// call (the current revision) or in a request of its own (earlier ones, where the transport
+    /// carries the answer), else the `confirm: true` it passed.
+    fn confirmation(&self, confirmation: &Confirmation, call: &Call, ctx: &Ctx, ctl: &Ctl) -> Approval {
+        let can_be_asked = ctx.caps.get("elicitation").and_then(Value::as_object).is_some_and(|e| e.is_empty() || e.contains_key("form"));
+        let mut why = "This client doesn't support elicitation, so it can't be asked.".to_owned();
+        if can_be_asked && ctx.modern() {
+            return match confirmation.answered_in(&call.retry) {
+                Some(Answer::Yes) => Approval::Yes,
+                Some(Answer::No(reason)) => Approval::No(confirmation.declined(&reason)),
+                None => Approval::Ask(confirmation.input_required()),
             };
-            let ran = sim_api::with_call_hooks(ctl.hooks(), || tools::run(&*inner.backend, &inner.pages, &name, &args));
-            drop(beat);
-            Ok(tools::result(&name, ran, era))
-        });
+        }
+        if can_be_asked {
+            match *lock(&self.elicit_timeout) {
+                Some(wait) => {
+                    return match self.question(confirmation.elicit_params(), wait, ctl) {
+                        Ok(result) => match Confirmation::read(&result) {
+                            Answer::Yes => Approval::Yes,
+                            Answer::No(reason) => Approval::No(confirmation.declined(&reason)),
+                        },
+                        Err(reason) => Approval::No(confirmation.declined(&reason)),
+                    };
+                }
+                None => why = "This connection can't carry a question to the client (the current revision's clients can be asked over any transport).".into(),
+            }
+        }
+        if call.args.get("confirm") == Some(&json!(true)) { Approval::Yes } else { Approval::No(confirmation.needs_argument(&why)) }
+    }
+
+    /// Asks the client `elicitation/create` and waits for the user's answer.
+    fn question(&self, params: Value, wait: Duration, ctl: &Ctl) -> Result<Value, String> {
+        let id = format!("simee-confirm-{}", self.next_question.fetch_add(1, Ordering::Relaxed) + 1);
+        let key = rpc::id_key(&json!(id));
+        let (tx, rx) = channel();
+        lock(&self.asked).insert(key.clone(), tx);
+        self.say(&json!({"jsonrpc": "2.0", "id": id, "method": "elicitation/create", "params": params}));
+        let deadline = Instant::now() + wait;
+        let answer = loop {
+            if ctl.cancelled.load(Ordering::Relaxed) {
+                break Err("the call was cancelled".to_owned());
+            }
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else { break Err("no answer came".to_owned()) };
+            match rx.recv_timeout(left.min(ELICIT_POLL)) {
+                Ok(Ok(result)) => break Ok(result),
+                Ok(Err(error)) => break Err(format!("the client answered with an error: {}", error["message"].as_str().unwrap_or("?"))),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break Err("the question was dropped".to_owned()),
+            }
+        };
+        lock(&self.asked).remove(&key);
+        answer
+    }
+
+    /// Takes a client's response to a question of this server's (the server sends no other request)
+    /// and hands it to the call waiting for it. A response nobody waits for, such as an answer that
+    /// came after the call gave up, is dropped: it isn't a request, and a JSON-RPC peer never
+    /// answers a response. Whether `line` was a response.
+    fn answer_question(&self, line: &str) -> bool {
+        // A request or a notification always has a `method`; checking is cheaper than parsing,
+        // unless a question is out and every line might be its answer.
+        if line.contains("\"method\"") && lock(&self.asked).is_empty() {
+            return false;
+        }
+        let Some((id, outcome)) = rpc::parse_response(line) else { return false };
+        if let Some(waiting) = lock(&self.asked).remove(&rpc::id_key(&id)) {
+            // The asker may have given up (and gone) already.
+            let _ = waiting.send(outcome);
+        }
+        true
+    }
+
+    /// Who the client is, for its policy and the log: the transport's word, else the name it gave.
+    fn client(&self, ctx: &Ctx, params: &Value) -> String {
+        if let Some(name) = lock(&self.identity).clone() {
+            return name;
+        }
+        let declared = if ctx.modern() {
+            rpc::meta(params)[rpc::META_CLIENT_INFO]["name"].as_str().map(str::to_owned)
+        } else {
+            lock(&self.legacy).as_ref().and_then(|(_, _, name)| name.clone())
+        };
+        declared.unwrap_or_else(|| "unknown".to_owned())
+    }
+
+    /// The tools this client is shown: those it may use, and on a read-only server only those that
+    /// change nothing.
+    fn listed_tools(&self, client: &str, toolsets: &Toolsets, ctx: &Ctx) -> Vec<Value> {
+        let mut listed = tools::list(toolsets, ctx);
+        if self.safety.policy_for(client).read_only {
+            listed.retain(|t| t["name"].as_str().is_some_and(tools::read_only));
+        }
+        listed
     }
 
     fn task_request(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
@@ -521,7 +778,14 @@ impl Inner {
 
     /// `subscriptions/listen`: acknowledges what the server will send, then sends it until the
     /// client cancels the request. The request gets no response while it is open.
-    fn listen(self: &Arc<Self>, id: &Value, params: &Value, ctx: &Ctx) -> Result<(), RpcError> {
+    fn listen(
+        self: &Arc<Self>,
+        id: &Value,
+        params: &Value,
+        ctx: &Ctx,
+        toolsets: &Toolsets,
+        backend: Arc<dyn Backend>,
+    ) -> Result<(), RpcError> {
         let filter = params.get("notifications").cloned().unwrap_or_else(|| json!({}));
         if !filter.is_object() {
             return Err(RpcError::invalid_params("`notifications` must be an object"));
@@ -532,9 +796,9 @@ impl Inner {
         }
         // What isn't ours, or reads through a tool this server doesn't serve, isn't acknowledged.
         let uris: Vec<String> =
-            strings(&filter, "resourceSubscriptions").into_iter().filter(|u| resources::check(u, &self.toolsets).is_ok()).collect();
+            strings(&filter, "resourceSubscriptions").into_iter().filter(|u| resources::check(u, toolsets).is_ok()).collect();
         // The list is of devices, which a server without `devices` doesn't say.
-        let list_changed = filter["resourcesListChanged"] == true && self.toolsets.contains("devices");
+        let list_changed = filter["resourcesListChanged"] == true && toolsets.contains("devices");
         let sink = self.sink.clone();
         let acknowledge = {
             let (sink, id, uris) = (sink.clone(), id.clone(), uris.clone());
@@ -567,16 +831,22 @@ impl Inner {
                 params["_meta"] = json!({rpc::META_SUBSCRIPTION: subscription});
                 sink(json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string());
             });
-            watch::spawn(self.backend.clone(), Spec { uris: uris.clone(), list_changed }, self.timing.watch, emit)
+            watch::spawn(backend, Spec { uris: uris.clone(), list_changed }, self.timing.watch, emit)
         });
         lock(&self.listens).insert(rpc::id_key(id), Listen { subscription: id.clone(), _watcher: watcher });
         Ok(())
     }
 
     /// A legacy client's `resources/subscribe` and `resources/unsubscribe`.
-    fn legacy_subscription(self: &Arc<Self>, method: &str, params: &Value) -> Result<Value, RpcError> {
+    fn legacy_subscription(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        toolsets: &Toolsets,
+        backend: Arc<dyn Backend>,
+    ) -> Result<Value, RpcError> {
         let uri = params.get("uri").and_then(Value::as_str).ok_or_else(|| RpcError::invalid_params("`uri` is required"))?;
-        resources::check(uri, &self.toolsets).map_err(|error| rpc::for_era(error, Era::Legacy))?;
+        resources::check(uri, toolsets).map_err(|error| rpc::for_era(error, Era::Legacy))?;
         let mut subscribed = lock(&self.subscribed);
         if method == "resources/subscribe" {
             subscribed.uris.insert(uri.to_owned());
@@ -595,7 +865,7 @@ impl Inner {
             let sink = self.sink.clone();
             let emit: Emit =
                 Arc::new(move |method, params| sink(json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string()));
-            subscribed.watcher = Some(watch::spawn(self.backend.clone(), spec, self.timing.watch, emit));
+            subscribed.watcher = Some(watch::spawn(backend, spec, self.timing.watch, emit));
         }
         Ok(json!({}))
     }

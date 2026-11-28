@@ -49,15 +49,36 @@ impl Env {
 
     /// `simee mcp` with `SIMEE_MCP_TOOLSETS` set to `toolsets` (unset: the default, `core`).
     fn mcp_with(&self, toolsets: Option<&str>) -> Mcp {
-        self.spawn(toolsets, None)
+        self.spawn(toolsets, None, &["--admission", "ignore"])
     }
 
     /// `simee mcp` (every tool) with `SIMEE_MCP_SCREEN_FPS` set to `fps`.
     fn mcp_fps(&self, fps: &str) -> Mcp {
-        self.spawn(Some("all"), Some(fps))
+        self.spawn(Some("all"), Some(fps), &["--admission", "ignore"])
     }
 
-    fn spawn(&self, toolsets: Option<&str>, screen_fps: Option<&str>) -> Mcp {
+    /// `simee mcp` (every tool) with these flags and no others: the host's load decides whether a
+    /// boot or a creation is admitted, as it does for any agent.
+    fn mcp_flags(&self, flags: &[&str]) -> Mcp {
+        self.spawn(Some("all"), None, flags)
+    }
+
+    /// Where `simee mcp` keeps its audit log (and its token) in this environment.
+    fn state(&self) -> PathBuf {
+        self.root.join("state")
+    }
+
+    /// `simee` with these arguments, in this environment.
+    fn simee(&self, args: &[&str]) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_simee"))
+            .args(args)
+            .env("HOME", self.root.join("home"))
+            .env("SIMEE_STATE_DIR", self.state())
+            .output()
+            .expect("simee runs")
+    }
+
+    fn spawn(&self, toolsets: Option<&str>, screen_fps: Option<&str>, flags: &[&str]) -> Mcp {
         let mut command = Command::new(env!("CARGO_BIN_EXE_simee"));
         match toolsets {
             Some(t) => command.env("SIMEE_MCP_TOOLSETS", t),
@@ -69,7 +90,9 @@ impl Env {
         };
         let mut child = command
             .arg("mcp")
+            .args(flags)
             .env("HOME", self.root.join("home"))
+            .env("SIMEE_STATE_DIR", self.state())
             .env("ANDROID_HOME", self.root.join("sdk"))
             .env("ANDROID_AVD_HOME", self.root.join("avd"))
             .env_remove("ANDROID_SDK_ROOT")
@@ -265,4 +288,111 @@ fn the_default_server_lists_prompts_and_says_which_toolsets_they_need() {
     let missing = mcp.request("prompts/get", json!({"name": "boot-and-install", "arguments": {"platform": "ios"}}), false);
     assert_eq!(missing["error"]["code"], -32602, "{missing}");
     assert!(mcp.close().success());
+}
+
+/// The text of a tool result.
+fn text(result: &Value) -> &str {
+    result["content"][0]["text"].as_str().unwrap_or_default()
+}
+
+fn create_fold(mcp: &mut Mcp) -> Value {
+    mcp.task("create", json!({"name": "fold", "platform": "android", "system_image": IMAGE, "form_factor": "foldable"}))
+}
+
+#[test]
+fn deleting_a_device_needs_the_users_confirmation_and_every_call_is_in_the_audit_log() {
+    let e = Env::new("confirm");
+    let mut mcp = e.mcp_flags(&["--admission", "ignore"]);
+    assert_eq!(create_fold(&mut mcp)["status"], "completed");
+
+    // The agent can't do it on its own say-so.
+    let refused = mcp.call("delete", json!({"device": "fold"}));
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(text(&refused).contains("needs the user's confirmation") && text(&refused).contains("`confirm: true`"), "{refused}");
+    assert_eq!(mcp.call("devices", json!({}))["structuredContent"][0]["udid"], "fold", "the device is still there");
+    // With the user's agreement it goes through.
+    assert_eq!(mcp.call("delete", json!({"device": "fold", "confirm": true})).get("isError"), None);
+    assert_eq!(mcp.call("devices", json!({}))["structuredContent"], json!([]));
+    assert!(mcp.close().success());
+
+    // The log has each call, and `simee mcp-audit` reads it.
+    let log = e.state().join("mcp-audit.log");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&log).expect("log").permissions().mode() & 0o777, 0o600);
+    }
+    let shown = e.simee(&["mcp-audit", "--json"]);
+    assert!(shown.status.success(), "{}", String::from_utf8_lossy(&shown.stderr));
+    let entries: Vec<Value> =
+        String::from_utf8(shown.stdout).expect("utf-8").lines().map(|l| serde_json::from_str(l).expect("JSON line")).collect();
+    let seen: Vec<(&str, &str)> = entries.iter().map(|e| (e["tool"].as_str().unwrap_or(""), e["status"].as_str().unwrap_or(""))).collect();
+    assert_eq!(
+        seen,
+        [("create", "ok"), ("delete", "refused"), ("devices", "ok"), ("delete", "ok"), ("devices", "ok")],
+        "one entry per call, in order"
+    );
+    let refused_only = e.simee(&["mcp-audit", "--status", "refused", "--tool", "delete"]);
+    let text = String::from_utf8(refused_only.stdout).expect("utf-8");
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert!(text.contains("delete refused") && text.contains("needs the user's confirmation"), "{text}");
+    assert!(!e.simee(&["mcp-audit", "--log", "/nonexistent/audit.log"]).status.success());
+}
+
+#[test]
+fn a_read_only_server_lists_and_runs_only_what_changes_nothing() {
+    let e = Env::new("readonly");
+    let mut mcp = e.mcp_flags(&["--read-only", "--no-audit-log"]);
+    let tools = mcp.request("tools/list", json!({}), false)["result"]["tools"].clone();
+    let tools = tools.as_array().expect("tools");
+    assert!(tools.iter().any(|t| t["name"] == "devices") && !tools.iter().any(|t| t["name"] == "tap" || t["name"] == "create"));
+    let refused = mcp.call("create", json!({"name": "fold", "platform": "android", "system_image": IMAGE}));
+    assert_eq!(refused["isError"], true);
+    assert!(text(&refused).contains("read-only"), "{refused}");
+    assert_eq!(mcp.call("devices", json!({}))["structuredContent"], json!([]));
+    assert!(mcp.close().success());
+    assert!(!e.state().join("mcp-audit.log").exists(), "--no-audit-log keeps none");
+}
+
+#[test]
+fn the_device_flag_limits_which_devices_a_client_may_make_and_touch() {
+    let e = Env::new("allow");
+    let mut mcp = e.mcp_flags(&["--allow-device", "ci-*", "--admission", "ignore"]);
+    let refused = mcp.task("create", json!({"name": "fold", "platform": "android", "system_image": IMAGE}));
+    assert!(refused["result"]["content"][0]["text"].as_str().is_some_and(|t| t.contains("couldn't touch afterwards")), "{refused}");
+    let made = mcp.task("create", json!({"name": "ci-fold", "platform": "android", "system_image": IMAGE}));
+    assert_eq!(made["status"], "completed", "{made}");
+    assert_eq!(mcp.call("devices", json!({}))["structuredContent"][0]["udid"], "ci-fold");
+    assert!(mcp.close().success());
+}
+
+#[test]
+fn a_policy_file_gives_each_client_its_own_rules() {
+    let e = Env::new("policy");
+    let file = e.root.join("policy.json");
+    std::fs::write(&file, r#"{"clients": {"reviewer": {"read_only": true}}}"#).expect("policy");
+    let mut mcp = e.mcp_flags(&["--policy", file.to_str().expect("utf-8"), "--no-audit-log", "--admission", "ignore"]);
+    let as_client = |mcp: &mut Mcp, name: &str, tool: &str, args: Value| {
+        let params = json!({"name": tool, "arguments": args, "_meta": {"io.modelcontextprotocol/protocolVersion": VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {}, "io.modelcontextprotocol/clientInfo": {"name": name}}});
+        let id = mcp.next;
+        mcp.next += 1;
+        mcp.send(&json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": params}));
+        loop {
+            let message = mcp.line();
+            if message["id"] == id {
+                return message["result"].clone();
+            }
+        }
+    };
+    let make = json!({"name": "fold", "platform": "android", "system_image": IMAGE});
+    let refused = as_client(&mut mcp, "reviewer", "create", make.clone());
+    assert!(refused["isError"] == true && text(&refused).contains("read-only"), "{refused}");
+    // Another client is not held to it. (`create` runs inline for a client without the tasks extension.)
+    let made = as_client(&mut mcp, "builder", "create", make);
+    assert_eq!(made.get("isError"), None, "{made}");
+    assert!(mcp.close().success());
+    // A policy that doesn't parse stops the server before it serves anything.
+    std::fs::write(&file, r#"{"clients": {"reviewer": {"readonly": true}}}"#).expect("policy");
+    assert!(!e.mcp_flags(&["--policy", file.to_str().expect("utf-8")]).close().success());
 }

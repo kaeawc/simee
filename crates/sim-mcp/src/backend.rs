@@ -116,6 +116,26 @@ pub mod fake {
 
     use super::Backend;
 
+    /// A scratch directory of its own, removed on drop.
+    pub struct Scratch(pub std::path::PathBuf);
+
+    impl Scratch {
+        pub fn new(tag: &str) -> Scratch {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("simee-mcp-{tag}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch");
+            Scratch(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// A latch: calls to a method named in `block` wait until it is released.
     #[derive(Default)]
     pub struct Gate {

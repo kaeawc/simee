@@ -49,19 +49,21 @@ pub const CORE: &str = "core";
 pub struct Toolsets {
     core: bool,
     groups: Vec<Group>,
+    /// A narrower set this one is limited to: a client's own toolsets within the server's.
+    limit: Option<Box<Toolsets>>,
 }
 
 impl Default for Toolsets {
     /// `core`: what a general agent needs to drive a device.
     fn default() -> Toolsets {
-        Toolsets { core: true, groups: Vec::new() }
+        Toolsets { core: true, groups: Vec::new(), limit: None }
     }
 }
 
 impl Toolsets {
     /// Every tool.
     pub fn all() -> Toolsets {
-        Toolsets { core: true, groups: Group::ALL.to_vec() }
+        Toolsets { core: true, groups: Group::ALL.to_vec(), limit: None }
     }
 
     /// Reads `core,debug` (names separated by commas or spaces; `all` is every one). Empty is the
@@ -71,7 +73,7 @@ impl Toolsets {
         if names.is_empty() {
             return Ok(Toolsets::default());
         }
-        let mut sets = Toolsets { core: false, groups: Vec::new() };
+        let mut sets = Toolsets { core: false, groups: Vec::new(), limit: None };
         let mut all = false;
         for name in names {
             match name {
@@ -99,7 +101,23 @@ impl Toolsets {
 
     /// Whether `tool` is served.
     pub fn contains(&self, tool: &str) -> bool {
-        (self.core && in_core(tool)) || group(tool).is_some_and(|g| self.groups.contains(&g))
+        let own = (self.core && in_core(tool)) || group(tool).is_some_and(|g| self.groups.contains(&g));
+        own && self.limit.as_ref().is_none_or(|l| l.contains(tool))
+    }
+
+    /// These toolsets, limited to the tools `other` serves too.
+    pub fn intersect(&self, other: &Toolsets) -> Toolsets {
+        let mut limited = self.clone();
+        limited.limit = Some(Box::new(match limited.limit.take() {
+            Some(l) => l.intersect(other),
+            None => other.clone(),
+        }));
+        limited
+    }
+
+    /// What a client's limit is, if it has one.
+    pub fn limit(&self) -> Option<&Toolsets> {
+        self.limit.as_deref()
     }
 
     /// The names, as `SIMEE_MCP_TOOLSETS` would spell them.
@@ -160,6 +178,11 @@ fn paged(tool: &str) -> Option<Option<&'static str>> {
     PAGED.iter().find(|(m, _)| *m == tool).map(|(_, field)| *field)
 }
 
+/// Whether `tool` changes nothing (the catalog's `Read`; a tool nobody classified may).
+pub fn read_only(tool: &str) -> bool {
+    effect(tool).is_some_and(Effect::read_only)
+}
+
 /// Whether `name` is a tool (served or not).
 pub fn exists(name: &str) -> bool {
     name == VIEW_TOOL || METHODS.iter().any(|(m, ..)| *m == name)
@@ -203,6 +226,9 @@ fn describe(method: &str, params: &str, doc: &str, schema: &Value) -> String {
     if LONG_RUNNING.contains(&method) {
         text.push_str(" Can take a while (seconds to minutes): a client with the tasks extension gets a task to poll.");
     }
+    if crate::safety::CONFIRM.contains(&method) {
+        text.push_str(&format!(" {}", crate::safety::confirm_sentence(method)));
+    }
     if paged(method).is_some() {
         text.push_str(&format!(
             " A long list pages: give `limit` (at most {MAX_LIMIT}) and pass back `next_cursor` as `cursor` for the next page; \
@@ -228,6 +254,11 @@ fn input(method: &str) -> Value {
     let mut schema = input_schema(method).unwrap_or_else(|| json!({"type": "object"}));
     if let (Some(name), Some(properties)) = (withheld(method), schema["properties"].as_object_mut()) {
         properties.remove(name);
+    }
+    if crate::safety::CONFIRM.contains(&method) {
+        schema["properties"]["confirm"] = json!({"type": "boolean",
+            "description": "Only after the user has agreed, for a client that can't be asked itself: true confirms this call. \
+                A client that can be asked is asked, and this is ignored"});
     }
     if paged(method).is_some() {
         schema["properties"]["limit"] = json!({"type": "integer", "minimum": 1, "maximum": MAX_LIMIT,
@@ -595,6 +626,14 @@ pub fn toolset_of(tool: &str) -> &'static str {
 /// resource that reads through a tool is refused the same way.
 pub fn not_enabled(tool: &str, toolsets: &Toolsets) -> RpcError {
     let set = toolset_of(tool);
+    if let Some(limit) = toolsets.limit().filter(|l| !l.contains(tool)) {
+        return RpcError::invalid_params(format!(
+            "Tool `{tool}` isn't allowed for this client: it is in the `{set}` toolset, and this client's policy allows `{}`. \
+             The operator changes it with `toolsets` in the policy file (`simee mcp --policy`, docs/mcp-safety.md)",
+            limit.label()
+        ))
+        .with_data(json!({"tool": tool, "toolset": set, "allowed": limit.label()}));
+    }
     RpcError::invalid_params(format!(
         "Tool `{tool}` isn't enabled on this server: it is in the `{set}` toolset, and this server serves `{}`. \
          Start it with {TOOLSETS_ENV}={},{set} (or all)",
