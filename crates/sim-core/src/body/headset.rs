@@ -8,7 +8,7 @@
 //! shows as a lip around the eye-side face, a `Role::Lens` front glass on the outside (-z, what
 //! the back view shows) and `Role::Strap` head straps running back toward -z. The frame is one
 //! wide display whose density is chosen so it spans the eyepiece area, not the density simee
-//! reports for it (a generic body keeps that density, as every generic body does).
+//! reports for it (a generic body too: [`SIZES_BY_DPI`] is false).
 //!
 //! Glasses (the SDK's `ai_glasses_device`, [`ANDROID_GLASSES_SCREEN`]) are a front bar with two
 //! `Role::Lens` lenses, `Role::Strap` temples toward -z, and the HUD as the screen in the right
@@ -16,10 +16,19 @@
 
 use super::table::{GENERIC, Spec};
 use super::*;
-use crate::form_factor::ANDROID_GLASSES_SCREEN;
+use crate::form_factor::{ANDROID_GLASSES_SCREEN, is_glasses_tag};
 
 /// Headsets and glasses have bodies ([`super::has_body`]).
 pub(super) const ENABLED: bool = true;
+
+/// A headset's frame spans the eyepiece area (a width and height it fits), and the glasses' HUD
+/// fits the lens, whatever dpi simee reports for the screen.
+pub(super) const SIZES_BY_DPI: bool = false;
+
+/// The widest and tallest a frame is drawn on a headset's face, mm: the eyepiece area.
+const EYEPIECE: [f32; 2] = [150.0, 112.0];
+/// The width of the glasses' HUD on the lens, mm.
+const HUD_SPAN: f32 = 32.0;
 
 const VISION_PRO: &str = "Apple publishes the Vision Pro's display (23 million pixels, 3660x3200 per eye) and weight (600-650 g) but no outer size: width, height, depth, visor shape, seal and strap are estimates, and the frame is drawn at a density that spans the eyepiece area";
 const XR_HEADSET: &str = "no published dimensions for the SDK's xr_headset_device: width, height, depth, visor shape, seal and strap are estimates, and the frame is drawn at a density that spans the eyepiece area";
@@ -88,9 +97,13 @@ fn headset_extras([w, h, t]: [f32; 3]) -> Vec<Block> {
 fn headset(id: &str, name: String, platform: Platform, source: Source, size: [f32; 3], screen: Screen) -> Body {
     let [_, h, _] = size;
     let [sw, sh] = screen.size();
-    // The shell's corner keeps the frame's corners inside its outline.
+    // The shell's corner keeps the frame's corners on the flat face, inside the outline inset by
+    // the bevel: a corner at the margin `m` from the edge is inside while R(k - 1) <= k m - bevel,
+    // k being the superellipse's 2^(1/n) reach along its diagonal.
     let margin = ((size[0] - sw) / 2.0).min((h - sh) / 2.0);
-    let radius = (0.45 * h).min(3.0 * margin);
+    let bevel = (0.8 * margin).min(8.0);
+    let k = 2.0_f32.powf(1.0 / 3.0);
+    let radius = (0.45 * h).min(0.9 * (k * margin - bevel) / (k - 1.0));
     Body {
         id: id.to_owned(),
         aliases: Vec::new(),
@@ -100,7 +113,7 @@ fn headset(id: &str, name: String, platform: Platform, source: Source, size: [f3
         source,
         size,
         corner: corner(radius, 3.0),
-        bevel: (0.8 * margin).min(8.0),
+        bevel,
         screens: vec![screen],
         bump: None,
         buttons: Vec::new(),
@@ -130,7 +143,8 @@ pub(super) fn rows() -> Vec<Body> {
             headset(p.id, p.name.to_owned(), p.platform, Source::Generic(p.source), p.size, screen)
         })
         .collect();
-    out.push(ai_glasses("ai_glasses_device", "Android XR AI glasses".to_owned(), Platform::Android, Source::Generic(GLASSES), None));
+    let (w, h, _) = ANDROID_GLASSES_SCREEN;
+    out.push(ai_glasses("ai_glasses_device", "Android XR AI glasses".to_owned(), Platform::Android, Source::Generic(GLASSES), (w, h)));
     out
 }
 
@@ -138,29 +152,25 @@ fn reference_shape(platform: Platform) -> Shape {
     super::table::reference_shape(platform, FormFactor::Vision)
 }
 
-/// Glasses: a front bar, a lens each side, temples toward -z, the HUD in the right lens. `hud` is
-/// the screen at the density a generic body keeps; a row fits it to the lens.
-fn ai_glasses(id: &str, name: String, platform: Platform, source: Source, hud: Option<Screen>) -> Body {
+/// Glasses: a front bar, a lens each side, temples toward -z, the HUD of `px` fitted to the right
+/// lens.
+fn ai_glasses(id: &str, name: String, platform: Platform, source: Source, px: (u32, u32)) -> Body {
     let (lens_w, lens_h) = (50.0_f32, 40.0_f32);
     let eye = 36.0_f32;
     let lens_y = 2.0;
-    let mut screen = hud.unwrap_or_else(|| {
-        let (w, h, _) = ANDROID_GLASSES_SCREEN;
-        let span = 32.0;
-        Screen {
-            display: Display::Main,
-            face: Face::Front,
-            px: (w, h),
-            ppi: w as f32 * MM_PER_INCH / span,
-            center: [0.0, 0.0],
-            shape: reference_shape(platform),
-            corner_radius: 0.0,
-            cutout: None,
-            published: None,
-        }
-    });
+    let mut screen = Screen {
+        display: Display::Main,
+        face: Face::Front,
+        px,
+        ppi: px.0.max(px.1) as f32 * MM_PER_INCH / HUD_SPAN,
+        center: [0.0, 0.0],
+        shape: reference_shape(platform),
+        corner_radius: 0.0,
+        cutout: None,
+        published: None,
+    };
     let [sw, sh] = screen.size();
-    // A larger HUD than the lens widens the bar and both lenses around it.
+    // The lens holds the HUD, however tall or wide it is.
     let (lens_w, lens_h) = (lens_w.max(sw + 6.0), lens_h.max(sh + 6.0));
     let eye = eye.max(lens_w / 2.0 + 2.0);
     screen.center = [eye, lens_y];
@@ -189,14 +199,16 @@ fn ai_glasses(id: &str, name: String, platform: Platform, source: Source, hud: O
     }
 }
 
-/// A headset or glasses with no row: the screen at its density in a visor around it, or for
-/// Android XR's glasses screen, a front bar around the HUD.
+/// A headset or glasses with no row: Android XR glasses (the `ai-glasses` image) get a front bar
+/// around the HUD, else a visor around the frame, which spans the eyepiece area.
 pub(super) fn generic(g: &Spec) -> Option<Body> {
-    let (gw, gh, _) = ANDROID_GLASSES_SCREEN;
-    if g.platform == Platform::Android && g.px == (gw, gh) {
-        return Some(ai_glasses(g.id, g.name.clone(), g.platform, Source::Generic(GENERIC), Some(g.screen(0.0))));
+    if g.platform == Platform::Android && is_glasses_tag(g.image_tag) {
+        return Some(ai_glasses(g.id, g.name.clone(), g.platform, Source::Generic(GENERIC), g.px));
     }
-    let screen = g.screen(0.0);
+    let (px, py) = (g.px.0 as f32, g.px.1 as f32);
+    let span = EYEPIECE[0].min(EYEPIECE[1] * px / py);
+    let mut screen = g.screen(0.0);
+    screen.ppi = px * MM_PER_INCH / span;
     let [sw, sh] = screen.size();
     let margin = (0.08 * sw.max(sh)).max(10.0);
     let (w, h) = (sw + 2.0 * margin, sh + 2.0 * margin);
@@ -340,22 +352,35 @@ mod tests {
     }
 
     #[test]
-    fn a_generic_body_keeps_the_density_simee_reports() {
+    fn a_generic_body_fits_the_eyepiece_and_the_image_tag_picks_glasses() {
         let (w, h, dpi) = ANDROID_GLASSES_SCREEN;
         let glasses = Kind::new(Platform::Android, FormFactor::Vision).expect("xr").image_profile("ai-glasses");
         assert_eq!((glasses.width, glasses.height, glasses.density), (w, h, Density::Dpi(dpi)));
-        let b = for_android("custom_glasses", &glasses).expect("glasses body");
+        let b = for_android_image("custom_glasses", &glasses, None, "ai-glasses").expect("glasses body");
         assert!(matches!(b.source, Source::Generic(_)) && b.shows((w, h)));
-        assert_eq!(b.screens[0].ppi, dpi as f32);
         assert_eq!(extras(&b, Role::Lens).len(), 2, "glasses, not a visor");
-        assert!(Arc::ptr_eq(&b, &for_android("custom_glasses", &glasses).expect("again")), "cached");
+        let hud = &b.screens[0];
+        assert!((hud.size()[0] - HUD_SPAN).abs() < 1e-3, "the HUD fits the lens, not {dpi} dpi");
+        assert!(Arc::ptr_eq(&b, &for_android_image("custom_glasses", &glasses, None, "ai-glasses").expect("again")), "cached");
+        // The same 450x450 screen on another image is a headset, a different body.
+        let visor = for_android_image("custom", &glasses, None, "google-xr").expect("visor");
+        assert_ne!(visor.id, b.id);
+        assert!(extras(&visor, Role::Lens).len() == 1 && visor.screens[0].size()[0] <= EYEPIECE[0]);
         // The SDK's own device names get their rows.
-        assert_eq!(for_android("ai_glasses_device", &glasses).map(|b| b.id.clone()).as_deref(), Some("ai_glasses_device"));
+        assert_eq!(
+            for_android_image("ai_glasses_device", &glasses, None, "ai-glasses").map(|b| b.id.clone()).as_deref(),
+            Some("ai_glasses_device")
+        );
         let headset = Kind::new(Platform::Android, FormFactor::Vision).expect("xr").profile();
         assert_eq!(for_android("xr_headset_device", &headset).map(|b| b.id.clone()).as_deref(), Some("xr_headset_device"));
-        let generic = for_android("other", &headset).expect("generic headset");
-        assert_eq!(generic.screens[0].ppi, 240.0);
-        assert!(generic.screens[0].rect()[1] < generic.size[0] / 2.0);
+        // A generic headset's frame spans the eyepiece area at the aspect simee reports.
+        for (platform, aspect) in [(Platform::Android, 2560.0 / 2558.0), (Platform::Ios, 2732.0 / 2048.0)] {
+            let p = Kind::new(platform, FormFactor::Vision).expect("kind").profile();
+            let g = for_profile(&p).expect("generic headset");
+            let [sw, sh] = g.screens[0].size();
+            assert!(sw <= EYEPIECE[0] + 1e-3 && sh <= EYEPIECE[1] + 1e-3 && (sw / sh - aspect).abs() < 1e-4, "{platform:?}: {sw}x{sh}");
+            assert!(sw.max(sh * aspect) > 0.99 * EYEPIECE[0].min(EYEPIECE[1] * aspect), "{platform:?} fills it");
+        }
     }
 
     #[test]
@@ -375,7 +400,7 @@ mod tests {
             for (x, y) in [(l, bottom), (l, top), (r, bottom), (r, top)] {
                 let (dx, dy) = ((x.abs() - a).max(0.0), (y.abs() - c).max(0.0));
                 let norm = (dx.powf(n) + dy.powf(n)).powf(1.0 / n);
-                assert!(norm <= b.corner.radius, "{}: the frame's corner is outside the outline", b.id);
+                assert!(norm <= b.corner.radius - b.bevel, "{}: the frame's corner is off the flat face", b.id);
             }
         }
     }

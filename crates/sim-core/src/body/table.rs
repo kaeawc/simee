@@ -5,11 +5,13 @@
 //! estimates, and each row's source note says so. No row carries a logo or a vendor asset.
 //!
 //! Phones, tablets and foldables live here. Each other form factor has a module of its own
-//! ([`watch`], [`tv`], [`car`], [`headset`]) with the same three items, which this table and
+//! ([`watch`], [`tv`], [`car`], [`headset`]) with the same four items, which this table and
 //! [`super::has_body`] ask and nothing else needs to know about:
 //! - `ENABLED: bool`: the form factor has bodies;
 //! - `rows() -> Vec<Body>`: its rows of the table (published devices);
-//! - `generic(&Spec) -> Option<Body>`: a body for a screen no row has.
+//! - `generic(&Spec) -> Option<Body>`: a body for a screen no row has;
+//! - `SIZES_BY_DPI: bool`: its generic body's screen is drawn at the dpi simee reports (the shared
+//!   reference-body test checks that size only when true; a TV or headset sized another way says false).
 
 use super::*;
 use super::{car, headset, tv, watch};
@@ -56,7 +58,7 @@ pub(super) fn rows() -> Vec<Body> {
         let folded = p.fold.map(|f| (f.folded_width, f.folded_height));
         let hinge = HingeSpec::default();
         let id = generic_id(Platform::Android, f, (p.width, p.height), p.density, p.shape, folded, hinge);
-        out.extend(generic(&id, Platform::Android, f, (p.width, p.height), p.density, p.shape, folded, hinge));
+        out.extend(generic(&id, Platform::Android, f, (p.width, p.height), p.density, p.shape, folded, hinge, ""));
     }
     out
 }
@@ -643,6 +645,10 @@ pub(super) struct Spec<'a> {
     /// ([`assumed_ppi`]).
     pub ppi: f32,
     pub shape: Shape,
+    /// The system image's tag (`ai-glasses`, `android-xr`, `google_apis`, `google-tv`, ...), or ""
+    /// when it isn't known (an Apple device, a profile without an image): what tells a headset
+    /// from glasses.
+    pub image_tag: &'a str,
 }
 
 impl Spec<'_> {
@@ -683,13 +689,14 @@ pub(super) fn generic(
     shape: Shape,
     folded: Option<(u32, u32)>,
     hinge: HingeSpec,
+    image_tag: &str,
 ) -> Option<Body> {
     let ppi = match density {
         Density::Dpi(d) => d.max(1) as f32,
         Density::Scale(s) => assumed_ppi(form_factor, s),
     };
     let name = format!("Generic {} {} ({}x{})", platform.label(), form_factor.as_str(), px.0, px.1);
-    let spec = Spec { id, name, platform, form_factor, px, ppi, shape };
+    let spec = Spec { id, name, platform, form_factor, px, ppi, shape, image_tag };
     match form_factor {
         FormFactor::Foldable => Some(generic_book(id, &spec.name, platform, GENERIC, px, folded, ppi, shape, hinge, 2.0)),
         FormFactor::Phone | FormFactor::Tablet => Some(generic_slab(&spec)),

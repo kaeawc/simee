@@ -1508,7 +1508,10 @@ mod tests {
             let status = if body.is_none() { Some(scene::NO_BODY.as_str()) } else { None };
             assert_eq!(s.status.as_deref(), status, "{}", d.name);
             if let Some(b) = body {
-                assert!(scene::place(&b, size, sim_core::rotation::Rotation::Deg0).is_some(), "{}", d.name);
+                let placed = scene::place(&b, size, sim_core::rotation::Rotation::Deg0).expect("placed");
+                let screen = b.screen(placed.display).expect("the placed screen");
+                // The frame lands on the body screen with its pixels (either orientation), not a fallback.
+                assert!(screen.px == size || screen.px == (size.1, size.0), "{}: {:?} vs {size:?}", d.name, screen.px);
             }
         }
         // The glasses' body is built from the glasses' own screen, not the headset's.
