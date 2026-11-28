@@ -93,20 +93,34 @@ binstall lychee || warn "lychee install failed (lint.sh will skip it)"
 
 step "script and workflow linters (lint.sh)"
 BIN=/usr/local/bin
-case "$ARCH" in x86_64) SC_ARCH=x86_64 GO_ARCH=amd64 ;; aarch64) SC_ARCH=aarch64 GO_ARCH=arm64 ;; esac
-if [ "$(shellcheck --version 2>/dev/null | sed -n 's/^version: //p')" != "$SHELLCHECK_V" ]; then
+case "$ARCH" in
+  x86_64) SC_ARCH=x86_64 GO_ARCH=amd64 ;;
+  aarch64) SC_ARCH=aarch64 GO_ARCH=arm64 ;;
+  *) SC_ARCH="$ARCH" GO_ARCH="$ARCH" ;;
+esac
+# Fetch and install one release binary; warns (never fails the setup) when either step fails.
+install_shellcheck() {
   curl -fsSL --retry 3 "https://github.com/koalaman/shellcheck/releases/download/v$SHELLCHECK_V/shellcheck-v$SHELLCHECK_V.linux.$SC_ARCH.tar.xz" |
-    tar -xJ -C /tmp && $SUDO install -m 0755 "/tmp/shellcheck-v$SHELLCHECK_V/shellcheck" "$BIN/shellcheck" ||
-    warn "shellcheck install failed"
+    tar -xJ -C /tmp || return 1
+  $SUDO install -m 0755 "/tmp/shellcheck-v$SHELLCHECK_V/shellcheck" "$BIN/shellcheck"
+}
+install_shfmt() {
+  curl -fsSL --retry 3 -o /tmp/shfmt "https://github.com/mvdan/sh/releases/download/v$SHFMT_V/shfmt_v${SHFMT_V}_linux_$GO_ARCH" || return 1
+  $SUDO install -m 0755 /tmp/shfmt "$BIN/shfmt"
+}
+install_actionlint() {
+  curl -fsSL --retry 3 "https://github.com/rhysd/actionlint/releases/download/v$ACTIONLINT_V/actionlint_${ACTIONLINT_V}_linux_$GO_ARCH.tar.gz" |
+    tar -xz -C /tmp actionlint || return 1
+  $SUDO install -m 0755 /tmp/actionlint "$BIN/actionlint"
+}
+if [ "$(shellcheck --version 2>/dev/null | sed -n 's/^version: //p')" != "$SHELLCHECK_V" ]; then
+  install_shellcheck || warn "shellcheck install failed"
 fi
 if [ "$(shfmt --version 2>/dev/null)" != "v$SHFMT_V" ]; then
-  curl -fsSL --retry 3 -o /tmp/shfmt "https://github.com/mvdan/sh/releases/download/v$SHFMT_V/shfmt_v${SHFMT_V}_linux_$GO_ARCH" &&
-    $SUDO install -m 0755 /tmp/shfmt "$BIN/shfmt" || warn "shfmt install failed"
+  install_shfmt || warn "shfmt install failed"
 fi
 if ! command -v actionlint >/dev/null 2>&1; then
-  curl -fsSL --retry 3 "https://github.com/rhysd/actionlint/releases/download/v$ACTIONLINT_V/actionlint_${ACTIONLINT_V}_linux_$GO_ARCH.tar.gz" |
-    tar -xz -C /tmp actionlint && $SUDO install -m 0755 /tmp/actionlint "$BIN/actionlint" ||
-    warn "actionlint install failed"
+  install_actionlint || warn "actionlint install failed"
 fi
 # Ubuntu 24.04's Python is externally managed (PEP 668): yamllint lives in a venv.
 LINT_VENV="$HOME/.venvs/simee-lint"
