@@ -1970,6 +1970,7 @@ pub(crate) mod tests {
             memory_available_bytes: None,
             memory_free_pct: Some(59.0),
             now: decide(&reading, &Thresholds::default()),
+            basis: None,
         }
     }
 

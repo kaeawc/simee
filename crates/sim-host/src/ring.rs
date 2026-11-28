@@ -100,6 +100,14 @@ impl Ring {
         self.points.is_empty()
     }
 
+    /// Seconds from the oldest point to the newest.
+    pub fn span_s(&self) -> f64 {
+        match (self.points.front(), self.points.back()) {
+            (Some(a), Some(b)) => b.t - a.t,
+            _ => 0.0,
+        }
+    }
+
     /// The points within `window_s` of the newest.
     fn window(&self, window_s: u32) -> impl Iterator<Item = &Point> {
         let from = self.points.back().map_or(0.0, |p| p.t) - f64::from(window_s);
