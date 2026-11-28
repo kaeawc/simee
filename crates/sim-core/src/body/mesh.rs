@@ -1,6 +1,7 @@
 //! The procedural mesh for a [`Body`]: each panel a rounded box (the outline extruded through the
 //! body's thickness, its front and back edges rounded over by the bevel), the screens set flush
-//! into its faces with their own UVs, and the bump, buttons and crown as small rounded boxes.
+//! into its faces with their own UVs, and the bump, buttons, crown and extra blocks
+//! (`Body::extras`) as rounded boxes.
 //!
 //! One vertex and index buffer per body, split into [`Part`]s by role and panel so the scene picks
 //! a material per part and draws a foldable's panel 1 with [`super::HingeAxis::transform`]. The
@@ -66,6 +67,16 @@ pub enum Role {
     Bump,
     Button,
     Crown,
+    /// A [`super::Block`] of trim: a headset's light seal, a head unit's dash surround.
+    Trim,
+    /// A watch strap or lug, a headset's head strap, a pair of glasses' temple.
+    Strap,
+    /// What a TV stands on: a pedestal, feet.
+    Stand,
+    /// A rotary knob.
+    Knob,
+    /// A lens: glasses', a headset's visor glass.
+    Lens,
 }
 
 /// The mesh for `body`, generated (use [`cached_mesh`] in a frame loop).
@@ -190,6 +201,17 @@ pub fn mesh(body: &Body) -> Mesh {
         };
         let shape = RoundRect { center: [0.0, 0.0], half: [across / 2.0, along / 2.0], radii: [radius; 4], exponent: 2.0 };
         b.part(role, pi, |b| slab(b, &Frame::side(side, origin), &shape, depth, bevel, &Faces::default()));
+    }
+    // Each extra block is a part of its own, on the panel its centre is on.
+    for x in &body.extras {
+        let pi = body.panel_at([x.center[0], x.center[1]]);
+        let shape = RoundRect {
+            center: [0.0, 0.0],
+            half: [x.size[0] / 2.0, x.size[1] / 2.0],
+            radii: [x.corner.radius; 4],
+            exponent: x.corner.exponent,
+        };
+        b.part(x.role, pi, |b| slab(b, &Frame::at(x.center), &shape, x.size[2], x.bevel, &Faces::default()));
     }
     b.mesh
 }

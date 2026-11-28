@@ -33,11 +33,12 @@ mod gpu;
 mod layout;
 mod motion;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use rune::{Color, Cursor, Drag, El, GesturePhase, Key, KeyEvent, MagnifyEvent, Mods, Phase, PointerEvent, RotateEvent, Tx, WheelEvent};
 use sim_core::body::{self, Body, Display, Face};
+use sim_core::form_factor::FormFactor;
 use sim_core::platform::Platform;
 use sim_core::rotation::Rotation;
 
@@ -57,11 +58,33 @@ pub const ON: &str = "3D view on: drag beside the device to orbit, ⇧-drag to p
                       ⌘1 ⌘2 ⌘4 ⌘5 3/4, front, side, back, ⌘F flip, ⌘[ ⌘] turn. Touches on its screen come with #156";
 /// What a drag on the drawn screen says.
 pub const SCREEN_DRAG: &str = "Touches on the 3D screen come with #156: drag beside the device, or hold ⌥, to move the camera";
-/// What ⌘3 says for a device with no body.
-pub const NO_BODY: &str = "The 3D view has bodies for phones, tablets, foldables and watches";
 /// The body row of an iPhone's CarPlay display (a car head unit, `sim_core::body`'s car rows):
 /// drawn while the display shows ([`body_for`]). Without that row the view stays flat.
 pub const CARPLAY_BODY: &str = "CarPlay-800x480";
+/// What ⌘3 says for a device with no body: the form factors that have one ([`body::has_body`]).
+pub static NO_BODY: LazyLock<String> = LazyLock::new(|| no_body(body::has_body));
+
+/// "The 3D view has bodies for …", listing the form factors `has` says have one.
+fn no_body(has: impl Fn(FormFactor) -> bool) -> String {
+    let names: Vec<&str> = FormFactor::ALL
+        .into_iter()
+        .filter(|f| has(*f))
+        .map(|f| match f {
+            FormFactor::Phone => "phones",
+            FormFactor::Tablet => "tablets",
+            FormFactor::Foldable => "foldables",
+            FormFactor::Watch => "watches",
+            FormFactor::Tv => "TVs",
+            FormFactor::Auto => "car head units",
+            FormFactor::Vision => "XR headsets and glasses",
+        })
+        .collect();
+    match names.split_last() {
+        Some((last, [])) => format!("The 3D view has bodies for {last}"),
+        Some((last, rest)) => format!("The 3D view has bodies for {} and {last}", rest.join(", ")),
+        None => "The 3D view has no device bodies".into(),
+    }
+}
 
 /// Whether this process has the scene's compositor, set once in `main` before the window opens
 /// (live Rust editing has none; tests leave it false unless they set it).
@@ -342,8 +365,10 @@ impl View {
 }
 
 /// The selected device's body: the table's row for its device type (an Apple identifier, an
-/// AVD's `hw.device.name`) when it has one, else a generic body for its screen. While an iPhone's
-/// CarPlay display shows in its place, the car head unit's ([`CARPLAY_BODY`]), never the iPhone's.
+/// AVD's `hw.device.name`) when it has one, else a generic body for its screen. An Android
+/// device not running here gets the reference screen of its system image (AI glasses' own). While
+/// an iPhone's CarPlay display shows in its place, the car head unit's ([`CARPLAY_BODY`]), never
+/// the iPhone's.
 pub fn body_for(s: &State) -> Option<Arc<Body>> {
     let d = s.selected_info()?;
     if s.carplay_shown() {
@@ -353,11 +378,13 @@ pub fn body_for(s: &State) -> Option<Arc<Body>> {
         Platform::Ios => body::get(&d.device_type_id).or_else(|| body::for_profile(&d.kind()?.profile())),
         Platform::Android => {
             let device = s.android.as_ref().filter(|a| a.info.udid == d.udid);
-            let profile = device.and_then(|a| a.profile().ok()).or_else(|| d.kind().map(|k| k.profile()))?;
+            // `system-images;android-36;ai-glasses;arm64-v8a`: the image's tag.
+            let tag = d.runtime_id.split(';').nth(2).unwrap_or_default();
+            let profile = device.and_then(|a| a.profile().ok()).or_else(|| d.kind().map(|k| k.image_profile(tag)))?;
             // An unlisted foldable folds the way its AVD's hinge says (a flip, its angles).
             let config = device.and_then(|a| a.avd.as_ref());
             let hinge = config.and_then(|c| sim_core::fold::Hinge::from_config(|k| c.get(k).map(str::to_owned)));
-            body::for_android_hinge(&d.device_type_id, &profile, hinge.as_ref())
+            body::for_android_image(&d.device_type_id, &profile, hinge.as_ref(), tag)
         }
     }
 }
@@ -536,6 +563,21 @@ mod tests {
         let (t, msg) = Toggle::from_env(Some("3d"), None, false);
         assert!(!t.on);
         assert_eq!(msg.as_deref(), Some(UNAVAILABLE));
+    }
+
+    #[test]
+    fn no_body_lists_the_form_factors_with_bodies() {
+        let before = |f: FormFactor| matches!(f, FormFactor::Phone | FormFactor::Tablet | FormFactor::Foldable | FormFactor::Watch);
+        assert_eq!(no_body(before), "The 3D view has bodies for phones, tablets, foldables and watches");
+        assert_eq!(
+            no_body(|_| true),
+            "The 3D view has bodies for phones, tablets, foldables, watches, TVs, car head units and XR headsets and glasses"
+        );
+        assert_eq!(no_body(|f| f == FormFactor::Phone), "The 3D view has bodies for phones");
+        assert_eq!(*NO_BODY, no_body(body::has_body));
+        for f in FormFactor::ALL {
+            assert!(NO_BODY.contains(no_body(|g| g == f).trim_start_matches("The 3D view has bodies for ")) == body::has_body(f), "{f:?}");
+        }
     }
 
     #[test]

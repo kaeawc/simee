@@ -18,7 +18,8 @@
 //!
 //! `cargo run` opens the window (`SIMEE_DEVICE=<udid|name|booted>` preselects a device);
 //! `cargo run -- --snap shot.png --scene demo` renders headless (scenes: demo, android, foldable,
-//! folded, tablet, ipad, watch, tv, apple-watch, apple-tv, carplay, turned, turned-tablet, empty,
+//! folded, tablet, ipad, watch, tv, apple-watch, apple-tv, auto, carplay, vision-pro, android-xr,
+//! glasses, turned, turned-tablet, empty,
 //! sidebar-hidden, inspector-hidden, panes-hidden, panes-wide, resources, resources-memory, admission,
 //! admission-many, popped); a release build needs `--features tooling` for it.
 
@@ -687,6 +688,46 @@ fn show_offline_carplay(s: &mut State, on: bool) {
     }
 }
 
+/// The demo data with `device`, which the demo list doesn't have, added, selected and running.
+fn select_added(s: &mut State, device: DeviceInfo, size: (u32, u32), shape: Shape) {
+    select_running(s, &device.udid.clone(), size, shape);
+    s.devices.push(DeviceInfo { state: DeviceState::Booted, ..device });
+}
+
+/// What a form factor's scene says with the 3D view on (`SIMEE_VIEW=3d`) while its form factor
+/// has no body: what ⌘3 would, the screen staying flat.
+fn say_if_no_body(s: &mut State) {
+    if s.view3d.on && s.showing_screen() && scene::body_for(s).is_none() {
+        s.status = Some(scene::NO_BODY.clone());
+    }
+}
+
+/// An Android Automotive head unit (the reference 1024x768 screen).
+fn auto_scene(s: &mut State) {
+    select_running(s, "automotive", (1024, 768), Shape::Rectangle);
+    say_if_no_body(s);
+}
+
+/// Apple Vision Pro, at half size.
+fn vision_pro_scene(s: &mut State) {
+    select_running(s, "G7", (1366, 1024), Shape::Rectangle);
+    say_if_no_body(s);
+}
+
+/// An Android XR headset (the SDK's `xr_headset_device`), at half size.
+fn android_xr_scene(s: &mut State) {
+    let headset = android_info("xr_headset", FormFactor::Vision, "android-36;google-xr", DeviceState::Booted);
+    select_added(s, headset, (1280, 1279), Shape::Rectangle);
+    say_if_no_body(s);
+}
+
+/// Android XR AI glasses (the SDK's `ai_glasses_device`, 450x450).
+fn glasses_scene(s: &mut State) {
+    let glasses = android_info("ai_glasses", FormFactor::Vision, "android-36;ai-glasses", DeviceState::Booted);
+    select_added(s, glasses, (450, 450), Shape::Rectangle);
+    say_if_no_body(s);
+}
+
 fn empty(s: &mut State) {
     s.offline = true;
     s.actions.clear();
@@ -1022,7 +1063,7 @@ fn boot(s: &mut State, udids: &[String]) {
 fn toggle_view3d(s: &mut State) {
     s.status = s.view3d.flip();
     if s.view3d.on && s.showing_screen() && scene::body_for(s).is_none() {
-        s.status = Some(scene::NO_BODY.into());
+        s.status = Some(scene::NO_BODY.clone());
     } else if s.view3d.on {
         s.status = Some(scene::ON.into());
     }
@@ -1234,7 +1275,11 @@ fn main() {
             ("tv", tv_scene),
             ("apple-watch", apple_watch_scene),
             ("apple-tv", apple_tv_scene),
+            ("auto", auto_scene),
             ("carplay", carplay_scene),
+            ("vision-pro", vision_pro_scene),
+            ("android-xr", android_xr_scene),
+            ("glasses", glasses_scene),
             ("turned", turned_scene),
             ("turned-tablet", turned_tablet_scene),
             ("empty", empty),
@@ -1493,15 +1538,55 @@ mod tests {
 
     #[test]
     fn a_device_with_no_body_stays_flat_and_says_so() {
-        let mut rt = polled_runtime(tv_scene);
+        let mut rt = polled_runtime(auto_scene);
         rt.on_key = Some(on_key);
         rt.state.view3d.supported = true;
         rt.key(cmd('3'));
         rt.frame(1.0 / 60.0);
         assert!(rt.state.view3d.on);
-        assert_eq!(rt.state.status.as_deref(), Some(scene::NO_BODY));
+        assert_eq!(rt.state.status.as_deref(), Some(scene::NO_BODY.as_str()));
         assert!(rt.find("scene-3d").is_none());
         assert!(rt.find("device-screen").is_some());
+    }
+
+    #[test]
+    fn form_factor_scenes_show_their_device_in_3d_or_say_it_has_no_body() {
+        use sim_core::platform::{AndroidOs, AppleOs, SubPlatform};
+        type Scene = fn(&mut State);
+        let cases: [(Scene, SubPlatform, (u32, u32)); 4] = [
+            (auto_scene, SubPlatform::Android(AndroidOs::Automotive), (1024, 768)),
+            (vision_pro_scene, SubPlatform::Apple(AppleOs::VisionOs), (1366, 1024)),
+            (android_xr_scene, SubPlatform::Android(AndroidOs::Xr), (1280, 1279)),
+            (glasses_scene, SubPlatform::Android(AndroidOs::Xr), (450, 450)),
+        ];
+        for (scene_fn, sub, size) in cases {
+            let mut s = init();
+            s.view3d = scene::Toggle { on: true, supported: true, ..scene::Toggle::default() };
+            scene_fn(&mut s);
+            let d = s.selected_info().expect("a device is selected");
+            let kind = d.kind().expect("a kind");
+            assert_eq!((kind.sub_platform, s.offline_size), (sub, size), "{}", d.name);
+            assert!(s.showing_screen(), "{}", d.name);
+            // A body once its form factor has one; until then the flat screen and the reason.
+            let body = scene::body_for(&s);
+            assert_eq!(body.is_some(), sim_core::body::has_body(kind.form_factor), "{}", d.name);
+            let status = if body.is_none() { Some(scene::NO_BODY.as_str()) } else { None };
+            assert_eq!(s.status.as_deref(), status, "{}", d.name);
+            if let Some(b) = body {
+                let placed = scene::place(&b, size, sim_core::rotation::Rotation::Deg0).expect("placed");
+                let screen = b.screen(placed.display).expect("the placed screen");
+                // The frame lands on the body screen with its pixels (either orientation), not a fallback.
+                assert!(screen.px == size || screen.px == (size.1, size.0), "{}: {:?} vs {size:?}", d.name, screen.px);
+            }
+        }
+        // The glasses' body is built from the glasses' own screen, not the headset's.
+        let mut s = init();
+        glasses_scene(&mut s);
+        let d = s.selected_info().expect("glasses");
+        let tag = d.runtime_id.split(';').nth(2).expect("an image tag");
+        let (w, h, _) = sim_core::form_factor::ANDROID_GLASSES_SCREEN;
+        let p = d.kind().expect("a kind").image_profile(tag);
+        assert_eq!((p.width, p.height), (w, h));
     }
 
     fn text_of(rt: &Runtime<State>, key: &str) -> String {
@@ -1624,7 +1709,7 @@ mod tests {
         rt.frame(1.0 / 60.0);
         assert!(rt.state.view3d.on);
         if sim_core::body::get(scene::CARPLAY_BODY).is_none() {
-            assert_eq!(rt.state.status.as_deref(), Some(scene::NO_BODY));
+            assert_eq!(rt.state.status.as_deref(), Some(scene::NO_BODY.as_str()));
             assert!(rt.find("scene-3d").is_none(), "no head unit body yet: flat");
             assert!(rt.find("device-screen").is_some());
         } else {

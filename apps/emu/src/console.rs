@@ -52,9 +52,15 @@ fn sub_help(description: &str, subcommands: &[(&str, &str)], ko: &str) -> String
 
 /// `network status|speed <speed>|delay <latency>` (stock syntax and replies; names and
 /// values in [`sim_core::network`]). Stock reads the whole rest of the line as the argument.
+/// simee adds `network loss <percent>|<up>:<down>|none` (stock has no loss command), which the
+/// NAT applies to each direction's IP packets and `network status` reports while set.
 fn network(info: &ConsoleInfo, words: &[&str]) -> String {
-    const SUBCOMMANDS: &[(&str, &str)] =
-        &[("status", "dump network status"), ("speed", "change network speed"), ("delay", "change network latency")];
+    const SUBCOMMANDS: &[(&str, &str)] = &[
+        ("status", "dump network status"),
+        ("speed", "change network speed"),
+        ("delay", "change network latency"),
+        ("loss", "change network packet loss (simee)"),
+    ];
     const ABOUT: &str = "allows you to manage the settings related to the network data connection of the\r\nemulated device.";
     let mut conditions = info.network.lock().unwrap_or_else(|e| e.into_inner());
     match words {
@@ -66,6 +72,11 @@ fn network(info: &ConsoleInfo, words: &[&str]) -> String {
         ["delay"] => "KO: missing <delay> argument, see 'help network delay'".into(),
         ["delay", arg @ ..] if conditions.set_latency(&arg.join(" ")) => "OK".into(),
         ["delay", ..] => "KO: invalid <delay> argument, see 'help network delay' for valid values".into(),
+        ["loss"] => "KO: missing <loss> argument: network loss <percent> or <up>:<down>, each 0 to 100 (none: no loss)".into(),
+        ["loss", arg @ ..] => match conditions.set_loss(&arg.join(" ")) {
+            Ok(()) => "OK".into(),
+            Err(why) => format!("KO: invalid <loss> argument: {why}; use <percent> or <up>:<down>"),
+        },
         _ => sub_help(ABOUT, SUBCOMMANDS, "KO:  bad sub-command"),
     }
 }
@@ -1016,6 +1027,38 @@ mod tests {
         assert!(missing.contains("\r\navailable sub-commands:\r\n    status           dump network status\r\n"), "{missing}");
         assert!(missing.ends_with("\r\n\r\nKO: missing sub-command"), "{missing}");
         assert!(run(&info, "network warp").ends_with("\r\nKO:  bad sub-command"));
+    }
+
+    /// simee's `network loss <percent>|<up>:<down>|none`: shown in `network status` while set,
+    /// its errors say what is wrong and what it takes, and a refused argument changes nothing.
+    #[test]
+    fn network_loss_sets_each_direction_and_shows_in_status() {
+        let info = console(FormFactor::Phone);
+        assert_eq!(run(&info, "network loss 10:25"), "OK");
+        let status = run(&info, "network status");
+        assert!(status.ends_with("  maximum latency:  0 ms\r\n  download loss:    25 %\r\n  upload loss:      10 %\r\nOK"), "{status}");
+        let c = *info.network.lock().expect("network");
+        assert_eq!((c.upload_loss_pct, c.download_loss_pct), (10.0, 25.0));
+        assert_eq!(run(&info, "network loss 5"), "OK");
+        assert!(run(&info, "network status").contains("download loss:    5 %\r\n  upload loss:      5 %"));
+        assert_eq!(
+            run(&info, "network loss"),
+            "KO: missing <loss> argument: network loss <percent> or <up>:<down>, each 0 to 100 (none: no loss)"
+        );
+        assert_eq!(
+            run(&info, "network loss 120"),
+            "KO: invalid <loss> argument: `120` is out of range, each loss is 0 to 100 percent; use <percent> or <up>:<down>"
+        );
+        assert_eq!(run(&info, "network loss half"), "KO: invalid <loss> argument: `half` isn't a percentage; use <percent> or <up>:<down>");
+        assert!(run(&info, "network status").contains("upload loss:      5 %"), "a rejected argument changes nothing");
+        // Speed and delay leave it alone; `none` clears it, and the report is stock's again.
+        assert_eq!(run(&info, "network speed full"), "OK");
+        assert_eq!(run(&info, "network delay none"), "OK");
+        assert!(info.network.lock().expect("network").is_shaped());
+        assert_eq!(run(&info, "network loss none"), "OK");
+        assert!(!run(&info, "network status").contains("loss"));
+        assert!(!info.network.lock().expect("network").is_shaped());
+        assert!(run(&info, "network").contains("\r\n    loss             change network packet loss (simee)\r\n"));
     }
 
     /// Stock's replies when it can't snapshot: every `save`/`load` is a KO a tool can fall

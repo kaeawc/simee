@@ -741,6 +741,35 @@ mod tests {
     }
 
     #[test]
+    fn face_on_is_one_to_one_for_every_screen_of_every_body_in_the_table() {
+        // Every row's every screen showing a frame of its own pixels, face on, in a tall and a
+        // wide slot: its corners are the flat screen's to a hundredth of a pixel. A row a form
+        // factor's module adds is covered here as it lands.
+        let mut checked = 0;
+        for body in sim_core::body::all() {
+            for s in &body.screens {
+                for slot in [(1700, 1500), (3200, 1500)] {
+                    let (mut job, flat) = shown(&body.id, s.px, sim_core::rotation::Rotation::Deg0, slot);
+                    let what = format!("{} {:?} in {slot:?}", body.id, s.display);
+                    assert_eq!(job.placement.display, s.display, "{what}: the frame goes on its screen");
+                    job.camera = Camera::preset(super::super::Preset::Face);
+                    let q = job.solve(slot, flat).screen.unwrap_or_else(|| panic!("{what}: face on, the screen faces the camera"));
+                    let h = flat[2];
+                    let w = h * s.px.0 as f32 / s.px.1 as f32;
+                    let (x, y) = (slot.0 as f32 / 2.0 + flat[0] - w / 2.0, slot.1 as f32 / 2.0 + flat[1] - h / 2.0);
+                    let want = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
+                    // Seen from the front or the back, each corner lands on one of the flat screen's.
+                    let near = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 0.01 && (a[1] - b[1]).abs() < 0.01;
+                    assert!(want.iter().all(|w| q.iter().any(|c| near(*c, *w))), "{what}: {q:?} vs {want:?}");
+                    assert!(q.iter().all(|c| want.iter().any(|w| near(*c, *w))), "{what}: {q:?} vs {want:?}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 2 * sim_core::body::all().len(), "every row has a screen");
+    }
+
+    #[test]
     fn face_on_at_zoom_zero_is_still_one_to_one_on_a_landscape_phone() {
         // The pin beside the clamp: the eye is outside the body already, so 1:1 is untouched.
         let slot = (3200, 1500);
