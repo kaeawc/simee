@@ -32,7 +32,7 @@ mod packet;
 #[cfg_attr(not(unix), allow(dead_code))]
 mod shape;
 #[cfg(all(test, unix))]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(unix)]
 use std::collections::VecDeque;

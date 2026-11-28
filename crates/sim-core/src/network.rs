@@ -172,7 +172,14 @@ impl Conditions {
         let (up, down) = match loss {
             "" | "none" => (0.0, 0.0),
             _ => match loss.split_once(':') {
-                Some((up, down)) => (loss_pct(up)?, loss_pct(down)?),
+                Some((up, down)) => {
+                    for (side, part) in [("upload", up), ("download", down)] {
+                        if part.trim().is_empty() {
+                            return Err(format!("the {side} value is missing"));
+                        }
+                    }
+                    (loss_pct(up)?, loss_pct(down)?)
+                }
                 None => {
                     let both = loss_pct(loss)?;
                     (both, both)
@@ -346,6 +353,8 @@ mod tests {
         assert_eq!(loss("none"), Ok((0.0, 0.0)));
         assert_eq!(loss(""), Ok((0.0, 0.0)));
         assert_eq!(loss("-0"), Ok((0.0, 0.0)));
+        assert_eq!(loss("10:"), Err("the download value is missing".into()));
+        assert_eq!(loss(":10"), Err("the upload value is missing".into()));
         let err = loss("lots").expect_err("a word");
         assert!(err.contains("`lots` isn't a percentage"), "{err}");
         let err = loss("10:101").expect_err("over 100");

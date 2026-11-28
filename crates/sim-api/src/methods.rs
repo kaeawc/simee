@@ -394,8 +394,8 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "network_shape",
         "device, preset?(offline|3g|edge|lte|lossy|very-bad|none), offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?; iOS: port_base?, port_count?, rules?([{pattern, offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?}]), proxy?(default true), inject?(false|true|\"launchd\"|\"boot\"), set?",
         "Shape the device's network without root. proxy: a shaping HTTP/SOCKS proxy set in the device's configd_sim. inject: an in-process socket shaper; \"boot\" reboots the device with it in launchd's environment so every process, WebKit included, is shaped live by the profile. \
-         Android: the emulator's NAT through its console (`network speed <up>:<down>` kbit/s, `network delay <ms>`, and simee's `network loss <pct>`: that percent of the guest's TCP, UDP and ICMP packets dropped each way; what isn't given keeps the device's value, and only what changes is sent) and offline as airplane mode (`cmd connectivity airplane-mode`), returning the commands sent; \
-         loss_pct (so lossy and very-bad) is refused on the stock emulator, whose console has no loss command, and rules, port ranges, proxy and inject are refused on Android",
+         Android: the emulator's NAT through its console (`network speed <up>:<down>` kbit/s, `network delay <ms>`, and simee's `network loss <pct>`; what isn't given keeps the device's value, and only what changes is sent) and offline as airplane mode (`cmd connectivity airplane-mode`), returning the commands sent; \
+         loss_pct means different things per platform: on iOS the percent of new connections that time out, on Android the percent of the guest's TCP, UDP and ICMP packets dropped in each direction. On Android it (so lossy and very-bad) is refused on the stock emulator, whose console has no loss command, and rules, port ranges, proxy and inject are refused on Android",
     ),
     (
         "network_state",

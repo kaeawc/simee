@@ -996,6 +996,16 @@ fn full_upload_loss_drops_the_guests_datagrams_and_pings_but_never_arp() {
     assert!(next_frame(&mut n, Duration::from_secs(5), is_echo_reply).is_some());
 }
 
+/// For other devices' tests: a NAT at 100% loss both ways, sent a ping, loses it (true), so a
+/// test that runs beside it knows the loss is live.
+pub(crate) fn full_loss_drops_a_ping() -> bool {
+    let (_, mut n) = lossy(100.0, 100.0, 1);
+    n.transmit(&arp_request(GW));
+    assert!(next_frame(&mut n, Duration::from_secs(5), is_arp_reply).is_some(), "ARP is link control, never lost");
+    n.transmit(&ping_frame(GW, 0x97, 1, b"lost"));
+    next_frame(&mut n, Duration::from_millis(300), is_echo_reply).is_none()
+}
+
 #[test]
 fn full_download_loss_drops_what_the_host_sends_back_but_the_host_still_hears_the_guest() {
     let server = UdpSocket::bind("127.0.0.1:0").expect("bind");
