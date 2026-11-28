@@ -2,7 +2,7 @@
 """iOS API method latency through `simee serve`: round trips over one persistent connection.
 
     python3 -I scripts/bench/ios-api.py --suite NAME [--calls N] [--baseline SIMEE] [--simee BIN]
-        [--device-type TYPE] [--runtime ID] [--bundle ID] [--rounds N] [--quick] [--out DIR]
+        [--device-type TYPE] [--runtime ID] [--bundle ID] [--rounds N] [--quick] [--no-quiet-gate] [--out DIR]
     python3 -I scripts/bench/ios-api.py --list
 
 Creates a simulator (`simctl create`, booted with `simctl bootstatus -b`, 30 s to quieten), and
@@ -225,6 +225,7 @@ def main():
     p.add_argument('--bundle', default=SETTINGS)
     p.add_argument('--rounds', type=int, default=3)
     p.add_argument('--quick', action='store_true')
+    p.add_argument('--no-quiet-gate', action='store_true', help='skip the quiet-host gate (a smoke run; its numbers are not published)')
     p.add_argument('--out', default=os.path.join(REPO, 'bench', 'results'))
     a = p.parse_args()
     if a.list:
@@ -242,6 +243,7 @@ def main():
         print('ios-api.py: skipped: no iOS simulator runtime installed', file=sys.stderr)
         return 3
     dtype = a.device_type or ('iPad Pro 13-inch (M5)' if a.suite == 'pointer' else 'iPhone 17 Pro')
+    summarize.quiet_gate(a.no_quiet_gate)
     host_start = summarize.host()
     simee = a.simee
     if not simee:

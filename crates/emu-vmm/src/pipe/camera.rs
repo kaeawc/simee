@@ -1036,6 +1036,7 @@ mod tests {
         assert!((3..=7).contains(&n), "{n} opens in a second");
     }
 
+    #[cfg(unix)]
     /// Another device's screen as the simee server serves it: a feed on a socket. The camera shows
     /// the test card until the feed is served, then reads it, at the size the guest opened.
     #[test]
@@ -1063,6 +1064,7 @@ mod tests {
     }
 
     /// Whether a 176x144 frame's luma isn't flat: the test card (black, red or blue is flat).
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn card(r: &[u8]) -> bool {
         let luma = &payload(r)[3..3 + 176 * 144];
         luma.iter().any(|&y| y != luma[0])
@@ -1070,8 +1072,10 @@ mod tests {
 
     /// The server's side of a feed whose source device A is red until the flag says it shut down:
     /// then its capture ends and it doesn't open. Any other source opens as usual.
+    #[cfg_attr(not(unix), allow(dead_code))]
     struct ShutsDown(Arc<AtomicBool>);
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     struct Red(Box<dyn sim_camera::Source>, Arc<AtomicBool>);
 
     impl sim_camera::Source for Red {
@@ -1097,6 +1101,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn feed_session(tag: &str) -> (std::path::PathBuf, Session) {
         let path = std::path::PathBuf::from("/tmp").join(format!("emu-cam-{tag}-{}.sock", std::process::id()));
         std::fs::remove_file(&path).ok();
@@ -1107,6 +1112,7 @@ mod tests {
         (path, s)
     }
 
+    #[cfg(unix)]
     /// B booted before A: the server serves B's feed, but A isn't there to fill it. The camera
     /// shows the test card within a second, not black, and A's frames once it is up.
     #[test]
@@ -1134,6 +1140,7 @@ mod tests {
         assert!(luma_after(&mut s, 82), "red once the feed sends it");
     }
 
+    #[cfg(unix)]
     /// A shuts down mid-stream: the server's feed stays up but goes silent. The camera shows the
     /// test card within a second (not A's last frame), and A's frames again when they resume.
     #[test]

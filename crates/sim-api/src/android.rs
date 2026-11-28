@@ -494,7 +494,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use serde_json::{Value, json};
     use sim_android::testing::{FakeAdb, FakeEmulator, fake_adb, fake_emulator};

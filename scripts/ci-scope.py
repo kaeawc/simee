@@ -656,7 +656,9 @@ def glob_re(pattern):
 
 
 def filter_runs(patterns, path):
-    """Whether a paths filter takes path: the last pattern that matches wins, `!` excludes."""
+    """Whether a paths filter takes path: the last pattern that matches wins, `!` excludes.
+    The patterns and git name files with `/`, so a path joined by Windows's `os.path` does too."""
+    path = path.replace(os.sep, "/")
     hit = False
     for pat in patterns:
         if glob_re(pat.lstrip("!")).match(path):
@@ -758,7 +760,7 @@ def software_inputs(crates, names):
                 if not p:
                     raise ValueError("%s:%d includes a path ci-scope can't read" % (f, ln))
                 out.add(p)
-    return out
+    return {f.replace(os.sep, "/") for f in out}
 
 
 def software_errors(crates):

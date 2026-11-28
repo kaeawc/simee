@@ -1,5 +1,7 @@
 //! Formats images of several sizes and checks them with every e2fsck available on the host: the
-//! Android SDK's (e2fsprogs 1.42) and Homebrew's (current). Skipped when neither is installed.
+//! Android SDK's (e2fsprogs 1.42) and Homebrew's (current). Skipped when neither is installed, and
+//! not built on Windows, where e2fsprogs doesn't run and `st_blocks` doesn't exist.
+#![cfg(unix)]
 
 use std::fs::File;
 use std::os::unix::fs::MetadataExt;

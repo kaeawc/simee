@@ -25,8 +25,8 @@
 //!   The observer waits with no timer and is stopped when the feed ends or its output can't be
 //!   followed (and exits by itself with this process).
 
+use sim_core::hostfs::MetadataExt;
 use std::collections::HashMap;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -667,6 +667,11 @@ pub struct Ios {
     /// Where devices' directories are (`<root>/<UDID>/data`).
     devices: PathBuf,
     by_device: HashMap<String, Device>,
+    /// The device set `devices` is, when it isn't the default set (#409).
+    set: Option<String>,
+    /// How to connect to the simulator service on that set (the calling session's way).
+    #[cfg(target_os = "macos")]
+    open: Option<crate::ios::Opener>,
     #[cfg(target_os = "macos")]
     ctx: Option<sim_coresim::Context>,
 }
@@ -683,9 +688,19 @@ impl Ios {
         Ios {
             devices,
             by_device: HashMap::new(),
+            set: None,
+            #[cfg(target_os = "macos")]
+            open: None,
             #[cfg(target_os = "macos")]
             ctx: None,
         }
+    }
+
+    /// The devices of the device set at `set` (#409), whose directory holds them as the default
+    /// set's does, connecting to the service through `open`.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn in_set(set: String, open: crate::ios::Opener) -> Ios {
+        Ios { set: Some(set.clone()), open: Some(open), ..Ios::with_root(PathBuf::from(set)) }
     }
 
     fn data(&self, udid: &str) -> Result<PathBuf, String> {
@@ -693,7 +708,8 @@ impl Ios {
         if data.is_dir() {
             Ok(data)
         } else {
-            Err(format!("{} doesn't exist: is `{udid}` a simulator of the default device set?", data.display()))
+            let set = self.set.as_deref().map_or_else(|| "the default device set".to_owned(), |set| format!("the device set {set}"));
+            Err(format!("{} doesn't exist: is `{udid}` a simulator of {set}?", data.display()))
         }
     }
 
@@ -769,7 +785,10 @@ mod device {
     impl Ios {
         fn sim(&mut self, udid: &str) -> Result<sim_coresim::Device, String> {
             if self.ctx.is_none() {
-                self.ctx = Some(sim_coresim::Context::new().map_err(|e| e.to_string())?);
+                self.ctx = Some(match &self.open {
+                    Some(open) => open(self.set.as_deref())?,
+                    None => sim_coresim::Context::new().map_err(|e| e.to_string())?,
+                });
             }
             let ctx = self.ctx.as_ref().ok_or("no service connection")?;
             let device = ctx.device(udid).map_err(|e| e.to_string())?;
