@@ -75,6 +75,10 @@ pub fn effect(method: &str) -> Option<Effect> {
         "appearance" | "location" | "status_bar" | "clear_status_bar" | "content_size" | "increase_contrast" | "dynamic_island"
         | "backlight" | "keyboard_language" | "hardware_keyboard" | "ca_debug" | "network_clear" | "audio_volume" | "audio_route"
         | "audio_mute" | "fold" | "carplay" | "profile" | "privacy" | "car_stop" => Set,
+        // The console's battery, radio and sensors (#160): each reads back what it set.
+        "battery" | "cellular" | "sensor" => Set,
+        // A call rings and an SMS is stored each time; a shake swings the accelerometer and puts it back.
+        "phone_call" | "sms" | "shake" => Act,
         "create" | "boot" | "boot_many" | "clone" | "tap" | "swipe" | "touch" | "button" | "type" | "key" | "open_url" | "install"
         | "memory_warning" | "biometric" | "rotate" | "rotary" | "watch_gesture" | "remote_swipe" | "xr" | "touchpad" | "stylus"
         | "pointer" | "vehicle" | "audio_capture_stop" | "contrast_check" | "import" | "car_start" => Act,
@@ -180,17 +184,17 @@ pub fn group(method: &str) -> Option<Group> {
         "link" | "unlink" | "links" | "link_status" => Lifecycle,
         "screen" | "screenshot" | "wait_idle" | "contrast_check" | "logs" => Observe,
         "tap" | "swipe" | "touch" | "button" | "type" | "key" | "rotate" | "fold" | "xr" | "touchpad" | "stylus" | "rotary"
-        | "watch_gesture" | "remote_swipe" | "pointer" | "biometric" => Input,
+        | "watch_gesture" | "remote_swipe" | "pointer" | "biometric" | "sensor" | "shake" => Input,
         "open_url" | "install" | "uninstall" | "launch" | "terminate" | "apps" | "privacy" | "push" => Apps,
         "appearance" | "location" | "status_bar" | "clear_status_bar" | "content_size" | "increase_contrast" | "dynamic_island"
         | "backlight" | "keyboard_language" | "hardware_keyboard" | "memory_warning" | "notify" | "carplay" | "vehicle" | "car_start"
-        | "car_stop" => Settings,
+        | "car_stop" | "battery" | "phone_call" | "sms" => Settings,
         "ca_debug" | "ca_debug_state" | "exec" | "processes" | "kill" | "connections" | "traffic" | "mem_leaks" | "mem_heap"
         | "mem_vmmap" | "mem_history" | "crash_reports" | "console" => Debug,
         "containers" | "ls" | "read" | "write" | "rm" | "du" | "clear_container" | "defaults_read" | "defaults_write"
         | "reset_keychain" => Files,
         "prefs_stores" | "prefs_read" | "prefs_write" | "prefs_delete" | "prefs_batch" | "prefs_watch" => Prefs,
-        "network_shape" | "network_state" | "network_flows" | "network_clear" | "network_env" => Network,
+        "network_shape" | "network_state" | "network_flows" | "network_clear" | "network_env" | "cellular" => Network,
         "audio_state" | "audio_volume" | "audio_route" | "audio_capture_start" | "audio_capture_stop" | "audio_mute" => Audio,
         "stream_start" | "stream_status" | "stream_stop" | "streams" => Stream,
         "camera_sources" | "camera_link" | "camera_unlink" | "camera_links" => Camera,

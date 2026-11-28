@@ -65,6 +65,8 @@ fn fake(android: &Android, avd: &str, stock: bool, no_loss: bool) -> FakeEmulato
     let shared_network = network.clone();
     let loss_fails: Arc<std::sync::atomic::AtomicBool> = Arc::default();
     let loss_broken = loss_fails.clone();
+    // The battery, radio, calls and sensors (`power`, `gsm`, `sensor`), shared as the emulator's are.
+    let hardware: Arc<Mutex<Hardware>> = Arc::default();
     // The advertised adb port is the console's plus one, so the console must not be on 65535 (an
     // ephemeral port the OS hands out now and then): bind again, keeping the unusable one held so
     // the next bind gets another.
@@ -84,7 +86,7 @@ fn fake(android: &Android, avd: &str, stock: bool, no_loss: bool) -> FakeEmulato
             // A thread per connection, so concurrent clients are served concurrently.
             let (log, status, turned) = (log.clone(), status.clone(), turned.clone());
             let (links, fails, network) = (links.clone(), fails.clone(), network.clone());
-            let loss_broken = loss_broken.clone();
+            let (loss_broken, hardware) = (loss_broken.clone(), hardware.clone());
             std::thread::spawn(move || {
                 let mut out = stream.try_clone().expect("clone");
                 let _ = out.write_all(b"Android Console: type 'help' for a list of commands\r\nOK\r\n");
@@ -156,6 +158,7 @@ fn fake(android: &Android, avd: &str, stock: bool, no_loss: bool) -> FakeEmulato
                             Ok(()) => "OK".to_owned(),
                             Err(why) => format!("KO: invalid <loss> argument: {why}; use <percent> or <up>:<down>"),
                         },
+                        ["power" | "gsm" | "sensor", ..] => hardware.lock().expect("hardware").answer(&line),
                         ["screenshot", path] => {
                             let frame = Frame { width: 2, height: 1, rgba: vec![9, 9, 9, 255, 8, 8, 8, 255] };
                             std::fs::write(path, sim_core::frame::encode_png(&frame).expect("png")).expect("write png");
@@ -192,6 +195,111 @@ fn fake(android: &Android, avd: &str, stock: bool, no_loss: bool) -> FakeEmulato
     let ad = format!("port.serial={port}\nport.adb={}\navd.name={avd}\n{emulator}", port + 1);
     std::fs::write(running.join(format!("pid_{}.ini", std::process::id())), ad).expect("advertise");
     FakeEmulator { console, display, fold_status, rotation, cameras, camera_link_fails, network: shared_network, loss_fails }
+}
+
+/// What the fake's `power`, `gsm` and `sensor` commands keep, answered as emu's console answers.
+struct Hardware {
+    ac: bool,
+    status: &'static str,
+    capacity: u32,
+    voice: String,
+    data: String,
+    /// (inbound, number, state) per call.
+    calls: Vec<(bool, String, &'static str)>,
+    acceleration: String,
+}
+
+impl Default for Hardware {
+    fn default() -> Hardware {
+        Hardware {
+            ac: true,
+            status: "Charging",
+            capacity: 50,
+            voice: "home".into(),
+            data: "home".into(),
+            calls: Vec::new(),
+            acceleration: "0:9.80665:0".into(),
+        }
+    }
+}
+
+impl Hardware {
+    fn answer(&mut self, line: &str) -> String {
+        let ok = "OK".to_owned();
+        match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+            ["power", "display"] => format!(
+                "AC: {}\r\nstatus: {}\r\nhealth: Good\r\npresent: true\r\ncapacity: {}\r\nOK",
+                if self.ac { "online" } else { "offline" },
+                self.status,
+                self.capacity
+            ),
+            ["power", "ac", v] => {
+                self.ac = *v == "on";
+                ok
+            }
+            ["power", "status", v] => {
+                self.status = match *v {
+                    "charging" => "Charging",
+                    "discharging" => "Discharging",
+                    "not-charging" => "Not charging",
+                    "full" => "Full",
+                    _ => "Unknown",
+                };
+                ok
+            }
+            ["power", "capacity", v] => match v.parse::<u32>() {
+                Ok(n) if n <= 100 => {
+                    self.capacity = n;
+                    ok
+                }
+                _ => "KO: Usage: \"capacity <percentage>\"".to_owned(),
+            },
+            ["gsm", "status"] => format!("gsm voice state: {}\r\ngsm data state:  {}\r\nOK", self.voice, self.data),
+            ["gsm", "voice", v] => {
+                self.voice = (*v).to_owned();
+                ok
+            }
+            ["gsm", "data", v] => {
+                self.data = (*v).to_owned();
+                ok
+            }
+            ["gsm", "list"] => {
+                let mut s: String = self
+                    .calls
+                    .iter()
+                    .map(|(inbound, n, st)| format!("{} {n:<10} : {st}\r\n", if *inbound { "inbound from" } else { "outbound to " }))
+                    .collect();
+                s.push_str("OK");
+                s
+            }
+            ["gsm", "call", n] => {
+                self.calls.push((true, (*n).to_owned(), "incoming"));
+                ok
+            }
+            ["gsm", op @ ("accept" | "busy" | "hold" | "cancel"), n] => match self.calls.iter().position(|c| c.1 == *n) {
+                None => format!("KO: no current call to/from number '{n}'"),
+                Some(i) if matches!(*op, "cancel" | "busy") => {
+                    self.calls.remove(i);
+                    ok
+                }
+                Some(i) => {
+                    self.calls[i].2 = if *op == "accept" { "active" } else { "held" };
+                    ok
+                }
+            },
+            ["sensor", "status"] => "acceleration: enabled.\r\nlight: enabled.\r\nOK".to_owned(),
+            ["sensor", "get", "acceleration"] => format!("acceleration = {}\r\nOK", self.acceleration),
+            ["sensor", "get", "light"] => "light = 400\r\nOK".to_owned(),
+            ["sensor", "set", "acceleration", v] => {
+                self.acceleration = (*v).to_owned();
+                ok
+            }
+            ["sensor", "get" | "set", name, ..] if sim_core::goldfish::sensor_handle(name).is_none() => {
+                format!("KO: unknown sensor '{name}'")
+            }
+            _ => ok,
+        }
+    }
 }
 
 /// `lines` once it holds `n` entries (or after 5 s, whatever it holds).

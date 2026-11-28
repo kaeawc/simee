@@ -513,6 +513,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
         "audio_state" | "audio_volume" | "audio_mute" => audio(&android, &d, method, p),
         m if crate::android_car::METHODS.contains(&m) => crate::android_car::call(&android, &d, m, p),
         m if crate::android_notify::METHODS.contains(&m) => crate::android_notify::call(&android, &d, m, p),
+        m if crate::android_controls::METHODS.contains(&m) => crate::android_controls::call(&d, m, p),
         "network_shape" | "network_state" | "network_clear" | "connections" | "traffic" => {
             crate::android_net::call(&android, &d, method, p)
         }

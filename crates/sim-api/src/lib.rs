@@ -19,6 +19,7 @@
 
 mod android;
 mod android_car;
+mod android_controls;
 mod android_files;
 mod android_net;
 mod android_notify;

@@ -105,6 +105,23 @@ pub fn sensor_handle(name: &str) -> Option<usize> {
     SENSORS.iter().position(|s| *s == name)
 }
 
+/// How many values sensor `name` (a protocol name) carries, as emu's console sets them: the motion
+/// and orientation sensors 3 (x, y, z), `rgbc-light` 4, the rest 1.
+pub fn sensor_values(name: &str) -> Option<usize> {
+    sensor_handle(name)?;
+    Some(match name {
+        "acceleration"
+        | "acceleration-uncalibrated"
+        | "gyroscope"
+        | "gyroscope-uncalibrated"
+        | "magnetic"
+        | "magnetic-uncalibrated"
+        | "orientation" => 3,
+        "rgbc-light" => 4,
+        _ => 1,
+    })
+}
+
 /// The sensors a device advertises (the `list-sensors` bitmask), decided like stock's
 /// android/hw-sensors.cpp: each `config.ini` flag with its hardware-properties.ini default, hinge
 /// angles 1 and 2 by `hw.sensor.hinge.count`, and heart rate and wrist tilt forced on for Wear OS
