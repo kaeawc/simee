@@ -7,8 +7,8 @@
 //! a free host port (from [`FIRST_BRIDGE_PORT`]) to the companion's port 5601, a reverse on the watch from its own
 //! 5601 to that host port, and a broadcast that makes the watch's Play services dial it. The
 //! forward lives in the adb server and the reverse in the watch's `adbd`, so an adb server restart
-//! or a reboot of either device loses them: [`bridge_with`] again (with the pair's saved port), with
-//! no [`handshake`], since Play services keeps the pairing itself.
+//! or a reboot of either device loses them: [`bridge_with`] again (with the pair's saved port, and
+//! the saved ports of the phone's other pairs), with no [`handshake`], since Play services keeps the pairing itself.
 //!
 //! Everything put in a guest shell is checked or quoted first: package names and node ids against
 //! their grammar (`sim_core::wear`), the watch's name quoted ([`crate::apps::shell_quote`]).
@@ -82,38 +82,52 @@ impl Adb {
 
 /// Bridges `watch` to `phone`: forwards the first free host port from [`FIRST_BRIDGE_PORT`] on
 /// the phone to the companion's 5601, reverses 5601 on the watch to that port, and refreshes the
-/// watch's connection. Returns the host port, which the pair keeps to take the bridge down.
-/// [`bridge_with`] rebuilds a bridge that is known.
+/// watch's connection. Returns the host port, which the pair keeps (with both serials) to take
+/// the bridge down. [`bridge_with`] rebuilds a bridge that is known, and is what a phone with
+/// other watches uses.
 pub fn bridge(phone: &Adb, watch: &Adb) -> Result<u16, String> {
-    bridge_with(phone, watch, None)
+    bridge_with(phone, watch, None, &[])
 }
 
-/// [`bridge`] for a pair that may already have a port: after a reboot of the watch or a restart
-/// of the adb server one end of the old bridge survives, and a new port would leave it behind.
-/// The pair's port is `saved` (what the caller kept), else where the watch's own reverse of 5601
-/// still points. It is reused when the phone still forwards it to 5601, bound again when it is
-/// free, and replaced by the first free port when another program has taken it. A step that fails
-/// takes back what this call did (a forward that was already there stays).
+/// [`bridge`] for a pair that may already have a port, on a phone that may have other pairs.
+///
+/// After a reboot of the watch or a restart of the adb server one end of the old bridge survives,
+/// and a new port would leave it behind. The pair's port is `saved` (what the caller kept), else
+/// where the watch's own reverse of 5601 still points. It is reused when the phone still forwards
+/// it to 5601, bound again when it is free, and replaced by the first free port when another
+/// program has taken it. A step that fails takes back what this call did: a forward that was
+/// already there stays, and so does a reverse that already pointed at the port.
+///
+/// `reserved` is every host port recorded for this phone's other pairs, running or not. A phone
+/// reboot drops all its forwards, so a pair that is down looks just like a port that is free: the
+/// next watch bridged would take it, and when the first comes back the two share one forward (and
+/// unbridging one unpairs the other). A reserved port is never handed out, `saved` or found, until
+/// the caller drops it from the list because that pair is unbridged or proven gone. A port below
+/// [`FIRST_BRIDGE_PORT`] (inside the emulators' range, say from another tool's bridge) is never
+/// reused either.
 ///
 /// A port in the adb server's forward table (another pair's, a head unit's) is skipped; one that
 /// another program holds on the host is refused by adb and the next is tried.
-pub fn bridge_with(phone: &Adb, watch: &Adb, saved: Option<u16>) -> Result<u16, String> {
+pub fn bridge_with(phone: &Adb, watch: &Adb, saved: Option<u16>, reserved: &[u16]) -> Result<u16, String> {
     let tunnels = phone.forward_tunnels()?;
-    let in_use: HashSet<u16> = tunnels.iter().map(|t| t.listen).collect();
+    let skip: HashSet<u16> = tunnels.iter().map(|t| t.listen).chain(reserved.iter().copied()).collect();
     let ours: HashSet<u16> = tunnels.iter().filter(|t| t.owner == phone.serial && t.target == COMPANION_PORT).map(|t| t.listen).collect();
-    let known = saved.or_else(|| {
-        let reverses = watch.reverse_tunnels().ok()?;
-        reverses.iter().find(|t| t.listen == COMPANION_PORT).map(|t| t.target)
-    });
+    let reverses = watch.reverse_tunnels().ok();
+    let reverse_to = reverses.as_ref().and_then(|r| r.iter().find(|t| t.listen == COMPANION_PORT).map(|t| t.target));
+    let known = saved.or(reverse_to).filter(|p| *p >= FIRST_BRIDGE_PORT && !reserved.contains(p));
     let (port, bound_here) = match known.filter(|p| ours.contains(p)) {
         Some(port) => (port, false),
-        None => (forward_free_port(phone, &in_use, known.filter(|p| *p != 0))?, true),
+        None => (forward_free_port(phone, &skip, known)?, true),
     };
     let rest = watch.reverse(COMPANION_PORT, port).and_then(|()| watch.refresh_connection());
     match rest {
         Ok(()) => Ok(port),
         Err(e) => {
-            let _ = watch.remove_reverse(COMPANION_PORT);
+            // Only a reverse this call made: one that was there, or that couldn't be listed, may
+            // be the working one.
+            if reverses.is_some() && reverse_to != Some(port) {
+                let _ = watch.remove_reverse(COMPANION_PORT);
+            }
             if bound_here {
                 let _ = phone.remove_forward(port);
             }
@@ -123,12 +137,12 @@ pub fn bridge_with(phone: &Adb, watch: &Adb, saved: Option<u16>) -> Result<u16, 
 }
 
 /// Forwards `first` (when given) or else the first port from [`FIRST_BRIDGE_PORT`] that isn't in
-/// `in_use` and adb accepts.
-fn forward_free_port(phone: &Adb, in_use: &HashSet<u16>, first: Option<u16>) -> Result<u16, String> {
+/// `skip` and adb accepts.
+fn forward_free_port(phone: &Adb, skip: &HashSet<u16>, first: Option<u16>) -> Result<u16, String> {
     let mut tried = Vec::new();
     let mut last = String::new();
     let candidates = first.into_iter().chain(FIRST_BRIDGE_PORT..=u16::MAX);
-    for port in candidates.filter(|p| !in_use.contains(p)).take(BRIDGE_TRIES) {
+    for port in candidates.filter(|p| !skip.contains(p)).take(BRIDGE_TRIES) {
         match phone.bind_forward(port, COMPANION_PORT, false) {
             Ok(()) => return Ok(port),
             // adb's refusals of a port: `cannot rebind existing socket`, `cannot bind listener: ...`.
@@ -307,6 +321,11 @@ impl Drop for Logcat {
     }
 }
 
+/// `ports` as `a, b, c`.
+fn ports(ports: &[u16]) -> String {
+    ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")
+}
+
 /// What [`unbridge`] did, and what it couldn't.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Unbridged {
@@ -324,13 +343,19 @@ pub struct Unbridged {
     pub notes: Vec<String>,
 }
 
-/// Takes a pair's bridge down on whichever devices still run: the phone's forwards of 5601 and of
-/// `port` to the companion's port (only those the phone owns), the watch's reverse of 5601 to
-/// `port`, the companion's data on the phone when it is the Pixel Watch app (it would reconnect
-/// through its cloud sync otherwise), and a refresh of the watch's connection. A device that
-/// isn't running (`None`) has nothing to take down, as adb dropped its tunnels with it; one that
-/// fails to answer is a [`Unbridged::problems`] entry and the other steps still run.
-pub fn unbridge(phone: Option<&Adb>, watch: Option<&Adb>, port: u16, companion: &str) -> Result<Unbridged, String> {
+/// Takes a pair's bridge down on whichever devices still run, touching only what belongs to this
+/// phone and this watch: the phone's forward of `port` to the companion's port (the phone's own,
+/// by serial), the watch's reverse of 5601 to `port` (the watch's own table), the older recipe's
+/// forward of 5601 and the companion's data on the phone when it is the Pixel Watch app (it would
+/// reconnect through its cloud sync otherwise), and a refresh of the watch's connection.
+///
+/// Those last two serve every watch on the phone, so they are kept while another pair remains:
+/// another forward of the phone's to 5601, or a port in `reserved` (every host port recorded for
+/// the phone's other pairs, running or not, as for [`bridge_with`]). A `port` that is itself in
+/// `reserved` is another pair's too, so its forward is kept and only this watch's reverse goes.
+/// A device that isn't running (`None`) has nothing to take down, as adb dropped its tunnels with
+/// it; one that fails to answer is a [`Unbridged::problems`] entry and the other steps still run.
+pub fn unbridge(phone: Option<&Adb>, watch: Option<&Adb>, port: u16, companion: &str, reserved: &[u16]) -> Result<Unbridged, String> {
     let companion = package_name(companion)?;
     if port == 0 {
         return Err("a bridge's host port isn't 0".into());
@@ -338,18 +363,33 @@ pub fn unbridge(phone: Option<&Adb>, watch: Option<&Adb>, port: u16, companion: 
     let (mut problems, mut notes) = (Vec::new(), Vec::new());
     let mut note = |what: &str, e: String| problems.push(format!("{what}: {e}"));
     let mut forwards = Vec::new();
-    // The host ports of the phone's other bridges; `None` when they couldn't be listed.
-    let mut others = None;
+    // The host ports of the phone's other pairs; `None` when its forwards couldn't be listed.
+    let mut others: Option<Vec<u16>> = None;
     if let Some(phone) = phone {
         match phone.forwards() {
             Ok(list) => {
-                others = Some(
-                    list.iter()
-                        .filter(|&&(host, device)| device == COMPANION_PORT && host != COMPANION_PORT && host != port)
-                        .map(|f| f.0)
-                        .collect::<Vec<u16>>(),
-                );
-                for host in [COMPANION_PORT, port] {
+                let mut other: Vec<u16> = list
+                    .iter()
+                    .filter(|&&(host, device)| device == COMPANION_PORT && host != COMPANION_PORT && host != port)
+                    .map(|f| f.0)
+                    .chain(reserved.iter().copied())
+                    .collect();
+                other.sort_unstable();
+                other.dedup();
+                // The older recipe's forward of 5601 serves whichever watch is paired.
+                let mut ours = Vec::new();
+                if other.is_empty() {
+                    ours.push(COMPANION_PORT);
+                } else if list.contains(&(COMPANION_PORT, COMPANION_PORT)) {
+                    notes
+                        .push(format!("kept the forward of tcp:{COMPANION_PORT}: the phone has other pairs (host port {})", ports(&other)));
+                }
+                if reserved.contains(&port) {
+                    notes.push(format!("kept the forward of tcp:{port}: another pair's record names that port"));
+                } else {
+                    ours.push(port);
+                }
+                for host in ours {
                     if list.contains(&(host, COMPANION_PORT)) {
                         match phone.remove_forward(host) {
                             Ok(()) => forwards.push(host),
@@ -357,6 +397,7 @@ pub fn unbridge(phone: Option<&Adb>, watch: Option<&Adb>, port: u16, companion: 
                         }
                     }
                 }
+                others = Some(other);
             }
             Err(e) => note("listing the phone's forwards", e),
         }
@@ -376,10 +417,7 @@ pub fn unbridge(phone: Option<&Adb>, watch: Option<&Adb>, port: u16, companion: 
     if let (Some(phone), true) = (phone, companion == PIXEL_COMPANION) {
         if others.as_ref().is_none_or(|o| !o.is_empty()) {
             let why = match &others {
-                Some(o) => format!(
-                    "the phone is still bridged to another watch (host port {})",
-                    o.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")
-                ),
+                Some(o) => format!("the phone has other pairs (host port {})", ports(o)),
                 None => "the phone's other bridges couldn't be listed".to_owned(),
             };
             notes.push(format!("kept {companion}'s data: {why}, and clearing it unpairs every watch"));
@@ -546,7 +584,7 @@ mod tests {
         let port = bridge(&p.phone, &p.watch).expect("bridge");
         p.watch.remove_reverse(5601).expect("the reboot drops the reverse");
         let before = p.calls().len();
-        assert_eq!(bridge_with(&p.phone, &p.watch, Some(port)), Ok(port));
+        assert_eq!(bridge_with(&p.phone, &p.watch, Some(port), &[]), Ok(port));
         assert_eq!(p.rig.fake.forwards(), [format!("{PHONE} tcp:{port} tcp:5601")], "the forward is not leaked");
         assert_eq!(p.rig.fake.reverses(), [format!("{WATCH} tcp:5601 tcp:{port}")]);
         let calls = p.calls();
@@ -567,7 +605,7 @@ mod tests {
         let port = bridge(&p.phone, &p.watch).expect("bridge");
         p.phone.remove_forward(port).expect("the server restart drops the forward");
         p.watch.remove_reverse(5601).expect("and the reverse");
-        assert_eq!(bridge_with(&p.phone, &p.watch, Some(port)), Ok(port));
+        assert_eq!(bridge_with(&p.phone, &p.watch, Some(port), &[]), Ok(port));
         assert_eq!(p.rig.fake.forwards(), [format!("{PHONE} tcp:{port} tcp:5601")]);
     }
 
@@ -576,11 +614,11 @@ mod tests {
         let p = pair("stolen");
         let saved = P0 + 5;
         p.rig.adb("emulator-5558").bind_forward(saved, 5277, false).expect("another device's forward");
-        assert_eq!(bridge_with(&p.phone, &p.watch, Some(saved)), Ok(P0));
+        assert_eq!(bridge_with(&p.phone, &p.watch, Some(saved), &[]), Ok(P0));
         // And one that is a forward of the phone's, but not to the companion's port, is not reused.
         let q = pair("not-companion");
         q.phone.bind_forward(saved, 5277, false).expect("a head unit's forward");
-        assert_eq!(bridge_with(&q.phone, &q.watch, Some(saved)), Ok(P0));
+        assert_eq!(bridge_with(&q.phone, &q.watch, Some(saved), &[]), Ok(P0));
     }
 
     #[test]
@@ -598,7 +636,7 @@ mod tests {
         let port = bridge(&p.phone, &p.watch).expect("bridge");
         p.watch.remove_reverse(5601).expect("reboot");
         p.rig.fake.reverse_fails();
-        assert!(bridge_with(&p.phone, &p.watch, Some(port)).is_err());
+        assert!(bridge_with(&p.phone, &p.watch, Some(port), &[]).is_err());
         assert_eq!(p.rig.fake.forwards().len(), 1, "the earlier forward is not this call's to remove");
     }
 
@@ -624,15 +662,128 @@ mod tests {
         let p = pair("shared-phone");
         let second = p.rig.adb("emulator-5560");
         let (a, b) = (bridge(&p.phone, &p.watch).expect("a"), bridge(&p.phone, &second).expect("b"));
-        let done = unbridge(Some(&p.phone), Some(&p.watch), a, PIXEL_COMPANION).expect("unbridge a");
+        let done = unbridge(Some(&p.phone), Some(&p.watch), a, PIXEL_COMPANION, &[]).expect("unbridge a");
         assert!(!done.companion_cleared && done.reverse_removed && done.forwards_removed == [a], "{done:?}");
         assert_eq!(done.notes.len(), 1);
         assert!(done.notes[0].contains(PIXEL_COMPANION) && done.notes[0].contains(&b.to_string()), "{:?}", done.notes);
         assert!(!p.calls().iter().any(|c| c.contains("pm clear")), "{:?}", p.calls());
         assert_eq!(p.rig.fake.forwards(), [format!("{PHONE} tcp:{b} tcp:5601")], "the other watch's bridge stands");
         // The last one out clears it.
-        let done = unbridge(Some(&p.phone), Some(&second), b, PIXEL_COMPANION).expect("unbridge b");
+        let done = unbridge(Some(&p.phone), Some(&second), b, PIXEL_COMPANION, &[]).expect("unbridge b");
         assert!(done.companion_cleared && done.notes.is_empty(), "{done:?}");
+    }
+
+    /// The forward ports the phone holds, ascending.
+    fn phone_ports(p: &Pair) -> Vec<u16> {
+        let mut ports: Vec<u16> = p.phone.forwards().expect("forwards").into_iter().map(|f| f.0).collect();
+        ports.sort_unstable();
+        ports
+    }
+
+    #[test]
+    fn a_new_watch_cannot_take_a_down_pairs_port_after_a_phone_reboot() {
+        let p = pair("reboot-reuse");
+        let (w1, w3) = (&p.watch, p.rig.adb("emulator-5560"));
+        let port1 = bridge(&p.phone, w1).expect("w1");
+        assert_eq!(port1, P0);
+        // The phone reboots: adb drops its forwards, and w1's reverse to the port stays on w1.
+        p.phone.remove_forward(port1).expect("reboot");
+        // The caller still has w1's record, so w3 is not offered w1's now-free port.
+        let port3 = bridge_with(&p.phone, &w3, None, &[port1]).expect("w3");
+        assert_eq!(port3, P0 + 1);
+        // w1 comes back and gets its own port again: one forward each, not one shared.
+        assert_eq!(bridge_with(&p.phone, w1, Some(port1), &[port3]), Ok(port1));
+        assert_eq!(phone_ports(&p), [port1, port3]);
+        let mut reverses = p.rig.fake.reverses();
+        reverses.sort();
+        assert_eq!(reverses, [format!("emulator-5556 tcp:5601 tcp:{port1}"), format!("emulator-5560 tcp:5601 tcp:{port3}")]);
+        // Unbridging w3 takes down w3's bridge and leaves w1's, and the companion stays.
+        let done = unbridge(Some(&p.phone), Some(&w3), port3, PIXEL_COMPANION, &[port1]).expect("unbridge w3");
+        assert_eq!(
+            (done.forwards_removed.as_slice(), done.reverse_removed, done.companion_cleared),
+            (&[port3][..], true, false),
+            "{done:?}"
+        );
+        assert_eq!(phone_ports(&p), [port1], "w1's forward stands");
+        assert_eq!(p.rig.fake.reverses(), [format!("{WATCH} tcp:5601 tcp:{port1}")], "so does w1's reverse");
+        assert!(!p.calls().iter().any(|c| c.contains("pm clear")), "{:?}", p.calls());
+        // The last pair out takes the companion's data too.
+        let done = unbridge(Some(&p.phone), Some(w1), port1, PIXEL_COMPANION, &[]).expect("unbridge w1");
+        assert!(done.companion_cleared && done.forwards_removed == [port1], "{done:?}");
+    }
+
+    #[test]
+    fn a_reserved_port_is_never_handed_out_whether_saved_found_or_scanned() {
+        let p = pair("reserved");
+        // Saved by the caller, but another pair's record names it.
+        assert_eq!(bridge_with(&p.phone, &p.watch, Some(P0), &[P0]), Ok(P0 + 1));
+        // Found from the watch's surviving reverse.
+        let q = pair("reserved-found");
+        q.watch.reverse(5601, P0 + 4).expect("a surviving reverse");
+        assert_eq!(bridge_with(&q.phone, &q.watch, None, &[P0 + 4]), Ok(P0));
+        // Found, and the phone still forwards it: another pair's bridge, so not reused.
+        let w = pair("reserved-live");
+        let live = bridge(&w.phone, &w.watch).expect("w1");
+        let w3 = w.rig.adb("emulator-5560");
+        w3.reverse(5601, live).expect("a reverse onto w1's port");
+        assert_eq!(bridge_with(&w.phone, &w3, None, &[live]), Ok(live + 1));
+        assert_eq!(phone_ports(&w), [live, live + 1]);
+        // The scan skips a run of them.
+        let r = pair("reserved-scan");
+        let reserved: Vec<u16> = (0..5).map(|i| P0 + i).collect();
+        assert_eq!(bridge_with(&r.phone, &r.watch, None, &reserved), Ok(P0 + 5));
+    }
+
+    #[test]
+    fn unbridge_keeps_a_forward_that_another_pairs_record_names() {
+        let p = pair("shared-port");
+        let port = bridge(&p.phone, &p.watch).expect("w1");
+        // A second watch that ended up reversing to the same port (a bridge built before the
+        // record existed): unbridging it is not unbridging w1.
+        let w3 = p.rig.adb("emulator-5560");
+        w3.reverse(5601, port).expect("shared");
+        let done = unbridge(Some(&p.phone), Some(&w3), port, PIXEL_COMPANION, &[port]).expect("unbridge");
+        assert!(done.forwards_removed.is_empty() && done.reverse_removed && !done.companion_cleared, "{done:?}");
+        assert!(done.notes.iter().any(|n| n.contains("another pair's record")), "{:?}", done.notes);
+        assert_eq!(phone_ports(&p), [port]);
+        assert_eq!(p.rig.fake.reverses(), [format!("{WATCH} tcp:5601 tcp:{port}")]);
+    }
+
+    #[test]
+    fn unbridge_keeps_the_older_recipes_forward_while_another_pair_remains() {
+        let (p, port) = bridged("legacy-forward");
+        let done = unbridge(Some(&p.phone), Some(&p.watch), port, LEGACY_COMPANION, &[P0 + 9]).expect("unbridge");
+        assert_eq!(done.forwards_removed, [port]);
+        assert!(done.notes.iter().any(|n| n.contains("tcp:5601")), "{:?}", done.notes);
+        assert_eq!(phone_ports(&p), [5601]);
+    }
+
+    #[test]
+    fn a_failed_refresh_removes_only_a_reverse_this_call_made() {
+        let p = pair("refresh-fails");
+        let port = bridge(&p.phone, &p.watch).expect("bridge");
+        p.rig.fake.wear("refresh.fail", WATCH, "");
+        assert!(bridge(&p.phone, &p.watch).expect_err("refresh times out").contains("closed"));
+        assert_eq!(p.rig.fake.reverses(), [format!("{WATCH} tcp:5601 tcp:{port}")], "the working reverse stays");
+        assert_eq!(phone_ports(&p), [port]);
+        // A bridge that was new is taken back whole.
+        let q = pair("refresh-fails-new");
+        q.rig.fake.wear("refresh.fail", WATCH, "");
+        assert!(bridge(&q.phone, &q.watch).is_err());
+        assert!(q.rig.fake.reverses().is_empty() && q.rig.fake.forwards().is_empty());
+    }
+
+    #[test]
+    fn a_recovered_port_inside_the_emulator_range_is_not_reused() {
+        // Studio's assistant (or a bridge from before the range moved) reversed to 5602.
+        let p = pair("old-range");
+        p.watch.reverse(5601, 5602).expect("another tool's reverse");
+        assert_eq!(bridge(&p.phone, &p.watch), Ok(P0));
+        assert_eq!(p.rig.fake.forwards(), [format!("{PHONE} tcp:{P0} tcp:5601")]);
+        assert_eq!(p.rig.fake.reverses(), [format!("{WATCH} tcp:5601 tcp:{P0}")], "the reverse moves to the bridge's range");
+        // A saved port outside the bridge range is no better.
+        let q = pair("old-range-saved");
+        assert_eq!(bridge_with(&q.phone, &q.watch, Some(5602), &[]), Ok(P0));
     }
 
     #[test]
@@ -884,7 +1035,7 @@ mod tests {
         let (p, port) = bridged("down");
         assert_eq!(port, P0);
         let before = p.calls().len();
-        let done = unbridge(Some(&p.phone), Some(&p.watch), port, PIXEL_COMPANION).expect("unbridge");
+        let done = unbridge(Some(&p.phone), Some(&p.watch), port, PIXEL_COMPANION, &[]).expect("unbridge");
         assert_eq!(
             done,
             Unbridged {
@@ -914,7 +1065,7 @@ mod tests {
     #[test]
     fn unbridge_clears_only_the_pixel_companion() {
         let (p, port) = bridged("legacy");
-        let done = unbridge(Some(&p.phone), Some(&p.watch), port, LEGACY_COMPANION).expect("unbridge");
+        let done = unbridge(Some(&p.phone), Some(&p.watch), port, LEGACY_COMPANION, &[]).expect("unbridge");
         assert!(!done.companion_cleared);
         assert!(!p.calls().iter().any(|c| c.contains("pm clear")), "{:?}", p.calls());
     }
@@ -923,7 +1074,7 @@ mod tests {
     fn unbridge_with_the_watch_stopped_still_clears_the_phone() {
         let (p, port) = bridged("nowatch");
         let before = p.calls().len();
-        let done = unbridge(Some(&p.phone), None, port, PIXEL_COMPANION).expect("unbridge");
+        let done = unbridge(Some(&p.phone), None, port, PIXEL_COMPANION, &[]).expect("unbridge");
         assert_eq!(
             done,
             Unbridged {
@@ -942,7 +1093,7 @@ mod tests {
     fn unbridge_with_the_phone_stopped_still_takes_down_the_watch() {
         let (p, port) = bridged("nophone");
         let before = p.calls().len();
-        let done = unbridge(None, Some(&p.watch), port, PIXEL_COMPANION).expect("unbridge");
+        let done = unbridge(None, Some(&p.watch), port, PIXEL_COMPANION, &[]).expect("unbridge");
         assert_eq!(
             done,
             Unbridged {
@@ -961,7 +1112,7 @@ mod tests {
     #[test]
     fn unbridge_with_both_stopped_does_nothing() {
         let p = pair("neither");
-        assert_eq!(unbridge(None, None, P0, PIXEL_COMPANION), Ok(Unbridged::default()));
+        assert_eq!(unbridge(None, None, P0, PIXEL_COMPANION, &[]), Ok(Unbridged::default()));
         assert!(p.calls().is_empty());
     }
 
@@ -973,7 +1124,7 @@ mod tests {
         p.watch.reverse(5601, 5700).expect("another bridge's reverse");
         // And a forward of the phone's own to something that isn't the companion.
         p.phone.bind_forward(P0 + 1, 5277, false).expect("head unit");
-        let done = unbridge(Some(&p.phone), Some(&p.watch), P0, LEGACY_COMPANION).expect("unbridge");
+        let done = unbridge(Some(&p.phone), Some(&p.watch), P0, LEGACY_COMPANION, &[]).expect("unbridge");
         assert!(done.forwards_removed.is_empty() && !done.reverse_removed, "{done:?}");
         assert_eq!(p.rig.fake.forwards().len(), 2);
         assert_eq!(p.rig.fake.reverses(), [format!("{WATCH} tcp:5601 tcp:5700")]);
@@ -982,8 +1133,8 @@ mod tests {
     #[test]
     fn unbridge_checks_its_input_before_adb() {
         let p = pair("badinput");
-        assert!(unbridge(Some(&p.phone), Some(&p.watch), P0, "com.x;reboot").is_err());
-        assert!(unbridge(Some(&p.phone), Some(&p.watch), 0, PIXEL_COMPANION).is_err());
+        assert!(unbridge(Some(&p.phone), Some(&p.watch), P0, "com.x;reboot", &[]).is_err());
+        assert!(unbridge(Some(&p.phone), Some(&p.watch), 0, PIXEL_COMPANION, &[]).is_err());
         assert!(p.calls().is_empty());
     }
 }
