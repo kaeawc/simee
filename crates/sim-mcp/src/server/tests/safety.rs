@@ -347,6 +347,61 @@ fn shutting_down_what_this_client_booted_needs_no_confirmation_and_anything_else
 }
 
 #[test]
+fn a_console_command_is_judged_line_by_line_and_by_every_name_the_console_knows() {
+    let (rig, _) = rig_world(Policy::default(), None);
+    let asks = |args: Value| {
+        let result = call(&rig, "console", args.clone());
+        let asked = is_error(&result) && text(&result).contains("needs the user's confirmation");
+        assert!(asked || !is_error(&result), "{args}: {result}");
+        asked
+    };
+    // The console runs each line as its own command: a harmless first word hides nothing.
+    for command in ["ping\r\nkill", "ping\nkill", "ping\rkill", "ping\r\n\r\n  kill  ", "\tkill"] {
+        assert!(asks(json!({"device": "ci-2", "command": command})), "{command:?}");
+    }
+    assert!(asks(json!({"device": "ci-2", "commands": ["ping", "help\nkill"]})));
+    // A snapshot goes by `del` as well as `delete`, which is the stock console's and emu's own.
+    for command in ["avd snapshot del fresh", "avd snapshot delete fresh", "AVD SNAPSHOT DEL fresh", "ping\navd snapshot del x", "crash"] {
+        assert!(asks(json!({"device": "ci-2", "command": command})), "{command:?}");
+    }
+    // Several commands in one call: the first that is harmless, or a kill, doesn't excuse a snapshot's deletion.
+    assert!(asks(json!({"device": "ci-2", "commands": ["kill", "avd snapshot del x"]})));
+    assert!(asks(json!({"device": "ci-2", "commands": ["avd snapshot del x", "kill"]})));
+    // What isn't destructive still isn't asked about.
+    for command in ["ping", "avd snapshot list", "avd snapshot load x", "avd name", "network status", "killer", "event send EV_KEY:KEY_K:1"]
+    {
+        assert!(!asks(json!({"device": "ci-2", "command": command})), "{command:?}");
+    }
+    // A client that booted the emulator may end it as it may with `shutdown`, but a snapshot's
+    // deletion in the same call is still asked.
+    assert!(!is_error(&call(&rig, "boot", json!({"device": "ci-1"}))));
+    assert!(!asks(json!({"device": "ci-1", "command": "ping\r\nkill"})));
+    assert!(!is_error(&call(&rig, "boot", json!({"device": "ci-1"}))));
+    assert!(asks(json!({"device": "ci-1", "commands": ["kill", "avd snapshot del x"]})));
+    assert!(asks(json!({"device": "ci-1", "command": "avd snapshot del x"})));
+    assert!(rig.fake.called("console").iter().all(|p| p.get("confirm").is_none()));
+}
+
+#[test]
+fn a_tool_a_policy_adds_to_confirm_says_so_in_its_schema_and_only_for_that_client() {
+    let policy = Policy::parse(r#"{"clients": {"careful": {"confirm": ["tap"]}}}"#).expect("policy");
+    let rig = rig(policy);
+    let listed = |client: &str| {
+        let id = rig.send_raw("tools/list", json!({"_meta": meta(client, json!({}))}));
+        rig.response(id)["result"]["tools"].as_array().expect("tools").clone()
+    };
+    let tap = |tools: &[Value]| tools.iter().find(|t| t["name"] == "tap").cloned().expect("tap");
+    let careful = tap(&listed("careful"));
+    assert_eq!(careful["inputSchema"]["properties"]["confirm"]["type"], "boolean", "{careful}");
+    assert!(careful["description"].as_str().is_some_and(|d| d.contains("Needs the user's confirmation every time")), "{careful}");
+    let other = tap(&listed("someone-else"));
+    assert!(
+        other["inputSchema"]["properties"].get("confirm").is_none()
+            && !other["description"].as_str().unwrap_or("").contains("confirmation")
+    );
+}
+
+#[test]
 fn tools_that_only_sometimes_destroy_confirm_only_when_they_do() {
     let (rig, _) = rig_world(Policy::default(), None);
     // Setting and keeping a preference, and a console command that stops nothing, are not asked about.

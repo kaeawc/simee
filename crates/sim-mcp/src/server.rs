@@ -802,8 +802,14 @@ impl Inner {
     /// change nothing.
     fn listed_tools(&self, client: &str, toolsets: &Toolsets, ctx: &Ctx) -> Vec<Value> {
         let mut listed = tools::list(toolsets, ctx);
-        if self.safety.policy_for(client).read_only {
+        let policy = self.safety.policy_for(client);
+        if policy.read_only {
             listed.retain(|t| t["name"].as_str().is_some_and(tools::read_only));
+        }
+        for tool in &mut listed {
+            if tool["name"].as_str().is_some_and(|name| policy.confirm_also.contains(name)) {
+                tools::mark_confirming(tool);
+            }
         }
         listed
     }

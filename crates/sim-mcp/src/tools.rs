@@ -249,6 +249,35 @@ fn describe(method: &str, params: &str, doc: &str, schema: &Value) -> String {
     text
 }
 
+/// The `confirm` field of a tool that asks for the user's confirmation.
+fn confirm_property() -> Value {
+    json!({"type": "boolean",
+        "description": "Only after the user has agreed, for a client that can't be asked itself: true confirms this call. \
+            A client that can be asked is asked, and this is ignored"})
+}
+
+/// Says in a listed tool that this client's policy makes it confirm, as the tools that always do
+/// say it: the sentence, and the `confirm` field. (A tool that confirms for every client has both
+/// already.)
+pub fn mark_confirming(tool: &mut Value) {
+    let Some(name) = tool["name"].as_str().map(str::to_owned) else { return };
+    if crate::safety::may_confirm(&name) {
+        return;
+    }
+    if let Some(description) = tool["description"].as_str() {
+        // Before the platforms line, where the others put it.
+        let sentence = crate::safety::confirm_sentence(&name);
+        tool["description"] = match description.split_once("\n\nPlatforms:") {
+            Some((head, rest)) => format!("{head} {sentence}\n\nPlatforms:{rest}"),
+            None => format!("{description} {sentence}"),
+        }
+        .into();
+    }
+    if let Some(properties) = tool["inputSchema"]["properties"].as_object_mut() {
+        properties.insert("confirm".into(), confirm_property());
+    }
+}
+
 /// A tool's input schema: the method's, less what's withheld, plus paging.
 fn input(method: &str) -> Value {
     let mut schema = input_schema(method).unwrap_or_else(|| json!({"type": "object"}));
@@ -256,9 +285,7 @@ fn input(method: &str) -> Value {
         properties.remove(name);
     }
     if crate::safety::may_confirm(method) {
-        schema["properties"]["confirm"] = json!({"type": "boolean",
-            "description": "Only after the user has agreed, for a client that can't be asked itself: true confirms this call. \
-                A client that can be asked is asked, and this is ignored"});
+        schema["properties"]["confirm"] = confirm_property();
     }
     if paged(method).is_some() {
         schema["properties"]["limit"] = json!({"type": "integer", "minimum": 1, "maximum": MAX_LIMIT,

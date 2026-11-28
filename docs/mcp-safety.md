@@ -52,10 +52,16 @@ same call the person agreed to.
 when the client's `boot` or `boot_many` asked for it is the client's own to stop, and needs no
 confirmation. Booting a device that was already running doesn't make it the client's.
 
-A policy can add tools to the confirming set (`"confirm": ["write", "exec"]`). A name that isn't a
+A policy can add tools to the confirming set (`"confirm": ["write", "exec"]`); that client's `tools/list` then shows them with the `confirm` field and the sentence, as for the tools that always confirm. A name that isn't a
 tool is an error when the policy is read: a misspelt tool would confirm nothing.
 
 ### What confirms, and what doesn't
+
+A `console` call is read the way the console runs it: every command of the call, and every line of
+each (the console takes a CR or an LF as the end of a command), so `ping\r\nkill` is a `kill` and
+a `kill` before a snapshot's deletion doesn't excuse it. The names are the stock console's, in
+`sim_core::console`, which `emu`'s own console parser matches through, so a name `emu` accepts for
+a deletion can't be one this layer doesn't know.
 
 Every tool the catalog marks as changing something was looked at. The rule: a call confirms when
 it removes something that nothing puts back (a device, files, an app and its data, a container, the
@@ -69,8 +75,8 @@ keychain, a preference), signals a process, or stops a device the client didn't 
 | `reset_keychain` | Every keychain item |
 | `prefs_delete`, and `prefs_batch` when an op has `delete` | A preference key |
 | `kill` | Ends a process on the device |
-| `shutdown`, and `console` with `kill`, `avd stop` | Stops a device. Not asked for one this client booted |
-| `console` with `avd snapshot delete` | A snapshot's data |
+| `shutdown`, and `console` with `kill`, `crash` or `avd stop` | Stops a device. Not asked for one this client booted |
+| `console` with `avd snapshot del` or `delete` | A snapshot's data. Always asked, also for a device this client booted |
 
 | Doesn't confirm | Why not, and what to do |
 | --- | --- |

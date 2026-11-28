@@ -199,7 +199,7 @@ impl Safety {
             return Verdict::Go(prepared);
         }
         // A shutdown of what this client started is its own to end; anything else it asks about.
-        let own_to_end = tool == "shutdown" || sometimes == Some(Destructive::Stops);
+        let own_to_end = tool == "shutdown" || matches!(sometimes, Some(Destructive::Console(e)) if e.ends_emulator && !e.deletes_snapshot);
         if own_to_end && !policy.confirm_also.contains(tool) {
             let clients = self.clients();
             let booted = clients.get(client).map(|c| &c.booted);
@@ -277,7 +277,7 @@ impl Safety {
                     state.booted.remove(&d.udid);
                 }
             }
-            "console" if destructive_args(tool, args) == Some(Destructive::Stops) => {
+            "console" if matches!(destructive_args(tool, args), Some(Destructive::Console(e)) if e.ends_emulator) => {
                 for d in &prepared.resolved {
                     state.booted.remove(&d.udid);
                 }
@@ -485,9 +485,14 @@ fn what_it_does(tool: &str, args: &Value, targets: &[(String, Result<Resolved, S
         "prefs_delete" => format!("delete the preference `{}` in `{}` of `{}` on {on}", text("key"), text("store"), text("bundle_id")),
         "prefs_batch" => format!("delete preference keys of `{}` in `{}` on {on}", text("bundle_id"), text("store")),
         "console" => {
-            let commands = console_commands(args).join("; ");
+            let commands = console_commands(args).join("; ").replace(['\r', '\n'], " ");
             match sometimes {
-                Some(Destructive::Snapshot) => format!("send `{commands}` to the emulator console of {on}: a snapshot is deleted"),
+                Some(Destructive::Console(e)) if e.ends_emulator && e.deletes_snapshot => {
+                    format!("send `{commands}` to the emulator console of {on}: the emulator stops and a snapshot is deleted")
+                }
+                Some(Destructive::Console(e)) if e.deletes_snapshot => {
+                    format!("send `{commands}` to the emulator console of {on}: a snapshot is deleted")
+                }
                 _ => format!("send `{commands}` to the emulator console of {on}: the emulator stops"),
             }
         }
@@ -498,10 +503,9 @@ fn what_it_does(tool: &str, args: &Value, targets: &[(String, Result<Resolved, S
 /// Why a call to a tool that only sometimes confirms does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Destructive {
-    /// A console command that stops the emulator.
-    Stops,
-    /// A console command that deletes a snapshot, or a batch of preferences with a delete in it.
-    Snapshot,
+    /// What the commands of a `console` call do between them.
+    Console(sim_core::console::Effects),
+    /// A batch of preferences with a delete in it.
     Deletes,
 }
 
@@ -514,19 +518,14 @@ fn console_commands(args: &Value) -> Vec<&str> {
     }
 }
 
-/// Whether this call to `tool` destroys something though the tool doesn't always: `console`'s
-/// `kill`, `avd stop` and `avd snapshot delete` do what `shutdown` and a delete do, behind another
-/// tool's name, and a `prefs_batch` with a delete op is a `prefs_delete`.
+/// Whether this call to `tool` destroys something though the tool doesn't always: a `console`
+/// that ends the emulator or deletes a snapshot does what `shutdown` and a delete do behind
+/// another tool's name, and a `prefs_batch` with a delete op is a `prefs_delete`. The console runs
+/// every line of every command, so each is read ([`sim_core::console`], which also holds the names
+/// `emu`'s console answers to).
 fn destructive_args(tool: &str, args: &Value) -> Option<Destructive> {
     match tool {
-        "console" => console_commands(args).iter().find_map(|command| {
-            let words: Vec<String> = command.split_whitespace().map(str::to_ascii_lowercase).collect();
-            match words.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-                ["kill", ..] | ["avd", "stop", ..] => Some(Destructive::Stops),
-                ["avd", "snapshot", "delete", ..] => Some(Destructive::Snapshot),
-                _ => None,
-            }
-        }),
+        "console" => Some(sim_core::console::effects_of(console_commands(args))).filter(|e| e.any()).map(Destructive::Console),
         "prefs_batch" => {
             let ops = args.get("ops").and_then(Value::as_array)?;
             // An op that isn't an object is the method's to refuse; one that says `delete` at all is asked about.

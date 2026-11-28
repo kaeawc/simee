@@ -128,7 +128,7 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   privacy service names, geometry,
   gesture planning, HID usages and buttons (per form factor: the Siri Remote, crown steps, watch
   gestures, orientations and the Purple orientation message), `carplay.rs` (StarkConfig, runtime
-  gate), `goldfish.rs` (stock emulator key names, the `qwerty2` key set, sensor masks), `xr.rs`
+  gate), `goldfish.rs` (stock emulator key names, the `qwerty2` key set, sensor masks), `console.rs` (what console commands end or delete, whose names emu's console parser shares), `xr.rs`
   (Android XR commands and the `xr_service` messages), `vhal.rs` (the vehicle HAL's
   `EmulatorMessage` codec, property names and values), `network.rs` (the stock console's
   `network speed|delay` presets, parsing and `network status` report), `framebuffer.rs` (which
