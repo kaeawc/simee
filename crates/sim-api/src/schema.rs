@@ -57,6 +57,9 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         "admission_timeout_s" | "count" => Int,
         // every iOS method's device set (#409)
         "set" => Str,
+        // Android's kill and exec (#414)
+        "force" => Bool,
+        "max_bytes" => Int,
         // stream_* (#266)
         "whip_url" | "token" | "stream_id" => Str,
         "fps" | "max_size" | "bitrate" => Int,

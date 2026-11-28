@@ -148,72 +148,72 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `stream_status` | Android, iOS | stream_id | A stream's state (starting, running, ended and why), its stages in the order reached (requested, first_encoded_frame, whip_connected, ended; ms since requested) and stats (encoded, sent, keyframes, bytes, fps, bitrate_bps, the publisher's bitrate_estimate_bps, the viewers' pli and fir keyframe requests, input events and errors); renews its lease |
 | `stream_stop` | Android, iOS | stream_id | Stop a stream: ends its encode loop and sends the WHIP DELETE; its last status, with deleted |
 | `streams` | Android, iOS | device?; iOS: set? | This process's streams (or one device's), each as stream_status shows it, without renewing a lease |
-| `contrast_check` | Android, iOS | device, region?, scale?, appearance?(current\|both), restore?(light\|dark), settle_ms?(500), path?, display?(main\|outer\|inner\|carplay); iOS: set? | Text and controls below WCAG contrast in a screenshot, from pixels alone: finds text-like regions, estimates each one's foreground and background, and reports those under 4.5:1 (normal text) or 3:1 (large text of about 18 pt, icons and controls) with their box, the two colours and the ratio, and the screenshot with the findings boxed (`png`, or written to path). Text over a photo or a busy background has no one background and isn't judged. appearance both (iOS) checks the light and the dark UI (switches, waits settle_ms, checks) and leaves the device in restore (default light); Android can't switch appearance yet. region is {x, y, width, height} in pixels; scale is pixels per point (default: the device's, else 1) |
-| `tap` | Android, iOS | device, x, y, hold_ms?, display?(main\|outer\|inner\|carplay); iOS: set? | Tap at pixels, held hold_ms (default: iOS 10, Android 60) (display, iOS only: an iPhone Duo's outer or inner screen, an iPhone's CarPlay screen) |
-| `swipe` | Android, iOS | device, x1, y1, x2, y2, duration_ms?, settle?, display?(main\|outer\|inner\|carplay), edge?(top\|bottom\|left\|right; iOS); iOS: set? | Swipe between pixels over duration_ms (default 300; iOS sends its samples on schedule, so a busy host doesn't stretch it); with edge (iOS) the touch comes in from that screen edge, as a drag from Simulator.app's bezel: home and the app switcher from the bottom, Notification Center and Control Center from the top (Android's edge gestures need only the start point) |
-| `touch` | Android, iOS | device, x, y, phase(down\|move\|up), display?(main\|outer\|inner\|carplay), edge?(top\|bottom\|left\|right; iOS); iOS: set? | One raw touch sample |
-| `button` | Android, iOS | device, button(home\|lock\|side\|siri\|apple-pay\|action \| back\|volume-up\|volume-down\|recents\|menu\|up\|down\|left\|right\|select\|play-pause), hold_ms?; iOS: set? | Press a hardware button, as the device's form factor has it: the Siri Remote on Apple TV (menu/back, home, select, play-pause, arrows) and the D-pad on Android TV; on Apple Watch home is the crown's press. Held hold_ms (default: 10 for home and lock on an iPhone or iPad, else 80) |
-| `type` | Android, iOS | device, text; iOS: set? | Type on the hardware keyboard (iOS: a key report every 3 ms) |
-| `key` | Android, iOS | device, usage; iOS: set? | Press a key by HID usage (iOS: down and up 3 ms apart) |
-| `open_url` | Android, iOS | device, url; iOS: set? | Open a URL (Android: `am start -a VIEW`) |
-| `install` | Android, iOS | device, path; iOS: set? | Install an .app (Android: an .apk with `adb install -r`, an .aab through bundletool when it is on the PATH) |
-| `uninstall` | Android, iOS | device, bundle_id; iOS: set? | Uninstall an app (Android: the package name; `pm uninstall`) |
-| `launch` | Android, iOS | device, bundle_id, restart?; iOS: args?, env?, shaped?, malloc_stack_logging?, set? | Launch (iOS: with arguments and environment, shaped injecting the network shaper, malloc_stack_logging setting MallocStackLogging=1 for mem_leaks' stacks and mem_history; Android: the package's launcher activity); restart: terminate a running instance first, default true (Android: `am start -S`); false brings a running app to the front; returns pid (Android: and the `activity` it started) |
-| `terminate` | Android, iOS | device, bundle_id; iOS: set? | Terminate an app (Android: `am force-stop`) |
-| `apps` | Android, iOS | device; iOS: set?; Android: all? | Installed bundle ids (Android: the third-party packages, with all the system's too) |
-| `appearance` | iOS | device, mode(light\|dark), set? | Light or dark UI |
-| `location` | Android, iOS | device, latitude, longitude; iOS: set? | Simulated location |
-| `privacy` | iOS | device, action(grant\|revoke), service, bundle_id, set? | Privacy permission |
-| `push` | iOS | device, bundle_id, payload, set? | Deliver an APNs payload (object) |
-| `status_bar` | iOS | device, time?, data_network?, wifi_mode?, wifi_bars?, cellular_mode?, cellular_bars?, operator?, battery_state?, battery_level?, set? | Override status bar |
-| `clear_status_bar` | iOS | device, set? | Remove status bar overrides |
-| `content_size` | iOS | device, size, set? | Dynamic Type size (name or 0-11) |
-| `increase_contrast` | iOS | device, on, set? | Increase Contrast |
-| `dynamic_island` | iOS | device, suppressed, set? | Hide the Dynamic Island |
-| `backlight` | iOS | device, on, set? | Display backlight |
-| `keyboard_language` | iOS | device, language, set? | Software keyboard language |
-| `hardware_keyboard` | iOS | device, on, set? | Connect the hardware keyboard |
-| `ca_debug` | iOS | device, option, on, set? | Render overlay (see ca_debug_state for names) |
-| `ca_debug_state` | iOS | device, set? | Every render overlay and whether it is on |
-| `reset_keychain` | iOS | device, set? | Delete every keychain item |
-| `memory_warning` | iOS | device, set? | Simulate a memory warning |
-| `notify` | iOS | device, name, state?, set? | Post a Darwin notification (optionally setting its state) |
-| `biometric` | iOS | device, action(match\|nomatch\|enroll\|unenroll), face?, set? | Touch ID / Face ID |
-| `exec` | iOS | device, program, args?, env?, set? | Run a program inside the device; returns stdout/stderr |
-| `logs` | iOS | device, last?, predicate?, stream?(false), set? | Unified log lines (default last 1m), as `log show --style compact` prints them. stream: the first call starts one in-device `log stream` for the device's boot, and later calls answer the window from it without spawning (log show answers a window reaching back before the stream started, a predicate, and a `last` other than <n>s\|m\|h\|d); the stream stops after 5 idle minutes or a reboot. It omits launchd_sim's lines, signpost state dumps and `Last log repeated` lines (iOS 27.2: 12% of a settled device's lines, 1% of a just-booted one's), and its timestamps are often 1 ms later |
-| `processes` | iOS | device, set? | Device processes with CPU and memory |
-| `kill` | iOS | device, pid, signal?, set? | Signal a device process |
-| `connections` | iOS | device, set? | Open sockets of device processes |
-| `traffic` | iOS | device, set? | Bytes in/out per device process |
-| `mem_leaks` | iOS | device, bundle_id \| pid, raw?, timeout_s?(120), set? | Leaked memory of a running app (the host's `leaks`): totals, and the leaks grouped by type and allocation stack, most bytes first, each with its instances and stack (innermost frame first; launch with malloc_stack_logging for stacks). raw adds the report as printed. See [Memory tools](#memory-tools-mem_) |
-| `mem_heap` | iOS | device, bundle_id \| pid, raw?, timeout_s?(120), set? | A running app's heap by class (the host's `heap`): zones, node and byte totals, and every class with its count, bytes and average size, most instances first. raw adds the report as printed |
-| `mem_vmmap` | iOS | device, bundle_id \| pid, raw?, timeout_s?(120), set? | A running app's memory regions (the host's `vmmap --summary`): each region type's virtual, resident, dirty, swapped, volatile and empty bytes and count, the malloc zones with allocations and fragmentation, and the totals. raw adds the report as printed |
-| `mem_history` | iOS | device, bundle_id \| pid, address, raw?, timeout_s?(120), set? | The allocation stack of an address in a running app (the host's `malloc_history`), as events with their stacks; needs the app launched with malloc_stack_logging (MallocStackLogging=1 logs live allocations only). raw adds the report as printed |
-| `containers` | iOS | device, sizes?, set? | App data and bundle containers |
-| `ls` | iOS | device, path?, set? | List a directory under the device data dir |
-| `read` | iOS | device, path, set? | Read a file (base64) |
-| `write` | iOS | device, path, text? \| base64?, set? | Write a file |
-| `rm` | iOS | device, path, set? | Remove a file or directory |
-| `du` | iOS | device, path?, set? | Size in bytes |
-| `clear_container` | iOS | device, path, set? | Empty a container (an app's data) without deleting it |
-| `defaults_read` | iOS | device, domain, set? | Read a preferences domain |
-| `defaults_write` | iOS | device, domain, key, value, type?, set? | Write a preference (type: string\|int\|float\|bool) |
-| `prefs_stores` | Android, iOS | device, bundle_id; iOS: set? | An app's preference stores, each with the id the other prefs_* methods take: Android `shared_prefs/<name>.xml` and DataStore `datastore/<name>.preferences_pb`, iOS the app's domain (its bundle id) and its app-group suites; any other iOS domain is reachable by its name |
-| `prefs_read` | Android, iOS | device, bundle_id, store?, fresh?; iOS: set? | Every key of an app's preference stores (or one) with its typed value, {type, value}: string, int, long, float, double, bool, string_set (Android), date (ISO 8601), data (base64), array and dictionary (iOS; of typed values), and the read-only unsupported {native, raw} for what no type holds exactly. iOS reads integers as long and reals as double. Without store, each store answers {store, values} or {store, error}. fresh (iOS): read through cfprefsd, one in-device call, for writes it hasn't flushed to disk yet (it flushes about every 10 s) |
-| `prefs_write` | Android, iOS | device, bundle_id, store, key, value, type(string\|int\|long\|float\|double\|bool\|string_set\|date\|data\|array\|dictionary); iOS: set? | Set one key to a typed value (refused when the value isn't of its type or the store can't hold the type); visible says whether the app sees it now or after_relaunch, app what was done to the app for it (untouched, stopped, relaunched: a running Android app writes its old values back over the file), with a note on why |
-| `prefs_delete` | Android, iOS | device, bundle_id, store, key; iOS: set? | Remove one key; visible and app as prefs_write's |
-| `prefs_batch` | Android, iOS | device, bundle_id, store, ops([{key, type, value} \| {key, delete: true}]); iOS: set? | Set and remove several keys of one store, all or nothing: every op is checked first (each key once), then the store is written once or not at all (iOS: a batch refused up front changes nothing, but cfprefsd applies an accepted one key by key, so a reader at that moment can see part of it; if the final synchronize fails after the keys were handed over, the error names them and says some may already be live in the running app) |
-| `prefs_watch` | Android, iOS | device, bundle_id, store?, cursor?, wait_ms?; iOS: set? | Changes to an app's preference stores (or one), as `logs` stream does: the first call starts a feed in this process and returns a cursor; a call with it returns the changes since, {store, key, old, new, at}, oldest first, waiting up to wait_ms (at most 60000) for one, and the next cursor (reset: the feed restarted, re-read; missed: changes dropped unread past its 16 MiB; ended: the device stopped or nobody read it for 5 minutes, and a call without a cursor starts anew) |
-| `crash_reports` | iOS | device, set? | Host crash reports for this device |
-| `info` | Android, iOS | device; iOS: set? | Paths and identity |
-| `network_shape` | iOS | device, preset?(offline\|3g\|edge\|lte\|lossy\|very-bad\|none), offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?, port_base?, port_count?, rules?([{pattern, offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?}]), proxy?(default true), inject?(false\|true\|"launchd"\|"boot"), set? | Shape the device's network without root. proxy: a shaping HTTP/SOCKS proxy set in the device's configd_sim. inject: an in-process socket shaper; "boot" reboots the device with it in launchd's environment so every process, WebKit included, is shaped live by the profile |
-| `network_state` | iOS | device, set? | Current profile, proxy port and injection state |
-| `network_flows` | iOS | device, set? | Connections through the device's shaping proxy (host, bytes, duration, outcome) |
-| `network_clear` | iOS | device, set? | Remove shaping: clear the device proxy, stop the proxy, remove injection |
-| `audio_state` | iOS | device, set? | Device audio settings (routed host UIDs, volume) and every host audio device |
-| `audio_volume` | iOS | device, level(0-100), set? | Device output volume (100 = unity); applies to audio clients started afterwards |
-| `audio_route` | iOS | device, scope(input\|output), uid \| "default", set? | Pin the device's input or output to a host device (any device, including loopback); applies to clients started afterwards |
-| `audio_capture_start` | iOS | device, path?(.wav), mute?, set? | Capture this device's audio output with a process tap (no driver); mute silences it on the host meanwhile; returns capture_id |
+| `contrast_check` | Android, iOS | device, region?, scale?, appearance?(current\|both), restore?(light\|dark), settle_ms?(500), path?, display?(main\|outer\|inner\|carplay) | Text and controls below WCAG contrast in a screenshot, from pixels alone: finds text-like regions, estimates each one's foreground and background, and reports those under 4.5:1 (normal text) or 3:1 (large text of about 18 pt, icons and controls) with their box, the two colours and the ratio, and the screenshot with the findings boxed (`png`, or written to path). Text over a photo or a busy background has no one background and isn't judged. appearance both (iOS) checks the light and the dark UI (switches, waits settle_ms, checks) and leaves the device in restore (default light); Android can't switch appearance yet. region is {x, y, width, height} in pixels; scale is pixels per point (default: the device's, else 1) |
+| `tap` | Android, iOS | device, x, y, hold_ms?, display?(main\|outer\|inner\|carplay) | Tap at pixels, held hold_ms (default: iOS 10, Android 60) (display, iOS only: an iPhone Duo's outer or inner screen, an iPhone's CarPlay screen) |
+| `swipe` | Android, iOS | device, x1, y1, x2, y2, duration_ms?, settle?, display?(main\|outer\|inner\|carplay), edge?(top\|bottom\|left\|right; iOS) | Swipe between pixels over duration_ms (default 300; iOS sends its samples on schedule, so a busy host doesn't stretch it); with edge (iOS) the touch comes in from that screen edge, as a drag from Simulator.app's bezel: home and the app switcher from the bottom, Notification Center and Control Center from the top (Android's edge gestures need only the start point) |
+| `touch` | Android, iOS | device, x, y, phase(down\|move\|up), display?(main\|outer\|inner\|carplay), edge?(top\|bottom\|left\|right; iOS) | One raw touch sample |
+| `button` | Android, iOS | device, button(home\|lock\|side\|siri\|apple-pay\|action \| back\|volume-up\|volume-down\|recents\|menu\|up\|down\|left\|right\|select\|play-pause), hold_ms? | Press a hardware button, as the device's form factor has it: the Siri Remote on Apple TV (menu/back, home, select, play-pause, arrows) and the D-pad on Android TV; on Apple Watch home is the crown's press. Held hold_ms (default: 10 for home and lock on an iPhone or iPad, else 80) |
+| `type` | Android, iOS | device, text | Type on the hardware keyboard (iOS: a key report every 3 ms) |
+| `key` | Android, iOS | device, usage | Press a key by HID usage (iOS: down and up 3 ms apart) |
+| `open_url` | Android, iOS | device, url | Open a URL (Android: `am start -a VIEW`) |
+| `install` | Android, iOS | device, path | Install an .app (Android: an .apk with `adb install -r`, an .aab through bundletool when it is on the PATH) |
+| `uninstall` | Android, iOS | device, bundle_id | Uninstall an app (Android: the package name; `pm uninstall`) |
+| `launch` | Android, iOS | device, bundle_id, restart?; iOS: args?, env?, shaped?, malloc_stack_logging? | Launch (iOS: with arguments and environment, shaped injecting the network shaper, malloc_stack_logging setting MallocStackLogging=1 for mem_leaks' stacks and mem_history; Android: the package's launcher activity); restart: terminate a running instance first, default true (Android: `am start -S`); false brings a running app to the front; returns pid (Android: and the `activity` it started) |
+| `terminate` | Android, iOS | device, bundle_id | Terminate an app (Android: `am force-stop`) |
+| `apps` | Android, iOS | device; Android: all? | Installed bundle ids (Android: the third-party packages, with all the system's too) |
+| `appearance` | iOS | device, mode(light\|dark) | Light or dark UI |
+| `location` | Android, iOS | device, latitude, longitude | Simulated location |
+| `privacy` | iOS | device, action(grant\|revoke), service, bundle_id | Privacy permission |
+| `push` | iOS | device, bundle_id, payload | Deliver an APNs payload (object) |
+| `status_bar` | iOS | device, time?, data_network?, wifi_mode?, wifi_bars?, cellular_mode?, cellular_bars?, operator?, battery_state?, battery_level? | Override status bar |
+| `clear_status_bar` | iOS | device | Remove status bar overrides |
+| `content_size` | iOS | device, size | Dynamic Type size (name or 0-11) |
+| `increase_contrast` | iOS | device, on | Increase Contrast |
+| `dynamic_island` | iOS | device, suppressed | Hide the Dynamic Island |
+| `backlight` | iOS | device, on | Display backlight |
+| `keyboard_language` | iOS | device, language | Software keyboard language |
+| `hardware_keyboard` | iOS | device, on | Connect the hardware keyboard |
+| `ca_debug` | iOS | device, option, on | Render overlay (see ca_debug_state for names) |
+| `ca_debug_state` | iOS | device | Every render overlay and whether it is on |
+| `reset_keychain` | iOS | device | Delete every keychain item |
+| `memory_warning` | iOS | device | Simulate a memory warning |
+| `notify` | iOS | device, name, state? | Post a Darwin notification (optionally setting its state) |
+| `biometric` | iOS | device, action(match\|nomatch\|enroll\|unenroll), face? | Touch ID / Face ID |
+| `exec` | Android, iOS | device, program, args?, env?; Android: timeout_s?, max_bytes? | Run a program inside the device; returns stdout/stderr. Android: over adb as the shell user, the argv passed through unchanged (quoted, so nothing in it is expanded; a program can't start with `-`), with exit_code; past timeout_s (30, at most 86400) it is stopped and the call fails, and a stream that reaches max_bytes (8 MiB) is cut there (truncated true) and the program stopped if it still ran (exit_code null). Stopping it stops its process group, so what it started too |
+| `logs` | iOS | device, last?, predicate? | Unified log lines (default last 1m) |
+| `processes` | Android, iOS | device | Device processes with CPU and memory. Android: the guest's `ps -A` (cpu is CPU time over the process's life), each app process with its package |
+| `kill` | Android, iOS | device, pid \| bundle_id, signal?; Android: force? | Signal a device process (default 15, SIGTERM). iOS takes pid only. Android: bundle_id stops the app instead (`am force-stop`); a process the shell user may not signal is signalled as root (`su 0`, on google_apis images); init, zygote, zygote64, system_server, surfaceflinger, servicemanager, hwservicemanager, vndservicemanager, vold, lmkd, logd, adbd, netd, installd, ueventd, keystore2 and statsd are refused unless force |
+| `connections` | iOS | device | Open sockets of device processes |
+| `traffic` | iOS | device | Bytes in/out per device process |
+| `mem_leaks` | iOS | device, bundle_id \| pid, raw?, timeout_s?(120) | Leaked memory of a running app (the host's `leaks`): totals, and the leaks grouped by type and allocation stack, most bytes first, each with its instances and stack (innermost frame first; launch with malloc_stack_logging for stacks). raw adds the report as printed. See [Memory tools](#memory-tools-mem_) |
+| `mem_heap` | iOS | device, bundle_id \| pid, raw?, timeout_s?(120) | A running app's heap by class (the host's `heap`): zones, node and byte totals, and every class with its count, bytes and average size, most instances first. raw adds the report as printed |
+| `mem_vmmap` | iOS | device, bundle_id \| pid, raw?, timeout_s?(120) | A running app's memory regions (the host's `vmmap --summary`): each region type's virtual, resident, dirty, swapped, volatile and empty bytes and count, the malloc zones with allocations and fragmentation, and the totals. raw adds the report as printed |
+| `mem_history` | iOS | device, bundle_id \| pid, address, raw?, timeout_s?(120) | The allocation stack of an address in a running app (the host's `malloc_history`), as events with their stacks; needs the app launched with malloc_stack_logging (MallocStackLogging=1 logs live allocations only). raw adds the report as printed |
+| `containers` | iOS | device, sizes? | App data and bundle containers |
+| `ls` | iOS | device, path? | List a directory under the device data dir |
+| `read` | iOS | device, path | Read a file (base64) |
+| `write` | iOS | device, path, text? \| base64? | Write a file |
+| `rm` | iOS | device, path | Remove a file or directory |
+| `du` | iOS | device, path? | Size in bytes |
+| `clear_container` | iOS | device, path | Empty a container (an app's data) without deleting it |
+| `defaults_read` | iOS | device, domain | Read a preferences domain |
+| `defaults_write` | iOS | device, domain, key, value, type? | Write a preference (type: string\|int\|float\|bool) |
+| `prefs_stores` | Android, iOS | device, bundle_id | An app's preference stores, each with the id the other prefs_* methods take: Android `shared_prefs/<name>.xml` and DataStore `datastore/<name>.preferences_pb`, iOS the app's domain (its bundle id) and its app-group suites; any other iOS domain is reachable by its name |
+| `prefs_read` | Android, iOS | device, bundle_id, store?, fresh? | Every key of an app's preference stores (or one) with its typed value, {type, value}: string, int, long, float, double, bool, string_set (Android), date (ISO 8601), data (base64), array and dictionary (iOS; of typed values), and the read-only unsupported {native, raw} for what no type holds exactly. iOS reads integers as long and reals as double. Without store, each store answers {store, values} or {store, error}. fresh (iOS): read through cfprefsd, one in-device call, for writes it hasn't flushed to disk yet (it flushes about every 10 s) |
+| `prefs_write` | Android, iOS | device, bundle_id, store, key, value, type(string\|int\|long\|float\|double\|bool\|string_set\|date\|data\|array\|dictionary) | Set one key to a typed value (refused when the value isn't of its type or the store can't hold the type); visible says whether the app sees it now or after_relaunch, app what was done to the app for it (untouched, stopped, relaunched: a running Android app writes its old values back over the file), with a note on why |
+| `prefs_delete` | Android, iOS | device, bundle_id, store, key | Remove one key; visible and app as prefs_write's |
+| `prefs_batch` | Android, iOS | device, bundle_id, store, ops([{key, type, value} \| {key, delete: true}]) | Set and remove several keys of one store, all or nothing: every op is checked first (each key once), then the store is written once or not at all (iOS: a batch refused up front changes nothing, but cfprefsd applies an accepted one key by key, so a reader at that moment can see part of it; if the final synchronize fails after the keys were handed over, the error names them and says some may already be live in the running app) |
+| `prefs_watch` | Android, iOS | device, bundle_id, store?, cursor?, wait_ms? | Changes to an app's preference stores (or one), as `logs` stream does: the first call starts a feed in this process and returns a cursor; a call with it returns the changes since, {store, key, old, new, at}, oldest first, waiting up to wait_ms (at most 60000) for one, and the next cursor (reset: the feed restarted, re-read; missed: changes dropped unread past its 16 MiB; ended: the device stopped or nobody read it for 5 minutes, and a call without a cursor starts anew) |
+| `crash_reports` | iOS | device | Host crash reports for this device |
+| `info` | Android, iOS | device | Paths and identity |
+| `network_shape` | iOS | device, preset?(offline\|3g\|edge\|lte\|lossy\|very-bad\|none), offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?, port_base?, port_count?, rules?([{pattern, offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?}]), proxy?(default true), inject?(false\|true\|"launchd"\|"boot") | Shape the device's network without root. proxy: a shaping HTTP/SOCKS proxy set in the device's configd_sim. inject: an in-process socket shaper; "boot" reboots the device with it in launchd's environment so every process, WebKit included, is shaped live by the profile |
+| `network_state` | iOS | device | Current profile, proxy port and injection state |
+| `network_flows` | iOS | device | Connections through the device's shaping proxy (host, bytes, duration, outcome) |
+| `network_clear` | iOS | device | Remove shaping: clear the device proxy, stop the proxy, remove injection |
+| `audio_state` | iOS | device | Device audio settings (routed host UIDs, volume) and every host audio device |
+| `audio_volume` | iOS | device, level(0-100) | Device output volume (100 = unity); applies to audio clients started afterwards |
+| `audio_route` | iOS | device, scope(input\|output), uid \| "default" | Pin the device's input or output to a host device (any device, including loopback); applies to clients started afterwards |
+| `audio_capture_start` | iOS | device, path?(.wav), mute? | Capture this device's audio output with a process tap (no driver); mute silences it on the host meanwhile; returns capture_id |
 | `audio_capture_stop` | iOS | capture_id | Stop a capture: frames, duration_ms, rms, peak, dbfs, path |
 | `audio_mute` | iOS | device, on, set? | Silence (or restore) this device's audio on the host: a per-device null sink |
 | `camera_sources` | Android, iOS | kind?(host\|virtual\|synthetic) | The sources a device camera can link to, each with the `source` id camera_link takes: the host's cameras (built-in, external, Continuity Camera, and virtual cameras such as OBS Virtual Camera, flagged `virtual`) and the synthetic kinds (pattern:testcard, qr:, text:, image:, video: on macOS, solid:); and the host's camera permission (macOS: the TCC status of the app that started the server, with the fix when it blocks capture), read without ever prompting |

@@ -17,19 +17,22 @@
 //!
 //! Security: every bind requires a bearer token from a token file only its owner can read (created
 //! in simee's state directory when none is named); [`Config::no_auth`] turns that off, on a
-//! loopback bind only. A non-loopback bind needs [`Config::insecure_remote`] (there is no TLS
-//! here). A browser's `Origin` must be a loopback one, and on a loopback bind so must `Host` (DNS
-//! rebinding). A request head has one deadline from its first byte, bodies are bounded in size and
-//! time, connections are capped per peer address and in all, and an error closes the connection
-//! (so a body nobody read is never taken for the next request). A session belongs to the token
-//! that opened it. SSE streams carry no event ids, so a dropped stream can't be resumed.
+//! loopback bind only. A non-loopback bind needs TLS ([`Config::tls`], the `tls` cargo feature) or
+//! [`Config::insecure_remote`] (plain HTTP: the token crosses the network in the clear). A browser's
+//! `Origin` must be a loopback one, and on a loopback bind so must `Host` (DNS rebinding). A request
+//! head has one deadline from its first byte, bodies are bounded in size and time, connections are
+//! capped per peer address and in all, and an error closes the connection (so a body nobody read is
+//! never taken for the next request). Over TLS the handshake is under the same deadline and slots,
+//! and reads are bounded by one deadline however many socket reads a record takes (`conn.rs`). A
+//! session belongs to the token that opened it. SSE streams carry no event ids, so a dropped stream
+//! can't be resumed.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
@@ -41,6 +44,11 @@ use crate::rpc::{self, INVALID_REQUEST, Incoming, LEGACY, META_SUBSCRIPTION, MOD
 use crate::server::{Server, Timing};
 use crate::tasks::Sink;
 use crate::tools::Toolsets;
+
+mod conn;
+mod tls;
+
+use conn::Conn;
 
 /// The one path the transport serves.
 pub const ENDPOINT: &str = "/mcp";
@@ -117,8 +125,11 @@ pub struct Config {
     /// process (and anything a reverse proxy on this host forwards) can then drive the devices.
     pub no_auth: bool,
     /// Acknowledges that a non-loopback bind serves plain HTTP: the token crosses the network in
-    /// the clear.
+    /// the clear. Not needed with [`Config::tls`].
     pub insecure_remote: bool,
+    /// Serve HTTPS (TLS 1.3) instead of HTTP. Needs the `tls` cargo feature: without it
+    /// [`start`] fails and says so.
+    pub tls: Option<Tls>,
     pub toolsets: Toolsets,
     pub limits: Limits,
     pub timing: Timing,
@@ -131,11 +142,24 @@ impl Config {
             token_file: None,
             no_auth: false,
             insecure_remote: false,
+            tls: None,
             toolsets: Toolsets::default(),
             limits: Limits::default(),
             timing: Timing::default(),
         }
     }
+}
+
+/// Where a TLS server gets its certificate.
+#[derive(Clone, Debug)]
+pub enum Tls {
+    /// A PEM certificate chain (leaf first) and its PEM private key.
+    Files { cert: PathBuf, key: PathBuf },
+    /// A self-signed certificate for development, made on first use and cached in `dir` (default:
+    /// simee's state directory) in a file only its owner can read. It names `localhost`, the
+    /// loopback addresses, the address the server binds when that is one address, and `names`. A
+    /// client trusts it by pinning the SHA-256 fingerprint the server prints.
+    SelfSigned { dir: Option<PathBuf>, names: Vec<String> },
 }
 
 /// simee's state directory: `$SIMEE_STATE_DIR`, else `~/Library/Application Support/simee` on
@@ -165,7 +189,16 @@ pub fn default_token_file() -> io::Result<PathBuf> {
 /// Serves until the process ends.
 pub fn serve(backend: Arc<dyn Backend>, config: Config) -> io::Result<()> {
     let running = start(backend, config)?;
-    eprintln!("simee mcp: Streamable HTTP on http://{}{ENDPOINT}", running.addr());
+    match running.tls_fingerprint() {
+        Some(fingerprint) => {
+            eprintln!("simee mcp: Streamable HTTP over TLS 1.3 on https://{}{ENDPOINT}", running.addr());
+            if let Some(cert) = running.tls_certificate() {
+                eprintln!("simee mcp: certificate {} (give clients this file, or pin the fingerprint below)", cert.display());
+            }
+            eprintln!("simee mcp: certificate SHA-256 fingerprint {fingerprint}");
+        }
+        None => eprintln!("simee mcp: Streamable HTTP on http://{}{ENDPOINT}", running.addr()),
+    }
     match running.token_file() {
         Some(path) => eprintln!("simee mcp: bearer tokens from {} (send `Authorization: Bearer <token>`)", path.display()),
         None => eprintln!("simee mcp: no authentication (--no-auth): any local user or process can drive the devices"),
@@ -177,6 +210,7 @@ pub fn serve(backend: Arc<dyn Backend>, config: Config) -> io::Result<()> {
 /// Binds and starts serving on a thread of its own.
 pub fn start(backend: Arc<dyn Backend>, config: Config) -> io::Result<Running> {
     let tokens = prepare_auth(&config, default_token_file)?;
+    let tls = config.tls.as_ref().map(|tls| tls::Server::new(tls, config.addr.ip())).transpose()?;
     let listener = TcpListener::bind(config.addr)?;
     let addr = listener.local_addr()?;
     let router = Arc::new(Router::default());
@@ -186,6 +220,7 @@ pub fn start(backend: Arc<dyn Backend>, config: Config) -> io::Result<Running> {
         loopback: addr.ip().is_loopback(),
         config,
         tokens,
+        tls,
         router,
         stateless,
         sessions: Mutex::default(),
@@ -223,6 +258,17 @@ impl Running {
         lock(&self.shared.sessions).len()
     }
 
+    /// The SHA-256 fingerprint of the certificate clients see, as `AB:CD:…` (`None` without TLS).
+    pub fn tls_fingerprint(&self) -> Option<&str> {
+        self.shared.tls.as_ref().map(tls::Server::fingerprint)
+    }
+
+    /// The PEM certificate file to give clients so they trust the server (`None` without TLS):
+    /// the one named, or, for a self-signed certificate, a copy without its key.
+    pub fn tls_certificate(&self) -> Option<&Path> {
+        self.shared.tls.as_ref().map(tls::Server::certificate)
+    }
+
     /// The token file requests are checked against (`None` with [`Config::no_auth`]).
     pub fn token_file(&self) -> Option<&Path> {
         self.shared.tokens.as_ref().map(|t| t.path.as_path())
@@ -253,12 +299,13 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Checks the bind against the policy and loads the token file (`default` when none is named).
 fn prepare_auth(config: &Config, default: impl FnOnce() -> io::Result<PathBuf>) -> io::Result<Option<Tokens>> {
     let loopback = config.addr.ip().is_loopback();
-    if !loopback && !config.insecure_remote {
+    if !loopback && !config.insecure_remote && config.tls.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "{} is not a loopback address: this server has no TLS, so its bearer token would cross the network in the clear; \
-                 pass --insecure-remote to serve it anyway (on a trusted network or behind a TLS proxy)",
+                "{} is not a loopback address: without TLS its bearer token would cross the network in the clear; \
+                 serve HTTPS with --tls-cert and --tls-key (or --tls-self-signed for development), or pass \
+                 --insecure-remote to serve plain HTTP anyway (on a trusted network or behind a TLS proxy)",
                 config.addr
             ),
         ));
@@ -534,6 +581,7 @@ fn origin_allowed(origin: &str) -> bool {
 
 // ---- Routing what servers say back to the requests that asked ----
 
+#[derive(Debug, PartialEq, Eq)]
 enum Out {
     Response(String),
     Note(String),
@@ -543,19 +591,31 @@ enum Out {
 struct Route {
     id: Value,
     token: Option<Value>,
-    tx: Sender<Out>,
+    tx: Arc<NoteTx>,
 }
 
-/// How many messages a session's `GET` stream queues for a client that reads slowly. Messages for
-/// one resource are one (the latest), so this is how many different things can change before the
-/// oldest is dropped: they are notifications that something changed, and the client reads the
+/// How many notifications a stream's queue holds for a client that reads slowly: a request's
+/// own (progress, what a `subscriptions/listen` announces) and a session's `GET` stream. Messages
+/// for one resource are one (the latest), so this is how many different things can change before
+/// the oldest is dropped: they are notifications that something changed, and the client reads the
 /// state when it next looks.
-const STANDALONE_QUEUE: usize = 256;
+const NOTE_QUEUE: usize = 256;
 
-/// What a `GET` stream's queue holds: the messages, oldest first, and whether its sender is gone.
+/// A queued notification.
+struct Note {
+    /// What it supersedes: a later one with the same key replaces it.
+    key: Option<String>,
+    line: String,
+    /// Never dropped for room (a `subscriptions/listen`'s acknowledgement, which comes first).
+    pinned: bool,
+}
+
+/// What a stream's queue holds: the notifications, oldest first, the response (a request's one
+/// and last message, kept apart so that no notification can push it out), and whether its sender
+/// is gone.
 struct QueueState {
-    /// Each message with what it supersedes: a later one with the same key replaces it.
-    notes: VecDeque<(Option<String>, String)>,
+    notes: VecDeque<Note>,
+    response: Option<String>,
     closed: bool,
 }
 
@@ -565,32 +625,53 @@ struct Queue {
     capacity: usize,
 }
 
-/// The sending end of a `GET` stream's queue. It never waits for the client, so a stalled client
-/// can't hold up the server's watcher, and dropping it ends the stream.
+/// The sending end of a stream's queue. It never waits for the client, so a stalled client can't
+/// hold up the server's watcher, and dropping it ends the stream.
 struct NoteTx(Arc<Queue>);
 
-/// The `GET` stream's end of the queue.
+/// The stream's end of the queue.
 struct NoteRx(Arc<Queue>);
 
 fn note_queue(capacity: usize) -> (NoteTx, NoteRx) {
-    let queue =
-        Arc::new(Queue { state: Mutex::new(QueueState { notes: VecDeque::new(), closed: false }), ready: Condvar::new(), capacity });
+    let queue = Arc::new(Queue {
+        state: Mutex::new(QueueState { notes: VecDeque::new(), response: None, closed: false }),
+        ready: Condvar::new(),
+        capacity,
+    });
     (NoteTx(queue.clone()), NoteRx(queue))
 }
 
 impl NoteTx {
-    /// Queues `line`. A queued message with the same `key` is dropped for it (only the latest
-    /// state of a resource matters), and past the capacity the oldest message goes.
+    /// Queues `line`. A queued notification with the same `key` is dropped for it (only the latest
+    /// state of a resource matters), and past the capacity the oldest unpinned one goes.
+    #[cfg(test)]
     fn push(&self, key: Option<String>, line: String) {
+        self.queue(Note { key, line, pinned: false });
+    }
+
+    /// Queues a notification as [`supersedes`] and [`pinned`] say.
+    fn note(&self, message: &Value, line: String) {
+        self.queue(Note { key: supersedes(message), line, pinned: pinned(message) });
+    }
+
+    fn queue(&self, note: Note) {
         let mut state = lock(&self.0.state);
-        if let Some(key) = &key {
-            state.notes.retain(|(k, _)| k.as_ref() != Some(key));
+        if let Some(key) = &note.key {
+            state.notes.retain(|n| n.key.as_ref() != Some(key));
         }
-        state.notes.push_back((key, line));
+        state.notes.push_back(note);
         while state.notes.len() > self.0.capacity {
-            state.notes.pop_front();
+            let Some(oldest) = state.notes.iter().position(|n| !n.pinned) else { break };
+            state.notes.remove(oldest);
         }
         drop(state);
+        self.0.ready.notify_one();
+    }
+
+    /// Queues a request's response, which is neither coalesced nor dropped, and comes after the
+    /// notifications queued before it.
+    fn respond(&self, line: String) {
+        lock(&self.0.state).response = Some(line);
         self.0.ready.notify_one();
     }
 }
@@ -604,12 +685,15 @@ impl Drop for NoteTx {
 
 impl NoteRx {
     /// The next message, waiting up to `timeout`; the queued ones are delivered before a close.
-    fn recv_timeout(&self, timeout: Duration) -> Result<String, RecvTimeoutError> {
+    fn recv_timeout(&self, timeout: Duration) -> Result<Out, RecvTimeoutError> {
         let deadline = Instant::now() + timeout;
         let mut state = lock(&self.0.state);
         loop {
-            if let Some((_, line)) = state.notes.pop_front() {
-                return Ok(line);
+            if let Some(note) = state.notes.pop_front() {
+                return Ok(Out::Note(note.line));
+            }
+            if let Some(line) = state.response.take() {
+                return Ok(Out::Response(line));
             }
             if state.closed {
                 return Err(RecvTimeoutError::Disconnected);
@@ -624,18 +708,26 @@ impl NoteRx {
 
     #[cfg(test)]
     fn try_recv(&self) -> Option<String> {
-        lock(&self.0.state).notes.pop_front().map(|(_, line)| line)
+        lock(&self.0.state).notes.pop_front().map(|n| n.line)
     }
 }
 
-/// What a message for no request supersedes in a `GET` stream's queue: an update of a resource
-/// replaces the one before it, and so does a change of the list.
+/// What a notification supersedes in a stream's queue: an update of a resource replaces the one
+/// before it, and so does a change of the list; the latest progress of a request is its progress,
+/// and the latest state of a task its state.
 fn supersedes(message: &Value) -> Option<String> {
     match message["method"].as_str()? {
         "notifications/resources/updated" => Some(format!("updated {}", message["params"]["uri"].as_str()?)),
-        method @ "notifications/resources/list_changed" => Some(method.to_owned()),
+        method @ ("notifications/resources/list_changed" | "notifications/progress") => Some(method.to_owned()),
+        "notifications/tasks" => Some(format!("task {}", message["params"]["taskId"].as_str()?)),
         _ => None,
     }
+}
+
+/// Whether a notification must survive the queue's dropping the oldest: the acknowledgement that
+/// opens a `subscriptions/listen` is what the client waits for first.
+fn pinned(message: &Value) -> bool {
+    message["method"] == "notifications/subscriptions/acknowledged"
 }
 
 /// A session's stream for messages that belong to no request, with the generation of the `GET`
@@ -688,7 +780,7 @@ impl Router {
                 out.push_str(&line[..start]);
                 out.push_str(&id);
                 out.push_str(rest);
-                let _ = route.tx.send(Out::Response(out));
+                route.tx.respond(out);
             }
             return;
         }
@@ -698,7 +790,7 @@ impl Router {
             let route = key.and_then(|k| lock(&self.routes).remove(&k));
             if let Some(route) = route {
                 message["id"] = route.id;
-                let _ = route.tx.send(Out::Response(message.to_string()));
+                route.tx.respond(message.to_string());
             }
             return;
         }
@@ -709,7 +801,8 @@ impl Router {
             let found = lock(&self.routes).get(&key).map(|r| (r.id.clone(), r.tx.clone()));
             if let Some((id, tx)) = found {
                 message["params"]["_meta"][META_SUBSCRIPTION] = id;
-                let _ = tx.send(Out::Note(message.to_string()));
+                let line = message.to_string();
+                tx.note(&message, line);
             }
             return;
         }
@@ -718,7 +811,8 @@ impl Router {
             let found = key.and_then(|k| lock(&self.routes).get(&k).and_then(|r| Some((r.token.clone()?, r.tx.clone()))));
             if let Some((token, tx)) = found {
                 message["params"]["progressToken"] = token;
-                let _ = tx.send(Out::Note(message.to_string()));
+                let line = message.to_string();
+                tx.note(&message, line);
             }
             return;
         }
@@ -727,7 +821,7 @@ impl Router {
         if let Some(slot) = standalone
             && let Some((_, tx)) = lock(slot).as_ref()
         {
-            tx.push(supersedes(&message), line);
+            tx.note(&message, line);
         }
     }
 }
@@ -799,6 +893,8 @@ struct Shared {
     /// Whether the bind is loopback, so `Host` must be too.
     loopback: bool,
     tokens: Option<Tokens>,
+    /// The TLS configuration, when the server speaks TLS.
+    tls: Option<tls::Server>,
     router: Arc<Router>,
     /// Serves the current revision's requests that name no session.
     stateless: Server,
@@ -1029,7 +1125,7 @@ enum HeadDeadline {
     FirstByteBy(Instant),
 }
 
-fn read_head(reader: &mut BufReader<TcpStream>, when: HeadDeadline, limits: &Limits) -> Result<Head, HeadError> {
+fn read_head(reader: &mut BufReader<Conn>, when: HeadDeadline, limits: &Limits) -> Result<Head, HeadError> {
     let mut raw: Vec<u8> = Vec::with_capacity(512);
     let (mut deadline, mut started) = match when {
         HeadDeadline::Fixed(at) => (at, true),
@@ -1037,8 +1133,7 @@ fn read_head(reader: &mut BufReader<TcpStream>, when: HeadDeadline, limits: &Lim
     };
     let mut blank = 0;
     loop {
-        let left = remaining(deadline).map_err(|_| HeadError::Gone)?;
-        reader.get_ref().set_read_timeout(Some(left)).map_err(|_| HeadError::Gone)?;
+        reader.get_ref().set_deadline(deadline).map_err(|_| HeadError::Gone)?;
         let buf = match reader.fill_buf() {
             Ok(buf) => buf,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1129,7 +1224,7 @@ fn reason(status: u16) -> &'static str {
 }
 
 /// Writes a whole response in one write.
-fn write_response(mut stream: &TcpStream, status: u16, headers: &[(&str, String)], body: &[u8], close: bool) -> io::Result<()> {
+fn write_response(mut stream: impl Write, status: u16, headers: &[(&str, String)], body: &[u8], close: bool) -> io::Result<()> {
     let mut out = format!("HTTP/1.1 {status} {}\r\n", reason(status));
     if !body.is_empty() {
         out.push_str("Content-Type: application/json\r\n");
@@ -1157,12 +1252,12 @@ fn error_body(code: i64, message: &str) -> String {
 /// An event stream on a response: chunked on HTTP/1.1 (so the connection survives it), to the
 /// connection's end on 1.0.
 struct Sse<'a> {
-    stream: &'a TcpStream,
+    stream: &'a Conn,
     chunked: bool,
 }
 
 impl<'a> Sse<'a> {
-    fn start(stream: &'a TcpStream, http11: bool, headers: &[(&str, String)]) -> io::Result<Sse<'a>> {
+    fn start(stream: &'a Conn, http11: bool, headers: &[(&str, String)]) -> io::Result<Sse<'a>> {
         let mut out = String::from("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n");
         out.push_str(if http11 { "Transfer-Encoding: chunked\r\n" } else { "Connection: close\r\n" });
         for (name, value) in headers {
@@ -1218,28 +1313,22 @@ enum Peer {
     Broken,
 }
 
-/// Looks at the client's side without blocking or consuming anything.
-fn peer_state(stream: &TcpStream) -> Peer {
-    if stream.set_nonblocking(true).is_err() {
-        return Peer::Open;
-    }
-    let mut byte = [0u8; 1];
-    let state = match stream.peek(&mut byte) {
-        Ok(0) => Peer::Finished,
-        Ok(_) => Peer::Open,
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted => Peer::Open,
-        Err(_) => Peer::Broken,
-    };
-    let _ = stream.set_nonblocking(false);
-    state
-}
-
 fn connection(shared: &Arc<Shared>, slot: &mut Slot, stream: TcpStream, accepted: Instant) {
     let limits = shared.config.limits;
     let _ = stream.set_nodelay(true);
     let _ = stream.set_write_timeout(Some(limits.write_timeout));
-    let mut reader = BufReader::new(stream);
-    let mut when = HeadDeadline::Fixed(accepted + limits.request_timeout);
+    // The first request's head is due `request_timeout` after the accept, a TLS handshake included.
+    let first = accepted + limits.request_timeout;
+    let conn = match &shared.tls {
+        None => Conn::plain(stream),
+        Some(tls) => match tls.accept(stream, first) {
+            Ok(conn) => conn,
+            // The handshake failed and its connection is closed.
+            Err(_) => return,
+        },
+    };
+    let mut reader = BufReader::new(conn);
+    let mut when = HeadDeadline::Fixed(first);
     loop {
         let head = match read_head(&mut reader, when, &limits) {
             Ok(head) => head,
@@ -1265,31 +1354,14 @@ fn connection(shared: &Arc<Shared>, slot: &mut Slot, stream: TcpStream, accepted
         }
         when = HeadDeadline::FirstByteBy(Instant::now() + limits.keep_alive);
     }
-    linger(reader.get_ref());
-}
-
-/// Closes a connection without losing the last response: a close with unread input in the socket
-/// resets it, and the client may never read what was written (a 413 sent before the body is read).
-/// So: stop writing, read and drop what is still arriving for a moment, then close.
-fn linger(mut stream: &TcpStream) {
-    let _ = stream.shutdown(Shutdown::Write);
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-    let start = Instant::now();
-    let mut scratch = [0u8; 8192];
-    let mut total = 0;
-    while total < (1 << 20) && start.elapsed() < Duration::from_millis(500) {
-        match stream.read(&mut scratch) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => total += n,
-        }
-    }
+    reader.get_ref().close();
 }
 
 /// One request on a connection. Each method returns whether the connection can carry another.
 struct Exchange<'a> {
     shared: &'a Arc<Shared>,
     slot: &'a mut Slot,
-    reader: &'a mut BufReader<TcpStream>,
+    reader: &'a mut BufReader<Conn>,
     head: &'a Head,
     /// The token the request carried (`None` without authentication).
     principal: Option<String>,
@@ -1332,7 +1404,7 @@ fn framing(head: &Head) -> Result<Framing, &'static str> {
 }
 
 impl Exchange<'_> {
-    fn stream(&self) -> &TcpStream {
+    fn stream(&self) -> &Conn {
         self.reader.get_ref()
     }
 
@@ -1516,9 +1588,9 @@ impl Exchange<'_> {
                 let key = self.shared.router.key();
                 let token =
                     params.get_mut("_meta").and_then(|m| m.get_mut("progressToken")).map(|t| std::mem::replace(t, key.clone().into()));
-                let (tx, rx) = channel();
+                let (tx, rx) = note_queue(NOTE_QUEUE);
                 let client_key = rpc::id_key(&id);
-                self.shared.router.insert(key.clone(), Route { id, token, tx });
+                self.shared.router.insert(key.clone(), Route { id, token, tx: Arc::new(tx) });
                 if let Some(s) = &session {
                     lock(&s.cancels).insert(client_key.clone(), key.clone());
                 }
@@ -1541,7 +1613,7 @@ impl Exchange<'_> {
     /// notification for it comes first. A client that has gone (a write to it fails) cancels the
     /// request. One that only finished sending (a half-close) is still reading: if it takes an
     /// event stream, the response becomes one so its pings can tell; if not, it waits.
-    fn answer(&self, rx: &Receiver<Out>, server: &Server, key: &str, headers: &[(&str, String)]) -> bool {
+    fn answer(&self, rx: &NoteRx, server: &Server, key: &str, headers: &[(&str, String)]) -> bool {
         let stream = self.stream();
         let streams = self.head.accepts("text/event-stream");
         let cancel = || {
@@ -1576,7 +1648,7 @@ impl Exchange<'_> {
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     if sse.is_none() {
-                        match peer_state(stream) {
+                        match stream.peer_state() {
                             Peer::Open => continue,
                             Peer::Broken => {
                                 cancel();
@@ -1622,13 +1694,13 @@ impl Exchange<'_> {
             return self.fail(404, INVALID_REQUEST, "no such session (it ended or expired)", &[]);
         };
         let idle = self.shared.config.limits.session_idle;
-        let (tx, rx) = note_queue(STANDALONE_QUEUE);
+        let (tx, rx) = note_queue(NOTE_QUEUE);
         let generation = self.shared.router.next.fetch_add(1, Ordering::Relaxed);
         *lock(&session.standalone) = Some((generation, tx));
         let ended = match Sse::start(self.stream(), self.head.http11, &[]) {
             Ok(sse) => loop {
                 match rx.recv_timeout(self.shared.config.limits.ping) {
-                    Ok(line) => {
+                    Ok(Out::Note(line) | Out::Response(line)) => {
                         if sse.event(&line).is_err() {
                             break false;
                         }
@@ -1668,11 +1740,11 @@ impl Exchange<'_> {
     }
 }
 
-fn read_exact(reader: &mut BufReader<TcpStream>, n: usize, deadline: Instant) -> io::Result<Vec<u8>> {
+fn read_exact(reader: &mut BufReader<Conn>, n: usize, deadline: Instant) -> io::Result<Vec<u8>> {
     let mut body = vec![0u8; n];
     let mut filled = 0;
     while filled < n {
-        reader.get_ref().set_read_timeout(Some(remaining(deadline)?))?;
+        reader.get_ref().set_deadline(deadline)?;
         match reader.read(&mut body[filled..]) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(k) => filled += k,
@@ -1684,10 +1756,10 @@ fn read_exact(reader: &mut BufReader<TcpStream>, n: usize, deadline: Instant) ->
 }
 
 /// One CRLF-terminated line of at most `max` bytes.
-fn read_line(reader: &mut BufReader<TcpStream>, max: usize, deadline: Instant) -> io::Result<String> {
+fn read_line(reader: &mut BufReader<Conn>, max: usize, deadline: Instant) -> io::Result<String> {
     let mut line = Vec::new();
     loop {
-        reader.get_ref().set_read_timeout(Some(remaining(deadline)?))?;
+        reader.get_ref().set_deadline(deadline)?;
         let mut byte = [0u8; 1];
         match reader.read(&mut byte) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
@@ -1707,7 +1779,7 @@ fn read_line(reader: &mut BufReader<TcpStream>, max: usize, deadline: Instant) -
 }
 
 /// A chunked body of at most `max` bytes (`FileTooLarge` past it).
-fn read_chunked(reader: &mut BufReader<TcpStream>, max: usize, deadline: Instant) -> io::Result<Vec<u8>> {
+fn read_chunked(reader: &mut BufReader<Conn>, max: usize, deadline: Instant) -> io::Result<Vec<u8>> {
     let mut body = Vec::new();
     loop {
         let line = read_line(reader, 1024, deadline)?;
