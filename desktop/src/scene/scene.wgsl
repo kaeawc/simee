@@ -80,7 +80,7 @@ fn soft_box(d: vec3f, k: vec3f, half: vec2f, soft: f32) -> f32 {
     let right = normalize(cross(vec3f(0.0, 1.0, 0.0), k) + vec3f(1e-4, 0.0, 0.0));
     let up = cross(k, right);
     let p = abs(vec2f(dot(d, right), dot(d, up)) / c);
-    let e = smoothstep(half + vec2f(soft), half - vec2f(soft), p);
+    let e = vec2f(1.0) - smoothstep(half - vec2f(soft), half + vec2f(soft), p);
     return e.x * e.y;
 }
 
@@ -139,7 +139,7 @@ fn outside(p: vec2f, b: vec2f) -> f32 {
     var frame = textureSample(screen, samp, fr.uv_rect.xy + t * fr.uv_rect.zw).rgb;
     if (fr.flags.x > 0.5) { frame = decode(frame); }
 
-    if (dr.base.a > 1.5) {
+    if (abs(dr.base.a - 2.0) < 0.5) {
         // The floor: the stage's colour, darkened under the body. Seen from below there is none.
         let blur = max(dr.params.w, 1.0);
         let d = outside(v.world.xz - fr.foot.xy, fr.foot.zw) / blur;
@@ -171,7 +171,7 @@ fn outside(p: vec2f, b: vec2f) -> f32 {
     let mirrored = to_camera(reflect(-e, n));
     let grazing = pow(1.0 - nv, 5.0);
 
-    if (dr.base.a > 0.5) {
+    if (abs(dr.base.a - 1.0) < 0.5) {
         // The live screen: its own pixels, and over them what the cover glass mirrors.
         let glass = (reflectance + (1.0 - reflectance) * grazing) * studio(mirrored, rough);
         return vec4f(frame + vec3f(min(glass, 0.2) * SCREEN_SHEEN * fr.eye.w), 1.0);

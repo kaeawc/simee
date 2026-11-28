@@ -23,7 +23,7 @@ const SAMPLES: u32 = 4;
 const COLOR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Bytes of the frame uniform (`Frame` in scene.wgsl) and of one draw's (`Draw`).
-const FRAME_BYTES: u64 = 208;
+const FRAME_BYTES: u64 = 192;
 const DRAW_BYTES: u64 = 96;
 /// How dark the contact shadow is at its middle (a share of the stage's colour taken away), how
 /// far it fades beyond the body's footprint and how far under the body the floor lies, the last
@@ -308,6 +308,12 @@ fn uniform_buffer(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer
     })
 }
 
+/// How much of the cover glass's reflection the live screen shows: none face on (1:1), where the
+/// screen's pixels are the flat view's untouched.
+fn screen_sheen(camera: &Camera) -> f32 {
+    (1.0 - camera.one_to_one).clamp(0.0, 1.0)
+}
+
 fn bytes(values: &[f32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
@@ -509,7 +515,7 @@ impl Gpu {
         let floor = Floor::under(center, half);
         let bg = super::background();
         // The glass's reflection leaves the live screen as the view comes face on (1:1).
-        let sheen = (1.0 - job.camera.one_to_one).clamp(0.0, 1.0);
+        let sheen = screen_sheen(&job.camera);
         let bd = backdrop.texture();
         let (bw, bh) = (bd.width().max(1) as f32, bd.height().max(1) as f32);
         let (x, y) = (x - site.origin[0], y - site.origin[1]);
@@ -678,8 +684,8 @@ mod tests {
 
     #[test]
     fn uniform_layouts_match_the_shader() {
-        // view_proj, eye, the camera's three axes, uv_rect, flags, stage, foot.
-        assert_eq!(FRAME_BYTES, 64 + 9 * 16);
+        // view_proj, eye, the camera's three axes, uv_rect, flags, stage, foot (8 vec4).
+        assert_eq!(FRAME_BYTES, 64 + 8 * 16);
         // model, base, params.
         assert_eq!(DRAW_BYTES, 64 + 2 * 16);
         assert_eq!(bytes(&[1.0, -2.0]).len(), 8);
@@ -714,6 +720,17 @@ mod tests {
     const SLOT: (u32, u32) = (1700, 1500);
     fn flat_rect() -> [f32; 4] {
         super::super::screen_rect([0.0, 0.0, SLOT.0 as f32, SLOT.1 as f32], 2.0, [24.0, 1206.0 / 2622.0, 0.0, 0.0])
+    }
+
+    #[test]
+    fn face_on_adds_no_reflection_to_the_screen_so_its_pixels_are_the_flat_views() {
+        // The shader's live branch returns `frame + min(glass, 0.2) * 0.45 * sheen`, and never
+        // multiplies the frame: with sheen 0 it is the backdrop's pixel exactly.
+        assert_eq!(screen_sheen(&Camera::preset(super::super::Preset::Face)), 0.0);
+        // Off axis the reflection returns, and it is the only term that does.
+        assert!(screen_sheen(&Camera::preset(super::super::Preset::ThreeQuarter)) > 0.0);
+        let wgsl = include_str!("scene.wgsl");
+        assert!(wgsl.contains("return vec4f(frame + vec3f(min(glass, 0.2) * SCREEN_SHEEN * fr.eye.w), 1.0);"));
     }
 
     #[test]
