@@ -170,6 +170,23 @@ gate_acquire pretend
 check "gate_acquire fails when the gate exits without a slot" "$([ $? = 1 ] && echo ok)"
 check "and leaves no waiter to signal at exit" "$([ "${#GATE_SLOTS[@]}" = 0 ] && echo ok)"
 
+# --- The arms' environments ---
+
+lib64=/sdk/lib64
+env_has() { case ",$(arm_env "$1")," in *",$2,"*) echo ok ;; *) ;; esac }
+for arm in mvk-metal mvk-swangle; do
+  check "$arm names the MoltenVK ICD explicitly" "$(env_has "$arm" ANDROID_EMU_VK_ICD=moltenvk)"
+  check "$arm doesn't point the loader at another manifest" "$([ -z "$(env_has "$arm" "VK_DRIVER_FILES=$lib64/vulkan/libkosmickrisp_icd.json")" ] && echo ok)"
+done
+for arm in kk-metal kk-swangle; do
+  check "$arm names the KosmicKrisp ICD explicitly" "$(env_has "$arm" ANDROID_EMU_VK_ICD=kosmickrisp)"
+done
+check "mvk-metal keeps ANGLE on Metal" "$(env_has mvk-metal ANGLE_DEFAULT_PLATFORM=metal)"
+check "mvk-swangle keeps SwANGLE" "$(env_has mvk-swangle ANGLE_DEFAULT_PLATFORM=swiftshader)"
+check "no arm names two ICDs" "$(for arm in mvk-metal mvk-swangle kk-metal kk-swangle; do arm_env "$arm" | tr ',' '\n' | grep -c '^ANDROID_EMU_VK_ICD='; done | sort -u | tr -d '\n' | grep -qx 1 && echo ok)"
+check "the MoltenVK arms keep emu's renderer-only init on the same ICD" "$(case $(init_env mvk-metal) in ANDROID_EMU_VK_ICD=moltenvk,*) echo ok ;; *) ;; esac)"
+lib64=""
+
 # --- A boot: the ports are checked after the slot wait, right before the launch ---
 
 # boot_arm with its collaborators replaced by ones that record the order they are called in.

@@ -7,8 +7,10 @@
 #                              [--rounds N] [--quick] [--out DIR]
 #
 # Arms (host Vulkan under gfxstream + the renderer's host GLES, ANGLE):
-#   mvk-metal     MoltenVK + ANGLE on Metal       -gpu host, ANGLE_DEFAULT_PLATFORM=metal
-#   mvk-swangle   MoltenVK + SwANGLE              -gpu host, ANGLE_DEFAULT_PLATFORM=swiftshader
+#   mvk-metal     MoltenVK + ANGLE on Metal       -gpu host, ANDROID_EMU_VK_ICD=moltenvk,
+#                                                 ANGLE_DEFAULT_PLATFORM=metal
+#   mvk-swangle   MoltenVK + SwANGLE              -gpu host, ANDROID_EMU_VK_ICD=moltenvk,
+#                                                 ANGLE_DEFAULT_PLATFORM=swiftshader
 #   kk-metal      KosmicKrisp + ANGLE on Metal    -gpu host, ANDROID_EMU_VK_ICD=kosmickrisp and
 #                                                 VK_DRIVER_FILES/VK_ICD_FILENAMES at the renderer's
 #                                                 lib64/vulkan/libkosmickrisp_icd.json
@@ -316,15 +318,8 @@ stop_boot() {
   BOOT_PID=""
   BOOT_IDENT=""
 }
-# RENDERERS_SOURCE_ONLY=1: only the functions above (scripts/bench/test-renderers.sh).
-[ "${RENDERERS_SOURCE_ONLY:-0}" = 1 ] && return 0
+# --- The arms (functions; $lib64 is set by the caller) ---------------------------------------
 
-image_for() {
-  case $1 in
-    30 | 33 | 34 | 36) echo "system-images/android-$1/google_apis/arm64-v8a" ;;
-    *) echo "" ;;
-  esac
-}
 label() {
   case $1 in
     mvk-metal) echo "MoltenVK + ANGLE-Metal" ;;
@@ -336,12 +331,15 @@ label() {
     *) echo "$1" ;;
   esac
 }
-# The arm's environment, comma-separated K=V (android_boot's emu:K=V form).
+# The arm's environment, comma-separated K=V (android_boot's emu:K=V form). Every Vulkan arm names
+# its ICD, MoltenVK's included: emu's default driver depends on the API level (KosmicKrisp where
+# MoltenVK can't compile a guest's pipelines), so an unset one would mean different drivers on
+# different APIs.
 arm_env() {
   local kk="$lib64/vulkan/libkosmickrisp_icd.json"
   case $1 in
-    mvk-metal) echo "ANGLE_DEFAULT_PLATFORM=metal" ;;
-    mvk-swangle) echo "ANGLE_DEFAULT_PLATFORM=swiftshader" ;;
+    mvk-metal) echo "ANDROID_EMU_VK_ICD=moltenvk,ANGLE_DEFAULT_PLATFORM=metal" ;;
+    mvk-swangle) echo "ANDROID_EMU_VK_ICD=moltenvk,ANGLE_DEFAULT_PLATFORM=swiftshader" ;;
     kk-metal) echo "ANDROID_EMU_VK_ICD=kosmickrisp,VK_DRIVER_FILES=$kk,VK_ICD_FILENAMES=$kk,ANGLE_DEFAULT_PLATFORM=metal" ;;
     kk-swangle) echo "ANDROID_EMU_VK_ICD=kosmickrisp,VK_DRIVER_FILES=$kk,VK_ICD_FILENAMES=$kk,ANGLE_DEFAULT_PLATFORM=swiftshader" ;;
     *) echo "" ;;
@@ -373,6 +371,15 @@ arm_icd() {
   esac
 }
 
+# RENDERERS_SOURCE_ONLY=1: only the functions above (scripts/bench/test-renderers.sh).
+[ "${RENDERERS_SOURCE_ONLY:-0}" = 1 ] && return 0
+
+image_for() {
+  case $1 in
+    30 | 33 | 34 | 36) echo "system-images/android-$1/google_apis/arm64-v8a" ;;
+    *) echo "" ;;
+  esac
+}
 # The SDK and renderer, without failing (the dry run works on a host with neither).
 if [ -z "${ANDROID_HOME:-}" ]; then
   if [ "$(uname -s)" = Darwin ]; then ANDROID_HOME=$HOME/Library/Android/sdk; else ANDROID_HOME=$HOME/Android/Sdk; fi

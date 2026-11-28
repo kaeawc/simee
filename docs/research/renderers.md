@@ -24,8 +24,8 @@ Six arms, each chosen through the environment emu leaves alone when it is alread
 
 | Arm | `-gpu` | Environment |
 | --- | --- | --- |
-| MoltenVK + ANGLE-Metal | `host` | `ANGLE_DEFAULT_PLATFORM=metal` |
-| MoltenVK + SwANGLE | `host` | `ANGLE_DEFAULT_PLATFORM=swiftshader` |
+| MoltenVK + ANGLE-Metal | `host` | `ANDROID_EMU_VK_ICD=moltenvk`, `ANGLE_DEFAULT_PLATFORM=metal` |
+| MoltenVK + SwANGLE | `host` | `ANDROID_EMU_VK_ICD=moltenvk`, `ANGLE_DEFAULT_PLATFORM=swiftshader` |
 | KosmicKrisp + ANGLE-Metal | `host` | `ANDROID_EMU_VK_ICD=kosmickrisp`, `VK_DRIVER_FILES`/`VK_ICD_FILENAMES` = `lib64/vulkan/libkosmickrisp_icd.json`, `ANGLE_DEFAULT_PLATFORM=metal` |
 | KosmicKrisp + SwANGLE | `host` | the same with `ANGLE_DEFAULT_PLATFORM=swiftshader` |
 | lavapipe | `lavapipe` | none (host GLES as emu picks it) |
@@ -33,7 +33,11 @@ Six arms, each chosen through the environment emu leaves alone when it is alread
 
 gfxstream itself points the Vulkan loader at the manifest that `ANDROID_EMU_VK_ICD` names:
 with `VK_LOADER_DEBUG=driver` the KosmicKrisp arm loads `libvulkan_kosmickrisp.dylib`, and
-the default loads `libMoltenVK.dylib`. All the ICDs come from the SDK emulator's
+the MoltenVK arms load `libMoltenVK.dylib`. Every Vulkan arm sets
+`ANDROID_EMU_VK_ICD`, MoltenVK's included, so an arm means the same driver on every API: from #412
+on, emu's default for an unset one depends on the API level (KosmicKrisp where MoltenVK can't
+compile a guest's pipelines). The tables below were measured on APIs 36 and 30 with the variable
+unset for the MoltenVK arms, where the default was MoltenVK. All the ICDs come from the SDK emulator's
 `lib64/vulkan` (37.2.13); nothing was downloaded.
 
 For each API, the script creates one AVD with `emu -create-avd -no-golden` (google_apis arm64,
