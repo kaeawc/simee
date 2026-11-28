@@ -22,7 +22,8 @@
 //! glasses, turned, turned-tablet, empty,
 //! sidebar-hidden, inspector-hidden, panes-hidden, panes-wide, toggled-list, toggled-panel, panel-empty,
 //! resources, resources-memory, admission,
-//! admission-many, popped, list-booted, list-search); a release build needs `--features tooling` for it.
+//! admission-many, popped, list-booted, list-search, toolbar-crowded, toolbar-empty); a release
+//! build needs `--features tooling` for it.
 
 mod admission;
 mod android;
@@ -1248,9 +1249,13 @@ fn stylus_input(s: &State, input: Input) {
 /// holds it whole.
 const MAX_WINDOW_W: f32 = 1440.0;
 
+/// Points above and below the fitted screen: the title bar ([`panes::TITLE_H`]), then 110 of
+/// toolbar, gaps and status line.
+const FIT_CHROME_H: f32 = panes::TITLE_H + 110.0;
+
 /// The window that fits a device screen of `size` pixels: the sidebar (240), the gutters (32),
 /// the screen at [`android::SCREEN_POINTS`] tall (at least 420 wide, for the toolbar) and the
-/// Android panel (340); 110 points of toolbar and status around it. A device with a bezel
+/// Android panel (340); [`FIT_CHROME_H`] of title bar, toolbar and status around it. A device with a bezel
 /// ([`controls::bezel`]) has a [`bezel::BAND`] of stage around its screen on every side, which the
 /// window budgets on top, so the screen is drawn at the size it has without one. A landscape tablet's screen
 /// (2560x1600 is 1216 points wide at that height) would make the window wider than a laptop's
@@ -1264,7 +1269,7 @@ fn fit_window(size: (u32, u32), form_factor: Option<FormFactor>, bezel: bool) ->
     // A landscape tablet keeps its laptop-sized window: the band comes out of the screen there.
     let screen_w = if form_factor == Some(FormFactor::Tablet) { full_w.min(MAX_WINDOW_W - CHROME_W - band) } else { full_w };
     let screen_h = screen_w / aspect;
-    (CHROME_W + (screen_w + band).max(420.0), screen_h + band + 110.0)
+    (CHROME_W + (screen_w + band).max(420.0), screen_h + band + FIT_CHROME_H)
 }
 
 /// Sends one touch or keystroke input to the device on screen.
@@ -1384,6 +1389,8 @@ fn main() {
             ("admission-many", admission::many_scene),
             ("list-booted", list::booted_scene),
             ("list-search", list::search_scene),
+            ("toolbar-crowded", view::crowded_toolbar_scene),
+            ("toolbar-empty", view::empty_toolbar_scene),
         ],
         setup: Some(setup),
         poll: Some(poll),
@@ -1408,6 +1415,9 @@ fn main() {
         let opened_at = panes::open_at(&mut spec, &store);
         // With the view off the compositor draws Rune's default frame.
         let app = rune::App::new(spec)
+            // Content under the transparent titlebar, as by default, but only the title bar's
+            // `.window_drag()` band moves the window, so its pane toggles take presses (#588).
+            .chrome(rune::Chrome { drag_regions: true, ..rune::Chrome::DEFAULT })
             .on_visibility(on_visibility)
             .on_window(panes::remember_window)
             .on_close(popout::on_main_close)
@@ -2834,12 +2844,12 @@ mod tests {
         // Phones and portrait tablets keep the full-height screen.
         let tablet = Some(FormFactor::Tablet);
         let phone = fit_window((720, 1280), Some(FormFactor::Phone), false);
-        assert_eq!(phone.1, android::SCREEN_POINTS + 110.0);
+        assert_eq!(phone.1, android::SCREEN_POINTS + FIT_CHROME_H);
         assert!(fit_window((1600, 2560), tablet, false).1 == phone.1 && fit_window((1600, 2560), tablet, false).0 < MAX_WINDOW_W);
         // A Pixel Tablet in landscape would be 1828 points wide at full height: it is shorter.
         let (w, h) = fit_window((2560, 1600), tablet, false);
         assert_eq!(w, MAX_WINDOW_W);
-        let screen = (w - 612.0, h - 110.0);
+        let screen = (w - 612.0, h - FIT_CHROME_H);
         assert!((screen.0 / screen.1 - 1.6).abs() < 1e-3, "the screen keeps its aspect: {screen:?}");
     }
 
@@ -2849,7 +2859,7 @@ mod tests {
     fn only_tablets_are_shown_shorter_to_fit_a_laptop() {
         let full = |(w, h): (u32, u32)| {
             let screen_w = android::SCREEN_POINTS * w as f32 / h as f32;
-            (240.0 + 32.0 + screen_w.max(420.0) + 340.0, android::SCREEN_POINTS + 110.0)
+            (240.0 + 32.0 + screen_w.max(420.0) + 340.0, android::SCREEN_POINTS + FIT_CHROME_H)
         };
         for (size, ff) in [
             ((2208, 1840), FormFactor::Foldable),
@@ -2870,14 +2880,14 @@ mod tests {
     fn the_fitted_window_budgets_the_bezel_band() {
         let band = 2.0 * bezel::BAND;
         let phone = fit_window((720, 1280), Some(FormFactor::Phone), true);
-        assert_eq!(phone, (612.0 + android::SCREEN_POINTS * 0.5625 + band, android::SCREEN_POINTS + 110.0 + band));
+        assert_eq!(phone, (612.0 + android::SCREEN_POINTS * 0.5625 + band, android::SCREEN_POINTS + FIT_CHROME_H + band));
         let tablet = fit_window((2560, 1600), Some(FormFactor::Tablet), true);
         assert_eq!(tablet.0, MAX_WINDOW_W, "a landscape tablet stays within the laptop cap");
-        assert_eq!(tablet.1, (MAX_WINDOW_W - 612.0 - band) / 1.6 + 110.0 + band);
+        assert_eq!(tablet.1, (MAX_WINDOW_W - 612.0 - band) / 1.6 + FIT_CHROME_H + band);
         // No bezel, no band: a TV is the window it had.
         assert_eq!(
             fit_window((1920, 1080), Some(FormFactor::Tv), false),
-            (612.0 + android::SCREEN_POINTS * 1920.0 / 1080.0, android::SCREEN_POINTS + 110.0)
+            (612.0 + android::SCREEN_POINTS * 1920.0 / 1080.0, android::SCREEN_POINTS + FIT_CHROME_H)
         );
     }
 
@@ -3032,5 +3042,119 @@ mod tests {
         press(&mut rt, "boot-button");
         assert!(boots.booted().is_empty());
         assert_eq!(rt.state.status.as_deref(), Some("iPhone 17 Pro Max is already booting"));
+    }
+
+    /// The whole window as the app draws it (the admission sheet included), polled, with boots
+    /// that wait for the test and the check `call` on its own thread as in the live window.
+    fn sheet_runtime(boots: &FakeBoots, call: admission::Call) -> Runtime<State> {
+        let mut s = init();
+        demo(&mut s);
+        let mut rt = Runtime::new(s, admission::view, (1240.0, 870.0), Env::new(true, 2.0));
+        rt.poll = Some(poll);
+        rt.frame(0.0);
+        rt.state.offline_screen = false;
+        rt.state.booter = Some(boots.booter());
+        rt.state.admission = admission::Gate::with_call(call);
+        rt.state.admission.connect(Arc::new(|| {}));
+        rt
+    }
+
+    /// Clicks `row` and waits for the threaded check's sheet.
+    fn click_for_sheet(rt: &mut Runtime<State>, row: &str) {
+        press(rt, row);
+        until(rt, &format!("the sheet for {row} ({:?})", rt.state.status), |rt| rt.state.admission.sheet.is_some());
+        rt.frame(1.0 / 60.0);
+    }
+
+    /// #585: "Don't ask again" ticked and then Cancel (or Escape) remembers nothing. The next
+    /// boot of that kind (the same device clicked again, or its Boot button) shows the sheet
+    /// again; nothing boots; and the status line says what happened at every step.
+    #[test]
+    fn dont_ask_again_with_cancel_remembers_nothing() {
+        let boots = FakeBoots::default();
+        let mut rt = sheet_runtime(&boots, hold);
+        for round in 0..3 {
+            click_for_sheet(&mut rt, "device-row:C3");
+            press(&mut rt, "admission-dont-ask");
+            assert!(rt.state.admission.sheet.as_ref().is_some_and(|s| s.dont_ask), "ticked");
+            if round == 1 {
+                rt.key(KeyEvent::from(Key::Escape));
+                rt.frame(1.0 / 60.0);
+            } else {
+                press(&mut rt, "admission-cancel");
+            }
+            assert!(rt.state.admission.sheet.is_none() && !rt.state.admission.busy(), "round {round}: nothing waits");
+            assert!(rt.state.admission.skip.is_empty(), "round {round}: nothing remembered");
+            assert_eq!(rt.state.status.as_deref(), Some("Boot cancelled: the host says hold. The next boot asks again"));
+        }
+        // The Boot button asks again too, and another iPhone (the same kind) is asked about.
+        press(&mut rt, "boot-button");
+        until(&mut rt, "the Boot button's sheet", |rt| rt.state.admission.sheet.is_some());
+        rt.update(|s, _| admission::choose(s, admission::Choice::Cancel));
+        rt.frame(1.0 / 60.0);
+        click_for_sheet(&mut rt, "device-row:B2");
+        assert_eq!(rt.state.admission.sheet.as_ref().map(|s| s.request.devices[0].0.as_str()), Some("B2"));
+        assert!(boots.booted().is_empty(), "nothing booted");
+    }
+
+    /// #585: ticked with a choice that boots, it skips the check for that kind for the rest of
+    /// the session (another kind is still asked about); unticked, the next boot asks again.
+    #[test]
+    fn dont_ask_again_with_a_boot_skips_the_next_check_of_its_kind() {
+        let boots = FakeBoots::default();
+        let mut rt = sheet_runtime(&boots, hold);
+        // Unticked Boot anyway: asked again next time.
+        click_for_sheet(&mut rt, "device-row:C3");
+        press(&mut rt, "admission-boot-anyway");
+        until(&mut rt, "C3 booting", |rt| rt.state.jobs.booting("C3"));
+        assert!(rt.state.admission.skip.is_empty());
+        click_for_sheet(&mut rt, "device-row:B2");
+        // Ticked Boot anyway: the next iPhone boots without a check.
+        press(&mut rt, "admission-dont-ask");
+        press(&mut rt, "admission-boot-anyway");
+        until(&mut rt, "B2 booting", |rt| rt.state.jobs.booting("B2"));
+        assert!(rt.state.admission.skip.contains(&(Platform::Ios, FormFactor::Phone)));
+        for udid in ["B2", "C3"] {
+            boots.release(udid, Ok(()));
+        }
+        until(&mut rt, "booted", |rt| !rt.state.jobs.any());
+        rt.update(|s, _| s.devices.iter_mut().filter(|d| d.udid == "C3").for_each(|d| d.state = DeviceState::Shutdown));
+        press(&mut rt, "device-row:C3");
+        assert!(rt.state.admission.sheet.is_none() && !rt.state.admission.busy(), "no check");
+        assert_eq!(boots.booted(), ["C3", "B2", "C3"]);
+        assert!(rt.state.status.as_deref().is_some_and(|s| s.contains("don't ask again")), "{:?}", rt.state.status);
+        // An iPad is another kind: asked about.
+        click_for_sheet(&mut rt, "device-row:D4");
+        assert_eq!(boots.booted(), ["C3", "B2", "C3"]);
+    }
+
+    /// #585: while a check runs the status line says so (never the last boot's refusal), a click
+    /// on another device then says why it's dropped, and once the sheet is cancelled a click
+    /// asks again instead of being dropped.
+    #[test]
+    fn a_click_while_a_check_runs_and_after_cancel_is_never_silent() {
+        static GATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        fn slow(s: &mut sim_api::Session, m: &str, p: &serde_json::Value) -> Result<serde_json::Value, String> {
+            let start = std::time::Instant::now();
+            while !GATE.load(Ordering::Acquire) && start.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            hold(s, m, p)
+        }
+        let boots = FakeBoots::default();
+        let mut rt = sheet_runtime(&boots, slow);
+        rt.state.status = Some("Boot cancelled: the host says hold. The next boot asks again".into());
+        press(&mut rt, "device-row:C3");
+        assert!(rt.state.admission.busy() && rt.state.admission.sheet.is_none(), "the check runs");
+        assert_eq!(rt.state.status.as_deref(), Some("Checking whether the host can take iPhone 18 Pro…"));
+        press(&mut rt, "device-row:B2");
+        assert_eq!(rt.state.status.as_deref(), Some("iPhone 17 Pro Max not booted: the admission check for iPhone 18 Pro is still open"));
+        GATE.store(true, Ordering::Release);
+        until(&mut rt, "the sheet", |rt| rt.state.admission.sheet.is_some());
+        rt.frame(1.0 / 60.0);
+        press(&mut rt, "admission-cancel");
+        click_for_sheet(&mut rt, "device-row:B2");
+        assert_eq!(rt.state.admission.sheet.as_ref().map(|s| s.request.devices[0].0.as_str()), Some("B2"), "asked, not dropped");
+        assert!(boots.booted().is_empty());
     }
 }

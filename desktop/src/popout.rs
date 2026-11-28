@@ -18,7 +18,9 @@
 //! on the UI thread, so the [`Hub`] they share is an `Rc`: it lists the open pop-outs (for the
 //! device list's marks and their frames) and carries a device handed back to the main window.
 //!
-//! Pop-outs are flat: the 3D device view (#304) stays in the main window. Each window's frame is
+//! Pop-outs are flat: the 3D device view (#304) stays in the main window, and a pop-out's 3D
+//! toggle is dimmed with that reason ([`FLAT`]). A pop-out has no device list or panel of its own,
+//! so it has no pane toggles; ⌘⌥S and ⌘⌥I there say the panes are the main window's. Each window's frame is
 //! kept in the settings by device ([`crate::settings::Settings::popouts`]), so popping the same
 //! device out again, in this run or the next, opens it where it was.
 
@@ -604,13 +606,12 @@ pub fn scene(s: &mut State) {
     s.status = None;
 }
 
-/// The stage's toolbar button for the selected, running device.
-pub fn stage_button(udid: &str, t: Theme) -> El {
-    let udid = udid.to_owned();
-    crate::debug::icon_button("popout-button", &icons::REVEAL, "Pop out to a window (⌘⇧O)", false, t, move |s: &mut State| {
-        s.actions.push(Action::PopOut(udid.clone()))
-    })
-}
+/// The stage toolbar's button for the selected, running device: its icon and label (on the
+/// toolbar or in its overflow menu, it asks for [`Action::PopOut`]).
+pub const STAGE_BUTTON: (&Icon, &str) = (&icons::REVEAL, "Pop out to a window (⌘⇧O)");
+
+/// What a pop-out's 3D toggle says: the view is the main window's (#304, #591).
+pub const FLAT: &str = "Pop-outs are flat: pop back in (⌘⇧O) for the 3D view (⌘3)";
 
 /// The device list's mark on a device that's out in its own window.
 pub fn row_mark(udid: &str, t: Theme) -> El {
@@ -729,6 +730,9 @@ pub fn view(w: &Window, _: &mut Cx<Window>) -> El {
         for c in controls(&d.info) {
             bar = bar.child(button(c.key, c.icon, c.label, c.action, t));
         }
+        // The 3D toggle is there, dimmed with the reason, so the view stays discoverable: the
+        // scene's compositor draws only in the main window.
+        bar = bar.child(crate::view::toggle_button("view3d-button", &crate::view::CUBE, crate::view::VIEW3D_LABEL, false, Some(FLAT), t));
     }
     bar = bar.child(button("popin-button", &icons::RECENTS, "Pop back in (⌘⇧O)", Action::PopIn(d.info.udid.clone()), t));
     let body = if d.stopped() {
@@ -1085,6 +1089,16 @@ mod tests {
         let mut win = take_window(&mut main, "A1");
         assert!(win.find("popout-screen").is_some() && win.find("home-button").is_some() && win.find("popin-button").is_some());
         assert!(win.find("scene-3d").is_none(), "pop-outs are flat");
+        // #591: its 3D toggle is there, dimmed, saying where the view is; a press does nothing.
+        let cube = win.elements().into_iter().find(|e| e.key.as_deref() == Some("view3d-button")).expect("the 3D toggle");
+        assert_eq!(cube.help.as_deref(), Some(FLAT));
+        let (x, y) = win.find("view3d-button").unwrap();
+        win.pointer_down(x, y);
+        win.pointer_up(x, y);
+        win.frame(1.0 / 60.0);
+        assert!(win.state.actions.is_empty() && win.find("scene-3d").is_none());
+        // #588: a pop-out has no panes, so no pane toggles.
+        assert!(win.find("sidebar-toggle").is_none() && win.find("inspector-toggle").is_none());
         // Selecting it in the list focuses its window rather than showing it twice.
         act(&mut main, Action::Select("A1".into()));
         assert_eq!(main.state.selected.as_deref(), Some("pixel_9"));

@@ -5,8 +5,9 @@
 //! that is some but not all), or cancel. It never blocks silently: a check that fails or can't
 //! start boots anyway and says why in the status bar, and every sheet can be overridden.
 //!
-//! "Don't ask again this session" is remembered per platform and form factor, in memory only:
-//! the next boot of that kind skips the check until the window quits. The sheet's "why" link
+//! "Don't ask again this session" is remembered per platform and form factor, in memory only,
+//! when the sheet's choice boots (never on Cancel, #585): the next boot of that kind skips the
+//! check until the window quits. While a check runs the status line says so. The sheet's "why" link
 //! shows the [resource panel](crate::resources), whose gauges carry the host's verdict now.
 //!
 //! The check runs on a thread of its own (it samples the host and lists the running devices), so
@@ -307,7 +308,12 @@ pub fn ask(s: &mut State, info: &DeviceInfo) -> Vec<String> {
     }
     match s.admission.ask(Request::one(info)) {
         Some(d) => apply(s, d),
-        None => Vec::new(),
+        // The check runs: the status line says so until its sheet or boot lands, so the click
+        // never looks like nothing, nor like the last boot's refusal still on the line (#585).
+        None => {
+            s.status = Some(format!("Checking whether the host can take {}…", info.name));
+            Vec::new()
+        }
     }
 }
 
@@ -323,13 +329,15 @@ pub fn poll(s: &mut State) -> bool {
 }
 
 /// A sheet button: boots what it says (remembering "don't ask again" for the kind) or cancels.
+/// "Don't ask again" goes with a choice that boots only (#585): Cancel (or Escape) cancels this
+/// boot and remembers nothing, ticked or not, so the next boot of the kind asks again.
 pub fn choose(s: &mut State, choice: Choice) {
     let Some(sheet) = s.admission.sheet.take() else { return };
     let n = match choice {
         Choice::BootAnyway => sheet.request.devices.len(),
         Choice::Boot(n) => n,
         Choice::Cancel => {
-            s.status = Some(format!("Boot cancelled: the host says {}", sheet.verdict));
+            s.status = Some(format!("Boot cancelled: the host says {}. The next boot asks again", sheet.verdict));
             return;
         }
     };
@@ -406,6 +414,8 @@ fn scrim(sheet: &Sheet, t: Theme) -> El {
         .key("admission-dont-ask")
         .role("switch")
         .label(format!("Don't ask again for {kind} this session"))
+        .help("Applies when you boot from this sheet; Cancel remembers nothing")
+        .checked(sheet.dont_ask)
         .gap(8.0)
         .center_y()
         .on_press(|s: &mut State| {
