@@ -188,7 +188,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// iOS: wait until a booted simulator is quiet; prints how long that took.
+    /// Wait until a booted device is quiet (an Android guest: its own processes, over adb); prints how long that took.
     Settle {
         device: String,
         #[arg(long, default_value_t = 600)]
@@ -197,11 +197,11 @@ enum Cmd {
         #[arg(long, value_enum)]
         settle_cpu: Option<SettleCpu>,
     },
-    /// iOS: turn a named set of daemons off on a booted simulator (`slim`), or back on with --undo.
+    /// Turn a named set of daemons off on a booted device (`slim`; Android: packages, `pm disable-user`), or back on with --undo.
     Profile {
         device: String,
         name: String,
-        /// Re-enable the profile's daemons (they run again from the next boot).
+        /// Re-enable the profile's daemons (iOS: they run again from the next boot; Android: at once).
         #[arg(long)]
         undo: bool,
     },

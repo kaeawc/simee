@@ -143,7 +143,7 @@ mod real {
                 .with_no_client_auth()
                 .with_single_cert(chain, key)
                 .map_err(|e| invalid(format!("the certificate and key do not make a server identity: {e}")))?;
-            // The transport speaks HTTP/1.1 only: a client that offers `h2` is told to use this.
+            // The transport speaks HTTP/1.1 only: a client that offers only `h2` is refused (no common ALPN protocol).
             config.alpn_protocols = vec![b"http/1.1".to_vec()];
             Ok(Server { config: Arc::new(config), certificate, fingerprint, last_report: Mutex::new(None) })
         }
