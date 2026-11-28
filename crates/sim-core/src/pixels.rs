@@ -294,7 +294,7 @@ pub fn downscale_factor(width: u32, max_width: u32) -> u32 {
 }
 
 /// The `hello` width that makes emu send a `width` x `height` display with its longest side at
-/// least `max_size` and as close to it as a whole factor gets: emu shrinks by the whole factor
+/// or over `max_size`, as close to it as a whole factor allows: emu shrinks by the whole factor
 /// `ceil(width / hint)`, so this asks for the factor `floor(long / max_size)` (at least 1). The
 /// frame is then at or over the cap, never under it (the encoder can't scale a picture back up,
 /// so a smaller one would lose resolution); the encoder's own scaling finishes it to the exact

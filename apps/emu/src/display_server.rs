@@ -277,6 +277,9 @@ enum Turn {
 
 fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &AtomicBool, dir: &Path) {
     let mut sent = 0u64;
+    // The `hello` width the last frame went out for: a client that asks for another size of a
+    // screen that isn't drawing gets the newest frame again at that size.
+    let mut sent_mw = 0u32;
     // Pacing is a GCRA (a token bucket kept as one instant): `tat` is when the next frame would
     // be due at exactly one per interval; a frame may go up to half an interval before that.
     // The long-run rate stays at most one per interval, while a frame that comes in a little
@@ -302,7 +305,7 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
         // go and send the newest by then. A client that was idle gets it at once.
         let n = display.wait_newer(sent, Duration::from_secs(1));
         let mw = wants.max_width.load(Ordering::Relaxed);
-        if mw == 0 || n == sent {
+        if mw == 0 || (n == sent && mw == sent_mw) {
             continue;
         }
         let interval = wants.interval();
@@ -329,6 +332,7 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
             tat = Some(Instant::now() + interval);
             continue;
         };
+        sent_mw = mw;
         let captured = started.elapsed();
         // Read after the frame: a turn counts the frame again once it's set, so a frame taken
         // before a turn is followed by one that carries it.
@@ -1186,6 +1190,34 @@ mod tests {
     /// `hello 0` pauses a stream (the desktop's switched-away screen). While the guest keeps
     /// drawing, the paused stream waits for the client, not for frames: it neither spins nor
     /// counts as a reader, so the store frees its buffers; `hello <w>` sends the newest at once.
+    #[test]
+    fn a_new_hello_width_on_a_static_screen_resends_the_newest_frame_at_that_size() {
+        let store = Arc::new(FrameStore::with_idle(Duration::from_millis(50)));
+        let (w, h) = (8u32, 4u32);
+        let wants = Arc::new(Wants::default());
+        wants.set_max_width(720);
+        let stop = Arc::new(AtomicBool::new(false));
+        let dir = scratch("rehello");
+        let (out, mut client) = UnixStream::pair().expect("pair");
+        client.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+        let stream = {
+            let (store, wants, stop, dir) = (store.clone(), wants.clone(), stop.clone(), dir.join("simee"));
+            std::thread::spawn(move || frames(out, &store, &wants, &stop, &dir))
+        };
+        store.present(w, h, w * 4, sim_core::pixels::PixelFormat::RGBA_VIRTIO, &pixels(w, h, 1));
+        let (full, _) = read_frame(&mut client).expect("frame");
+        assert_eq!((full.width, full.height), (w, h));
+        // The guest draws nothing more; the client asks for half the width.
+        wants.set_max_width(4);
+        let (half, rgba) = read_frame(&mut client).expect("the same frame, resized");
+        assert_eq!((half.frame, half.width, half.height), (full.frame, 4, 2));
+        assert_eq!(rgba, downscale(w, h, &pixels(w, h, 1), 2).2);
+        wants.finish();
+        store.wake();
+        stream.join().expect("stream");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_paused_stream_waits_for_the_client_and_resumes_with_the_newest_frame() {
         let store = Arc::new(FrameStore::with_idle(Duration::from_millis(50)));

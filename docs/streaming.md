@@ -414,9 +414,13 @@ for again.
   `max_size` is a box-filter downscale (up to 4x4 taps per output pixel) done on the RGB first; a
   frame at most one pixel larger than the even output size is cropped instead. The buffers are
   reused between pictures, so a steady stream allocates nothing per frame.
-  On Linux the stream first asks emu for frames at that size (`hello` with the width whose whole
-  shrink factor brings the longest side under `max_size`, resent when a rotation changes it), so the
-  box filter only finishes the exact size (emu shrinks by the whole factor that leaves the longest side at or over `max_size`, never under it, since a picture can't be scaled back up) or runs in full when emu ignores the request.
+  On Linux the stream first asks emu for frames at that size: `hello` with the width whose whole
+  shrink factor leaves the longest side at or over `max_size`, as close to it as a whole factor
+  allows (never under it: a picture can't be scaled back up). The box filter then only finishes
+  the exact size, or runs in full when emu ignores the request. The request follows a rotation:
+  frames still in the old shape's size are held back (up to 15) so the encoder restarts once, and
+  emu sends its newest frame again at a new `hello` width, so a static screen still shows the
+  turned picture.
 - *Size.* OpenH264 stops at 3840x2160 (either way up); a larger picture without `max_size` is
   `Error::Unsupported`. Scaling up isn't supported.
 - *No hardware.* VA-API, NVENC and V4L2 are not wired (see "Not yet").

@@ -60,8 +60,9 @@ impl AndroidSource {
         })
     }
 
-    /// Connects and asks emu for frames whose longest side is at most `max_size`, so the encoder
-    /// has little or nothing left to scale. `screen` is the device's display size, when known:
+    /// Connects and asks emu for frames whose longest side is at or over `max_size`, as close to
+    /// it as a whole shrink factor allows, so the encoder has little left to scale (and never has
+    /// to scale up). `screen` is the device's display size, when known:
     /// with it the first frame already comes at that size, without it the first frame is full
     /// size. The request follows the display (a rotation turns the width): it is sent again when
     /// the frames show the shape changed. An emu that ignores the request sends full frames, which
@@ -123,6 +124,7 @@ impl Source for AndroidSource {
                 if (width, height) != hold.expected && hold.left > 0 {
                     // Still the old shape's size: the encoder restarts once, at the new one.
                     hold.left -= 1;
+                    self.unreported += frame.unreported + 1;
                     self.reader.recycle(frame.rgba);
                     return Ok(self.current.as_ref());
                 }
@@ -132,11 +134,12 @@ impl Source for AndroidSource {
                 // restart, so it goes out.
                 if self.current.is_some() {
                     self.hold = Some(Hold { expected, left: HOLD_FRAMES });
+                    self.unreported += frame.unreported + 1;
                     self.reader.recycle(frame.rgba);
                     return Ok(self.current.as_ref());
                 }
             }
-            self.unreported = frame.unreported;
+            self.unreported += frame.unreported;
             self.taken_at = Some(frame.at);
             let picture = Picture::new(width, height, PixelOrder::Rgba, frame.rgba);
             if let Some(old) = self.current.replace(picture) {
@@ -194,25 +197,55 @@ mod tests {
                         recorded.lock().expect("lines").push(line);
                     }
                 });
-                for (seq, (device, upright)) in script.into_iter().enumerate() {
+                // The last `hello` line and how many there are.
+                let latest = || {
+                    let lines = seen.lock().expect("lines");
+                    let hellos: Vec<u32> = lines.iter().filter_map(|l| l.strip_prefix("hello ")?.parse().ok()).collect();
+                    (hellos.last().copied(), hellos.len())
+                };
+                let mut send = |seq: u64, device: (u32, u32), upright: (u32, u32), hello: u32| {
+                    let factor = if honours { downscale_factor(upright.0, hello) } else { 1 };
+                    let (w, h) = downscaled_size(upright.0, upright.1, factor);
+                    let header = FrameHeader::new(w, h, device.0, device.1, seq).expect("header");
+                    let mut out = header.encode().to_vec();
+                    out.extend(vec![seq as u8; header.len as usize]);
+                    conn.write_all(&out).is_ok()
+                };
+                let mut last = None;
+                let mut sent_at = 0;
+                let mut seq = 0;
+                for (device, upright) in script {
                     if steps.recv().is_err() {
                         return;
                     }
                     let hello = loop {
-                        let last = seen.lock().expect("lines").iter().rev().find_map(|l| l.strip_prefix("hello ")?.parse::<u32>().ok());
-                        if let Some(h) = last {
+                        if let (Some(h), n) = latest() {
+                            sent_at = n;
                             break h;
                         }
                         std::thread::sleep(Duration::from_millis(1));
                     };
-                    let factor = if honours { downscale_factor(upright.0, hello) } else { 1 };
-                    let (w, h) = downscaled_size(upright.0, upright.1, factor);
-                    let header = FrameHeader::new(w, h, device.0, device.1, seq as u64).expect("header");
-                    let mut out = header.encode().to_vec();
-                    out.extend(vec![seq as u8; header.len as usize]);
-                    if conn.write_all(&out).is_err() {
+                    if !send(seq, device, upright, hello) {
                         return;
                     }
+                    (last, seq) = (Some((device, upright)), seq + 1);
+                }
+                // The screen draws nothing more. Like emu, send the newest frame again once the
+                // client asks for another size, and not before.
+                while let (Some((device, upright)), Ok(())) = (last, steps.recv()) {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while latest().1 <= sent_at {
+                        if Instant::now() > deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    let hello = latest().0.expect("a hello");
+                    sent_at = latest().1;
+                    if !send(seq, device, upright, hello) {
+                        return;
+                    }
+                    seq += 1;
                 }
                 // Hold the connection until the test ends (the step sender drops).
                 let _ = steps.recv();
@@ -251,7 +284,7 @@ mod tests {
     const PHONE: (u32, u32) = (64, 128);
 
     #[test]
-    fn a_fitted_source_asks_emu_for_the_width_that_brings_the_longest_side_under_max_size() {
+    fn a_fitted_source_asks_emu_for_the_width_that_keeps_the_longest_side_at_or_over_max_size() {
         let emu = Emu::new(true, vec![(PHONE, PHONE)]);
         let _source = AndroidSource::connect_fitted(&emu.dir, 64, Some(PHONE)).expect("connect");
         assert_eq!(emu.hellos_at_least(1), ["hello 32"], "factor 2 for a 128-pixel side under 64");
@@ -300,6 +333,33 @@ mod tests {
         assert_eq!(emu.next_picture(&mut source), (32, 64), "the in-between size never reaches the encoder");
         assert_eq!(emu.hellos_at_least(2), ["hello 32", "hello 64"]);
         assert_eq!(emu.next_picture(&mut source), (64, 32), "then the new shape's own size");
+    }
+
+    #[test]
+    fn a_rotation_on_a_static_screen_still_shows_the_turned_picture() {
+        let landscape = (128, 64);
+        // One frame in each shape and no more: the screen draws nothing after the turn, so the
+        // new picture comes only from emu sending the turned frame again at the new size.
+        let emu = Emu::new(true, vec![(PHONE, PHONE), (landscape, landscape)]);
+        let mut source = AndroidSource::connect_fitted(&emu.dir, 64, Some(PHONE)).expect("connect");
+        assert_eq!(emu.next_picture(&mut source), (32, 64));
+        assert_eq!(emu.next_picture(&mut source), (32, 64), "the turned frame at the old size is held");
+        assert_eq!(emu.hellos_at_least(2), ["hello 32", "hello 64"]);
+        assert_eq!(emu.next_picture(&mut source), (64, 32), "the resent frame is the new picture");
+    }
+
+    #[test]
+    fn frames_held_back_after_a_rotation_are_counted_as_skipped() {
+        let landscape = (128, 64);
+        let emu = Emu::new(true, vec![(PHONE, PHONE), (landscape, landscape), (landscape, landscape)]);
+        let mut source = AndroidSource::connect_fitted(&emu.dir, 64, Some(PHONE)).expect("connect");
+        emu.next_picture(&mut source);
+        assert_eq!(source.take_unreported(), 0);
+        emu.next_picture(&mut source);
+        assert_eq!(source.take_unreported(), 1, "the held frame is counted as skipped");
+        emu.hellos_at_least(2);
+        emu.next_picture(&mut source);
+        assert_eq!(source.take_unreported(), 0, "and only once");
     }
 
     #[test]
