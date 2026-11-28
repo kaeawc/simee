@@ -343,7 +343,7 @@ pub(crate) mod tests {
 
     /// A fresh `/tmp/simee-<pid>-<n>-<name>` directory (not under TMPDIR, which can be long enough
     /// that a socket path inside it exceeds SUN_LEN). Created 0700; `FakeDisplay` removes it on drop.
-    fn short_dir(name: &str) -> std::path::PathBuf {
+    pub(crate) fn short_dir(name: &str) -> std::path::PathBuf {
         use std::os::unix::fs::DirBuilderExt;
         static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

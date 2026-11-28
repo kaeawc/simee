@@ -17,21 +17,24 @@ the Dock and Finder show the mark. The mark in the window ([brand.md](design/bra
 activity indicator: it turns beside a running job and on the empty stage while a device boots, and
 each device in the list shows its state with it.
 
-The window draws with Rune's native Metal backend. `SIMEE_GPU_BACKEND=wgpu` switches it to wgpu's
-Metal backend, which the 3D device view needs, and `metal` chooses the default. The window looks
-and behaves the same on both, but wgpu costs a little more:
-[benchmarks.md](benchmarks.md#desktop-runes-native-metal-backend-against-wgpu). Rune's own
-`RUNE_GPU_BACKEND` overrides it.
+The window, the 3D device view included, draws with Rune's native Metal backend.
+`SIMEE_GPU_BACKEND=wgpu` switches it to wgpu's Metal backend, and `metal` chooses the default. The
+window looks and behaves the same on both, but wgpu costs a little more:
+[benchmarks.md](benchmarks.md#desktop-runes-native-metal-backend-against-wgpu) and the
+[3D view's costs](#3d-device-view) below. Rune's own `RUNE_GPU_BACKEND` overrides it.
 
 ## 3D device view
 
 ⌘3 switches the screen to a 3D view: the device's body (`sim_core::body`: phones, tablets,
 foldables and watches) in perspective, lit, with its live screen on the screen face. It is drawn
-with a depth buffer and 4x MSAA. `SIMEE_VIEW=3d` starts the window with it on. The 3D view needs
-the wgpu backend (`SIMEE_GPU_BACKEND=wgpu`). Rune's native Metal backend can't draw a depth
-buffer or MSAA yet (anomalyco/rune#2547, #193), so on it ⌘3 only says so in the status line. A TV,
-head unit or headset has no body and stays flat. With the 3D view off, the window is exactly the
-flat one: screenshots are byte-identical to the build without it on both backends.
+with a depth buffer and 4x MSAA. `SIMEE_VIEW=3d` starts the window with it on. It draws on both
+backends: Rune's native Metal backend, the default, has had depth attachments and MSAA resolves
+since anomalyco/rune#2563 (#193), and wgpu's (`SIMEE_GPU_BACKEND=wgpu`) remains an option.
+Headless renders of every scene (demo, android, foldable, folded, tablet, watch, turned) in the 3/4,
+side, back and face-on views, and flat, are byte-identical on the two backends. A TV, head unit or
+headset has no body and stays flat. Under live Rust editing (the `hot` feature) there is no
+compositor, so ⌘3 says it is unavailable there. With the 3D view off, the window is exactly the flat one:
+screenshots are byte-identical to the build without it on both backends.
 
 It starts in a 3/4 view from the right and above. `SIMEE_SCENE_CAMERA` starts it in another
 saved view: `front`, `side` (edge on: thickness, keys, camera bump), `back` or `face`.
@@ -71,9 +74,8 @@ the back. A turned device rolls the body with its panel, so the screen reads as 
 shows it. A foldable lies flat while it streams its inner screen. When it streams its cover
 screen, emu has folded it, so the body is shown shut. The desktop doesn't know a half-open
 angle (#154). The toolbar, the keyboard and the panel work as usual, and clicking the 3D view
-keeps the keyboard on the device. `RUNE_GPU_BACKEND` is read as Rune reads it (exactly `wgpu` or
-`metal`). Turning the 3D view off frees its render targets, and the camera is where you left it
-when it comes back on.
+keeps the keyboard on the device. Turning the 3D view off frees its render targets, and the
+camera is where you left it when it comes back on.
 
 The live screen on the body is the flat view's own picture, with no CPU copy. The flat screen
 stays laid out under an effect slot that asks Rune for a backdrop copy, and the compositor
@@ -81,7 +83,29 @@ samples the screen's rect of that copy. That costs one GPU texture copy of the w
 frame. Rune can't yet hand a compositor a `NativeSurface`'s texture (anomalyco/rune#2546,
 #192). The window draws only when something changes, so a still 3D view costs nothing.
 
-What the 3D view costs, against the flat view on the same wgpu backend (M3 Max, 2026-11-27):
+What the 3D view costs on each backend, against the flat view (M3 Max, macOS 26.6.2, Rune
+`e08594c`, 2026-11-27; headless, `--frames 300 --out <dir>`, median of 3 runs of each in a
+rotating order, a build with `--features tooling,rune/frame-profile`, 1-minute load average 7 to
+11). CPU is Rune's per-frame CPU; GPU is the process's `accumulatedGPUTime` per frame and includes
+the frame's readback to the output PNG:
+
+| | Metal flat | Metal 3D | wgpu flat | wgpu 3D |
+| --- | --- | --- | --- | --- |
+| iPhone 17 scene: frame CPU p50 / p95 | 0.19 / 0.24 ms | 0.27 / 0.32 ms | 0.22 / 0.29 ms | 0.42 / 0.50 ms |
+| iPhone 17 scene: encode and submit | 0.09 ms | 0.17 ms | 0.13 ms | 0.31 ms |
+| iPhone 17 scene: GPU per frame | 1.73 ms | 1.99 ms | 1.71 ms | 1.95 ms |
+| Pixel Fold scene: frame CPU p50 / p95 | 0.18 / 0.23 ms | 0.26 / 0.32 ms | 0.24 / 0.28 ms | 0.44 / 0.58 ms |
+| Pixel Fold scene: encode and submit | 0.09 ms | 0.17 ms | 0.14 ms | 0.35 ms |
+| Pixel Fold scene: GPU per frame | 1.50 ms | 1.76 ms | 1.44 ms | 1.62 ms |
+
+On native Metal the 3D view costs about 0.08 ms more CPU a frame than the flat view, against
+0.2 ms on wgpu, and 3D on Metal takes 0.15 to 0.18 ms less CPU a frame than 3D on wgpu. GPU time is
+the same on both within the runs' spread (about ±0.2 ms). That is why native Metal is the 3D
+view's default. The live rows below were taken on wgpu before native Metal could draw the scene
+(#260). They have not been taken again on Metal: a live run needs a window that stays visible on
+an idle desktop.
+
+What the 3D view costs, against the flat view on the same wgpu backend (Rune `f6f6e04`, #260):
 
 | | flat | 3D |
 | --- | --- | --- |

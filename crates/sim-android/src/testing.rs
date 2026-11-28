@@ -180,7 +180,12 @@ pub fn wait_for(lines: &Mutex<Vec<String>>, n: usize) -> Vec<String> {
 /// (surfaceflinger) and 530 (cameraserver), which need `su 0` (present for `-9`, missing for 530's
 /// `-15`); an `exec` line, and its stop, run on the host's `sh`; and the audio commands keep a
 /// media stream (index 5 of 0..25, unmuted at first) that `dumpsys audio` reports
-/// ([`FakeAdb::image`] makes it an API 34 or an API 29 image).
+/// ([`FakeAdb::image`] makes it an API 34 or an API 29 image). The settle probe
+/// (`sim_android::settle::PROBE`) answers a booted guest whose uptime moves 1 s per probe and whose
+/// system_server uses 60% of a core between the first two probes and 2% after (the probe's own
+/// shell and `cat` busy throughout, as they are left out). The package manager has the `slim`
+/// profile's `apps.turbo`, `apps.wellbeing` and `partnersetup` (which it refuses to disable) and
+/// not `apps.restore`; what is disabled is kept in `disabled` beside the script.
 pub fn fake_adb(android: &Android) -> FakeAdb {
     let dir = android.env.sdk_root.as_ref().expect("sdk root").join("platform-tools");
     std::fs::create_dir_all(&dir).expect("platform-tools");
@@ -334,6 +339,10 @@ Ringer mode:
 - zen mode:0
 EOF
 }
+# One /proc/<pid>/stat line: pid, comm, ppid, utime and stime ticks.
+stat() { echo "$1 ($2) S $3 1 1 0 -1 4194560 100 0 0 0 $4 $5 0 0 20 0 1 0 100 0 0"; }
+d="$(dirname "$0")"
+installed() { printf 'package:android\npackage:com.android.systemui\npackage:com.google.android.apps.turbo\npackage:com.google.android.apps.wellbeing\npackage:com.google.android.partnersetup\n'; }
 case "$1" in
 install)
   case "$*" in
@@ -346,6 +355,29 @@ shell)
     "pm uninstall com.missing.app") echo "Failure [DELETE_FAILED_INTERNAL_ERROR]";;
     "pm uninstall "*) echo "Success";;
     "pm list packages -3") printf 'package:com.example.app\npackage:com.example.zeta\n';;
+    "pm list packages; echo @disabled; pm list packages -d") installed; echo @disabled; cat "$d/disabled" 2>/dev/null || true;;
+    "pm disable-user "*|"pm enable "*)
+      echo "$2" | tr ';' '\n' | while read -r c; do
+        p=${c##* }
+        case "$c" in
+          "pm disable-user --user 0 com.google.android.partnersetup")
+            echo "Error: java.lang.IllegalArgumentException: Cannot disable a protected package: $p";;
+          "pm disable-user --user 0 "*)
+            grep -qx "package:$p" "$d/disabled" 2>/dev/null || echo "package:$p" >> "$d/disabled"
+            echo "Package $p new state: disabled-user";;
+          "pm enable --user 0 "*)
+            grep -vx "package:$p" "$d/disabled" > "$d/disabled.tmp"; mv "$d/disabled.tmp" "$d/disabled"
+            echo "Package $p new state: enabled";;
+          "echo @disabled") echo @disabled;;
+          "pm list packages -d") cat "$d/disabled" 2>/dev/null || true;;
+        esac
+      done;;
+    "echo @self \$\$; cat /proc/uptime; getprop sys.boot_completed; cat /proc/[0-9]*/stat 2>/dev/null; true")
+      n=$(cat "$d/settle.n" 2>/dev/null || echo 0); echo $((n + 1)) > "$d/settle.n"
+      busy=$(( n == 0 ? 0 : 60 + (n - 1) * 2 ))
+      echo "@self 7000"; echo "$n.00 1.00"; echo 1
+      stat 1 init 0 10 20; stat 612 system_server 310 "$busy" 0; stat 900 ndroid.systemui 310 50 10
+      stat 7000 sh 206 $((n * 100)) 0; stat 7001 cat 7000 $((n * 100)) 0;;
     "pm list packages -3 -f") printf 'package:/data/app/~~Ab==/com.example.app-Cd==/base.apk=com.example.app\n';;
     "pm list packages") printf 'package:com.android.settings\npackage:com.example.zeta\npackage:android\npackage:com.example.app\n';;
     "cmd package query-activities --brief --components -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.example.app") echo 'com.example.app/.MainActivity';;
