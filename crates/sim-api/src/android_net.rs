@@ -46,7 +46,13 @@ pub(crate) fn call(android: &Android, d: &Device, method: &str, p: &Value) -> Re
         }
         "network_clear" => {
             d.set_network(Some("full"), Some("none"))?;
-            d.adb(android)?.set_airplane_mode(false).map(|()| Value::Null)
+            // Only when it is on: API 29 has no `cmd connectivity airplane-mode`, and an online
+            // device has nothing to undo.
+            let adb = d.adb(android)?;
+            if adb.airplane_mode()? {
+                adb.set_airplane_mode(false)?;
+            }
+            Ok(Value::Null)
         }
         "connections" => Ok(d.adb(android)?.sockets()?.sockets.iter().map(connection).collect()),
         "traffic" => Ok(d
@@ -88,8 +94,7 @@ fn shape(android: &Android, d: &Device, p: &Value) -> Result<Value, String> {
     });
     let mut commands = d.set_network(speed.as_deref(), delay.as_deref())?;
     if want.offline != base.offline {
-        d.adb(android)?.set_airplane_mode(want.offline)?;
-        commands.push(format!("cmd connectivity airplane-mode {}", if want.offline { "enable" } else { "disable" }));
+        commands.extend(d.adb(android)?.set_airplane_mode(want.offline)?);
     }
     Ok(json!({"profile": want, "proxy_port": null, "injected": false, "inject_mode": "none", "commands": commands}))
 }
@@ -241,6 +246,43 @@ mod tests {
         assert_eq!(run(&mut s, "network_state", json!({})).expect("state")["profile"], profile("edge"));
         assert!(adb.calls().contains(&"shell cmd connectivity airplane-mode enable".to_owned()));
         assert_eq!(shaping(&emulator), ["network speed 200:240", "network delay 400"]);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Makes the fake guest an older Android.
+    fn api(root: &std::path::Path, level: u32) {
+        std::fs::write(root.join("sdk/platform-tools/sdk"), format!("{level}\n")).expect("sdk");
+    }
+
+    #[test]
+    fn api_29_has_no_airplane_mode_command_so_offline_and_clear_use_the_setting() {
+        let (mut s, root, adb, _emulator) = session("api29");
+        api(&root, 29);
+        let out = run(&mut s, "network_shape", json!({"preset": "offline"})).expect("offline");
+        assert_eq!(
+            out["commands"],
+            json!(["settings put global airplane_mode_on 1", "am broadcast -a android.intent.action.AIRPLANE_MODE --ez state true"])
+        );
+        assert_eq!(run(&mut s, "network_state", json!({})).expect("state")["profile"], profile("offline"));
+        assert_eq!(run(&mut s, "network_clear", json!({})), Ok(Value::Null));
+        assert_eq!(run(&mut s, "network_state", json!({})).expect("state")["profile"], profile("none"));
+        // Online already: clear touches nothing.
+        let before = adb.calls().len();
+        assert_eq!(run(&mut s, "network_clear", json!({})), Ok(Value::Null));
+        assert!(!adb.calls()[before..].iter().any(|c| c.contains("airplane_mode_on 0") || c.contains("am broadcast")), "{:?}", adb.calls());
+        assert!(!adb.calls().iter().any(|c| c.contains("cmd connectivity")), "{:?}", adb.calls());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn api_30_and_later_use_the_connectivity_command() {
+        let (mut s, root, adb, _emulator) = session("api30");
+        api(&root, 30);
+        let out = run(&mut s, "network_shape", json!({"preset": "offline"})).expect("offline");
+        assert_eq!(out["commands"], json!(["cmd connectivity airplane-mode enable"]));
+        assert_eq!(run(&mut s, "network_clear", json!({})), Ok(Value::Null));
+        assert!(adb.calls().contains(&"shell cmd connectivity airplane-mode disable".to_owned()), "{:?}", adb.calls());
+        assert!(!adb.calls().iter().any(|c| c.contains("am broadcast")), "{:?}", adb.calls());
         std::fs::remove_dir_all(root).ok();
     }
 

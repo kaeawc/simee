@@ -191,7 +191,7 @@ pub fn wait_for(lines: &Mutex<Vec<String>>, n: usize) -> Vec<String> {
 /// apps); `kill` succeeds (logged only: no host process is signalled) except on pids 520
 /// (surfaceflinger) and 530 (cameraserver), which need `su 0` (present for `-9`, missing for 530's
 /// `-15`); and an `exec` line, and its stop, run on the host's `sh`. Airplane mode is a file
-/// beside the script that `cmd connectivity airplane-mode` sets and `settings get` reads; the
+/// beside the script that `cmd connectivity airplane-mode` (or `settings put`) sets; `sdk` beside it sets the API level (36 without it) and `settings get` reads; the
 /// network listings (`sim_android::net`) answer with a root listing of the kernel's socket tables
 /// and an eBPF per-uid stats dump.
 pub fn fake_adb(android: &Android) -> FakeAdb {
@@ -292,7 +292,7 @@ net_sockets() {
   net_owners
 }
 net_traffic() {
-  printf '%s\n' '@net:bpf' 'TrafficController:' '  mAppUidStatsMap:' '    uid rxBytes rxPackets txBytes txPackets' \
+  printf '%s\n' '@net:bpf' 'BPF map status:' '  mAppUidStatsMap: OK' '  mStatsMapA: OK' 'TrafficController:' '  mAppUidStatsMap:' '    uid rxBytes rxPackets txBytes txPackets' \
 '    1000 4096 10 2048 8' '    10086 123456 100 23456 50' '  mStatsMapA:'
   net_owners
 }
@@ -339,6 +339,9 @@ shell)
     # Every other signal succeeds, and is only logged: the fake never signals a host process.
     "kill -"*) ;;
     "settings get global airplane_mode_on") cat "$(dirname "$0")/airplane" 2>/dev/null || echo 0;;
+    "getprop ro.build.version.sdk") cat "$(dirname "$0")/sdk" 2>/dev/null || echo 36;;
+    "settings put global airplane_mode_on "*) echo "${2##* }" > "$(dirname "$0")/airplane";;
+    "am broadcast -a android.intent.action.AIRPLANE_MODE"*) echo "Broadcast completed: result=0";;
     "cmd connectivity airplane-mode enable") echo 1 > "$(dirname "$0")/airplane";;
     "cmd connectivity airplane-mode disable") echo 0 > "$(dirname "$0")/airplane";;
     # sim_android::net's socket listing, as root (google_apis has su), and its traffic counters.

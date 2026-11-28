@@ -62,7 +62,7 @@ const MARK: &str = "@net:";
 /// The kernel's socket tables, the socket fds of every process it may read, the process table
 /// (toybox `ps -A -o PID,UID,USER,NAME`, [`parse_ps`]) and
 /// each package's uid, in one shell, as root when `su 0` works.
-const SOCKETS: &str = "s='for f in tcp tcp6 udp udp6; do echo @net:$f; cat /proc/net/$f 2>/dev/null; done; \
+const SOCKETS: &str = "s='for f in tcp tcp6 udp udp6; do echo @net:$f; cat /proc/net/$f 2>&1; done; \
 echo @net:fd; ls -l /proc/[0-9]*/fd 2>/dev/null; echo @net:ps; ps -A -o PID,UID,USER,NAME; \
 echo @net:packages; pm list packages -U'; \
 if su 0 true 2>/dev/null; then echo @net:root; su 0 sh -c \"$s\"; else sh -c \"$s\"; fi";
@@ -109,16 +109,33 @@ impl Adb {
         }
     }
 
-    /// Turns airplane mode on or off (`cmd connectivity airplane-mode`, Android 11 on), which
-    /// takes every network down or brings them back as a user's toggle does.
-    pub fn set_airplane_mode(&self, on: bool) -> Result<(), String> {
-        let command = format!("cmd connectivity airplane-mode {}", if on { "enable" } else { "disable" });
-        let out = self.shell(&command, self.deadlines.query)?;
-        // `cmd` exits 0 even for a subcommand it doesn't have.
-        if out.contains("Unknown command") || out.contains("No shell command implementation") {
-            return Err(failure(&command, &out));
+    /// The guest's API level (`getprop ro.build.version.sdk`).
+    pub fn api_level(&self) -> Result<u32, String> {
+        let out = self.shell("getprop ro.build.version.sdk", self.deadlines.query)?;
+        out.trim().parse().map_err(|_| format!("ro.build.version.sdk is `{}`", out.trim()))
+    }
+
+    /// Turns airplane mode on or off, which takes every network down or brings them back as a
+    /// user's toggle does: `cmd connectivity airplane-mode` from Android 11 (API 30), else the
+    /// setting and the broadcast that applies it. Returns the commands run.
+    pub fn set_airplane_mode(&self, on: bool) -> Result<Vec<String>, String> {
+        if self.api_level()? >= 30 {
+            let command = format!("cmd connectivity airplane-mode {}", if on { "enable" } else { "disable" });
+            let out = self.shell(&command, self.deadlines.query)?;
+            // `cmd` exits 0 even for a subcommand it doesn't have.
+            if out.contains("Unknown command") || out.contains("No shell command implementation") {
+                return Err(failure(&command, &out));
+            }
+            return Ok(vec![command]);
         }
-        Ok(())
+        let commands = vec![
+            format!("settings put global airplane_mode_on {}", u8::from(on)),
+            format!("am broadcast -a android.intent.action.AIRPLANE_MODE --ez state {on}"),
+        ];
+        for command in &commands {
+            self.shell(command, self.deadlines.query)?;
+        }
+        Ok(commands)
     }
 
     /// The device's internet sockets, by process then fd, those no process could be matched to
@@ -289,8 +306,10 @@ fn parts(out: &str) -> HashMap<&str, String> {
 fn sockets_from(out: &str) -> Result<Sockets, String> {
     let parts = parts(out);
     let tables = [("tcp", 6, false), ("tcp6", 6, true), ("udp", 17, false), ("udp6", 17, true)];
-    if !parts.contains_key("tcp") || !parts.contains_key("ps") {
-        return Err(failure("reading /proc/net", out));
+    // `cat`'s own error (permission denied) is kept in the part, so a table the shell couldn't read fails here.
+    let tcp_readable = parts.get("tcp").is_some_and(|t| t.contains("local_address"));
+    if !tcp_readable || !parts.contains_key("ps") {
+        return Err(failure("reading /proc/net", parts.get("tcp").filter(|t| !t.trim().is_empty()).map_or(out, String::as_str)));
     }
     let part = |name: &str| parts.get(name).map_or("", String::as_str);
     let fds = parse_fds(part("fd"));
@@ -360,7 +379,9 @@ fn parse_qtaguid(text: &str) -> HashMap<u32, (u64, u64)> {
 /// of five numbers (`uid rxBytes rxPackets txBytes txPackets`) after its name.
 fn parse_uid_stats_map(text: &str) -> HashMap<u32, (u64, u64)> {
     let mut map = HashMap::new();
-    let mut lines = text.lines().skip_while(|l| !l.trim_start().starts_with("mAppUidStatsMap")).skip(1).map(str::trim);
+    // Dumps print a status block first (`mAppUidStatsMap: OK`, older netd's `mAppUidStatsMap status: OK`),
+    // so the rows start after the column header, which only the contents carry.
+    let mut lines = text.lines().map(str::trim).skip_while(|l| !l.starts_with("uid rxBytes")).skip(1);
     for line in lines.by_ref() {
         if line.starts_with("uid ") || line.is_empty() {
             continue;
@@ -559,7 +580,8 @@ package:com.android.settings uid:1000
 
     #[test]
     fn a_listing_without_the_kernels_tables_is_an_error() {
-        let err = sockets_from("/system/bin/sh: cat: /proc/net/tcp: Permission denied").expect_err("no tables");
+        let err =
+            sockets_from("@net:tcp\n/system/bin/sh: cat: /proc/net/tcp: Permission denied\n@net:tcp6\n@net:ps\n").expect_err("no tables");
         assert!(err.contains("Permission denied"), "{err}");
     }
 
@@ -582,7 +604,16 @@ package:com.android.settings uid:1000
 
     /// The eBPF map as `dumpsys` prints it (netd's TrafficController before Android 13, the
     /// connectivity module's after): a header line, then `uid rxBytes rxPackets txBytes txPackets`.
-    const BPF: &str = "TrafficController:
+    /// Source: AOSP packages/modules/Connectivity, service-t/.../NetworkStatsService.java
+    /// (`dumpMapStatus` -> `BpfDump.dumpMapStatus` prints `<map>: OK` under "BPF map status:";
+    /// `dumpAppUidStatsMapLocked` -> `BpfDump.dumpMap` prints `<map>:`, the header, then the rows
+    /// under "BPF map content:"). Confirmed from those sources; netd's older `status: OK` spelling is inferred.
+    const BPF: &str = "BPF map status:
+  mCookieTagMap: OK
+  mAppUidStatsMap: OK
+  mStatsMapA status: OK
+BPF map content:
+TrafficController:
   mCookieTagMap:
     cookie=1 tag=0x0 uid=10086
   mAppUidStatsMap:
@@ -659,6 +690,23 @@ mod device_tests {
     }
 
     #[test]
+    fn airplane_mode_before_android_11_is_the_setting_and_a_broadcast() {
+        let (android, root, adb, _emulator) = device("airplane29");
+        std::fs::write(root.join("sdk/platform-tools/sdk"), "29\n").expect("sdk");
+        let a = android.device("phone").expect("device").adb(&android).expect("adb");
+        assert_eq!(a.api_level(), Ok(29));
+        a.set_airplane_mode(true).expect("on");
+        assert!(a.airplane_mode().expect("read"));
+        let ran = a.set_airplane_mode(false).expect("off");
+        assert_eq!(ran[0], "settings put global airplane_mode_on 0");
+        assert!(!a.airplane_mode().expect("read"));
+        let calls = adb.calls();
+        assert!(!calls.iter().any(|c| c.contains("cmd connectivity")), "{calls:?}");
+        assert!(calls.contains(&"shell am broadcast -a android.intent.action.AIRPLANE_MODE --ez state true".to_owned()), "{calls:?}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn airplane_mode_is_read_and_set_over_adb() {
         let (android, root, adb, _emulator) = device("airplane");
         let a = android.device("phone").expect("device").adb(&android).expect("adb");
@@ -670,8 +718,10 @@ mod device_tests {
             adb.calls(),
             [
                 "shell settings get global airplane_mode_on",
+                "shell getprop ro.build.version.sdk",
                 "shell cmd connectivity airplane-mode enable",
                 "shell settings get global airplane_mode_on",
+                "shell getprop ro.build.version.sdk",
                 "shell cmd connectivity airplane-mode disable",
             ]
         );
