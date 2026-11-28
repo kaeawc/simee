@@ -7,6 +7,7 @@
 //! The simulator service is behind [`Service`] (`sim-coresim` implements it over CoreSimulator,
 //! tests over a fake), so all of it builds and tests on any host.
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -110,39 +111,120 @@ fn mode(meta: &fs::Metadata) -> Option<u32> {
     Some(meta.permissions().mode() & 0o7777)
 }
 
-/// Absolute link targets that name this host rather than the device: its users' homes, volumes
-/// and temporary directories.
-const HOST_ROOTS: [&str; 6] = ["/Users/", "/Volumes/", "/private/var/folders/", "/var/folders/", "/private/tmp/", "/tmp/"];
+/// Absolute link targets that name this host rather than the device: its users' homes, volumes,
+/// temporary directories, and any file by its inode (`/.vol/<device>/<inode>`).
+const HOST_ROOTS: [&str; 7] = ["/Users", "/Volumes", "/private/var/folders", "/var/folders", "/private/tmp", "/tmp", "/.vol"];
 
-/// Whether absolute link target `t` is under one of [`HOST_ROOTS`] (or is one).
-fn names_host(t: &str) -> bool {
-    HOST_ROOTS.iter().any(|h| t.starts_with(h) || t == h.trim_end_matches('/'))
+/// The firmlink that is the data volume's root: `/System/Volumes/Data/Users` is `/Users`.
+const DATA_VOLUME: &str = "/System/Volumes/Data";
+
+/// The most links one path may follow, as the kernel's `MAXSYMLINKS` on macOS: a target that
+/// takes more of the tree's own links is refused.
+const MAX_HOPS: usize = 32;
+
+/// Whether `outer` is `inner` or one of its ancestors (both absolute, folded, no trailing `/`).
+fn holds(outer: &str, inner: &str) -> bool {
+    outer == "/" || outer == inner || inner.strip_prefix(outer).is_some_and(|r| r.starts_with('/'))
 }
 
-/// Whether a link at `rel` (relative to the data directory) to the relative `target` climbs out
-/// of the data directory as written (a `..` past its root), without looking at the disk.
-fn leaves_data(rel: &str, target: &str) -> bool {
-    let mut depth = rel.matches('/').count();
-    for c in target.split('/') {
+/// Whether absolute link target `t` names the host, or can't be judged without the host's disk.
+/// It is compared as the volume compares names ([`fold`](crate::manifest::fold)), with `//` and
+/// `.` collapsed and the [`DATA_VOLUME`] prefix taken for `/`: a path under one of
+/// [`HOST_ROOTS`], or one that holds one (`/`, `/private`, `/System/Volumes`), names the host. So
+/// does any `..`, which only the host's own links resolve (`/var/..` is `/private`).
+fn names_host(t: &str) -> bool {
+    let fold = crate::manifest::fold;
+    let mut parts = Vec::new();
+    for c in t.split('/') {
         match c {
             "" | "." => {}
-            ".." if depth == 0 => return true,
-            ".." => depth -= 1,
-            _ => depth += 1,
+            ".." => return true,
+            c => parts.push(c),
+        }
+    }
+    let data_volume = fold(DATA_VOLUME);
+    let mut p = fold(&format!("/{}", parts.join("/")));
+    while let Some(rest) = p.strip_prefix(&data_volume).filter(|r| r.is_empty() || r.starts_with('/')) {
+        p = if rest.is_empty() { "/".to_owned() } else { rest.to_owned() };
+    }
+    holds(&p, &data_volume) || HOST_ROOTS.iter().map(|h| fold(h)).any(|h| holds(&h, &p) || holds(&p, &h))
+}
+
+/// Bundle path `p` relative to the data directory (`""` for `data` itself).
+fn under_data(p: &str) -> &str {
+    p.strip_prefix(DATA).and_then(|r| r.strip_prefix('/')).unwrap_or("")
+}
+
+/// Whether a link at `rel` (relative to the data directory) to the relative `target` leads out
+/// of the data directory once resolved as the host resolves it: component by component, through
+/// the tree's own `links` (by folded path under the data directory, so in any spelling the volume
+/// takes for theirs), a `..` past the root leaving it, an absolute link's target judged by
+/// [`names_host`] with what is left of the path, and more than [`MAX_HOPS`] links refused. A name
+/// the tree doesn't have is taken as a directory (on the disk it doesn't resolve at all).
+fn leaves_data<'a>(links: &BTreeMap<String, &'a str>, rel: &'a str, target: &'a str) -> bool {
+    let mut at: Vec<&str> = rel.split('/').collect();
+    at.pop();
+    let mut todo: VecDeque<&str> = target.split('/').collect();
+    let mut hops = 0;
+    while let Some(c) = todo.pop_front() {
+        match c {
+            "" | "." => {}
+            ".." => {
+                if at.pop().is_none() {
+                    return true;
+                }
+            }
+            name => {
+                at.push(name);
+                let Some(&t) = links.get(&crate::manifest::fold(&at.join("/"))) else { continue };
+                hops += 1;
+                if hops > MAX_HOPS {
+                    return true;
+                }
+                at.pop();
+                if t.starts_with('/') {
+                    let rest: Vec<&str> = todo.into_iter().collect();
+                    return names_host(&format!("{t}/{}", rest.join("/")));
+                }
+                for c in t.split('/').rev() {
+                    todo.push_front(c);
+                }
+            }
         }
     }
     false
 }
 
+/// The symlinks in `tree` an import refuses, in tree order: an absolute one that names the host
+/// ([`names_host`]), a relative one that leads out of `data/` through the tree's links
+/// ([`leaves_data`]). The device's daemons run as the host user and would read and write through
+/// them.
+fn refused_links(tree: &[Entry]) -> Vec<&Entry> {
+    let links: BTreeMap<String, &str> = tree
+        .iter()
+        .filter_map(|e| match (e.kind, &e.target) {
+            (EntryKind::Symlink, Some(t)) => Some((crate::manifest::fold(under_data(&e.path)), t.as_str())),
+            _ => None,
+        })
+        .collect();
+    tree.iter()
+        .filter(|e| match (e.kind, &e.target) {
+            (EntryKind::Symlink, Some(t)) if t.starts_with('/') => names_host(t),
+            (EntryKind::Symlink, Some(t)) => leaves_data(&links, under_data(&e.path), t),
+            _ => false,
+        })
+        .collect()
+}
+
 /// What the bundle holds for a symlink at `rel` (relative to the data directory `root`) to
-/// `target`: a relative target as it is, unless it climbs out of the data directory; an absolute
-/// one into the data directory as the same place relative to the link; another absolute one as
-/// it is, unless it names the host (under the device's own directory or [`HOST_ROOTS`]). `None`
-/// is left out: an import refuses a bundle that holds one ([`link_refusal`]).
+/// `target`: a relative target as it is (the export then drops those that lead out of the data
+/// directory, [`refused_links`]); an absolute one into the data directory as the same place
+/// relative to the link; another absolute one as it is, unless it names the host (under the
+/// device's own directory, or [`names_host`]). `None` is left out.
 fn portable_target(root: &Path, rel: &str, target: &Path) -> Option<String> {
     let t = target.to_str()?;
     if !target.is_absolute() {
-        return (!leaves_data(rel, t)).then(|| t.to_owned());
+        return Some(t.to_owned());
     }
     if let Ok(inside) = target.strip_prefix(root) {
         let up = "../".repeat(rel.matches('/').count());
@@ -160,19 +242,15 @@ fn portable_target(root: &Path, rel: &str, target: &Path) -> Option<String> {
     Some(t.to_owned())
 }
 
-/// Why an import refuses tree entry `e`, a symlink an export would have left out: one that
-/// climbs out of `data/` or names a host path ([`HOST_ROOTS`]). The device's daemons run as the
-/// host user and would read and write through it.
-fn link_refusal(e: &Entry) -> Option<String> {
-    let (EntryKind::Symlink, Some(t)) = (e.kind, &e.target) else { return None };
-    let rel = e.path.strip_prefix(DATA).and_then(|r| r.strip_prefix('/')).unwrap_or("");
-    let out = if t.starts_with('/') { names_host(t) } else { leaves_data(rel, t) };
-    out.then(|| {
-        format!(
-            "the bundle's symlink `{}` points at `{t}`, outside the device's data, which an export never writes; it isn't imported",
-            e.path
-        )
-    })
+/// Why an import refuses `tree`, if it holds a symlink an export leaves out ([`refused_links`]).
+fn link_refusal(tree: &[Entry]) -> Option<String> {
+    let e = *refused_links(tree).first()?;
+    Some(format!(
+        "the bundle's symlink `{}` points at `{}`, which resolves to a host path or out of the device's data (through the \
+         bundle's own links), which an export never writes; it isn't imported",
+        e.path,
+        e.target.as_deref().unwrap_or_default()
+    ))
 }
 
 /// The data directory `root` as bundle contents: every regular file a disk at `data/<path>`,
@@ -267,7 +345,17 @@ pub fn export(svc: &dyn Service, udid: &str, to: &Path, opts: &Options) -> Resul
     let rt = runtimes.iter().find(|r| r.identifier.eq_ignore_ascii_case(&d.runtime)).ok_or_else(|| {
         Error::Refused(format!("{}'s runtime {} isn't installed here, so the bundle can't name its build", d.name, d.runtime))
     })?;
-    let walked = walk(&d.data_dir)?;
+    let mut walked = walk(&d.data_dir)?;
+    // Drop what an import would refuse; dropping a link changes where others lead, so again
+    // until none is left.
+    loop {
+        let refused: BTreeSet<String> = refused_links(&walked.tree).into_iter().map(|e| e.path.clone()).collect();
+        if refused.is_empty() {
+            break;
+        }
+        walked.tree.retain(|e| !refused.contains(&e.path));
+        walked.dropped.extend(refused.into_iter().map(|p| format!("{p} (a symlink to a host path)")));
+    }
     let secrets = vec![
         Secret {
             item: format!("{DATA}/Library/Keychains"),
@@ -371,7 +459,7 @@ pub fn import(svc: &dyn Service, reader: Reader, name: &str) -> Result<Imported>
     if !m.tree.iter().any(|e| e.path == DATA && e.kind == EntryKind::Dir) {
         return Err(Error::Refused(format!("the bundle has no {DATA}/ directory")));
     }
-    if let Some(why) = m.tree.iter().find_map(link_refusal) {
+    if let Some(why) = link_refusal(&m.tree) {
         return Err(Error::Refused(why));
     }
     let runtime = find_runtime(&svc.runtimes().map_err(Error::Refused)?, id)?;

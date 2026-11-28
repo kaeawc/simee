@@ -225,10 +225,19 @@ pub const MAX_SIZE: u64 = 1 << 40;
 /// `path` as a case-insensitive, normalization-insensitive volume (APFS's default, HFS+)
 /// compares names: canonically decomposed (NFD), case-folded, without the code points HFS+
 /// ignores. Two paths that fold alike are one file there. It folds at least as much as the
-/// volume does, so it may join names the volume keeps apart, never the reverse.
+/// volume does, so it may join names the volume keeps apart, never the reverse. Case is folded
+/// by lowercasing, uppercasing and lowercasing again, so every case of a letter whose uppercase
+/// is more than one letter joins it: `ẞ` lowercases to `ß`, which uppercases to `SS`, so `ẞ`,
+/// `ß` and `ss` are one name, as on APFS.
 pub(crate) fn fold(path: &str) -> String {
     let ignorable = |c: &char| matches!(*c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}');
-    path.nfd().flat_map(char::to_uppercase).flat_map(char::to_lowercase).filter(|c| !ignorable(c)).nfd().collect()
+    path.nfd()
+        .flat_map(char::to_lowercase)
+        .flat_map(char::to_uppercase)
+        .flat_map(char::to_lowercase)
+        .filter(|c| !ignorable(c))
+        .nfd()
+        .collect()
 }
 
 /// Whether `h` is a BLAKE3 hash as the manifest writes it: 64 lowercase hex digits.

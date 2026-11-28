@@ -134,7 +134,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          Android: an AVD that has booted under simee (its simee disks, config.ini without host paths, boot.prop) and \
          its system image's identity. iOS: the simulator's data directory (settings, apps and their containers, keychain) \
          as data/, its directories, symlinks and modes in the manifest's tree, without the contents of Library/Caches \
-         and tmp (listed in `left_out`) or symlinks to host paths (in `dropped`), and its device type and runtime \
+         and tmp (listed in `left_out`) or the symlinks an import refuses (in `dropped`), and its device type and runtime \
          (identifier and build); only reads the device, refusing one that is booted or a `to` inside it. Captures disks, \
          not RAM (resume is a cold boot). Returns sizes, the identity and the secrets inventory",
     ),
@@ -148,10 +148,13 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          config.ini keys holding host paths (listed in `dropped`); keeps the exported device's guest identity (ro.serialno, \
          android_id). iOS: finds the runtime by identifier and build and refuses, naming what to install, when it isn't \
          installed; creates a simulator of the bundle's device type on that exact build in the set and puts the bundle's \
-         data directory in as its own (a new UDID; the keychain and app data come along). It refuses a tree with two paths \
-         that are one on a case-insensitive volume (case and Unicode normalization folded) or a path under a symlink in any \
-         such spelling, and a symlink to a host path or out of data/; it writes nothing through a symlink. An iOS bundle \
-         carries app executables and data its apps trust: import one as you would run its code",
+         data directory in as its own (a new UDID; the keychain and app data come along). Before it makes the device, it \
+         refuses a tree with two paths that are one on a case-insensitive volume (case, ß and ss, and Unicode normalization \
+         folded) or a path under a symlink in any such spelling, and a symlink that resolves out of data/ (following the \
+         tree's own symlinks, at most 32) or to a host path: an absolute target, compared folded with // and . collapsed and \
+         /System/Volumes/Data read as /, under or holding /Users, /Volumes, /tmp, /var/folders (or their /private forms) or \
+         /.vol, or with a `..`. It writes nothing through a symlink. An iOS bundle carries app executables and data its apps \
+         trust: import one as you would run its code",
     ),
     ("shutdown", "device; iOS: set?", "Shut down"),
     (

@@ -384,6 +384,10 @@ fn paths_fold_as_a_case_and_normalization_insensitive_volume_compares_them() {
     assert_eq!(fold(&format!("data/{NFC}")), fold(&format!("data/{NFD}")));
     assert_eq!(fold(&format!("data/{}", NFC.to_uppercase())), fold(&format!("data/{NFD}")));
     assert_eq!(fold("data/a\u{200d}b"), fold("data/ab"), "a code point HFS+ ignores");
+    // APFS takes the capital sharp s, the sharp s and `ss` for one name.
+    assert_eq!(fold("data/\u{1e9e}"), fold("data/ss"));
+    assert_eq!(fold("data/\u{df}"), fold("data/SS"));
+    assert_eq!(fold("data/stra\u{1e9e}e"), fold("data/STRASSE"));
     assert_ne!(fold("data/a"), fold("data/b"));
     assert_eq!(fold("data/a/b").matches('/').count(), 2, "folding keeps the components");
 }
@@ -417,6 +421,12 @@ fn a_tree_that_reaches_a_link_by_another_spelling_is_refused() {
     assert!(err.contains("`data/m/x` lies under the symlink `data/M`"), "{err}");
     // Two directories alike when folded, no link at all.
     let err = refused(vec![dir("data/Docs"), dir("data/DOCS")]);
+    assert!(err.contains("are one path"), "{err}");
+    // The capital sharp s: `data/ẞ/x` is `data/ss/x` on APFS, refused here rather than when the
+    // tree is applied to a device already made.
+    let err = refused(vec![link("data/ss", "/etc"), dir("data/\u{1e9e}/x")]);
+    assert!(err.contains("`data/\u{1e9e}/x` lies under the symlink `data/ss`"), "{err}");
+    let err = refused(vec![link("data/\u{df}", "/etc"), dir("data/\u{1e9e}")]);
     assert!(err.contains("are one path"), "{err}");
     fs::remove_dir_all(root).ok();
 }
@@ -472,23 +482,67 @@ fn imports_refuse_links_out_of_the_data_directory() {
     populate(&src.data_dir);
     symlink("../../device.plist", src.data_dir.join("Library/up")).expect("climbing link");
     symlink("../Library/..", src.data_dir.join("Library/root")).expect("the data root");
+    // Climbs out only through a link to `.`, which a lexical check doesn't see.
+    symlink(".", src.data_dir.join("Library/self")).expect("a link to its own directory");
+    symlink("self/self/../../../tmp", src.data_dir.join("Library/esc")).expect("climbing through a link");
     let to = root.join("golden-dir");
     let ex = export(&fake, SOURCE, &to, &Options::default()).expect("export");
-    assert!(ex.manifest.dropped.contains(&"data/Library/up (a symlink to a host path)".to_owned()), "{:?}", ex.manifest.dropped);
-    assert!(ex.manifest.tree.iter().any(|e| e.path == "data/Library/root"), "a link to the data root stays");
-    for (path, target) in [
-        ("data/Library/agents", "/Users/someone/Library/LaunchAgents"),
-        ("data/Library/tmp", "/tmp"),
-        ("data/up", ".."),
-        ("data/Library/up", "../Preferences/../../../device.plist"),
+    for gone in ["data/Library/up", "data/Library/esc"] {
+        assert!(ex.manifest.dropped.contains(&format!("{gone} (a symlink to a host path)")), "{:?}", ex.manifest.dropped);
+    }
+    for stays in ["data/Library/root", "data/Library/self"] {
+        assert!(ex.manifest.tree.iter().any(|e| e.path == stays), "{stays} stays");
+    }
+    let deep = format!("{}{}tmp", "a/".repeat(20), "../".repeat(20));
+    for (extra, path, target) in [
+        (None, "data/Library/agents", "/Users/someone/Library/LaunchAgents"),
+        (None, "data/Library/tmp", "/tmp"),
+        (None, "data/up", ".."),
+        (None, "data/Library/up", "../Preferences/../../../device.plist"),
+        // The review's bypasses: through the tree's own link to `.`, and host paths spelled
+        // with `//`, `.`, the data volume's firmlink, another case, or `..`.
+        (Some(link("data/a", ".")), "data/b", deep.as_str()),
+        (Some(link("data/A", ".")), "data/b", "a/../tmp"),
+        (None, "data/Library/agents", "//Users/someone/Library/LaunchAgents"),
+        (None, "data/Library/agents", "/./Users/someone/Library/LaunchAgents"),
+        (None, "data/Library/agents", "/System/Volumes/Data/Users/someone/Library/LaunchAgents"),
+        (None, "data/Library/agents", "/system/volumes/data/private/tmp"),
+        (None, "data/Library/agents", "/users/someone"),
+        (None, "data/Library/agents", "/Library/../Users/someone"),
+        (None, "data/Library/agents", "/.vol/16777234/2"),
+        // A path that holds a host root: `data/root/Users/...` reaches it.
+        (None, "data/root", "/"),
+        (None, "data/root", "/private"),
+        (None, "data/root", "/System/Volumes"),
+        (None, "data/root", "/System/Volumes/Data"),
+        // Through an absolute link the tree keeps, and through a loop.
+        (Some(link("data/sys", "/System/Library")), "data/b", "sys/../../Users/someone"),
+        (None, "data/x", "x"),
+        (None, "data/x", "Library/../x/y"),
     ] {
         let mut m = ex.manifest.clone();
+        m.tree.extend(extra);
         m.tree.push(link(path, target));
         fs::write(to.join(crate::MANIFEST), m.to_json()).expect("manifest");
         let err = import(&fake, Reader::open(&to).expect("opens"), "copy").expect_err("refused").to_string();
+        // The link named, not the one it goes through (which stays inside).
         assert!(err.contains(&format!("symlink `{path}` points at `{target}`")), "{err}");
+        assert_eq!(fake.devices.borrow().len(), 1, "nothing was made for {target}");
     }
-    assert_eq!(fake.devices.borrow().len(), 1, "nothing was made");
+    // Links that stay inside the data directory, through the tree's own links, import.
+    let mut m = ex.manifest.clone();
+    m.tree.extend([
+        link("data/a", "."),
+        link("data/b", &format!("{}Library/../Library/Preferences", "a/".repeat(20))),
+        link("data/c", "Library/Prefs/com.apple.springboard.plist"),
+        link("data/d", "a/Library/self/self/../Library/Preferences"),
+        link("data/sys", "/System/Library"),
+        link("data/e", "sys/Frameworks"),
+    ]);
+    fs::write(to.join(crate::MANIFEST), m.to_json()).expect("manifest");
+    let im = import(&fake, Reader::open(&to).expect("opens"), "copy").expect("in-tree links import");
+    assert_eq!(fs::read(im.device.data_dir.join("c")).expect("through two links"), b"prefs");
+    assert!(im.device.data_dir.join("d/com.apple.springboard.plist").is_file());
     // A bundle whose disks add up to more than an import would read back is refused as it opens.
     let mut m = ex.manifest.clone();
     m.disks[0].size = crate::MAX_SIZE + 1;
