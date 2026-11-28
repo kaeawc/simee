@@ -880,6 +880,7 @@ fn coalesce_moves(inputs: Vec<Input>) -> Vec<Input> {
 fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
     // A landed admission check queues its boot (or shows its sheet) before the actions run.
     let mut changed = admission::poll(s);
+    changed |= view::close_stale_menu(s);
     // Before this poll's scan lands: what Return boots is what the list showed.
     list::keep_highlight(s);
     if let Some((button, due)) = s.held
@@ -3126,6 +3127,38 @@ mod tests {
         // An iPad is another kind: asked about.
         click_for_sheet(&mut rt, "device-row:D4");
         assert_eq!(boots.booted(), ["C3", "B2", "C3"]);
+    }
+
+    /// #585: "Checking…" is for the check only. When the check admits, or the sheet's Boot anyway
+    /// goes ahead, the line clears, and the sheet showing clears it too.
+    #[test]
+    fn checking_clears_when_a_boot_proceeds() {
+        let checking = |s: &State| s.status.as_deref().is_some_and(|t| t.contains("Checking"));
+        // The check admits.
+        let boots = FakeBoots::default();
+        let mut rt = sheet_runtime(&boots, admit);
+        press(&mut rt, "device-row:C3");
+        until(&mut rt, "C3 booting", |rt| rt.state.jobs.booting("C3"));
+        assert!(!checking(&rt.state), "admitted: {:?}", rt.state.status);
+        boots.release("C3", Ok(()));
+        // The check holds: the sheet clears the line, and Boot anyway keeps it clear.
+        let boots = FakeBoots::default();
+        let mut rt = sheet_runtime(&boots, hold);
+        click_for_sheet(&mut rt, "device-row:C3");
+        assert!(!checking(&rt.state), "sheet up: {:?}", rt.state.status);
+        press(&mut rt, "admission-boot-anyway");
+        until(&mut rt, "C3 booting", |rt| rt.state.jobs.booting("C3"));
+        assert!(!checking(&rt.state), "Boot anyway: {:?}", rt.state.status);
+        boots.release("C3", Ok(()));
+        // The sheet's own choice clears a stale line even when nothing else does.
+        let boots = FakeBoots::default();
+        let mut rt = sheet_runtime(&boots, hold);
+        click_for_sheet(&mut rt, "device-row:C3");
+        rt.state.status = Some("Checking whether the host can take iPhone 18 Pro…".into());
+        press(&mut rt, "admission-boot-anyway");
+        assert!(!checking(&rt.state), "choose: {:?}", rt.state.status);
+        until(&mut rt, "C3 booting", |rt| rt.state.jobs.booting("C3"));
+        boots.release("C3", Ok(()));
     }
 
     /// #585: while a check runs the status line says so (never the last boot's refusal), a click

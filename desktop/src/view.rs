@@ -228,6 +228,17 @@ impl Toolbar {
     }
 }
 
+/// Closes the overflow menu's flag once nothing overflows (a wider window, a hidden panel, a device
+/// that stopped), so it doesn't reopen on its own when the toolbar next overflows. Returns whether
+/// it changed anything.
+pub fn close_stale_menu(s: &mut State) -> bool {
+    if !s.panes.toolbar_menu || !Toolbar::of(s).more.is_empty() {
+        return false;
+    }
+    s.panes.toolbar_menu = false;
+    true
+}
+
 /// The stage toolbar's width inside its padding, once the window has been laid out.
 fn toolbar_width(s: &State) -> Option<f32> {
     use crate::panes::{Side, shown, shown_width};
@@ -729,6 +740,23 @@ mod tests {
         rt.key(KeyEvent::from(Key::Escape));
         settle(&mut rt);
         assert!(rt.find("toolbar-menu").is_none() && !rt.state.panes.toolbar_menu);
+    }
+
+    /// The menu opens only when asked: if nothing overflows while it is open (no device here), the
+    /// flag clears, and the menu doesn't reappear when the toolbar overflows again.
+    #[test]
+    fn the_overflow_menu_does_not_reopen_unasked() {
+        let mut rt = runtime(crowded_toolbar_scene, (1000.0, 560.0));
+        press(&mut rt, "toolbar-more");
+        assert!(rt.state.panes.toolbar_menu && rt.find("toolbar-menu").is_some());
+        let selected = rt.state.selected.clone();
+        rt.update(|s, _| s.selected = None);
+        settle(&mut rt);
+        assert!(!rt.state.panes.toolbar_menu, "cleared with nothing to overflow");
+        rt.update(|s, _| s.selected = selected);
+        settle(&mut rt);
+        assert!(rt.find("toolbar-more").is_some(), "overflowing again");
+        assert!(rt.find("toolbar-menu").is_none(), "but not open");
     }
 
     /// At the default size the same toolbar fits whole: no overflow menu.

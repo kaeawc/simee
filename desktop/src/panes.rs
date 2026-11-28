@@ -389,7 +389,7 @@ pub fn layout(s: &State, t: Theme, leading: f32, sidebar: El, stage: El, platfor
 /// one out in its own window) and however crowded its toolbar is. The rest of the band moves the
 /// window: macOS's own titlebar drag is off (`Chrome::drag_regions`), so the toggles take presses.
 pub fn title_bar(s: &State, t: Theme, leading: f32) -> El {
-    row()
+    let bar = row()
         .key("title-bar")
         .w_full()
         .h(TITLE_H)
@@ -397,11 +397,16 @@ pub fn title_bar(s: &State, t: Theme, leading: f32) -> El {
         .pl(leading.max(0.0) + TOGGLE_INSET)
         .pr(TOGGLE_INSET)
         .center_y()
-        .fill(t.card)
-        .window_drag()
-        .child(pane_toggle(s, Side::Sidebar, t))
-        .child(el().grow(1.0))
-        .child(pane_toggle(s, Side::Inspector, t))
+        .fill(t.card);
+    drag_band(bar).child(pane_toggle(s, Side::Sidebar, t)).child(el().grow(1.0)).child(pane_toggle(s, Side::Inspector, t))
+}
+
+/// Marks a title-bar band as moving (and zooming) the window. macOS only: the content runs under
+/// a transparent titlebar there and its own drag is off (`Chrome::drag_regions`). Linux and
+/// Windows keep their native frame's caption, so a second drag strip below it is left out and
+/// their window behaves as before this bar.
+pub fn drag_band(band: El) -> El {
+    if cfg!(target_os = "macos") { band.window_drag() } else { band }
 }
 
 /// A pane's drag handle: a strip on its inner edge. Dragging sets the width (cancelling puts it
