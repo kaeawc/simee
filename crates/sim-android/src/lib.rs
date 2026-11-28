@@ -16,6 +16,8 @@ pub mod files;
 pub mod host;
 pub mod listing;
 pub mod procs;
+pub mod profile;
+pub mod settle;
 /// A fake emulator and adb for tests (a Unix socket per device and `/bin/sh` scripts): unix only.
 #[cfg(all(unix, any(test, feature = "testing")))]
 pub mod testing;
@@ -31,7 +33,7 @@ pub use emu_avd::Env;
 /// AVD export and import results ([`Android::export_avd`], [`Android::import_avd`]).
 pub use emu_avd::bundle;
 use emu_avd::{Avd, NewAvd, Running};
-use sim_core::device::{DeviceInfo, DeviceState, RuntimeInfo, Selection, select};
+use sim_core::device::{DeviceInfo, DeviceState, DeviceTypeInfo, RuntimeInfo, Selection, select};
 use sim_core::form_factor::{FormFactor, InputMethod, Kind, Profile, android_profile};
 use sim_core::frame::Frame;
 use sim_core::gesture::{Phase, Sample, pace, pace_samples};
@@ -118,6 +120,55 @@ impl LogTail {
         let done: Vec<u8> = self.partial.drain(..=end).collect();
         String::from_utf8_lossy(&done).lines().any(|l| l.starts_with("emu: boot completed"))
     }
+}
+
+/// The hardware a new AVD can follow, as device types in the iOS backend's shape: simee's phone
+/// and tablet (no SDK definition: its own small screens, which boot faster), the foldables
+/// ([`sim_core::fold::devices`]), and the SDK definitions emu writes for the other form factors
+/// (`emu_avd::sdk_device`: Wear OS, TV, Automotive, the XR headset and the AI glasses). The
+/// identifier is the definition's `hw.device.name` (`pixel_fold`), or the form factor where there
+/// is none (`phone`); `create` takes the form factor, and a foldable's identifier as `device`. The
+/// XR pair is chosen by the system image (`ai-glasses` images get the glasses). The scale is the
+/// density over 160 dpi.
+pub fn device_types() -> Vec<DeviceTypeInfo> {
+    use emu_avd::sdk_device as sdk;
+    use sim_core::form_factor::{ANDROID_GLASSES_SCREEN, Density};
+    let kind = |form_factor: FormFactor| Kind::new(Platform::Android, form_factor).expect("every form factor is an Android one");
+    let entry = |form_factor: FormFactor, id: &str, name: &str, model: &str, (width, height, dpi): (u32, u32, u32)| DeviceTypeInfo {
+        identifier: id.to_owned(),
+        name: name.to_owned(),
+        model: model.to_owned(),
+        product_family: kind(form_factor).sub_platform.label().to_owned(),
+        screen_width: f64::from(width),
+        screen_height: f64::from(height),
+        screen_scale: f64::from(dpi) / 160.0,
+        platform: Platform::Android,
+        form_factor: Some(form_factor),
+    };
+    // The reference profile's screen (Android's are all in dpi).
+    let screen = |form_factor: FormFactor| {
+        let p = kind(form_factor).profile();
+        let dpi = match p.density {
+            Density::Dpi(d) => d,
+            Density::Scale(s) => s * 160,
+        };
+        (p.width, p.height, dpi)
+    };
+    let defined =
+        |form_factor: FormFactor, device: &sdk::SdkDevice, name: &str| entry(form_factor, device.id, name, device.id, screen(form_factor));
+    let mut out = vec![
+        entry(FormFactor::Phone, "phone", "Phone", "", screen(FormFactor::Phone)),
+        entry(FormFactor::Tablet, "tablet", "Tablet", "", screen(FormFactor::Tablet)),
+    ];
+    out.extend(sim_core::fold::devices().iter().map(|d| entry(FormFactor::Foldable, d.id, d.name, d.id, d.lcd)));
+    out.extend([
+        defined(FormFactor::Watch, &sdk::WEAR_LARGE_ROUND, "Wear OS Large Round"),
+        defined(FormFactor::Tv, &sdk::TV_1080P, "Television (1080p)"),
+        defined(FormFactor::Auto, &sdk::AUTOMOTIVE_1024P_LANDSCAPE, "Automotive (1024p landscape)"),
+        defined(FormFactor::Vision, &sdk::XR_HEADSET, "XR Headset"),
+        entry(FormFactor::Vision, sdk::AI_GLASSES.id, "AI Glasses", sdk::AI_GLASSES.id, ANDROID_GLASSES_SCREEN),
+    ]);
+    out
 }
 
 impl Android {
@@ -1613,6 +1664,45 @@ fn decode_png(bytes: &[u8]) -> Result<Frame, String> {
 mod tests {
     use super::*;
     use crate::testing::{fake_emulator, fake_stock_emulator, wait_for};
+
+    #[test]
+    fn device_types_are_the_hardware_new_avds_follow() {
+        let types = device_types();
+        let ids: Vec<&str> = types.iter().map(|t| t.identifier.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "phone",
+                "tablet",
+                "pixel_fold",
+                "surface_duo",
+                "wearos_large_round",
+                "tv_1080p",
+                "automotive_1024p_landscape",
+                "xr_headset_device",
+                "ai_glasses_device"
+            ]
+        );
+        // Every supported Android form factor has one, and every one is Android's.
+        for (f, p, kind) in sim_core::form_factor::matrix() {
+            if p == Platform::Android && kind.is_ok() {
+                assert!(types.iter().any(|t| t.form_factor == Some(f)), "{f:?}");
+            }
+        }
+        assert!(types.iter().all(|t| t.platform == Platform::Android));
+        let fold = &types[2];
+        assert_eq!((fold.name.as_str(), fold.model.as_str(), fold.product_family.as_str()), ("Pixel Fold", "pixel_fold", "Android"));
+        assert_eq!((fold.screen_width, fold.screen_height, fold.screen_scale), (2208.0, 1840.0, 2.625));
+        let phone = &types[0];
+        assert_eq!((phone.screen_width, phone.screen_height, phone.screen_scale), (720.0, 1280.0, 2.0));
+        assert_eq!((types[4].product_family.as_str(), types[5].product_family.as_str()), ("Wear OS", "Android TV"));
+        let glasses = types.last().expect("glasses");
+        assert_eq!((glasses.screen_width, glasses.screen_height, glasses.screen_scale), (450.0, 450.0, 1.0));
+        // A foldable's identifier is what `create` takes as `device`.
+        for t in types.iter().filter(|t| t.form_factor == Some(FormFactor::Foldable)) {
+            assert_eq!(sim_core::fold::device(&t.identifier).map(|d| d.id), Some(t.identifier.as_str()));
+        }
+    }
 
     struct Fixture {
         root: PathBuf,

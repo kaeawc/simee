@@ -28,6 +28,9 @@ use crate::params::{
     opt_u64, pairs, pencil_samples, png_result, pointer_request, remote_swipe_samples, screenshot_result, str_param, strings,
     swipe_samples, tap_samples, touch_sample,
 };
+// The settle rule, its options and a result's load figures: shared with Android's `settle`.
+pub(crate) use crate::settle::options as settle_options;
+use crate::settle::{not_settled, put_load, round, rule as settle_rule};
 
 /// Shaping proxies, one per device, owned by this (long-running) process.
 static PROXIES: std::sync::Mutex<Option<std::collections::HashMap<String, sim_netshape::proxy::Proxy>>> = std::sync::Mutex::new(None);
@@ -1401,30 +1404,6 @@ fn profile(name: &str) -> Result<&'static Profile, String> {
     })
 }
 
-/// The settle rule from `prefix` + `cpu_pct`, `window_s` and `foreground` (the defaults where
-/// absent): `settle_` for `boot` and `boot_many`, none for `settle`.
-fn settle_rule(p: &Value, prefix: &str) -> Result<crate::settle::Rule, String> {
-    let mut rule = crate::settle::Rule::default();
-    let key = |name: &str| format!("{prefix}{name}");
-    match p.get(key("cpu_pct")) {
-        None | Some(Value::Null) => {}
-        Some(v) => {
-            rule.cpu_pct =
-                v.as_f64().filter(|x| *x >= 0.0).ok_or_else(|| format!("{} must be a number of % of a core, not {v}", key("cpu_pct")))?
-        }
-    }
-    match p.get(key("window_s")) {
-        None | Some(Value::Null) => {}
-        Some(v) => {
-            rule.window = Duration::from_secs(v.as_u64().ok_or_else(|| format!("{} must be whole seconds, not {v}", key("window_s")))?)
-        }
-    }
-    if let Some(fg) = opt_bool(p, &key("foreground"))? {
-        rule.foreground = fg;
-    }
-    Ok(rule)
-}
-
 /// `launch`'s `restart`: true (the default) terminates a running instance and cold-starts the
 /// app; false leaves a running app as it is.
 fn launch_restart(p: &Value) -> Result<bool, String> {
@@ -1520,12 +1499,6 @@ pub(crate) fn boot_plan_text(p: &Value, many: bool) -> Result<String, String> {
     boot_plan(p, 1, many, || Ok(Vec::new())).map(|plan| format!("{plan:?}"))
 }
 
-/// `settle`'s rule and how long it waits (`timeout_s`, default 600 s).
-pub(crate) fn settle_options(p: &Value) -> Result<(crate::settle::Rule, Duration), String> {
-    let rule = settle_rule(p, "")?;
-    Ok((rule, opt_u64(p, "timeout_s").map_or_else(|| crate::settle::default_settle_timeout(1), Duration::from_secs)))
-}
-
 /// `logs`' window, predicate and whether it answers from the device's stream (`stream`, default false).
 pub(crate) fn log_options(p: &Value) -> Result<(&str, Option<&str>, bool), String> {
     Ok((str_param(p, "last").unwrap_or("1m"), str_param(p, "predicate"), opt_bool(p, "stream")?.unwrap_or(false)))
@@ -1602,31 +1575,6 @@ fn boot_device(device: &Device, plan: &BootPlan, launching: &dyn Fn() -> Result<
         put_load(&mut result, &settler);
     }
     Ok(result)
-}
-
-/// Why a wait that ran out of time didn't settle.
-fn not_settled(settler: &crate::settle::Settler, rule: crate::settle::Rule, timeout: Duration) -> String {
-    let what = if rule.foreground { " in the foreground" } else { "" };
-    let pct = settler.load().map_or_else(|| "no process tree".to_owned(), |l| format!("{:.0} % of a core{what}", l.judged_pct(&rule)));
-    format!("device did not settle within {}s ({pct} over the last {}s)", timeout.as_secs(), rule.window.as_secs())
-}
-
-/// A settle wait's last figures: processes, and CPU over the window (all of it, and the
-/// background-QoS and foreground parts); and the CPU seconds the tree used over the whole wait
-/// (from the boot when the wait followed one).
-fn put_load(result: &mut Value, settler: &crate::settle::Settler) {
-    let load = settler.load();
-    let used = settler.used();
-    result["cpu_s"] = json!(round(used.total_s));
-    result["background_cpu_s"] = json!(round(used.background_s));
-    result["procs"] = json!(settler.procs());
-    result["cpu_pct"] = json!(load.map(|l| round(l.total_pct)));
-    result["background_cpu_pct"] = json!(load.map(|l| round(l.background_pct)));
-    result["foreground_cpu_pct"] = json!(load.map(|l| round(l.foreground_pct())));
-}
-
-fn round(x: f64) -> f64 {
-    (x * 10.0).round() / 10.0
 }
 
 /// What applying (or undoing) a profile did: the labels now in the wanted state, those that

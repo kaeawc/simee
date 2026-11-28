@@ -156,6 +156,26 @@ guest both touched twice under Hypervisor.framework (about 4.0 GB for a 2 GB gue
 system-wide figure doesn't, but on this shared host CI moves it by gigabytes between samples, so
 neither is a clean per-device number yet (see Results).
 
+### The `settle` and `profile` methods
+
+The API's `settle` (#420) judges an Android device as iOS's judges a simulator, with the same
+parameters and result: the guest's processes (and kernel threads) under `cpu_pct` (10) % of a
+core over `window_s` (10) s, read from `/proc/<pid>/stat` in one adb call a second and timed on
+the guest's `/proc/uptime`, with `sys.boot_completed=1` and `system_server` running in place of
+SpringBoard. It measures the guest, not the emu process around it (the script above), so the
+figure doesn't include the emulator's own idle work; the probe's shell is left out, adbd is not.
+There is no QoS split to read, so all of it counts as foreground. The golden build's settle
+(`apps/emu/src/golden.rs`: the launcher resumed and the whole guest under 25% busy, twice 5 s
+apart) stays as it is: it runs in emu before the API exists.
+
+`profile {name: "slim"}` turns off, for user 0 (`pm disable-user`, kept in
+`package-restrictions.xml`, so across reboots and into clones and exports), Google packages that
+run their own scheduled work and that nothing AutoMobile or an app under test reaches: Device
+Health Services, Digital Wellbeing, the Data Restore Tool and Google Partner Setup
+(`crates/sim-android/src/profile.rs` says why each, and what is kept). One an image doesn't have
+is reported in `not_loaded`. What each saves isn't measured yet (benchmarks.md, "Not yet
+measured"); an entry that saves nothing measurable comes out.
+
 ## The console (88% of all vCPU exits)
 
 The PL011 traps twice per byte (FR read, DR write), synchronously in the writer. With
