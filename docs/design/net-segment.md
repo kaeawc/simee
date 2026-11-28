@@ -46,10 +46,10 @@ and those are resource overlays of a system image, which simee does not modify.
   whoever can write the directory, and swapping a parent for another user's is as good as writing
   the directory, so emu checks the whole path (`net::segment::secure_dir`), as ssh's StrictModes
   does for a key: the path is resolved once and that resolved path is used from then on; every
-  parent up to `/` must be owned by this user or root and not writable by group or others (a
-  root-owned sticky `/tmp` is the exception, and so is a group-writable directory of the user's
-  whose group is theirs alone); the segment directory must be this user's, not a link or a file,
-  and **not writable by others** (refused as found, not chmodded: sockets planted while it was
+  parent up to `/` must be owned by this user or root and not writable by group or others (group
+  write is refused outright, since a group like macOS's `staff` is shared; a root-owned sticky `/tmp`
+  is the one exception); the segment directory must be this user's, not a link or a file,
+  and **not writable by group or others** (refused as found, not chmodded: sockets planted while it was
   open would stay; one that others can only read is set to `0700`); and every entry in it must be
   this user's. The default base is private to the user (`sim_core::segment::default_root`:
   `$XDG_RUNTIME_DIR/simee/seg`, else `~/.simee/run/seg`), where there is nothing to refuse. A base

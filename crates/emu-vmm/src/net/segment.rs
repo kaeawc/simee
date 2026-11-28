@@ -127,11 +127,12 @@ fn judge_dir(is_dir: bool, owner: u32, mode: u32, me: u32) -> DirCheck {
 
 /// Judges a parent of the segment directory, as ssh's StrictModes does a key's: owned by this user
 /// or root, and not writable by group or others (those could rename the directory below it away).
-/// Exceptions: a root-owned sticky directory (`/tmp`), where others can only rename their own
-/// entries, and a group-writable directory of this user's whose group is theirs alone (a
-/// user-private group, as some systems give a home directory).
+/// Group write is refused outright: a group is private only if the user is its sole member, and
+/// that can't be told here (macOS gives every user `staff`, and a user-private group can have
+/// members added). The one exception is a root-owned sticky directory (`/tmp`), where others can
+/// only rename their own entries.
 #[cfg_attr(not(unix), allow(dead_code))]
-fn judge_ancestor(is_dir: bool, owner: u32, group: u32, mode: u32, me: u32, my_group: u32) -> Result<(), String> {
+fn judge_ancestor(is_dir: bool, owner: u32, mode: u32, me: u32) -> Result<(), String> {
     if !is_dir {
         return Err("is not a directory".into());
     }
@@ -139,11 +140,8 @@ fn judge_ancestor(is_dir: bool, owner: u32, group: u32, mode: u32, me: u32, my_g
         return Err(format!("belongs to uid {owner}, who could swap the directory below it for their own"));
     }
     let sticky_root = mode & 0o1000 != 0 && owner == 0;
-    let others = mode & 0o002 != 0;
-    let group_ok = owner == me && group == my_group;
-    let group = mode & 0o020 != 0 && !group_ok;
-    if (others || group) && !sticky_root {
-        return Err("is writable by others, who could swap the directory below it for their own (chmod go-w)".into());
+    if mode & 0o022 != 0 && !sticky_root {
+        return Err("is writable by group or others, who could swap the directory below it for their own (chmod go-w)".into());
     }
     Ok(())
 }
@@ -152,6 +150,17 @@ fn judge_ancestor(is_dir: bool, owner: u32, group: u32, mode: u32, me: u32, my_g
 #[cfg_attr(not(unix), allow(dead_code))]
 fn judge_entry(owner: u32, me: u32) -> Result<(), String> {
     if owner == me { Ok(()) } else { Err(format!("belongs to uid {owner}, not to this user (uid {me})")) }
+}
+
+/// What `lstat` of an entry that a listing named means: its owner, or `None` when the entry is
+/// already gone (its member stopped and removed its socket), which isn't a reason to refuse.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn listed(owner: io::Result<u32>) -> io::Result<Option<u32>> {
+    match owner {
+        Ok(uid) => Ok(Some(uid)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Makes sure `dir` is this user's own private directory, as it was made or found, with only
@@ -164,7 +173,6 @@ fn secure_dir(dir: &std::path::Path) -> io::Result<std::path::PathBuf> {
         io::Error::new(ErrorKind::PermissionDenied, format!("the segment directory {}: {} {why}", dir.display(), what.display()))
     };
     let me = rustix::process::geteuid().as_raw();
-    let my_group = rustix::process::getegid().as_raw();
     // The leaf first, before it is resolved: a link there is refused, not followed.
     let meta = std::fs::symlink_metadata(dir)?;
     if let DirCheck::Refuse(why) = judge_dir(meta.file_type().is_dir(), meta.uid(), meta.mode(), me) {
@@ -175,7 +183,7 @@ fn secure_dir(dir: &std::path::Path) -> io::Result<std::path::PathBuf> {
     let real = std::fs::canonicalize(dir)?;
     for parent in real.ancestors().skip(1) {
         let m = std::fs::symlink_metadata(parent)?;
-        judge_ancestor(m.file_type().is_dir(), m.uid(), m.gid(), m.mode(), me, my_group).map_err(|why| refuse(parent, why))?;
+        judge_ancestor(m.file_type().is_dir(), m.uid(), m.mode(), me).map_err(|why| refuse(parent, why))?;
     }
     let meta = std::fs::symlink_metadata(&real)?;
     match judge_dir(meta.file_type().is_dir(), meta.uid(), meta.mode(), me) {
@@ -184,8 +192,9 @@ fn secure_dir(dir: &std::path::Path) -> io::Result<std::path::PathBuf> {
         DirCheck::Refuse(why) => return Err(refuse(&real, why)),
     }
     for entry in std::fs::read_dir(&real)?.flatten() {
-        let m = std::fs::symlink_metadata(entry.path())?;
-        judge_entry(m.uid(), me).map_err(|why| refuse(&entry.path(), why))?;
+        // A peer that stops while the directory is listed removes its socket: gone, not an error.
+        let Some(owner) = listed(std::fs::symlink_metadata(entry.path()).map(|m| m.uid()))? else { continue };
+        judge_entry(owner, me).map_err(|why| refuse(&entry.path(), why))?;
     }
     Ok(real)
 }
@@ -716,28 +725,38 @@ mod tests {
 
     #[test]
     fn a_parent_is_judged_like_ssh_judges_the_path_to_a_key() {
-        let ok = |owner, group, mode| judge_ancestor(true, owner, group, mode, 501, 20);
-        assert!(ok(0, 0, 0o40755).is_ok(), "/ and /Users");
-        assert!(ok(501, 20, 0o40700).is_ok(), "ours, private");
-        assert!(ok(501, 20, 0o40755).is_ok(), "ours, readable");
-        assert!(ok(0, 0, 0o41777).is_ok(), "/tmp: root's and sticky");
-        assert!(ok(501, 20, 0o40775).is_ok(), "ours with a group that is ours alone");
-        for (owner, group, mode, what) in [
-            (502, 20, 0o40755, "another user's"),
-            (502, 20, 0o40700, "another user's, private"),
-            (0, 0, 0o40777, "world-writable and not sticky"),
-            (0, 0, 0o40775, "root's, group-writable"),
-            (0, 0, 0o40757, "root's, others-writable"),
-            (501, 20, 0o40777, "ours but world-writable"),
-            (501, 20, 0o41777, "ours and sticky: the sticky exception is root's /tmp"),
-            (501, 80, 0o40775, "ours, writable by a group that isn't ours alone"),
-            (502, 0, 0o41777, "another user's sticky directory"),
+        let ok = |owner, mode| judge_ancestor(true, owner, mode, 501);
+        assert!(ok(0, 0o40755).is_ok(), "/ and /Users");
+        assert!(ok(501, 0o40700).is_ok(), "ours, private");
+        assert!(ok(501, 0o40755).is_ok(), "ours, readable");
+        assert!(ok(0, 0o41777).is_ok(), "/tmp: root's and sticky");
+        for (owner, mode, what) in [
+            (502, 0o40755, "another user's"),
+            (502, 0o40700, "another user's, private"),
+            (0, 0o40777, "world-writable and not sticky"),
+            (0, 0o40775, "root's, group-writable"),
+            (0, 0o40757, "root's, others-writable"),
+            (501, 0o40777, "ours but world-writable"),
+            (501, 0o41777, "ours and sticky: the sticky exception is root's /tmp"),
+            (501, 0o40775, "ours, group-writable: the group may be `staff`, which every user is in"),
+            (501, 0o40770, "ours, group-writable and closed to others"),
+            (501, 0o40720, "ours, group-writable only"),
+            (502, 0o41777, "another user's sticky directory"),
         ] {
-            assert!(ok(owner, group, mode).is_err(), "{what}");
+            assert!(ok(owner, mode).is_err(), "{what}");
         }
-        assert!(judge_ancestor(false, 0, 0, 0o100644, 501, 20).is_err(), "not a directory");
-        let why = ok(502, 20, 0o40755).expect_err("refused");
+        assert!(judge_ancestor(false, 0, 0o100644, 501).is_err(), "not a directory");
+        let why = ok(502, 0o40755).expect_err("refused");
         assert!(why.contains("uid 502") && why.contains("swap"), "{why}");
+        assert!(ok(501, 0o40775).expect_err("refused").contains("group or others"));
+    }
+
+    #[test]
+    fn an_entry_that_vanished_while_listed_is_skipped_and_other_errors_are_not() {
+        assert_eq!(listed(Ok(501)).expect("owner"), Some(501));
+        assert_eq!(listed(Err(io::Error::from(io::ErrorKind::NotFound))).expect("gone"), None);
+        let err = listed(Err(io::Error::from(io::ErrorKind::PermissionDenied))).expect_err("not skipped");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]
@@ -772,15 +791,15 @@ mod tests {
         let err = SegmentPort::open(&spec(&open_parent.join("pair"), 3, 0)).err().expect("refused");
         assert_eq!(err.kind(), ErrorKind::PermissionDenied);
         let text = err.to_string();
-        assert!(text.contains(&open_parent.display().to_string()) && text.contains("writable by others"), "{text}");
+        assert!(text.contains(&open_parent.display().to_string()) && text.contains("writable by group or others"), "{text}");
         assert!(!has_members(&open_parent.join("pair")), "nothing was bound");
 
+        // Group write alone is enough: the group may be one every user is in.
         let group_open = parent("gparent", 0o775);
-        let ours = SegmentPort::open(&spec(&group_open.join("pair"), 3, 0));
-        // Ours with our own group: the user-private-group exception; any other group is refused.
-        let meta = std::fs::metadata(&group_open).expect("meta");
-        let own_group = std::os::unix::fs::MetadataExt::gid(&meta) == rustix::process::getegid().as_raw();
-        assert_eq!(ours.is_ok(), own_group, "{:?}", ours.err());
+        let err = SegmentPort::open(&spec(&group_open.join("pair"), 3, 0)).err().expect("refused");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("group or others"), "{err}");
+        assert!(!has_members(&group_open.join("pair")), "nothing was bound");
 
         let closed = parent("cparent", 0o755);
         drop(SegmentPort::open(&spec(&closed.join("pair"), 3, 0)).expect("a parent others can only read"));
