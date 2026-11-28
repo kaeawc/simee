@@ -288,6 +288,12 @@ pub const OUTPUTS: &[(&str, &str)] = &[
     ("camera_links", "[@camera_link]"),
     ("network_env", "{*: string}"),
     ("console", "[string]"),
+    ("battery", "{level: number, ac: boolean, status: string, health: string, present: boolean}"),
+    ("cellular", "{voice: string|null, data: string|null}"),
+    ("phone_call", r#"[{direction: "inbound"|"outbound", number: string, state: string}]"#),
+    ("sms", "null"),
+    ("sensor", "{name: string, values: [number]} | {sensors: [string]}"),
+    ("shake", "null"),
     ("rotate", "{orientation?: string, rotation?: number|null, note?: string}"),
     (
         "fold",

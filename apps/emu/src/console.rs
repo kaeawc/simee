@@ -1542,6 +1542,72 @@ mod tests {
         assert_eq!(run(&info, "screenshot"), "KO: no display (started with -gpu off?)");
     }
 
+    /// sim-android's typed controls (#160) against this console: every command it formats is one
+    /// this console takes, and every reply it reads back parses.
+    #[test]
+    fn the_api_s_hardware_controls_run_here_and_read_back() {
+        use sim_android::controls::*;
+        let info = console(FormFactor::Phone);
+        // Each command's reply lines, without the `OK`; a `KO` fails the test.
+        let all = |commands: &[String]| -> Vec<String> {
+            let mut out = Vec::new();
+            for c in commands {
+                let reply = run(&info, c);
+                assert!(!reply.starts_with("KO"), "{c}: {reply}");
+                out.extend(reply.split("\r\n").filter(|l| *l != "OK").map(str::to_owned));
+            }
+            out
+        };
+        let change =
+            BatteryChange { level: Some(17), health: Some(BatteryHealth::Overheat), present: Some(true), ..BatteryChange::charging(true) };
+        let mut commands = change.commands().expect("battery");
+        commands.push("power display".into());
+        let b = Battery::parse(&all(&commands)).expect("power display parses");
+        assert_eq!((b.level, b.ac, b.status, b.health, b.present), (17, true, BatteryStatus::Charging, BatteryHealth::Overheat, true));
+        for status in BatteryStatus::ALL {
+            let b = Battery::parse(&all(&[format!("power status {}", status.name()), "power display".into()])).expect("parses");
+            assert_eq!(b.status, status);
+        }
+        for health in BatteryHealth::ALL {
+            let b = Battery::parse(&all(&[format!("power health {}", health.name()), "power display".into()])).expect("parses");
+            assert_eq!(b.health, health);
+        }
+
+        let change = CellularChange { rssi: Some(7), voice: Some(Registration::Roaming), data: Some(Registration::Searching) };
+        let mut commands = change.commands().expect("cellular");
+        commands.push("gsm status".into());
+        let c = Cellular::parse(&all(&commands)).expect("gsm status parses");
+        assert_eq!((c.voice, c.data), (Some(Registration::Roaming), Some(Registration::Searching)));
+        assert_eq!(info.telephony.signal().0, 7);
+        for r in Registration::ALL {
+            let c = Cellular::parse(&all(&[format!("gsm data {}", r.name()), "gsm status".into()])).expect("parses");
+            assert_eq!(c.data, Some(r));
+        }
+
+        // The guest's radio HAL turns the radio on at boot; a call to a radio that's off is refused.
+        info.telephony.guest_input(b"AT+CFUN=1\r");
+        let calls = all(&[CallAction::Incoming.command("+15551234567").expect("call"), "gsm list".into()]);
+        assert_eq!(
+            Call::parse_list(&calls).expect("gsm list parses"),
+            [Call { direction: "inbound".into(), number: "+15551234567".into(), state: "incoming".into() }]
+        );
+        let calls = all(&[CallAction::Cancel.command("+15551234567").expect("cancel"), "gsm list".into()]);
+        assert_eq!(Call::parse_list(&calls).expect("parses"), []);
+
+        all(&[sms_command("MyBank", "Your code is 1234").expect("sms")]);
+        all(&[sms_command("+15551234567", "hi").expect("sms")]);
+
+        let set = sensor_set_command("acceleration", &[1.5, 9.0, -2.0]).expect("set");
+        let read = all(&[set, "sensor get acceleration".into()]);
+        assert_eq!(parse_sensor("acceleration", &read).expect("sensor get parses"), [1.5, 9.0, -2.0]);
+        for name in emu_vmm::pipe::sensors::NAMES.iter().filter(|n| !n.starts_with("hinge")) {
+            let width = sensor_values(name).expect(name);
+            all(&[sensor_set_command(name, &vec![2.0; width]).expect(name)]);
+            assert_eq!(parse_sensor(name, &all(&[format!("sensor get {name}")])).expect(name), vec![2.0; width], "{name}");
+        }
+        assert!(parse_sensor_status(&all(&["sensor status".into()])).contains(&"acceleration".to_owned()));
+    }
+
     #[test]
     fn screenshots_come_from_the_latest_frame() {
         use emu_vmm::display::DisplaySink;

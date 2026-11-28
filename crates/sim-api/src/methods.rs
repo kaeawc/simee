@@ -615,6 +615,51 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "device, command | commands",
         "Emulator console commands (`adb emu`'s protocol: sensor, geo, sms, gsm, finger, power, ...); reply lines",
     ),
+    // The console's hardware controls as typed methods (`android_controls.rs`, #160).
+    (
+        "battery",
+        "device, level?(0-100), charging?, ac?, status?(unknown|charging|discharging|not-charging|full), health?(unknown|good|overheat|dead|overvoltage|failure|cold), present?",
+        "The emulator's battery (the console's `power`): set the level in percent, plug in or unplug the charger (charging: AC on \
+         and charging, or AC off and discharging), or set ac, status, health and present one by one; with nothing to set, reads \
+         it. Returns level, ac, status, health and present as the emulator reports them (`power display`), which the guest's \
+         `dumpsys battery` shows",
+    ),
+    (
+        "cellular",
+        "device, rssi?(0-31), voice?(home|roaming|searching|denied|unregistered), data?(home|roaming|searching|denied|unregistered)",
+        "The emulator's cellular radio (the console's `gsm`): the signal strength (rssi, TS 27.007's 0 for -113 dBm or less to \
+         31 for -51 dBm or more, which the guest shows as bars) and the voice and data registrations (data unregistered drops \
+         cellular data only; network_shape offline, airplane mode, takes the whole device offline). Returns voice and data as `gsm status` reports them (null \
+         for a state it calls unknown)",
+    ),
+    (
+        "phone_call",
+        "device, action?(incoming|accept|busy|hold|cancel|list), number?",
+        "A call's far end (the console's `gsm`): incoming rings the device from number; accept answers the device's outgoing \
+         call to number (or takes it off hold), busy refuses one, hold holds the call and cancel hangs up. Returns the calls \
+         (`gsm list`): direction (inbound|outbound), number and state (incoming, waiting, active, held, ringing, or unknown \
+         while dialing); list (the default) only lists",
+    ),
+    (
+        "sms",
+        "device, from, text",
+        "Deliver an SMS to the device (the console's `sms send`), which the guest's SMS provider stores and the default SMS \
+         app shows: from is a phone number (digits, * and #, an optional leading +; at most 20) or a sender name of at most \
+         11 letters and digits; text is one line (its runs of spaces arrive as one), sent in several parts when long",
+    ),
+    (
+        "sensor",
+        "device, name?(acceleration, gyroscope, magnetic, orientation, temperature, proximity, light, pressure, humidity, ...), values?",
+        "The emulator's sensors (the console's `sensor`): set one to values (acceleration, gyroscope, magnetic and orientation \
+         take 3, rgbc-light 4, the rest 1) or, with no values, read it; returns name and values as the emulator reads them \
+         back. With no name, lists the sensors the device has ({sensors})",
+    ),
+    (
+        "shake",
+        "device, duration_ms?(1000), intensity?(30)",
+        "Shake the device: the accelerometer swings intensity m/s² each way along the device's x axis every 50 ms for \
+         duration_ms (at most 60000), over one console session, then goes back to what it read before, even when a swing fails",
+    ),
     (
         "rotate",
         "device, orientation?(portrait|landscape-right|portrait-upside-down|landscape-left; iOS); iOS: set?",
@@ -818,7 +863,8 @@ const ALL_PLATFORMS: &[&str] = &[
     "link_status",
 ];
 /// Methods only Android devices have.
-const ANDROID_ONLY: &[&str] = &["console", "xr", "vehicle", "touchpad", "car_start", "car_stop"];
+const ANDROID_ONLY: &[&str] =
+    &["console", "battery", "cellular", "phone_call", "sms", "sensor", "shake", "xr", "vehicle", "touchpad", "car_start", "car_stop"];
 
 /// The platforms whose devices `method` works on.
 pub fn platforms(method: &str) -> &'static [Platform] {

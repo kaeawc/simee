@@ -34,6 +34,8 @@ enum Ty {
     Objects,
     /// An array of strings.
     Strings,
+    /// An array of numbers.
+    Numbers,
 }
 
 /// The type of the parameter `name` of `method`: the same for every method that takes it, bar the
@@ -97,6 +99,12 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         // Android notify and biometric (#419)
         "extras" => Obj,
         "finger_id" => Int,
+        // The console's hardware controls (#160)
+        "charging" | "ac" | "present" => Bool,
+        "status" | "health" | "voice" | "data" | "number" => Str,
+        "rssi" => Int,
+        "intensity" => Num,
+        "values" => Numbers,
         "rules" => Objects,
         _ => return None,
     })
@@ -328,6 +336,7 @@ fn property(method: &str, param: &Param) -> Value {
         Some(Ty::Obj) => json!({"type": "object"}),
         Some(Ty::Objects) => json!({"type": "array", "items": {"type": "object"}}),
         Some(Ty::Strings) => json!({"type": "array", "items": {"type": "string"}}),
+        Some(Ty::Numbers) => json!({"type": "array", "items": {"type": "number"}}),
         None => json!({}),
     });
     if !param.choices.is_empty() {
@@ -520,6 +529,7 @@ mod tests {
             (Platform::Android, "boot_many") => text(crate::android::boot_many_options(p)),
             (Platform::Android, "import") => text(crate::android::import_allows_mismatch(p)),
             (Platform::Android, "car_start") => text(crate::android_car::start_options(p)),
+            (Platform::Android, "shake") => text(crate::android_controls::shake_options(p)),
             // Android's `settle` reads what iOS's does.
             (Platform::Android, "settle") => text(crate::settle::options(p)),
             // It needs a platform to read the rest.

@@ -361,6 +361,17 @@ mod tests {
     }
 
     #[test]
+    fn every_sensor_takes_as_many_values_as_sim_core_says() {
+        // The API checks a `sensor` call's value count against sim_core's table before the console.
+        let sensors = Sensors::new((1 << NAMES.len()) - 1);
+        for name in NAMES {
+            let width = sim_core::goldfish::sensor_values(name).expect(name);
+            assert_eq!(sensors.get(name).map(|v| v.len()), Some(width), "{name}");
+            assert!(sensors.set(name, vec![1.0; width]) && !sensors.set(name, vec![1.0; width + 1]), "{name}");
+        }
+    }
+
+    #[test]
     fn the_mask_decides_what_the_hal_lists() {
         let watch = (0x7ff | (1 << 17)) | (1 << 14) | (1 << 16);
         let sensors = Arc::new(Sensors::new(watch));
