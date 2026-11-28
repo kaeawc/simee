@@ -44,12 +44,16 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "platform?, form_factor?",
         "Every form factor on every platform: sub-platform, inputs and reference profile, or why it's unsupported",
     ),
-    ("devices", "booted?, platform?(android|ios), form_factor?", "List devices with their platform, form factor and sub-platform"),
+    (
+        "devices",
+        "booted?, platform?(android|ios), form_factor?; iOS: set?",
+        "List devices with their platform, form factor and sub-platform",
+    ),
     ("runtimes", "platform?", "List installed runtimes (Android: system images)"),
     ("device_types", "", "List device types"),
     (
         "create",
-        "name, platform?(ios|android), form_factor?, admission?(ignore|refuse); iOS: device_type, runtime; Android: system_image, device?(pixel_fold|surface_duo)",
+        "name, platform?(ios|android), form_factor?, admission?(ignore|refuse); iOS: device_type, runtime, set?; Android: system_image, device?(pixel_fold|surface_duo)",
         "Create a device. form_factor is checked against the device type (iOS) or the system image (Android) and shapes a new AVD. \
          Returns the device with `admission`, what booting it would do to the host (as `admission_check`); admission refuse fails \
          fast, creating nothing, unless the verdict is admit",
@@ -460,6 +464,9 @@ pub struct Session {
     /// A host state admission judges by instead of this host's (and the seed costs).
     #[cfg(test)]
     pub(crate) fake_host: Option<sim_host::admission::HostState>,
+    /// The iOS device set the environment names, instead of `SIMEE_IOS_DEVICE_SET`'s.
+    #[cfg(test)]
+    pub(crate) fake_env_set: Option<Option<String>>,
 }
 
 impl Session {
@@ -604,6 +611,8 @@ fn ios_list<T: serde::de::DeserializeOwned>(s: &mut Session, method: &str) -> Re
 /// safe point when cancelled (#297).
 pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
     let p = if p.is_null() { &Value::Object(Default::default()) } else { p };
+    let set = device_set(s, p);
+    s.ios.use_set(set);
     match method {
         "boot" | "boot_many" | "create" | "clone" => admitted(s, method, p),
         "admission_check" => {
@@ -615,6 +624,17 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         m if STEPPED.contains(&m) && has_call_hooks() => stepped(s, m, p),
         _ => dispatch(s, method, p),
     }
+}
+
+/// The iOS device set the call uses: its `set`, else the environment's, else the default set
+/// (#409). An unusable one fails only the methods that connect to the simulator service.
+fn device_set(s: &Session, p: &Value) -> Result<Option<String>, String> {
+    #[cfg(test)]
+    if let Some(env) = &s.fake_env_set {
+        return crate::params::device_set_with(p, env.as_deref());
+    }
+    let _ = s;
+    crate::params::device_set(p)
 }
 
 /// How a lifecycle call heeds the admission verdict (#275).
@@ -1410,7 +1430,7 @@ fn dispatch(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         m if crate::prefs::is_method(m) => {
             let (platform, udid) = resolve(s, p)?;
             ios_device_exists(s, platform, str_param(p, "device").unwrap_or("booted"))?;
-            crate::prefs::call(s.prefs.backend(platform), platform, &udid, m, p)
+            crate::prefs::call(s.prefs.backend_on(platform, &s.ios)?, platform, &udid, m, p)
         }
         m if METHODS.iter().any(|(name, ..)| *name == m) => {
             let (platform, udid) = resolve(s, p)?;

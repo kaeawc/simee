@@ -394,6 +394,9 @@ impl Backend for Unavailable {
 pub struct Session {
     pub(crate) ios: Box<dyn Backend>,
     pub(crate) android: Box<dyn Backend>,
+    /// The iOS backend of each other device set a call has named (#409), by its directory.
+    #[cfg(target_os = "macos")]
+    sets: HashMap<String, Box<dyn Backend>>,
 }
 
 impl Default for Session {
@@ -402,11 +405,32 @@ impl Default for Session {
         let ios: Box<dyn Backend> = Box::new(ios::Ios::default());
         #[cfg(not(target_os = "macos"))]
         let ios: Box<dyn Backend> = Box::new(Unavailable(Platform::Ios));
-        Session { ios, android: Box::new(Unavailable(Platform::Android)) }
+        Session {
+            ios,
+            android: Box::new(Unavailable(Platform::Android)),
+            #[cfg(target_os = "macos")]
+            sets: HashMap::new(),
+        }
     }
 }
 
 impl Session {
+    /// The backend for a device of `platform` in the iOS device set `ios`'s call uses (#409): a
+    /// set of its own keeps its devices' preference files in its own directory, and connects to
+    /// the simulator service on that set.
+    pub(crate) fn backend_on(&mut self, platform: Platform, ios: &crate::ios::Session) -> Result<&mut dyn Backend, String> {
+        #[cfg(target_os = "macos")]
+        if platform == Platform::Ios
+            && let Some(set) = ios.set()?
+        {
+            let backend = self.sets.entry(set.clone()).or_insert_with(|| Box::new(ios::Ios::in_set(set, ios.opener())));
+            return Ok(&mut **backend);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = ios;
+        Ok(self.backend(platform))
+    }
+
     pub(crate) fn backend(&mut self, platform: Platform) -> &mut dyn Backend {
         match platform {
             Platform::Ios => &mut *self.ios,

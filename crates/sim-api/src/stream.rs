@@ -90,6 +90,8 @@ pub(crate) struct Target {
     pub avd_dir: Option<PathBuf>,
     /// The size `touch` and `swipe` take, in pixels (asked for only with `input`).
     pub screen: Option<(u32, u32)>,
+    /// An iOS device's device set (#409): `None` is the default set.
+    pub set: Option<String>,
 }
 
 /// The encode loop on a device's frames.
@@ -212,7 +214,7 @@ impl Media for HostMedia {
         match target.platform {
             Platform::Ios => {
                 // The context, the display and the source stay on this thread.
-                let context = sim_coresim::Context::new().map_err(|e| e.to_string())?;
+                let context = sim_coresim::Context::open(target.set.as_deref()).map_err(|e| e.to_string())?;
                 let display = context.device(&target.udid).and_then(|d| d.display()).map_err(|e| e.to_string())?;
                 let mut source = sim_encode::IosSource::new(display).map_err(text)?;
                 sim_encode::stream::run(&mut source, &mut encoder, pacing, controls, sink).map(drop).map_err(text)
@@ -269,7 +271,10 @@ const UNAVAILABLE: &str = if cfg!(target_os = "linux") {
 
 /// The device behind the `device` parameter, through `info` (and `screen`, with `screen`).
 fn lookup(s: &mut Session, p: &Value, screen: bool) -> Result<Target, String> {
-    let mut query = json!({"device": str_param(p, "device").unwrap_or("booted")});
+    // The device set this call named, said again to the calls below (`""` is the default set).
+    let set = s.ios.set()?;
+    let in_set = json!(set.clone().unwrap_or_default());
+    let mut query = json!({"device": str_param(p, "device").unwrap_or("booted"), "set": in_set});
     if let Some(platform) = p.get("platform") {
         query["platform"] = platform.clone();
     }
@@ -278,13 +283,14 @@ fn lookup(s: &mut Session, p: &Value, screen: bool) -> Result<Target, String> {
     let avd_dir = info.get("avd_dir").and_then(Value::as_str).map(PathBuf::from);
     let screen = match screen && device.state == DeviceState::Booted {
         true => {
-            let size = crate::methods::call(s, "screen", &json!({"device": device.udid, "platform": device.platform.as_str()}))?;
+            let size =
+                crate::methods::call(s, "screen", &json!({"device": device.udid, "platform": device.platform.as_str(), "set": in_set}))?;
             let side = |k: &str| size[k].as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| format!("screen has no {k}: {size}"));
             Some((side("width")?, side("height")?))
         }
         false => None,
     };
-    Ok(Target { platform: device.platform, udid: device.udid, name: device.name, state: device.state, avd_dir, screen })
+    Ok(Target { platform: device.platform, udid: device.udid, name: device.name, state: device.state, avd_dir, screen, set })
 }
 
 static GLOBAL: OnceLock<Arc<Streams>> = OnceLock::new();
@@ -1029,7 +1035,7 @@ fn spawn_input(
     shared: Arc<Shared>,
     target: &Target,
 ) -> Option<InputThread> {
-    let device = json!({"device": target.udid, "platform": target.platform.as_str()});
+    let device = json!({"device": target.udid, "platform": target.platform.as_str(), "set": target.set.clone().unwrap_or_default()});
     let (done_tx, done_rx) = sync_channel(1);
     let handle = std::thread::Builder::new()
         .name("simee-stream-input".into())
@@ -1038,6 +1044,7 @@ fn spawn_input(
             while let Some((method, mut params)) = queue.pop(&shared.stopping) {
                 params["device"] = device["device"].clone();
                 params["platform"] = device["platform"].clone();
+                params["set"] = device["set"].clone();
                 let result = input.call(method, &params);
                 shared.input_done(&result);
                 if result.is_ok() && matches!(method, "rotate" | "fold") {
@@ -1444,7 +1451,7 @@ pub(crate) mod tests {
     }
 
     fn device(udid: &str, platform: Platform, state: DeviceState) -> Target {
-        Target { platform, udid: udid.into(), name: udid.into(), state, avd_dir: None, screen: Some((1179, 2556)) }
+        Target { platform, udid: udid.into(), name: udid.into(), state, avd_dir: None, screen: Some((1179, 2556)), set: None }
     }
 
     /// `iphone` (the default) and `pixel` are booted, `off` isn't.
@@ -1552,7 +1559,7 @@ pub(crate) mod tests {
         }
 
         /// The next `n` device calls the input thread made (`screen` aside), without the device
-        /// fields (each names the iPhone).
+        /// fields (each names the iPhone, in the stream's device set: the default one here).
         fn device_calls(&self, n: usize) -> Vec<(String, Value)> {
             let mut got = Vec::new();
             while got.len() < n {
@@ -1561,6 +1568,7 @@ pub(crate) mod tests {
                 };
                 let o = params.as_object_mut().expect("object");
                 assert_eq!((o.remove("device"), o.remove("platform")), (Some(json!("iphone")), Some(json!("ios"))), "{method}");
+                assert_eq!(o.remove("set"), Some(json!("")), "{method}: the default set, said so");
                 if method != "screen" {
                     got.push((method, params));
                 }
@@ -2056,6 +2064,7 @@ mod linux_media {
                 state: DeviceState::Booted,
                 avd_dir: Some(self.dir.clone()),
                 screen: None,
+                set: None,
             }
         }
     }
@@ -2146,6 +2155,7 @@ mod linux_without_the_encoder {
             state: DeviceState::Booted,
             avd_dir: None,
             screen: None,
+            set: None,
         };
         let run = HostMedia.run(&target, &EncoderConfig::default(), Pacing::new(30, None), &Controls::default(), &mut |_| Ok(Flow::Stop));
         assert_eq!(run, Err(err), "run refuses with the same reason");

@@ -26,6 +26,22 @@ pub fn need_str<'a>(p: &'a Value, key: &str) -> Result<&'a str, String> {
     str_param(p, key).ok_or_else(|| format!("missing string parameter `{key}`"))
 }
 
+/// The iOS device set a call uses (#409): its `set`, else `$SIMEE_IOS_DEVICE_SET`, else `None`
+/// (the default set); see [`sim_core::device::device_set`].
+pub fn device_set(p: &Value) -> Result<Option<String>, String> {
+    device_set_with(p, std::env::var(sim_core::device::DEVICE_SET_ENV).ok().as_deref())
+}
+
+/// [`device_set`] with `env` as the environment's set.
+pub fn device_set_with(p: &Value, env: Option<&str>) -> Result<Option<String>, String> {
+    let param = match p.get("set") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(set)) => Some(set.as_str()),
+        Some(other) => return Err(format!("set must be a device set's directory (a string), not {other}")),
+    };
+    sim_core::device::device_set(param, env)
+}
+
 pub fn need_f64(p: &Value, key: &str) -> Result<f64, String> {
     p.get(key).and_then(Value::as_f64).ok_or_else(|| format!("missing number parameter `{key}`"))
 }
@@ -395,6 +411,22 @@ fn bytes_field(bytes: Cow<'_, [u8]>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_device_set_is_the_set_param_then_the_environment_then_the_default() {
+        let env = Some("/farm/set");
+        // The default: nothing names a set.
+        assert_eq!(device_set_with(&json!({}), None), Ok(None));
+        assert_eq!(device_set_with(&json!({"set": null}), None), Ok(None), "null is a missing set");
+        // The environment's set, when the call names none.
+        assert_eq!(device_set_with(&json!({"device": "booted"}), env), Ok(Some("/farm/set".into())));
+        // The call's set, over the environment's; an empty one is the default set.
+        assert_eq!(device_set_with(&json!({"set": "/call/set"}), env), Ok(Some("/call/set".into())));
+        assert_eq!(device_set_with(&json!({"set": ""}), env), Ok(None));
+        let err = device_set_with(&json!({"set": 7}), None).expect_err("not a path");
+        assert!(err.contains("set") && err.contains('7'), "{err}");
+        assert!(device_set_with(&json!({"set": "rel"}), None).expect_err("relative").contains("absolute"));
+    }
 
     #[test]
     fn a_tap_or_button_holds_the_platform_default_unless_hold_ms_says() {

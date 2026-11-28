@@ -30,6 +30,12 @@ struct Cli {
     /// server fail instead of running here.
     #[arg(long, global = true)]
     verbose: bool,
+    /// The iOS device set to work in: a directory of simulators, as `simctl --set` takes (made if
+    /// missing). Its devices boot with no Simulator.app window. Default: `$SIMEE_IOS_DEVICE_SET`,
+    /// else the default set; `--set ''` is the default set. For `serve` and `mcp`, set
+    /// `SIMEE_IOS_DEVICE_SET` instead.
+    #[arg(long, global = true, value_name = "DIR")]
+    set: Option<String>,
     #[command(subcommand)]
     command: Cmd,
 }
@@ -550,6 +556,10 @@ fn mcp_http_config(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let set = cli.set.as_deref().map(set_arg);
+    if set.is_some() && matches!(cli.command, Cmd::Serve { .. } | Cmd::Mcp { .. }) {
+        anyhow::bail!("--set names the device set of one command; start a server on a set with SIMEE_IOS_DEVICE_SET=<dir>");
+    }
     match &cli.command {
         Cmd::Serve { socket } => {
             let path = socket.clone().unwrap_or_else(sim_api::default_socket);
@@ -578,7 +588,7 @@ fn main() -> Result<()> {
         Cmd::Call { method, params, socket } => {
             let path = socket.clone().unwrap_or_else(sim_api::default_socket);
             let params: Value = serde_json::from_str(params).context("params must be JSON")?;
-            let result = sim_api::call(&path, method, params).map_err(anyhow::Error::msg)?;
+            let result = sim_api::call(&path, method, with_set(params, set.as_deref())).map_err(anyhow::Error::msg)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             return Ok(());
         }
@@ -588,6 +598,7 @@ fn main() -> Result<()> {
     let mut transport = if in_process { Transport::local() } else { Transport::open(&sim_api::default_socket()) };
     transport.verbose = cli.verbose || flag("SIMEE_VERBOSE");
     transport.require = flag("SIMEE_REQUIRE_SERVER");
+    transport.set = set;
     let (stdout, stderr) = (std::io::stdout(), std::io::stderr());
     run(cli.command, &mut transport, &mut stdout.lock(), &mut stderr.lock())
 }
@@ -602,6 +613,25 @@ fn mcp_shutdown_on_signal() -> Result<()> {
         sim_api::shutdown::exit(sig);
     })
     .context("watching SIGINT and SIGTERM")
+}
+
+/// `--set`'s directory as it is sent: absolute (the process that runs the method may be a server
+/// elsewhere), or empty for the default set.
+fn set_arg(dir: &str) -> String {
+    match dir {
+        "" => String::new(),
+        dir => std::path::absolute(dir).map_or_else(|_| dir.to_owned(), |p| p.display().to_string()),
+    }
+}
+
+/// `params` with `set` added when `--set` named one and they have none (#409).
+fn with_set(params: Value, set: Option<&str>) -> Value {
+    let Some(set) = set else { return params };
+    let mut params = if params.is_null() { json!({}) } else { params };
+    if let Some(p) = params.as_object_mut() {
+        p.entry("set").or_insert_with(|| json!(set));
+    }
+    params
 }
 
 /// Whether an on/off environment variable is on (set, not empty, not `0`).
@@ -631,6 +661,8 @@ struct Transport {
     local: Option<Box<sim_api::Session>>,
     verbose: bool,
     require: bool,
+    /// `--set`: the iOS device set sent with every method.
+    set: Option<String>,
 }
 
 impl Transport {
@@ -642,6 +674,7 @@ impl Transport {
             local: None,
             verbose: false,
             require: false,
+            set: None,
         }
     }
 
@@ -672,6 +705,7 @@ impl Transport {
     }
 
     fn route(&mut self, method: &str, params: Value, binary: bool) -> Result<(Value, Option<Vec<u8>>)> {
+        let params = with_set(params, self.set.as_deref());
         let forwards = sim_api::forwards(method);
         let forward = forwards && self.connected();
         if forwards && !forward {
@@ -1324,6 +1358,25 @@ fn xr_params(device: &str, words: &[String]) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #409: `--set` goes with every method a command calls, as an absolute path, before or after
+    /// the subcommand; a `set` the params already have stays; without `--set` nothing is added
+    /// (the process that runs the method reads `SIMEE_IOS_DEVICE_SET`).
+    #[test]
+    fn the_set_flag_goes_with_every_call_as_an_absolute_path() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).expect("arguments");
+        assert_eq!(parse(&["--set", "/farm/set", "list"]).set.as_deref(), Some("/farm/set"));
+        assert_eq!(parse(&["list", "--set", "/farm/set"]).set.as_deref(), Some("/farm/set"));
+        assert_eq!(parse(&["list"]).set, None);
+        let cwd = std::env::current_dir().expect("cwd");
+        assert_eq!(set_arg("sets/a"), cwd.join("sets/a").display().to_string());
+        assert_eq!(set_arg("/farm/set"), "/farm/set");
+        assert_eq!(set_arg(""), "", "the default set, over the environment's");
+        assert_eq!(with_set(json!({"device": "booted"}), Some("/s")), json!({"device": "booted", "set": "/s"}));
+        assert_eq!(with_set(json!({"set": "/mine"}), Some("/s")), json!({"set": "/mine"}));
+        assert_eq!(with_set(json!({"device": "booted"}), None), json!({"device": "booted"}));
+        assert_eq!(with_set(Value::Null, Some("/s")), json!({"set": "/s"}));
+    }
 
     #[test]
     fn camera_file_sources_are_sent_as_absolute_paths() {

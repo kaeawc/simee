@@ -173,6 +173,30 @@ pub fn is_udid(query: &str) -> bool {
     groups.len() == 5 && groups.iter().zip([8, 4, 4, 4, 12]).all(|(g, len)| g.len() == len && g.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// The environment variable that names the iOS device set a call uses when it names none (#409).
+pub const DEVICE_SET_ENV: &str = "SIMEE_IOS_DEVICE_SET";
+
+/// The CoreSimulator device set a call uses (#409): the directory `param` (a call's `set`) names,
+/// else the one `env` ([`DEVICE_SET_ENV`]) names, else `None`, the default set
+/// (`~/Library/Developer/CoreSimulator/Devices`, the one Simulator.app shows). An empty `param`
+/// is the default set even when `env` names another; an empty `env` names none. A set is an
+/// absolute path (the service resolves it, not the caller's working directory), and trailing
+/// slashes are dropped so that one set has one name.
+pub fn device_set(param: Option<&str>, env: Option<&str>) -> Result<Option<String>, String> {
+    let (path, from) = match (param, env) {
+        (Some(""), _) | (None, None | Some("")) => return Ok(None),
+        (Some(path), _) => (path, "set"),
+        (None, Some(path)) => (path, DEVICE_SET_ENV),
+    };
+    if !path.starts_with('/') {
+        return Err(format!("{from} must be an absolute path to a device set's directory, not `{path}`"));
+    }
+    match path.trim_end_matches('/') {
+        "" => Err(format!("{from} must be a device set's own directory, not `{path}`")),
+        dir => Ok(Some(dir.to_owned())),
+    }
+}
+
 impl Selection {
     fn or_ambiguous(self) -> Self {
         if self == Self::None { Self::Ambiguous } else { self }
@@ -182,6 +206,34 @@ impl Selection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_set_prefers_the_param_then_the_environment_then_the_default() {
+        // The default: no param and no environment (or an empty one) is the default set.
+        assert_eq!(device_set(None, None), Ok(None));
+        assert_eq!(device_set(None, Some("")), Ok(None));
+        // The environment names the set when the call doesn't.
+        assert_eq!(device_set(None, Some("/farm/set")), Ok(Some("/farm/set".into())));
+        // The param names the set, over the environment.
+        assert_eq!(device_set(Some("/call/set"), None), Ok(Some("/call/set".into())));
+        assert_eq!(device_set(Some("/call/set"), Some("/farm/set")), Ok(Some("/call/set".into())));
+        // An empty param asks for the default set even when the environment names another.
+        assert_eq!(device_set(Some(""), Some("/farm/set")), Ok(None));
+        // One set, one name: trailing slashes are dropped.
+        assert_eq!(device_set(Some("/call/set/"), None), Ok(Some("/call/set".into())));
+        assert_eq!(device_set(None, Some("/farm/set//")), Ok(Some("/farm/set".into())));
+    }
+
+    #[test]
+    fn device_set_refuses_a_relative_path() {
+        let err = device_set(Some("sets/a"), None).expect_err("relative param");
+        assert!(err.contains("absolute") && err.contains("sets/a"), "{err}");
+        let err = device_set(None, Some("sets/b")).expect_err("relative environment");
+        assert!(err.contains(DEVICE_SET_ENV) && err.contains("sets/b"), "{err}");
+        // A relative environment value doesn't matter when the call names a set.
+        assert_eq!(device_set(Some("/call/set"), Some("sets/b")), Ok(Some("/call/set".into())));
+        assert_eq!(device_set(Some("/"), None), Err("set must be a device set's own directory, not `/`".into()));
+    }
 
     #[test]
     fn udid_shapes() {

@@ -6,7 +6,7 @@
         "readOnlyHint": true,
         "title": "devices"
       },
-      "description": "List devices with their platform, form factor and sub-platform. Read-only: changes nothing on the device or the host.\n\nPlatforms: Android, iOS. Parameters: booted?, platform?(android|ios), form_factor?. Toolsets: core, lifecycle.",
+      "description": "List devices with their platform, form factor and sub-platform. Read-only: changes nothing on the device or the host.\n\nPlatforms: Android, iOS. Parameters: booted?, platform?(android|ios), form_factor?; iOS: set?. Toolsets: core, lifecycle.",
       "inputSchema": {
         "properties": {
           "booted": {
@@ -20,6 +20,10 @@
               "android",
               "ios"
             ],
+            "type": "string"
+          },
+          "set": {
+            "description": "iOS only",
             "type": "string"
           }
         },
