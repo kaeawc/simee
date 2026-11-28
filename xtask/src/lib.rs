@@ -207,7 +207,7 @@ pub fn plan(mode: Mode, host: &Host, have: &Tools, changed: &[String]) -> Vec<Pl
             ],
         ));
     } else {
-        steps.push(step("tests", "cargo", &["test", "--workspace", "--quiet"]));
+        steps.push(step("tests", "cargo", &["test", "--workspace", "--no-fail-fast", "--quiet"]));
     }
     if host.os == "macos" {
         steps.push(step(
@@ -371,7 +371,11 @@ mod tests {
         let run: Vec<&str> = steps.iter().filter_map(|s| if let Planned::Run(s) = s { Some(s.label.as_str()) } else { None }).collect();
         assert_eq!(run, ["fmt", "fmt (desktop)", "clippy", "macOS test list", "tests"]);
         assert!(matches!(&steps[0], Planned::Skip { why, .. } if why == "bash and shellcheck not both installed"));
-        assert!(steps.iter().any(|s| matches!(s, Planned::Run(s) if s.label == "tests" && s.args == ["test", "--workspace", "--quiet"])));
+        assert!(
+            steps.iter().any(
+                |s| matches!(s, Planned::Run(s) if s.label == "tests" && s.args == ["test", "--workspace", "--no-fail-fast", "--quiet"])
+            )
+        );
         assert!(!labels(&steps).iter().any(|l| l.starts_with("clippy (")), "no other platform to check from Windows");
     }
 

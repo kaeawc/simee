@@ -98,7 +98,7 @@ fi
 if cargo nextest --version >/dev/null 2>&1; then
   step tests cargo nextest run --workspace --no-fail-fast --status-level fail --final-status-level fail --hide-progress-bar
 else
-  step tests cargo test --workspace --quiet
+  step tests cargo test --workspace --no-fail-fast --quiet
 fi
 # A strong import newer than macOS 11.0 stops dyld from loading emu or simee on older macOS.
 if [[ $(uname -s) == Darwin ]]; then

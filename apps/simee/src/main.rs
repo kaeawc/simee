@@ -1358,9 +1358,11 @@ mod tests {
     #[test]
     fn camera_file_sources_are_sent_as_absolute_paths() {
         let cwd = std::env::current_dir().expect("cwd");
+        // `/abs/clip.mov` has no drive on Windows, so it isn't absolute there.
+        let abs = std::env::temp_dir().join("clip.mov").display().to_string();
         for kind in ["image", "video"] {
             assert_eq!(camera_source(&format!("{kind}:clip.mov")), format!("{kind}:{}", cwd.join("clip.mov").display()));
-            assert_eq!(camera_source(&format!("{kind}:/abs/clip.mov")), format!("{kind}:/abs/clip.mov"));
+            assert_eq!(camera_source(&format!("{kind}:{abs}")), format!("{kind}:{abs}"));
         }
         assert_eq!(camera_source("qr:hello"), "qr:hello");
         assert_eq!(camera_source("webcam:0"), "webcam:0");
@@ -1499,6 +1501,7 @@ mod tests {
         (String::from_utf8(out).expect("utf-8"), String::from_utf8(err).expect("utf-8"), result.err().map(|e| e.to_string()))
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_server_and_this_process_print_the_same_bytes() {
         let root = android_root("forward");
@@ -1949,7 +1952,8 @@ mod tests {
     fn path_parameters_are_made_absolute() {
         let here = std::env::current_dir().expect("cwd");
         assert_eq!(absolute("shot.png"), here.join("shot.png").display().to_string());
-        assert_eq!(absolute("/tmp/x.png"), "/tmp/x.png");
+        let abs = std::env::temp_dir().join("x.png").display().to_string();
+        assert_eq!(absolute(&abs), abs);
     }
 
     #[test]
