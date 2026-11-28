@@ -108,9 +108,10 @@ did:
 - A call cancelled at a safe point undoes what it made: a `create` or `clone` that finishes
   during the drain is deleted, and a `boot` waiting for admission boots nothing.
 
-`simee mcp` stops its streams and exits the same way, without waiting for its calls; a watched
-`boot` that launched its device for a call in flight may shut that device down as it is
-cancelled. `emu` stops its guest as the console's `kill` does and exits 130 or 143 too.
+`simee mcp` shuts down the same way, over stdio and over HTTP: see "Stopping the server" in
+[mcp-safety.md](mcp-safety.md). A watched `boot` that launched its device for a call in flight may shut that
+device down as it is cancelled. `emu` stops its guest as the console's `kill` does and exits 130
+or 143 too.
 
 Relative `path` arguments (`screenshot`, `install`) are made absolute before they are sent.
 
@@ -144,6 +145,7 @@ Relative `path` arguments (`screenshot`, `install`) are made absolute before the
 | `erase` | iOS | device, set? | Erase content and settings (shut down first) |
 | `screen` | Android, iOS | device, display?(main\|outer\|inner\|carplay); iOS: set? | Screen size in pixels, the space tap, swipe and touch take (a folded Android foldable: the size its guest lays out for, a Pixel Fold's 1080x2092, as uiautomator's bounds). display (iOS): main is the screen in use (an unfolded iPhone Duo's inner one), outer and inner an iPhone Duo's two, carplay an iPhone's CarPlay screen |
 | `screenshot` | Android, iOS | device, path?, display?(main\|outer\|inner\|carplay); iOS: set? | PNG to path, else base64 in `png` (a folded Android foldable: its outer screen as the scanout shows it, a Pixel Fold's 949x1840; an iPhone Duo's inner screen as its framebuffer holds it, 2007x2853) |
+| `wait_idle` | iOS | device, quiet_ms?(300), timeout_ms?(10000), screenshot?(false), path?, display?(main\|outer\|inner\|carplay), set? | Wait until the screen is still: no frame has changed it for quiet_ms, at most timeout_ms (fails if it kept changing). Follows the display's frame callback and surface seed, reading no pixels while nothing is presented; where the seed ticks on a still screen (iOS 26.5, 10 times a second) a content hash decides. Returns waited_ms and frames (seed changes seen), and with screenshot the still screen as screenshot returns it (path, else base64 in `png`) |
 | `stream_start` | Android, iOS | device, whip_url, token?, fps?(30), max_size?(1280), bitrate?(2500000), audio?(false), input?(false); iOS: set? | Stream the screen as H.264 over WebRTC to a WHIP endpoint (plaintext http to a loopback host only, e.g. MediaMTX's `http://127.0.0.1:8889/<path>/whip`), with token as its bearer token; max_size caps the longest side (0: full size), bitrate is in bit/s; input offers the `simee-input` data channel, whose touches, keys, text, buttons, rotations, folds and scrolls reach the device (a server that refuses the data channel, as MediaMTX does, gets the stream without it: the result's input is false and input_note says why). One stream per device and URL, living in this process (`simee serve`) on a 30 s lease that stream_status renews: a stream nobody renews is stopped. Returns stream_id, whip_resource and lease_ttl_s (and, with input, whether it is on). Encoded on macOS by VideoToolbox (iOS and Android devices) and on Linux by OpenH264 in a build with `--features openh264` (Android devices only); audio isn't streamed yet |
 | `stream_status` | Android, iOS | stream_id | A stream's state (starting, running, ended and why), its stages in the order reached (requested, first_encoded_frame, whip_connected, ended; ms since requested) and stats (encoded, sent, keyframes, bytes, fps, bitrate_bps, the publisher's bitrate_estimate_bps, the viewers' pli and fir keyframe requests, input events and errors); renews its lease |
 | `stream_stop` | Android, iOS | stream_id | Stop a stream: ends its encode loop and sends the WHIP DELETE; its last status, with deleted |

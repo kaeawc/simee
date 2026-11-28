@@ -474,7 +474,8 @@ impl World {
                 d.foreground = None;
                 Ok(Value::Null)
             }
-            "info" => Ok(self.device(params)?.fields()),
+            // As the API answers: the device is one field of it (the server resolves names with it).
+            "info" => Ok(json!({"device": self.device(params)?.fields()})),
             "install" => {
                 let path = text(params, "path").ok_or("`path` is required")?;
                 let bundle = self.packages.get(&path).cloned().ok_or_else(|| format!("no such file: {path}"))?;

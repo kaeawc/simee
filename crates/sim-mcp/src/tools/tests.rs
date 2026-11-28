@@ -19,7 +19,7 @@ fn tool(tools: &[Value], name: &str) -> Value {
 }
 
 fn run_plain(backend: &dyn Backend, name: &str, args: &Value) -> Result<Value, String> {
-    run(backend, &Pages::default(), name, args)
+    run(backend, &Pages::default(), "me", name, args)
 }
 
 /// Whether `v` fits `schema` (type, enum, properties, required, items, additionalProperties,
@@ -333,6 +333,27 @@ fn screenshot_does_not_take_a_host_path() {
 }
 
 #[test]
+fn wait_idle_returns_its_still_screen_as_an_image_and_takes_no_host_path() {
+    let tools = all();
+    let wait = tool(&tools, "wait_idle");
+    assert_eq!(wait["inputSchema"]["properties"].get("path"), None);
+    assert!(!wait["description"].as_str().expect("description").contains("path"));
+    assert_eq!(wait["inputSchema"]["properties"]["quiet_ms"]["default"], 300);
+    assert_eq!(wait["outputSchema"]["properties"].get("png"), None, "the PNG is an image block");
+    let fake = Fake::default();
+    let err = run_plain(&fake, "wait_idle", &json!({"device": "d", "screenshot": true, "path": "/home/me/.zshrc"})).expect_err("refused");
+    assert!(err.contains("`path` isn't available through MCP"), "{err}");
+    assert!(fake.called("wait_idle").is_empty(), "never reaches the API");
+    let still = json!({"waited_ms": 300, "frames": 0, "width": 2, "height": 1, "png": "iVBOR"});
+    let out = result("wait_idle", Ok(still), Era::Modern);
+    assert_eq!(out["content"][0], json!({"type": "image", "data": "iVBOR", "mimeType": "image/png"}));
+    assert_eq!(out["structuredContent"], json!({"waited_ms": 300, "frames": 0, "width": 2, "height": 1}));
+    let plain = result("wait_idle", Ok(json!({"waited_ms": 300, "frames": 4})), Era::Modern);
+    assert_eq!(plain["structuredContent"], json!({"waited_ms": 300, "frames": 4}), "without screenshot, just the wait");
+    assert_eq!(misfit(&output_schema("wait_idle", Era::Modern), &out["structuredContent"], "wait_idle"), None);
+}
+
+#[test]
 fn the_docs_name_every_tool_and_resource() {
     // docs/mcp.md lives at the repository root, outside the published crate: in the
     // workspace a missing doc fails, from an unpacked .crate the test has nothing to check.
@@ -511,40 +532,40 @@ fn long_lists_page_through_one_snapshot() {
     fake.answer("processes", Ok(Value::Array(procs.clone())));
     let pages = Pages::default();
     // Without `limit` or `cursor`: the whole list, as the API returns it.
-    assert_eq!(run(&fake, &pages, "processes", &json!({"device": "d"})), Ok(Value::Array(procs.clone())));
-    let first = run(&fake, &pages, "processes", &json!({"device": "d", "limit": 2})).expect("page 1");
+    assert_eq!(run(&fake, &pages, "me", "processes", &json!({"device": "d"})), Ok(Value::Array(procs.clone())));
+    let first = run(&fake, &pages, "me", "processes", &json!({"device": "d", "limit": 2})).expect("page 1");
     assert_eq!((first["items"].clone(), first["total"].clone()), (json!(procs[..2]), json!(5)));
     assert_eq!(fake.called("processes").last(), Some(&json!({"device": "d"})), "paging isn't the API's");
     // The next pages come from the snapshot, even after the list changed.
     fake.answer("processes", Ok(json!([])));
     let cursor = first["next_cursor"].clone();
-    let second = run(&fake, &pages, "processes", &json!({"device": "d", "cursor": cursor})).expect("page 2");
+    let second = run(&fake, &pages, "me", "processes", &json!({"device": "d", "cursor": cursor})).expect("page 2");
     assert_eq!(second["items"], json!(procs[2..4]));
-    let third = run(&fake, &pages, "processes", &json!({"cursor": second["next_cursor"], "limit": 10})).expect("page 3");
+    let third = run(&fake, &pages, "me", "processes", &json!({"cursor": second["next_cursor"], "limit": 10})).expect("page 3");
     assert_eq!((third["items"].clone(), third["next_cursor"].clone()), (json!(procs[4..]), Value::Null));
     assert_eq!(fake.called("processes").len(), 2, "one call for the three pages");
     // A cursor this server didn't hand out, or for another tool, is refused.
     for (tool, cursor) in [("processes", json!("99.0.2")), ("processes", json!("junk")), ("logs", cursor.clone())] {
-        let err = run(&fake, &pages, tool, &json!({"cursor": cursor})).expect_err("expired");
+        let err = run(&fake, &pages, "me", tool, &json!({"cursor": cursor})).expect_err("expired");
         assert!(err.contains("`cursor` has expired"), "{err}");
     }
     for limit in [json!(0), json!(MAX_LIMIT + 1), json!("2")] {
-        assert!(run(&fake, &pages, "processes", &json!({"limit": limit})).expect_err("limit").contains("`limit`"));
+        assert!(run(&fake, &pages, "me", "processes", &json!({"limit": limit})).expect_err("limit").contains("`limit`"));
     }
     // A list inside an object pages in place.
     fake.answer("devices_usage", Ok(json!({"available": true, "devices": [{"id": "a"}, {"id": "b"}, {"id": "c"}], "simee": {}})));
-    let usage = run(&fake, &pages, "devices_usage", &json!({"limit": 2})).expect("usage");
+    let usage = run(&fake, &pages, "me", "devices_usage", &json!({"limit": 2})).expect("usage");
     assert_eq!(
         (usage["devices"].clone(), usage["total"].clone(), usage["available"].clone()),
         (json!([{"id": "a"}, {"id": "b"}]), json!(3), json!(true))
     );
-    let rest = run(&fake, &pages, "devices_usage", &json!({"cursor": usage["next_cursor"]})).expect("rest");
+    let rest = run(&fake, &pages, "me", "devices_usage", &json!({"cursor": usage["next_cursor"]})).expect("rest");
     assert_eq!((rest["devices"].clone(), rest["next_cursor"].clone()), (json!([{"id": "c"}]), Value::Null));
     // A short list is one page, and keeps nothing.
     fake.answer("logs", Ok(json!(["one"])));
-    assert_eq!(run(&fake, &pages, "logs", &json!({"limit": 5})), Ok(json!({"items": ["one"], "next_cursor": null, "total": 1})));
+    assert_eq!(run(&fake, &pages, "me", "logs", &json!({"limit": 5})), Ok(json!({"items": ["one"], "next_cursor": null, "total": 1})));
     // Tools that don't page pass `limit` through to the method, as before.
-    assert!(run(&fake, &pages, "apps", &json!({"limit": 1})).is_ok());
+    assert!(run(&fake, &pages, "me", "apps", &json!({"limit": 1})).is_ok());
     assert_eq!(fake.called("apps"), [json!({"limit": 1})]);
     let listed = all();
     assert_eq!(tool(&listed, "logs")["inputSchema"]["properties"]["limit"]["maximum"], MAX_LIMIT);
@@ -568,21 +589,77 @@ fn only_long_methods_for_task_clients_become_tasks() {
 fn snapshots_are_bounded_and_a_crafted_cursor_is_refused() {
     let pages = Pages::default();
     let v = json!([1, 2, 3]);
-    let ids: Vec<u64> = (0..6).map(|_| pages.keep_within("processes", &v, 3, usize::MAX)).collect();
-    assert!(pages.find("processes", ids[0]).is_none() && pages.find("processes", ids[2]).is_none());
-    assert!(pages.find("processes", ids[3]).is_some() && pages.find("processes", ids[5]).is_some());
+    let none = json!({});
+    let ids: Vec<String> = (0..6).map(|_| pages.keep_within("me", "processes", &none, &v, 3, usize::MAX)).collect();
+    assert!(pages.find("me", "processes", &ids[0]).is_none() && pages.find("me", "processes", &ids[2]).is_none());
+    assert!(pages.find("me", "processes", &ids[3]).is_some() && pages.find("me", "processes", &ids[5]).is_some());
     // By bytes: each is 7 bytes of JSON, so 15 holds two.
     let by_bytes = Pages::default();
-    let ids: Vec<u64> = (0..4).map(|_| by_bytes.keep_within("processes", &v, 16, 15)).collect();
-    assert!(by_bytes.find("processes", ids[1]).is_none() && by_bytes.find("processes", ids[2]).is_some());
-    assert!(by_bytes.find("processes", ids[3]).is_some());
+    let ids: Vec<String> = (0..4).map(|_| by_bytes.keep_within("me", "processes", &none, &v, 16, 15)).collect();
+    assert!(by_bytes.find("me", "processes", &ids[1]).is_none() && by_bytes.find("me", "processes", &ids[2]).is_some());
+    assert!(by_bytes.find("me", "processes", &ids[3]).is_some());
     // One alone over the cap is still kept.
-    assert!(by_bytes.find("processes", by_bytes.keep_within("processes", &v, 16, 1)).is_some());
+    let alone = by_bytes.keep_within("me", "processes", &none, &v, 16, 1);
+    assert!(by_bytes.find("me", "processes", &alone).is_some());
     // A hand-made cursor with a page size out of range is refused, not looped on.
     let fake = Fake::default();
-    let id = pages.keep_within("processes", &json!([1, 2, 3]), 3, usize::MAX);
+    let id = pages.keep_within("me", "processes", &none, &json!([1, 2, 3]), 3, usize::MAX);
     for size in [0, MAX_LIMIT + 1] {
-        let err = run(&fake, &pages, "processes", &json!({"cursor": format!("{id}.0.{size}")})).expect_err("range");
+        let err = run(&fake, &pages, "me", "processes", &json!({"cursor": format!("{id}.0.{size}")})).expect_err("range");
         assert!(err.contains("`cursor`"), "{err}");
     }
+}
+
+#[test]
+fn a_cursor_works_for_the_client_it_was_given_to_and_nobody_else() {
+    let fake = Fake::default();
+    let procs: Vec<Value> = (1..=5).map(|pid| json!({"pid": pid})).collect();
+    fake.answer("processes", Ok(Value::Array(procs.clone())));
+    let pages = Pages::default();
+    let first = run(&fake, &pages, "alice", "processes", &json!({"device": "d", "limit": 2})).expect("page 1");
+    let cursor = first["next_cursor"].as_str().expect("cursor").to_owned();
+    // Not a counter a neighbour can step through: 32 hex digits, different every time.
+    let id = cursor.split('.').next().expect("id");
+    assert!(id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()), "{cursor}");
+    let again = run(&fake, &pages, "alice", "processes", &json!({"device": "d", "limit": 2})).expect("again");
+    assert_ne!(again["next_cursor"], first["next_cursor"]);
+    // Another client, holding alice's cursor (an HTTP server's stateless sessions share the snapshots):
+    // the cursor is no cursor of theirs.
+    let err = run(&fake, &pages, "mallory", "processes", &json!({"cursor": cursor})).expect_err("not theirs");
+    assert!(err.contains("`cursor` has expired"), "{err}");
+    assert!(run(&fake, &pages, "alice", "processes", &json!({"cursor": cursor})).is_ok());
+}
+
+/// A backend that allows a call only while `allowed` is true: the policy's, as paging sees it.
+struct Revocable {
+    inner: Fake,
+    allowed: std::sync::atomic::AtomicBool,
+    asked: Mutex<Vec<(String, Value)>>,
+}
+
+impl Backend for Revocable {
+    fn call(&self, method: &str, params: &Value) -> Result<Value, String> {
+        self.inner.call(method, params)
+    }
+
+    fn permits(&self, method: &str, params: &Value) -> Result<(), String> {
+        self.asked.lock().expect("asked").push((method.to_owned(), params.clone()));
+        if self.allowed.load(std::sync::atomic::Ordering::SeqCst) { Ok(()) } else { Err("refused: not any more".into()) }
+    }
+}
+
+#[test]
+fn the_next_page_asks_the_policy_again_about_the_call_that_made_the_list() {
+    let backend = Revocable { inner: Fake::default(), allowed: true.into(), asked: Mutex::default() };
+    backend.inner.answer("processes", Ok(json!([1, 2, 3, 4, 5])));
+    let pages = Pages::default();
+    let first = run(&backend, &pages, "me", "processes", &json!({"device": "ci-1", "limit": 2})).expect("page 1");
+    assert!(backend.asked.lock().expect("asked").is_empty(), "the first page is the call itself, which was judged as it ran");
+    let cursor = first["next_cursor"].clone();
+    // The page after it is judged by the call that made the list, not by what the cursor request says.
+    run(&backend, &pages, "me", "processes", &json!({"device": "ci-2", "cursor": cursor})).expect("page 2");
+    assert_eq!(*backend.asked.lock().expect("asked"), [("processes".to_owned(), json!({"device": "ci-1"}))]);
+    backend.allowed.store(false, std::sync::atomic::Ordering::SeqCst);
+    let err = run(&backend, &pages, "me", "processes", &json!({"cursor": cursor})).expect_err("revoked");
+    assert!(err.starts_with("refused: "), "{err}");
 }

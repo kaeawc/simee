@@ -12,19 +12,21 @@ use sim_core::debug;
 use sim_core::device::{DeviceState, privacy_service};
 use sim_core::duo;
 use sim_core::form_factor::FormFactor;
+use sim_core::frame::encode_png;
 use sim_core::geometry::{Point, Size};
 use sim_core::gesture::{Sample, ScreenEdge, pace, pace_samples};
 use sim_core::hid::{Button, KeyEvent, key_events};
 use sim_core::indigo::PointerButton;
 use sim_core::pointer::{self, Held, HeldPointer, PointerAction};
 use sim_core::reuse::{BootKey, Reuse};
+use sim_core::shot::{Lookup, ShotCache};
 use sim_core::worker::Workers;
 use sim_coresim::{Appearance, Context, Device, Direction, Display, Hid, Orientation, StateWatch, StatusBar, WatchGesture};
 
 use crate::params::{
     PointerRequest, button, crown_delta, display, err, need_bool, need_f64, need_str, opt_bool, opt_edge, opt_form_factor, opt_orientation,
-    opt_u64, pairs, pencil_samples, pointer_request, remote_swipe_samples, screenshot_result, str_param, strings, swipe_samples,
-    tap_samples, touch_sample,
+    opt_u64, pairs, pencil_samples, png_result, pointer_request, remote_swipe_samples, screenshot_result, str_param, strings,
+    swipe_samples, tap_samples, touch_sample,
 };
 // The settle rule, its options and a result's load figures: shared with Android's `settle`.
 pub(crate) use crate::settle::options as settle_options;
@@ -496,7 +498,16 @@ struct Screens {
     /// 1206x2622 in all four orientations on an iPhone 17 Pro, iOS 27.2), and these displays are
     /// found again, `updateIOPorts` and all, in every new boot.
     sizes: [std::cell::Cell<Option<SizeAt>>; 2],
+    /// The last screenshot of each (#114): answered again while the surface's seed (or, where the
+    /// seed ticks on a still screen, its contents' hash) stays the same. Kept for this boot only,
+    /// beside the displays, and dropped with them; shared with the caller, which encodes a miss off
+    /// the worker and stores it.
+    shots: Shots,
 }
+
+/// The screenshot cache's key: which built-in screen (0 main, 1 inner) and the format.
+type ShotKey = (usize, &'static str);
+type Shots = Arc<std::sync::Mutex<ShotCache<ShotKey>>>;
 
 /// A framebuffer size (width, height) and the [`TURNS`] it was read at.
 type SizeAt = (u64, (u32, u32));
@@ -518,7 +529,16 @@ fn inner_for<T>(device_type_id: &str, second: Option<T>) -> Option<T> {
 impl Screens {
     fn open(device: &Device) -> Result<Self, String> {
         let (main, inner) = device.builtin_displays().map_err(err)?;
-        Ok(Self { main, inner: inner_for(&device.info().device_type_id, inner), sizes: Default::default() })
+        Ok(Self { main, inner: inner_for(&device.info().device_type_id, inner), sizes: Default::default(), shots: Shots::default() })
+    }
+
+    /// The PNG screenshot of `display`, one of these: the kept one while its surface still shows
+    /// it, else the frame to encode, with the cache to store the encoded bytes in.
+    fn shot(&self, display: &Display) -> Result<(Lookup<ShotKey>, Shots), String> {
+        let key = (usize::from(!std::ptr::eq(display, &self.main)), "png");
+        let turns = TURNS.load(Ordering::Acquire);
+        let found = self.shots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).lookup(key, turns, &mut Surfaced(display))?;
+        Ok((found, self.shots.clone()))
     }
 
     /// The framebuffer size of `display`, one of these: read once, then kept until a rotation or
@@ -737,6 +757,147 @@ fn capture(s: &mut Session, p: &Value) -> Result<sim_core::frame::Frame, String>
     match display(p)? {
         duo::Display::CarPlay => s.device(p)?.external_display().and_then(|d| d.capture()).map_err(err),
         which => on_display(s, p, which, |_, d| d.capture().map_err(err)),
+    }
+}
+
+/// `screenshot`. A built-in screen is looked up in its worker's cache (#114): an unchanged surface
+/// answers with the bytes encoded before; a miss is captured on the worker and encoded here, so the
+/// worker is free for input meanwhile, then kept. The CarPlay screen is captured and encoded per
+/// call, as before.
+fn screenshot(s: &mut Session, p: &Value) -> Result<Value, String> {
+    let which = display(p)?;
+    if which == duo::Display::CarPlay {
+        return screenshot_result(&capture(s, p)?, p);
+    }
+    let shot = match on_display(s, p, which, |screens, d| screens.shot(d))? {
+        (Lookup::Hit(shot), _) => shot,
+        (Lookup::Miss(frame, ticket), shots) => {
+            let png = encode_png(&frame)?;
+            shots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).store(ticket, frame.width, frame.height, png)
+        }
+    };
+    png_result(shot.width, shot.height, shot.bytes.as_slice(), p)
+}
+
+/// A display as the screenshot cache reads it.
+struct Surfaced<'a>(&'a Display);
+
+impl sim_core::shot::Source for Surfaced<'_> {
+    fn stamp(&mut self) -> Result<sim_core::shot::Stamp, String> {
+        self.0.stamp().map_err(err)
+    }
+    fn hash(&mut self) -> Result<(sim_core::shot::Stamp, u64), String> {
+        self.0.content_hash().map_err(err)
+    }
+    fn capture(&mut self) -> Result<(sim_core::frame::Frame, sim_core::shot::Stamp, u64), String> {
+        self.0.capture_hashed().map_err(err)
+    }
+}
+
+/// `wait_idle`'s quiet period (`quiet_ms`, default 300), its limit (`timeout_ms`, default 10 s) and
+/// whether it answers with the still screen (`screenshot`, default false).
+///
+pub(crate) fn wait_idle_options(p: &Value) -> Result<(Duration, Duration, bool), String> {
+    let (quiet_ms, timeout_ms) = (opt_u64(p, "quiet_ms").unwrap_or(300), opt_u64(p, "timeout_ms").unwrap_or(10_000));
+    if timeout_ms < quiet_ms {
+        return Err(format!(
+            "timeout_ms ({timeout_ms}) is shorter than quiet_ms ({quiet_ms}): the screen can't be still for the quiet period within it"
+        ));
+    }
+    Ok((Duration::from_millis(quiet_ms), Duration::from_millis(timeout_ms), opt_bool(p, "screenshot")?.unwrap_or(false)))
+}
+
+/// The least time between two looks at the device's state while `wait_idle` waits.
+const DEVICE_CHECK: Duration = Duration::from_millis(100);
+
+/// How often `wait_idle` reads the seed of a display that has no frame callback.
+const IDLE_POLL: Duration = Duration::from_millis(16);
+
+/// `wait_idle` (#114): waits on this thread, not the device's worker, so input keeps flowing; the
+/// screenshot after it goes through the worker's cache like any other.
+fn wait_idle(s: &mut Session, p: &Value) -> Result<Value, String> {
+    let (quiet, timeout, with_shot) = wait_idle_options(p)?;
+    let which = display(p)?;
+    let device = s.device(p)?;
+    if device.state() != DeviceState::Booted {
+        return Err(format!("{} isn't booted", device.info().name));
+    }
+    let still = sim_coresim::autoreleasepool(|| {
+        let (screens, external);
+        let display = match which {
+            duo::Display::CarPlay => {
+                external = device.external_display().map_err(err)?;
+                &external
+            }
+            which => {
+                screens = Screens::open(&device)?;
+                screens.pick(which)?.0
+            }
+        };
+        sim_core::idle::wait_idle(&mut Watched::new(display, &device), quiet, timeout, sim_core::idle::HASH_EVERY)
+    })?;
+    let mut result = json!({"waited_ms": still.waited.as_millis() as u64, "frames": still.frames});
+    if with_shot && let Value::Object(shot) = screenshot(s, p)? {
+        result.as_object_mut().expect("an object").extend(shot);
+    }
+    Ok(result)
+}
+
+/// A display `wait_idle` watches: its frame callback wakes the wait, and a display without one is
+/// polled every [`IDLE_POLL`].
+struct Watched<'a> {
+    display: &'a Display,
+    device: &'a Device,
+    checked_at: Option<Instant>,
+    presented: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    watch: Option<sim_coresim::FrameWatch>,
+}
+
+impl<'a> Watched<'a> {
+    fn new(display: &'a Display, device: &'a Device) -> Self {
+        let presented = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let posted = presented.clone();
+        let watch = display
+            .watch_frames(move || {
+                *posted.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                posted.1.notify_all();
+            })
+            .ok();
+        Self { display, device, checked_at: None, presented, watch }
+    }
+}
+
+impl sim_core::idle::Probe for Watched<'_> {
+    fn seed(&mut self) -> Result<u32, String> {
+        sim_coresim::autoreleasepool(|| self.display.stamp()).map(|s| s.seed).map_err(err)
+    }
+    fn hash(&mut self) -> Result<(u32, u64), String> {
+        sim_coresim::autoreleasepool(|| self.display.content_hash()).map(|(stamp, hash)| (stamp.seed, hash)).map_err(err)
+    }
+    fn wait(&mut self, at_most: Duration) {
+        if self.watch.is_none() {
+            return sleep(at_most.min(IDLE_POLL));
+        }
+        let (flag, cv) = &*self.presented;
+        let flag = flag.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut flag, _) = cv.wait_timeout_while(flag, at_most, |f| !*f).unwrap_or_else(std::sync::PoisonError::into_inner);
+        *flag = false;
+    }
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn stop(&mut self) -> Option<String> {
+        if crate::call_cancelled() {
+            return Some("cancelled: wait_idle was cancelled".to_owned());
+        }
+        // A device that shuts down freezes its surface, which would read as a still screen: look at
+        // its state, at most every `DEVICE_CHECK`.
+        let now = Instant::now();
+        if self.checked_at.is_some_and(|at| now.duration_since(at) < DEVICE_CHECK) {
+            return None;
+        }
+        self.checked_at = Some(now);
+        (self.device.state() != DeviceState::Booted).then(|| format!("{} stopped being booted during wait_idle", self.device.info().name))
     }
 }
 
@@ -1748,8 +1909,8 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             let (w, h) = screen_size(s, p)?;
             Ok(json!({"width": w, "height": h}))
         }
-        // Captured on the device's worker, encoded here: the worker is free for input meanwhile.
-        "screenshot" => screenshot_result(&capture(s, p)?, p),
+        "screenshot" => screenshot(s, p),
+        "wait_idle" => wait_idle(s, p),
         "contrast_check" => crate::contrast::run(&mut ContrastTarget { s, p }, p),
         m if INPUT_METHODS.contains(&m) => input(s, m, p),
         "rotate" => rotate(&s.device(p)?, opt_orientation(p)?),
@@ -2381,6 +2542,15 @@ fn read_log(reader: Box<dyn std::io::Read + Send>, tail: &SharedTail, clock: &dy
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    #[test]
+    fn a_wait_idle_timeout_under_its_quiet_period_is_refused_up_front() {
+        let e = super::wait_idle_options(&serde_json::json!({"quiet_ms": 300, "timeout_ms": 100})).expect_err("refused");
+        assert!(e.contains("timeout_ms") && e.contains("quiet_ms"), "{e}");
+        // Neighbours: equal is fine, and so are the defaults.
+        assert!(super::wait_idle_options(&serde_json::json!({"quiet_ms": 300, "timeout_ms": 300})).is_ok());
+        assert!(super::wait_idle_options(&serde_json::json!({})).is_ok());
+    }
 
     #[test]
     fn keys_go_a_gap_apart_and_twenty_characters_type_in_under_a_fifth_of_a_second() {
