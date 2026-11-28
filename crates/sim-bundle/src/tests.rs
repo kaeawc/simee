@@ -258,12 +258,20 @@ fn damaged_bundles_are_refused() {
 
 #[test]
 fn paths_and_hashes_are_checked_by_shape() {
-    for ok in ["config.ini", "simee/userdata.img", "a.b/c-d_e"] {
+    for ok in ["config.ini", "simee/userdata.img", "a.b/c-d_e", "\u{e9}t\u{e9}/stra\u{df}e"] {
         assert!(safe_path(ok), "{ok}");
     }
-    for bad in ["", "/abs", "../x", "a/../b", "a/./b", ".", "a/", "a\\b", "a\0b"] {
+    // Ignorable and format code points: a zero-width space, joiner and no-break space, a bidi
+    // override, a soft hyphen, a variation selector and a tag.
+    let ignorables = ["a\u{200b}b", "a\u{200d}b", "\u{feff}a", "a\u{202e}b", "a\u{ad}b", "a\u{fe0f}", "a\u{e0041}"];
+    for bad in ["", "/abs", "../x", "a/../b", "a/./b", ".", "a/", "a\\b", "a\0b"].into_iter().chain(ignorables) {
         assert!(!safe_path(bad), "{bad:?}");
     }
+    assert!(safe_target("../a/b") && safe_target("/System/Library") && safe_target(&"a".repeat(crate::MAX_TARGET)));
+    for bad in ["", "a\0b", "a\u{200b}"] {
+        assert!(!safe_target(bad), "{bad:?}");
+    }
+    assert!(!safe_target(&"a".repeat(crate::MAX_TARGET + 1)), "longer than macOS makes");
     assert!(is_hash(&hash(b"x")));
     assert!(!is_hash(&hash(b"x").to_uppercase()) && !is_hash("abc"));
 }

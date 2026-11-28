@@ -25,7 +25,7 @@ use std::time::Instant;
 
 pub use manifest::{
     AndroidImage, Base, CHUNK_SIZE, COLD_BOOT, COMPRESSION, Captures, Device, Disk, Entry, EntryKind, Extent, FORMAT, File, GuestIdentity,
-    Identity, IosSimulator, MAX_SIZE, Manifest, Secret, is_hash, safe_path,
+    Identity, IosSimulator, MAX_SIZE, MAX_TARGET, Manifest, Secret, ignorable, is_hash, safe_path, safe_target,
 };
 pub use store::{ChunkStore, chunk_name, compress, decompress_verified, hash, hash_file, max_compressed, parse_chunk_name, read_regular};
 pub use tar::{TarReader, TarWriter};
@@ -42,7 +42,7 @@ pub enum Error {
     Format(u64),
     #[error("bad bundle manifest: {0}")]
     Manifest(String),
-    #[error("unsafe path `{0}` in the bundle (absolute, empty, or with `.` or `..`)")]
+    #[error("unsafe path `{0}` in the bundle (absolute, empty, with `.` or `..`, or with an ignorable or format code point)")]
     Path(String),
     #[error("chunk {0} doesn't match its hash")]
     ChunkHash(String),
