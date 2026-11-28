@@ -50,7 +50,10 @@ impl Jobs {
         let (done, error) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(None)));
         let (d, e) = (done.clone(), error.clone());
         let spawned = std::thread::Builder::new().name(format!("simee-job-{udid}")).spawn(move || {
-            if let Err(msg) = work()
+            // A job that panics still finishes, as a failure: its device would otherwise keep the
+            // job (and refuse every later one) until the window quits.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|panic| Err(panicked(&*panic)));
+            if let Err(msg) = result
                 && let Ok(mut slot) = e.lock()
             {
                 *slot = Some(msg);
@@ -102,6 +105,12 @@ impl Jobs {
             })
             .collect()
     }
+}
+
+/// A panicked job's failure, with the panic's message when it has one.
+fn panicked(panic: &(dyn std::any::Any + Send)) -> String {
+    let msg = panic.downcast_ref::<&str>().copied().or_else(|| panic.downcast_ref::<String>().map(String::as_str));
+    msg.map_or_else(|| "the job panicked".to_owned(), |m| format!("the job panicked: {m}"))
 }
 
 /// What the sidebar's window-wide indicator says about the devices other than the one shown:
@@ -165,6 +174,19 @@ mod tests {
         b.send(()).expect("release B");
         assert_eq!(wait_finished(&mut jobs), [Finished { udid: "B".into(), label: BOOTING, result: Ok(()) }]);
         assert!(!jobs.any());
+    }
+
+    /// A job that panics finishes as a failure and frees its device for the next.
+    #[test]
+    fn a_panicking_job_finishes_as_a_failure() {
+        let mut jobs = Jobs::default();
+        jobs.start("A", BOOTING, Box::new(|| panic!("no such runtime")), None).expect("starts");
+        assert_eq!(
+            wait_finished(&mut jobs),
+            [Finished { udid: "A".into(), label: BOOTING, result: Err("the job panicked: no such runtime".into()) }]
+        );
+        assert!(!jobs.any());
+        assert!(jobs.start("A", BOOTING, Box::new(|| Ok(())), None).is_ok(), "the device takes a job again");
     }
 
     /// One job per device: a second on the same device is refused while the first runs, and

@@ -72,7 +72,7 @@ fn sidebar(s: &State, t: Theme, clock: Option<f32>) -> El {
         .radius(radius::SM)
         .fill(t.control_off)
         .on_edit(|s: &mut State| &mut s.search)
-        .on_input_change(|s: &mut State, _: &mut Tx| s.search_cursor = 0)
+        .on_input_change(|s: &mut State, _: &mut Tx| s.search_highlight = None)
         .on_input_key(crate::list::search_key);
     col()
         .w(240.0)
@@ -90,6 +90,8 @@ fn sidebar(s: &State, t: Theme, clock: Option<f32>) -> El {
 
 /// One device's row: its state mark (booting while a boot from here runs), name and platform. A
 /// click or Return selects it and boots it when it is shut down; ⌥ selects only ([`crate::list::activate`]).
+/// Its keys name the device (`device-<udid>`), never its place: focus follows the device when a
+/// rescan or a boot reorders the list, so Return presses the row the user focused.
 fn device_row(s: &State, i: usize, highlighted: bool, t: Theme, clock: Option<f32>) -> El {
     let d = &s.devices[i];
     let selected = s.selected.as_deref() == Some(d.udid.as_str());
@@ -98,20 +100,23 @@ fn device_row(s: &State, i: usize, highlighted: bool, t: Theme, clock: Option<f3
     let job = s.jobs.label(&d.udid);
     let motion = job.map_or_else(|| crate::mark::for_device(d.state), crate::mark::for_busy);
     let moving = job.is_some() || crate::mark::moves(d.state);
-    let state_mark =
-        crate::mark::toned(motion, clock.filter(|_| moving), Some(crate::mark::tone(d.platform)), 16.0).key(format!("device-{i}-mark"));
+    let state_mark = crate::mark::toned(motion, clock.filter(|_| moving), Some(crate::mark::tone(d.platform)), 16.0)
+        .key(format!("device-{}-mark", d.udid));
     let (udid, menu_udid) = (d.udid.clone(), d.udid.clone());
-    let popped = s.popouts.is_open(&d.udid).then(|| crate::popout::row_mark(i, t));
-    let mut badge = platform_badge(d, t).key(format!("device-{i}-platform"));
+    let popped = s.popouts.is_open(&d.udid).then(|| crate::popout::row_mark(&d.udid, t));
+    let mut badge = platform_badge(d, t).key(format!("device-{}-platform", d.udid));
     if selected {
         // The secondary colour is too faint on the tint.
         badge = badge.color(t.text);
     }
     // The bar's slot is there on every row, so names line up whichever is selected.
-    let bar =
-        el().key(format!("device-{i}-bar")).w(3.0).h(16.0).radius(1.5).fill(if selected { highlight.bar } else { Color::TRANSPARENT });
+    let bar = el().key(format!("device-{}-bar", d.udid)).w(3.0).h(16.0).radius(1.5).fill(if selected {
+        highlight.bar
+    } else {
+        Color::TRANSPARENT
+    });
     let mut item = row()
-        .key(format!("device-{i}"))
+        .key(format!("device-{}", d.udid))
         .role("button")
         .label(format!("{}, {}", d.name, d.label()))
         .focusable(true)
@@ -195,8 +200,8 @@ fn stage(s: &State, t: Theme, clock: Option<f32>) -> El {
         controls = controls
             .child(crate::mark::mark(crate::mark::for_busy(busy), clock, 20.0).key("busy-mark"))
             .child(text(busy).key("busy").font(type_::BODY).color(t.text_secondary));
-    } else if s.selected.is_some() && !booted {
-        controls = controls.child(button("boot-button", &icons::PLAY, "Boot", Action::Boot, true, t));
+    } else if let Some(udid) = s.selected.as_ref().filter(|_| !booted) {
+        controls = controls.child(button("boot-button", &icons::PLAY, "Boot", Action::Boot(udid.clone()), true, t));
     }
     if s.showing_screen()
         && popped.is_none()

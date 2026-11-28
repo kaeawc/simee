@@ -107,23 +107,42 @@ pub fn order(s: &State) -> Vec<usize> {
     rows(s).into_iter().filter_map(|r| if let Row::Device(i) = r { Some(i) } else { None }).collect()
 }
 
-/// The device ↑ and ↓ have reached, while the search field has focus or a query.
+/// The device ↑ and ↓ have reached (a `State::devices` index), while the search field has
+/// focus or a query: the one `State::search_highlight` names wherever the list has since moved
+/// it (a boot finishing, a rescan), else the first match.
 pub fn highlighted(s: &State) -> Option<usize> {
     if !s.search.focused && s.search.text.trim().is_empty() {
         return None;
     }
     let order = order(s);
-    order.get(s.search_cursor.min(order.len().saturating_sub(1))).copied()
+    let kept = s.search_highlight.as_deref().and_then(|u| order.iter().copied().find(|&i| s.devices[i].udid == u));
+    kept.or_else(|| order.first().copied())
+}
+
+/// Moves the highlight `by` places through the list's order, stopping at either end.
+fn step(s: &mut State, by: isize) {
+    let order = order(s);
+    let Some(last) = order.len().checked_sub(1) else { return };
+    let at = highlighted(s).and_then(|i| order.iter().position(|&o| o == i)).unwrap_or(0);
+    let to = at.saturating_add_signed(by).min(last);
+    s.search_highlight = Some(s.devices[order[to]].udid.clone());
 }
 
 /// A click on a row, or Return on it: selects the device, and boots it when it is shut down
-/// (past admission, by the Boot button's path); `select_only` (⌥) never boots.
+/// (past admission, by the Boot button's path); `select_only` (⌥) never boots. A device out in
+/// its own window is only brought forward there, even when it has stopped: its window says so,
+/// and closing it brings the device back here to boot.
 pub fn activate(s: &mut State, udid: &str, select_only: bool) {
-    let boots =
-        !select_only && s.jobs.label(udid).is_none() && s.devices.iter().any(|d| d.udid == udid && d.state == DeviceState::Shutdown);
+    let boots = !select_only
+        && !s.popouts.is_open(udid)
+        && s.jobs.label(udid).is_none()
+        && s.devices.iter().any(|d| d.udid == udid && d.state == DeviceState::Shutdown);
+    if !select_only && s.popouts.is_open(udid) && s.devices.iter().any(|d| d.udid == udid && d.state == DeviceState::Shutdown) {
+        s.status = Some(format!("{} stopped in its own window: close it to boot it here", s.device_name(udid)));
+    }
     s.actions.push(Action::Select(udid.to_owned()));
     if boots {
-        s.actions.push(Action::Boot);
+        s.actions.push(Action::Boot(udid.to_owned()));
     }
 }
 
@@ -134,13 +153,10 @@ pub fn search_key(s: &mut State, k: &KeyEvent, tx: &mut Tx) -> bool {
         Key::Escape if s.search.text.is_empty() => tx.blur(),
         Key::Escape => {
             s.search.clear();
-            s.search_cursor = 0;
+            s.search_highlight = None;
         }
-        Key::Down => {
-            let n = order(s).len();
-            s.search_cursor = (s.search_cursor + 1).min(n.saturating_sub(1));
-        }
-        Key::Up => s.search_cursor = s.search_cursor.min(order(s).len().saturating_sub(1)).saturating_sub(1),
+        Key::Down => step(s, 1),
+        Key::Up => step(s, -1),
         Key::Enter => {
             let Some(i) = highlighted(s) else { return true };
             let udid = s.devices[i].udid.clone();
@@ -190,7 +206,7 @@ pub fn booted_scene(s: &mut State) {
 pub fn search_scene(s: &mut State) {
     crate::demo(s);
     s.search = rune::TextEdit::new("17 26.5");
-    s.search_cursor = 1;
+    s.search_highlight = Some("B2".into());
 }
 
 #[cfg(test)]
@@ -291,7 +307,7 @@ mod tests {
     fn a_shut_down_device_boots_on_click_and_option_selects_only() {
         let mut s = demo();
         activate(&mut s, "B2", false);
-        assert_eq!(s.actions, [Action::Select("B2".into()), Action::Boot]);
+        assert_eq!(s.actions, [Action::Select("B2".into()), Action::Boot("B2".into())]);
         s.actions.clear();
         activate(&mut s, "B2", true);
         assert_eq!(s.actions, [Action::Select("B2".into())], "⌥ selects only");
