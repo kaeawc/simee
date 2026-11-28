@@ -8,6 +8,7 @@
 //! output is the same either way.
 
 mod doctor;
+mod mcp_install;
 mod mcp_safety;
 mod stream_cli;
 
@@ -450,7 +451,11 @@ enum Cmd {
     /// a tool, devices as resources, long operations as tasks, a device view as an app. Configure
     /// it in the agent's MCP settings as the command `simee mcp` (see docs/mcp.md). With `--http`,
     /// serve MCP's Streamable HTTP transport instead, at `http://ADDR/mcp`.
+    #[command(args_conflicts_with_subcommands = true)]
     Mcp {
+        /// `install` writes a client's MCP config; `config` prints it (docs/mcp-clients.md).
+        #[command(subcommand)]
+        action: Option<mcp_install::McpAction>,
         /// Serve Streamable HTTP on ADDR (default 127.0.0.1:8377). Every request needs a bearer
         /// token (see `--token-file`); a non-loopback ADDR also needs TLS (`--tls-cert` and
         /// `--tls-key`, or `--tls-self-signed`) or `--insecure-remote`.
@@ -608,6 +613,10 @@ fn main() -> Result<()> {
             audit.run(&mut std::io::stdout().lock())?;
             return Ok(());
         }
+        Cmd::Mcp { action: Some(action), .. } => {
+            let stdout = std::io::stdout();
+            return mcp_install::run(action, &mcp_install::Host::current()?, &mut stdout.lock());
+        }
         Cmd::Mcp { http: None, safety, .. } => {
             safety.install()?;
             mcp_shutdown_on_signal()?;
@@ -618,7 +627,7 @@ fn main() -> Result<()> {
             served?;
             return Ok(());
         }
-        Cmd::Mcp { http: Some(addr), token_file, no_auth, insecure_remote, tls, safety } => {
+        Cmd::Mcp { http: Some(addr), token_file, no_auth, insecure_remote, tls, safety, .. } => {
             safety.install()?;
             let config = mcp_http_config(addr, token_file.clone(), *no_auth, *insecure_remote, tls)?;
             mcp_shutdown_on_signal()?;
@@ -1744,6 +1753,7 @@ mod tests {
         assert!(matches!(parse(&["mcp"]), Ok(Cmd::Mcp { http: None, token_file: None, no_auth: false, insecure_remote: false, .. })));
         let mut transport = Transport::local();
         let stdio = Cmd::Mcp {
+            action: None,
             http: None,
             token_file: None,
             no_auth: false,
@@ -1753,6 +1763,15 @@ mod tests {
         };
         let e = run(stdio, &mut transport, &mut Vec::new(), &mut Vec::new()).expect_err("served by main, not run");
         assert!(e.to_string().contains("`mcp` and `mcp-audit` don't run through a transport"));
+    }
+
+    #[test]
+    fn mcp_install_and_config_are_subcommands_that_do_not_mix_with_serving_flags() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
+        assert!(matches!(parse(&["mcp", "install", "cursor", "--dry-run"]), Ok(Cmd::Mcp { action: Some(_), http: None, .. })));
+        assert!(matches!(parse(&["mcp", "config", "claude-desktop"]), Ok(Cmd::Mcp { action: Some(_), .. })));
+        assert!(parse(&["mcp", "--http", "install", "cursor"]).is_err());
+        assert!(parse(&["mcp", "install", "nonsense"]).is_err());
     }
 
     #[test]

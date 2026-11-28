@@ -8,3 +8,4 @@ junit.xml
 /desktop/target
 /scratch
 /bench
+__pycache__/

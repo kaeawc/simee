@@ -174,7 +174,8 @@ The desktop window serves the same API on `$TMPDIR/simee-desktop.sock`. Full ref
 with resources for devices and their screens, tasks for boots, and a device view. It runs the
 methods in its own process, like `--in-process`; configure it in the agent as the command `simee
 mcp`. It serves the `core` toolset (about twenty tools) unless `SIMEE_MCP_TOOLSETS` names others
-(`core,debug`, or `all`): see [toolsets](mcp.md#toolsets).
+(`core,debug`, or `all`): see [toolsets](mcp.md#toolsets). `simee mcp install <client>` writes the config for
+Claude Code, Cursor, VS Code and others: see [MCP clients](mcp-clients.md).
 
 Destructive tools ask a person first, boots go through the host's admission check, and every call is
 logged. `--read-only`, `--allow-device PATTERN`, `--created-devices-only`, `--policy FILE`,
