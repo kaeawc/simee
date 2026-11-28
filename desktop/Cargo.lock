@@ -3699,6 +3699,15 @@ dependencies = [
  "rustix 1.1.6",
  "simee-bundle",
  "simee-core",
+ "simee-emu-hvf",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "simee-emu-hvf"
+version = "0.2.0"
+dependencies = [
+ "libc",
  "thiserror 2.0.21",
 ]
 
