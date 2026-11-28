@@ -16,9 +16,12 @@ include = ["/Cargo.toml", "/LICENSE", "/examples", "/src", "/testdata"]
 doctest = false
 
 [dependencies]
-getrandom.workspace = true
 png.workspace = true
 serde.workspace = true
+
+# `entropy`: not for wasm, where getrandom needs a JS backend this crate has no use for.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+getrandom.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -7,6 +7,8 @@ pub mod contrast;
 pub mod debug;
 pub mod device;
 pub mod duo;
+// Not on wasm (the website builds sim-core there; the browser has no OS entropy to give).
+#[cfg(not(target_family = "wasm"))]
 pub mod entropy;
 pub mod fold;
 pub mod form_factor;
