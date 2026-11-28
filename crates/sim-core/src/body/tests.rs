@@ -156,9 +156,7 @@ fn screens_match_the_screen_simee_reports() {
     for f in bodied() {
         let p = kind(Platform::Android, f).profile();
         let b = for_profile(&p).expect("body");
-        let main = b.screen(Display::Main).or(b.screen(Display::Inner)).expect("screen");
-        assert_eq!((main.px, main.ppi, main.shape), ((p.width, p.height), 0.0 + dpi(p.density), p.shape), "{f:?}");
-        drawn_as_reported(&b, main.display, (p.width, p.height), Some(dpi(p.density)));
+        reference_screen(&b, &p, sizes_by_dpi(f));
     }
     for d in fold::devices() {
         let b = get(d.id).expect("body");
@@ -186,6 +184,18 @@ fn screens_match_the_screen_simee_reports() {
     assert!(duo.shows((2007, 2853)), "the inner LCD, stored portrait");
     drawn_as_reported(&duo, Display::Outer, (1398, 2034), None);
     drawn_as_reported(&duo, Display::Inner, (2007, 2853), None);
+}
+
+/// The Android reference body's main screen is the profile's pixels and shape, and when its module
+/// sizes by dpi (`SIZES_BY_DPI`) drawn at the dpi simee reports; otherwise only at its aspect.
+fn reference_screen(b: &Body, p: &Profile, by_dpi: bool) {
+    let main = b.screen(Display::Main).or(b.screen(Display::Inner)).expect("screen");
+    let f = p.kind.form_factor;
+    assert_eq!((main.px, main.shape), ((p.width, p.height), p.shape), "{f:?}");
+    if by_dpi {
+        assert_eq!(main.ppi, dpi(p.density), "{f:?}");
+    }
+    drawn_as_reported(b, main.display, (p.width, p.height), by_dpi.then(|| dpi(p.density)));
 }
 
 /// The screen drawn for `display` has the aspect of the pixels simee reports for it, turned if it
@@ -703,6 +713,28 @@ fn phone_tablet_and_foldable_bodies_are_unchanged_by_the_split() {
     }
 }
 
+/// A module that sizes its generic body another way (`SIZES_BY_DPI` false: a TV by its diagonal, a
+/// headset by its eyepiece) passes the shared reference check with a screen of any size, while one
+/// that sizes by dpi does not. The phone, tablet, foldable and watch rules stay by dpi.
+#[test]
+fn a_module_that_sizes_another_way_opts_out_of_the_dpi_check() {
+    assert!([FormFactor::Phone, FormFactor::Tablet, FormFactor::Foldable, FormFactor::Watch].into_iter().all(sizes_by_dpi));
+    let p = kind(Platform::Android, FormFactor::Phone).profile();
+    // The image tag reaches only the modules that read it: a phone has one body per screen.
+    let tagged = for_android_image("custom", &p, None, "google_apis").expect("phone");
+    assert_eq!(tagged.id, for_profile(&p).expect("phone").id);
+    let mut stub = (*for_profile(&p).expect("phone")).clone();
+    reference_screen(&stub, &p, true);
+    // The same screen drawn half again as large, as a nominal-diagonal TV would be.
+    stub.screens[0].ppi /= 1.5;
+    reference_screen(&stub, &p, false);
+    let by_dpi = std::panic::catch_unwind(|| reference_screen(&stub, &p, true));
+    assert!(by_dpi.is_err(), "a body at another size fails the dpi rule");
+    // A wrong aspect or pixel count fails either way.
+    stub.screens[0].px.0 += 1;
+    assert!(std::panic::catch_unwind(|| reference_screen(&stub, &p, false)).is_err());
+}
+
 #[test]
 fn has_body_is_what_each_form_factor_module_says() {
     assert!([FormFactor::Phone, FormFactor::Tablet, FormFactor::Foldable].into_iter().all(has_body));
@@ -713,7 +745,14 @@ fn has_body_is_what_each_form_factor_module_says() {
         (FormFactor::Vision, headset::ENABLED),
     ];
     for (f, enabled) in modules {
-        assert_eq!(has_body(f), enabled, "{f:?}");
+        // An enabled module produces a body for its reference screen on every platform that has the form factor.
+        if enabled {
+            for platform in Platform::ALL {
+                if let Ok(k) = Kind::new(platform, f) {
+                    assert!(for_profile(&k.profile()).is_some(), "{f:?} is enabled but has no body on {platform:?}");
+                }
+            }
+        }
         // A form factor with no body has no row, and no generic body on either platform.
         if !enabled {
             assert!(all().iter().all(|b| b.form_factor != f), "{f:?} has rows but no body");
