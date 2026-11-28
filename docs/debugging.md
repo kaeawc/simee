@@ -69,6 +69,10 @@ simee call audio_route '{"device":"…","scope":"output","uid":"BlackHole2ch_UID
 
 Microphone injection still needs a loopback device. Details: [docs/research/audio-camera.md](research/audio-camera.md).
 
+On Android, `audio_state`, `audio_volume` and `audio_mute` act on the guest's media stream over adb
+(`dumpsys audio`, `cmd media_session volume`, and `cmd audio adj-mute` from API 35). The device is
+silent on the host unless it was booted with `audio`; capture and routing are iOS-only for now.
+
 
 ## Android
 
