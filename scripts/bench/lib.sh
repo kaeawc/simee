@@ -29,6 +29,9 @@ BENCH_OUT=${BENCH_OUT:-$BENCH_REPO/bench/results}
 BENCH_ROUND=0
 BENCH_ARGS="$*"
 BENCH_PIDS=()
+# Devices the run measures but did not boot (UDIDs, AVD names, emulator-PORT serials): the gate
+# doesn't count them as foreign. Set with bench_target before bench_start.
+BENCH_TARGETS=()
 BENCH_CLEANUP=()
 BENCH_SHIFT=1
 BENCH_QUIET_GATE=${BENCH_QUIET_GATE:-1}
@@ -126,17 +129,23 @@ median() {
   grep -E '^-?[0-9.]+$' | sort -n | awk '{ v[NR] = $1 } END { if (NR % 2) print v[(NR + 1) / 2]; else if (NR) printf "%.3f\n", (v[NR / 2] + v[NR / 2 + 1]) / 2 }'
 }
 
+# bench_target ID...: devices this run measures that were already running.
+bench_target() { BENCH_TARGETS+=("$@"); }
+
 # bench_gate: waits for a quiet host (quiet.sh) and sets BENCH_GATE_STATUS, or refuses with what is
 # busy and exits 4 (run-all.sh stops the run on it: the next benchmark would wait for the same busy
-# host). Processes this run tracks are its own, not foreign. BENCH_QUIET_GATE=0 (--no-quiet-gate)
-# skips the gate.
+# host). Processes this run tracks are its own, not foreign (BENCH_PIDS entries: a PID, or
+# "PID|lstart|command", one per line to quiet.sh), and so are the devices it measures that the user
+# booted (bench_target). BENCH_QUIET_GATE=0 (--no-quiet-gate) skips the gate.
 bench_gate() {
   if [ "$BENCH_QUIET_GATE" = 0 ]; then
     BENCH_GATE_STATUS="disabled (--no-quiet-gate)"
     return 0
   fi
   bench_log "waiting for a quiet host (up to ${BENCH_QUIET_WAIT:-300} s)"
-  BENCH_GATE_STATUS=$(BENCH_QUIET_WHO=$(basename "$0") BENCH_QUIET_ALLOW_PIDS="${BENCH_PIDS[*]:-}" quiet_gate) || exit 4
+  local allow=""
+  [ ${#BENCH_PIDS[@]} -gt 0 ] && allow=$(printf '%s\n' "${BENCH_PIDS[@]}")
+  BENCH_GATE_STATUS=$(BENCH_QUIET_WHO=$(basename "$0") BENCH_QUIET_ALLOW_PIDS="$allow" BENCH_QUIET_TARGETS="${BENCH_TARGETS[*]:-}" quiet_gate) || exit 4
   bench_log "host is quiet: $BENCH_GATE_STATUS"
 }
 

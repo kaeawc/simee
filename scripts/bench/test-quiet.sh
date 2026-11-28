@@ -6,6 +6,9 @@
 #   - a quiet host passes; a loaded one is refused (status 4) with the load named;
 #   - a foreign emulator, simulator or compiler is refused by name and PID, while this shell, its
 #     ancestors, its descendants and BENCH_QUIET_ALLOW_PIDS are not, and a sibling of an ancestor is;
+#   - what is not foreign: the always-on CoreSimulatorService and its kin, the devices a run names
+#     (BENCH_QUIET_TARGETS: UDID, AVD name, serial) and what they started, while any other busy
+#     device still refuses; BENCH_PIDS entries in both formats (PID, PID|lstart|command);
 #   - thermal pressure and battery power, on Linux (/sys) and on macOS (pmset, powermetrics);
 #   - a bounded wait: a host that quietens within it passes, one that doesn't is refused in time;
 #   - the record: well-formed JSON with the fields the issue lists, beside each result, and
@@ -36,7 +39,7 @@ stub() { # name, body
   chmod +x "$work/bin/$1"
 }
 # shellcheck disable=SC2016
-stub ps 'cat "$FAKE_PS"'
+stub ps 'case "$*" in *args=*) cat "$FAKE_PS_ARGS" 2>/dev/null ;; *) cat "$FAKE_PS" ;; esac'
 # shellcheck disable=SC2016 # the stubs expand their own variables when they run
 stub getconf '[ "${1:-}" = _NPROCESSORS_ONLN ] && { echo "${FAKE_NCPU:-8}"; exit 0; }; exec '"$real_getconf"' "$@"'
 # shellcheck disable=SC2016
@@ -49,7 +52,7 @@ stub sudo 'exit 1'
 # shellcheck disable=SC2016
 stub powermetrics 'cat "$FAKE_PM"'
 export PATH="$work/bin:$PATH"
-export FAKE_PS="$work/ps.txt" FAKE_LOADAVG="$work/loadavg.mac" FAKE_THERM="$work/therm.txt"
+export FAKE_PS="$work/ps.txt" FAKE_PS_ARGS="$work/ps-args.txt" FAKE_LOADAVG="$work/loadavg.mac" FAKE_THERM="$work/therm.txt"
 export FAKE_BATT="$work/batt.txt" FAKE_PM="$work/pm.txt"
 export BENCH_QUIET_PROC="$work/proc" BENCH_QUIET_SYS="$work/sys" BENCH_QUIET_SELF_PID=100
 export BENCH_QUIET_WAIT=1 BENCH_QUIET_POLL=0.2
@@ -64,8 +67,9 @@ reset_host() { # a quiet Linux host with 8 CPUs, no sensors, no battery
    50    10 bash
   100    50 quiet.sh
 EOF
+  : >"$FAKE_PS_ARGS"
   export BENCH_QUIET_OS=Linux FAKE_NCPU=8 FAKE_UID=1000
-  unset BENCH_QUIET_ALLOW_PIDS BENCH_QUIET_MAX_LOAD BENCH_QUIET_LOAD_FACTOR
+  unset BENCH_QUIET_ALLOW_PIDS BENCH_QUIET_TARGETS BENCH_QUIET_MAX_LOAD BENCH_QUIET_LOAD_FACTOR
 }
 zone() { # type temp-in-millidegrees
   mkdir -p "$work/sys/class/thermal/thermal_zone0"
@@ -131,7 +135,7 @@ cat >"$FAKE_PS" <<'EOF'
   300    10 rustc
 EOF
 r=$(reasons)
-check "a foreign emulator is named with its PID" "$(has 'process: emulator qemu-system-aarch64 (pid 200)' "$r" && has 'emulator emu (pid 202)' "$r" && has 'emulator64-crash-service (pid 201)' "$r" && echo ok)"
+check "a foreign emulator is named with its PID (its crash service, a helper, is not)" "$(has 'process: emulator qemu-system-aarch64 (pid 200)' "$r" && has 'emulator emu (pid 202)' "$r" && hasnt '(pid 201)' "$r" && echo ok)"
 check "a foreign simulator and simee process are named" "$(has 'simulator simee (pid 203)' "$r" && has 'simulator launchd_sim (pid 204)' "$r" && echo ok)"
 check "a foreign compiler is named" "$(has 'compiler clang (pid 205)' "$r" && has 'compiler cargo (pid 206)' "$r" && echo ok)"
 check "an ancestor (the cargo that started this run) is not foreign" "$(hasnt '(pid 50)' "$r" && echo ok)"
@@ -162,12 +166,11 @@ cat >"$FAKE_PS" <<'EOF'
   100     1 bench.sh
   600     1 g++
   601     1 clang++
-  602     1 com.apple.CoreSimulator.CoreSimulatorService
-  603     1 clangd
-  604     1 comXapple.CoreSimulator.CoreSimulatorService
+  602     1 clangd
+  603     1 clang-format
 EOF
 r=$(reasons)
-check "names with regex characters match exactly (g++, clang++, a dotted service), nothing near them" "$(has 'compiler g++ (pid 600)' "$r" && has 'compiler clang++ (pid 601)' "$r" && has 'CoreSimulatorService (pid 602)' "$r" && hasnt '(pid 603)' "$r" && hasnt '(pid 604)' "$r" && echo ok)"
+check "names with regex characters match exactly (g++, clang++), nothing near them" "$(has 'compiler g++ (pid 600)' "$r" && has 'compiler clang++ (pid 601)' "$r" && hasnt '(pid 602)' "$r" && hasnt '(pid 603)' "$r" && echo ok)"
 
 reset_host
 zone cpu 91000
@@ -257,6 +260,189 @@ FAKE_UID=1000
 f=$("$here/quiet.sh" facts)
 check "macOS: without root and without passwordless sudo it says powermetrics wasn't read" "$(has 'powermetrics: not read' "$f" && has thermal=nominal "$f" && echo ok)"
 check "macOS: facts carry power and laptop" "$(has power=ac "$f" && has laptop=1 "$f" && echo ok)"
+
+# --- what is not foreign: resident helpers --------------------------------------------------------
+mac
+cat >>"$FAKE_PS" <<'PSEND'
+  720     1 /Library/Developer/PrivateFrameworks/CoreSimulator.framework/Versions/A/XPCServices/com.apple.CoreSimulator.CoreSimulatorService.xpc/Contents/MacOS/com.apple.CoreSimulator.CoreSimulatorService
+  721     1 /Applications/Xcode.app/Contents/Developer/Library/PrivateFrameworks/SimulatorTrampoline
+  722     1 adb
+  723     1 emulator64-crash-service
+PSEND
+sed -i 's|^  720 .*|  720     1 /X/com.apple.CoreSimulator.CoreSimulatorService|; s|^  721 .*|  721     1 /X/SimulatorTrampoline|' "$FAKE_PS"
+gate
+check "macOS: the CoreSimulatorService launchd starts on the first simctl call does not refuse the gate" "$([ "$rc" = 0 ] && hasnt CoreSimulator "$err" && echo ok)"
+check "macOS: nor does SimulatorTrampoline, adb's server or an emulator's crash service" "$([ -z "$(reasons)" ] && echo ok)"
+cat >>"$FAKE_PS" <<'PSEND'
+  724   720 /X/launchd_sim
+PSEND
+r=$(reasons)
+check "macOS: a booted device (launchd_sim) beside the service still refuses" "$(has 'simulator launchd_sim (pid 724)' "$r" && hasnt '(pid 720)' "$r" && echo ok)"
+
+# --- what is not foreign: the devices the run measures ----------------------------------------------
+U1=11111111-AAAA-4BBB-8CCC-000000000001
+U2=22222222-AAAA-4BBB-8CCC-000000000002
+mac
+cat >>"$FAKE_PS" <<PSEND
+  730     1 /X/launchd_sim
+  731     1 /X/launchd_sim
+  732   730 /X/SpringBoard
+PSEND
+cat >"$FAKE_PS_ARGS" <<PSEND
+  730 /X/launchd_sim /Users/u/Library/Developer/CoreSimulator/Devices/$U1/data/var/run/launchd_bootstrap.plist
+  731 /X/launchd_sim /Users/u/Library/Developer/CoreSimulator/Devices/$U2/data/var/run/launchd_bootstrap.plist
+PSEND
+r=$(reasons)
+check "two booted simulators refuse with no target" "$(has '(pid 730)' "$r" && has '(pid 731)' "$r" && echo ok)"
+r=$(BENCH_QUIET_TARGETS="$U1" reasons)
+check "a target UDID's launchd_sim is not foreign" "$(hasnt '(pid 730)' "$r" && echo ok)"
+check "another booted device still refuses beside the target" "$(has 'simulator launchd_sim (pid 731)' "$r" && echo ok)"
+r=$(BENCH_QUIET_TARGETS="$U1 $U2" reasons)
+check "every named target passes" "$([ -z "$r" ] && echo ok)"
+r=$(BENCH_QUIET_TARGETS="${U1%?}" reasons)
+check "a prefix of a UDID is not the target" "$(has '(pid 730)' "$r" && echo ok)"
+
+reset_host
+cat >"$FAKE_PS" <<'PSEND'
+    1     0 init
+  100     1 bench.sh
+  800     1 emulator
+  801   800 qemu-system-aarch64
+  802   800 emulator64-crash-service
+  803   800 emulator64-arm
+  810     1 emu
+  820     1 qemu-system-aarch64
+  830     1 emu
+  840     1 emu
+PSEND
+cat >"$FAKE_PS_ARGS" <<'PSEND'
+  800 /sdk/emulator/emulator -avd Pixel_Test -no-window
+  801 /sdk/emulator/qemu/qemu-system-aarch64 -avd Pixel_Test -ports 5554,5555
+  810 /x/emu -avd Pixel_Other -port 5556
+  820 /sdk/qemu-system-aarch64 -avd Pixel_Test_2 -ports 5558,5559
+  830 /x/emu @Pixel_At
+  840 /x/emu -avd /home/u/.android/avd/Pixel_Path.avd -port 5560
+PSEND
+r=$(BENCH_QUIET_TARGETS=Pixel_Test reasons)
+check "an AVD name names its emulator and the qemu it started" "$(hasnt '(pid 800)' "$r" && hasnt '(pid 801)' "$r" && echo ok)"
+check "what the target's emulator started (its crash service, a helper) is not foreign" "$(hasnt '(pid 802)' "$r" && hasnt '(pid 803)' "$r" && echo ok)"
+check "another AVD beside the target still refuses, even one whose name starts with it" "$(has 'emulator emu (pid 810)' "$r" && has 'emulator qemu-system-aarch64 (pid 820)' "$r" && echo ok)"
+r=$(BENCH_QUIET_TARGETS=emulator-5556 reasons)
+check "an emulator-PORT serial names the emulator on that port" "$(hasnt '(pid 810)' "$r" && has '(pid 800)' "$r" && echo ok)"
+r=$(BENCH_QUIET_TARGETS=emulator-555 reasons)
+check "a serial is the whole port, not a prefix of one" "$(has '(pid 810)' "$r" && has '(pid 800)' "$r" && echo ok)"
+r=$(BENCH_QUIET_TARGETS=Pixel_At reasons)
+check "@AVD names the device" "$(hasnt '(pid 830)' "$r" && has '(pid 810)' "$r" && echo ok)"
+r=$(BENCH_QUIET_TARGETS=Pixel_Path reasons)
+check "an AVD directory (NAME.avd) names the device" "$(hasnt '(pid 840)' "$r" && has '(pid 830)' "$r" && echo ok)"
+r=$(BENCH_QUIET_TARGETS="Pixel_Test emulator-5556 Pixel_At Pixel_Path Pixel_Test_2" reasons)
+check "naming every device leaves nothing foreign" "$([ -z "$r" ] && echo ok)"
+cat >"$FAKE_PS" <<'PSEND'
+    1     0 init
+  100     1 bench.sh
+  900     1 cargo
+  901     1 emulator
+PSEND
+cat >"$FAKE_PS_ARGS" <<'PSEND'
+  900 cargo build -avd-for-the-target
+  901 /sdk/emulator/emulator -avd Pixel_Test
+PSEND
+r=$(BENCH_QUIET_TARGETS=Pixel_Test reasons)
+check "a target never excuses a compiler" "$(has 'compiler cargo (pid 900)' "$r" && hasnt '(pid 901)' "$r" && echo ok)"
+cat >"$FAKE_PS_ARGS" <<'PSEND'
+PSEND
+r=$(BENCH_QUIET_TARGETS=Pixel_Test reasons)
+check "a process whose args can't be read is foreign, not guessed to be the target" "$(has '(pid 901)' "$r" && echo ok)"
+
+# camera.sh and encode.sh set the targets from their device arguments: the gate sees the device the
+# user booted as the run's own, and any other one as busy.
+reset_host
+cat >"$FAKE_PS" <<'PSEND'
+    1     0 init
+  100     1 bench.sh
+  950     1 emu
+  951     1 emu
+PSEND
+cat >"$FAKE_PS_ARGS" <<'PSEND'
+  950 /x/emu -avd Mine -ports 5554,5555
+  951 /x/emu -avd Theirs -ports 5556,5557
+PSEND
+out=$(cd "$work" && BENCH_QUIET_WAIT=0 bash -c '. "$1/lib.sh"; bench_target emulator-5554; bench_gate' _ "$here" 2>&1)
+rc=$?
+check "bench_gate with bench_target refuses the device that isn't the target" "$([ "$rc" = 4 ] && has 'emu (pid 951)' "$out" && hasnt '(pid 950)' "$out" && echo ok)"
+out=$(cd "$work" && BENCH_QUIET_WAIT=0 bash -c '. "$1/lib.sh"; bench_target emulator-5554 Theirs; bench_gate' _ "$here" 2>&1)
+rc=$?
+check "and passes when both are named" "$([ "$rc" = 0 ] && echo ok)"
+out=$(BENCH_QUIET_WAIT=0 python3 -I -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+import summarize
+print(summarize.quiet_gate(False, ["emulator-5554", "Theirs"]))' "$here" 2>&1)
+rc=$?
+check "summarize.quiet_gate takes the targets too (the Python benchmarks)" "$([ "$rc" = 0 ] && [ "$out" = passed ] && echo ok)"
+
+# --- BENCH_PIDS entries ------------------------------------------------------------------------
+reset_host
+cat >"$FAKE_PS" <<'PSEND'
+    1     0 init
+  100     1 bench.sh
+ 1000     1 emu
+ 1001     1 qemu-system-aarch64
+ 1002     1 emu
+PSEND
+check "an allowlist of plain PIDs, space-separated, still works" "$([ -z "$(BENCH_QUIET_ALLOW_PIDS='1000 1001 1002' reasons)" ] && echo ok)"
+allow=$(printf '%s\n' '1000|Sat Nov 28 10:00:00 2026|/x/emu -avd a' '1001|Sat Nov 28 10:00:01 2026|' '1002||')
+check "entries of the form PID|lstart|command, one per line, are read by their PID" "$([ -z "$(BENCH_QUIET_ALLOW_PIDS="$allow" reasons)" ] && echo ok)"
+r=$(BENCH_QUIET_ALLOW_PIDS="$(printf '%s\n' '1000|Sat Nov 28 10:00:00 2026|/x/emu 28 1001')" reasons)
+check "the lstart and command in an entry are never read as PIDs" "$(has '(pid 1001)' "$r" && has '(pid 1002)' "$r" && hasnt '(pid 1000)' "$r" && echo ok)"
+r=$(BENCH_QUIET_ALLOW_PIDS="$(printf '%s\n' 1000 '1001|Sat Nov 28 10:00:01 2026|')" reasons)
+check "both formats may be mixed" "$(hasnt '(pid 1000)' "$r" && hasnt '(pid 1001)' "$r" && has '(pid 1002)' "$r" && echo ok)"
+out=$(cd "$work" && BENCH_QUIET_WAIT=0 bash -c '. "$1/lib.sh"; BENCH_PIDS=("1000|Sat Nov 28 10:00:00 2026|/x/emu -avd a" "1001|Sat Nov 28 10:00:01 2026|" "1002||"); bench_gate' _ "$here" 2>&1)
+rc=$?
+check "bench_gate allows a run's tracked PIDs in the PID|lstart|command format" "$([ "$rc" = 0 ] && echo ok)"
+out=$(cd "$work" && BENCH_QUIET_WAIT=0 bash -c '. "$1/lib.sh"; BENCH_PIDS=(1000 1001 1002); bench_gate' _ "$here" 2>&1)
+rc=$?
+check "and in the plain PID format" "$([ "$rc" = 0 ] && echo ok)"
+
+# --- Linux power: a peripheral's battery is not the host's ---------------------------------------
+reset_host
+supply hidpp_battery_0 Battery status Discharging present 1 scope Device
+gate
+check "a wireless mouse's battery (scope=Device, Discharging) does not refuse the gate" "$([ "$rc" = 0 ] && echo ok)"
+check "and is not host power or a laptop" "$(f=$("$here/quiet.sh" facts) && has power=unknown "$f" && has laptop=0 "$f" && echo ok)"
+supply BAT0 Battery status Discharging present 1 scope System
+gate
+check "a scope=System battery discharging refuses" "$([ "$rc" = 4 ] && has 'power: on battery' "$err" && echo ok)"
+reset_host
+supply hidpp_battery_0 Battery status Discharging present 1 scope Device
+supply BAT0 Battery status Full present 1
+supply AC Mains online 1
+check "a system battery with no scope file counts, and the mouse's doesn't change AC" "$(f=$("$here/quiet.sh" facts) && has power=ac "$f" && has laptop=1 "$f" && echo ok)"
+reset_host
+supply phone USB online 1 scope Device
+check "a Device-scope USB supply (a phone on a port) is not AC" "$(f=$("$here/quiet.sh" facts) && has power=unknown "$f" && echo ok)"
+
+# --- macOS thermal: nominal only when something was measured --------------------------------------
+mac
+printf 'Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n' >"$FAKE_THERM"
+f=$("$here/quiet.sh" facts)
+check "macOS (Apple silicon): pmset with no limits and no powermetrics is thermal=unknown, not nominal" "$(has thermal=unknown "$f" && has 'powermetrics: not read' "$f" && echo ok)"
+gate
+check "and unknown passes the gate" "$([ "$rc" = 0 ] && echo ok)"
+FAKE_UID=0
+f=$("$here/quiet.sh" facts)
+check "macOS (Apple silicon): powermetrics read as root makes it nominal" "$(has thermal=nominal "$f" && has 'powermetrics: Nominal' "$f" && echo ok)"
+echo "Current pressure level: Heavy" >"$FAKE_PM"
+f=$("$here/quiet.sh" facts)
+check "and Heavy is pressure" "$(has thermal=pressure "$f" && echo ok)"
+FAKE_UID=1000
+mac
+f=$("$here/quiet.sh" facts)
+check "macOS (limits reported at 100): pmset's own reading is nominal without root" "$(has thermal=nominal "$f" && echo ok)"
+printf 'Note: No thermal warning level has been recorded\n' >"$FAKE_THERM"
+: >"$FAKE_THERM"
+f=$("$here/quiet.sh" facts)
+check "macOS: no pmset output at all stays unavailable" "$(has thermal=unavailable "$f" && echo ok)"
 
 # --- the bounded wait --------------------------------------------------------------------------
 reset_host

@@ -29,18 +29,33 @@ the same host) and exits 4.
 | Condition | Default | Read from |
 | --- | --- | --- |
 | 1-minute load | below 0.5 x CPUs (`BENCH_QUIET_LOAD_FACTOR`, or `BENCH_QUIET_MAX_LOAD` for an absolute limit) | `/proc/loadavg`; `sysctl vm.loadavg` |
-| Foreign processes | none: emulators (`emu`, `emulator`, `qemu-*`, `crosvm`), simulators (`Simulator`, `simee`, `launchd_sim`, CoreSimulator's service) or compilers (`cargo`, `rustc`, `clang`, `gcc`, `cc1`, `ld`, `swiftc`, `xcodebuild`, `ninja`) | `ps -axo pid=,ppid=,comm=` |
+| Foreign processes | none: emulators (`emu`, `emulator`, `qemu-*`, `crosvm`), simulators (`Simulator`, `simee`, `launchd_sim`: a booted device) or compilers (`cargo`, `rustc`, `clang`, `gcc`, `cc1`, `ld`, `swiftc`, `xcodebuild`, `ninja`) | `ps -axo pid=,ppid=,comm=` and `ps -axww -o pid=,args=` |
 | Thermal pressure | none | macOS: `pmset -g therm` (`CPU_Speed_Limit` or `CPU_Scheduler_Limit` under 100), and `powermetrics --samplers thermal` (a level other than Nominal) when it can run without a prompt; Linux: `/sys/class/thermal` (a zone at or over `BENCH_QUIET_MAX_TEMP_C`, default 85, or a processor cooling device above state 0) |
-| Power | not on battery | macOS: `pmset -g batt`; Linux: `/sys/class/power_supply` |
+| Power | not on battery | macOS: `pmset -g batt`; Linux: `/sys/class/power_supply` (a supply with `scope` `Device` is a peripheral's, not the host's) |
 
 - **The bench's own processes are never foreign.** Own is the gate's shell, its ancestors (the
   `cargo run` or the `run-all.sh` that started it), everything below it, and
   `BENCH_QUIET_ALLOW_PIDS` plus their descendants. A sibling of an ancestor is foreign. Processes
   are matched by name to *detect* them; the gate never signals anything, and the exact basename is
   matched (`clangd`, `simeectl`, `cargo-watch` are not foreign).
+- **Resident helpers are not foreign.** The gate counts what is busy because a device or a tool is
+  running. `com.apple.CoreSimulator.CoreSimulatorService` starts on the first `simctl` call and stays
+  up, and every iOS benchmark calls `simctl` before it measures, so only booted devices
+  (`launchd_sim`) count. `SimulatorTrampoline`, adb's server and an emulator's crash service are
+  helpers too.
+- **The device a run measures is its own.** A benchmark that measures a device the user booted
+  (`camera.sh --android/--ios`, `encode.sh --udid/--avd`, `bench_target`; `BENCH_QUIET_TARGETS` for
+  the gate itself) names it, as a UDID, an AVD name or an `emulator-PORT` serial. The processes
+  that are that device (`launchd_sim` with the UDID's directory in its arguments, `emu` or
+  `qemu-system-*` with `-avd NAME`, `@NAME` or its `-ports`) and what they started are not foreign.
+  Any other busy device still refuses. A process whose arguments can't be read is foreign.
+- **Tracked PIDs.** `BENCH_QUIET_ALLOW_PIDS` takes space-separated PIDs or one entry per line, and an
+  entry may be lib.sh's `PID|lstart|command`: only the PID is read.
 - **A host that cannot report is not refused for it.** A VM or container with no thermal sensors
   records `thermal: unavailable`; a desktop with no battery records `power: unknown`. Without root
-  or passwordless `sudo`, `powermetrics` is not read, and the record says so; `pmset` alone decides
+  or passwordless `sudo`, `powermetrics` is not read, and the record says so; `pmset` alone decides,
+  and when it prints no limit either (Apple silicon) nothing was measured, so the record says
+  `thermal: unknown`, not `nominal`
   (reports of `pmset -g therm` on Apple silicon show no `CPU_Speed_Limit`, so a Mac benchmarked
   without root may have only the load, process and power checks to rely on; run the publishing pass
   as root or with passwordless `sudo` for `powermetrics`).
@@ -69,7 +84,7 @@ Each result `<name>-<time>.json` has a sibling `<name>-<time>.host.json` (the sa
 | `model`, `chip`, `cores`, `cores_physical`, `mem_gb` | the machine (`Mac15,8`, `Apple M3 Max`, 16 logical cores, ...) |
 | `os`, `os_version`, `kvm` | the OS and its version; whether `/dev/kvm` exists (Linux) |
 | `load1_start`, `load1_end`, `load_source` | the 1-minute load at the start and the end, and where it came from |
-| `thermal_start`, `thermal_end`, `thermal_detail` | `nominal`, `pressure` or `unavailable`, and what was read |
+| `thermal_start`, `thermal_end`, `thermal_detail` | `nominal`, `pressure`, `unknown` (nothing could be measured) or `unavailable` (no sensors), and what was read |
 | `power_start`, `power_end`, `laptop` | `ac`, `battery`, `ups` or `unknown`; whether an internal battery exists |
 | `quiet_gate` | `passed`, `passed after 45 s`, or `disabled (--no-quiet-gate)` |
 | `publishable`, `not_publishable`, `noisy` | the verdict and its reasons |
@@ -137,7 +152,9 @@ and stays out of `docs/benchmarks.md`'s tables and the README; re-run it on a qu
 - **Power on Linux.** `power_supply/*/type` is `Mains` or `Battery` (and others), `online` is 0 or
   non-zero, and a battery's `status` is `Discharging`, `Charging`, `Full` or `Not charging`
   ([sysfs-class-power](https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-class-power)). Discharging is battery;
-  any online non-battery supply, or a charging or full battery, is AC.
+  any online non-battery supply, or a charging or full battery, is AC. `scope` is `System` or
+  `Device` (a wireless mouse's or headset's battery is `Device`), and a `Device` supply is skipped;
+  a system battery's driver may not set `scope` at all, so only `Device` is skipped.
 - **Spread statistic.** IQR over the median, not the standard deviation: three or four rounds is too
   few for a stable standard deviation, and one outlier (a boot that waited on a disk flush) dominates
   it; the IQR ignores a single tail value. The standard deviation is still recorded.
@@ -149,7 +166,7 @@ and stays out of `docs/benchmarks.md`'s tables and the README; re-run it on a qu
 
 `scripts/bench/test-quiet.sh` covers the gate and the record against a fake `/proc` and `/sys` and
 stubs for `ps`, `sysctl`, `pmset`, `powermetrics`, `sudo`, `id` and `getconf`: a loaded host is
-refused, a quiet one passes, foreign and own processes, thermal and power on both OSes, the bounded
+refused, a quiet one passes, foreign and own processes, resident helpers, named target devices, both `BENCH_PIDS` formats, thermal and power on both OSes, the bounded
 wait, well-formed records, the spread helpers and the budgets, and `run-all.sh --quiet`. It needs no
 device and no particular load. The macOS paths are exercised through the stubs and the output formats
 above, not on a Mac: the first run on the owner's Mac is the check that `pmset` and `powermetrics`

@@ -69,14 +69,16 @@ def facts():
     return dict(line.split('=', 1) for line in out.splitlines() if '=' in line)
 
 
-def quiet_gate(disabled=False):
+def quiet_gate(disabled=False, targets=()):
     """The quiet-host gate for a benchmark written in Python: waits for a quiet host and sets
     BENCH_GATE_STATUS (which `finish` records), or exits with status 4 when the host stays busy.
-    `disabled` is --no-quiet-gate."""
+    `disabled` is --no-quiet-gate. `targets` are devices the run measures that were already running
+    (UDIDs, AVD names, emulator-PORT serials): the gate doesn't count them as foreign."""
     if disabled:
         os.environ['BENCH_GATE_STATUS'] = 'disabled (--no-quiet-gate)'
         return os.environ['BENCH_GATE_STATUS']
-    env = dict(os.environ, BENCH_QUIET_WHO=os.path.basename(sys.argv[0]))
+    env = dict(os.environ, BENCH_QUIET_WHO=os.path.basename(sys.argv[0]),
+               BENCH_QUIET_TARGETS=' '.join(targets))
     r = subprocess.run(['bash', QUIET_SH, 'gate'], env=env, stdout=subprocess.PIPE, text=True)
     if r.returncode:
         sys.exit(4)
