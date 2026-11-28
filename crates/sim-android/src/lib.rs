@@ -15,6 +15,7 @@ pub mod console;
 pub mod dhu;
 pub mod display;
 pub mod files;
+pub mod forward;
 pub mod host;
 pub mod listing;
 pub mod net;
@@ -26,6 +27,7 @@ pub mod state;
 /// A fake emulator and adb for tests (a Unix socket per device and `/bin/sh` scripts): unix only.
 #[cfg(all(unix, any(test, feature = "testing")))]
 pub mod testing;
+pub mod wear;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

@@ -354,12 +354,7 @@ pub(crate) fn capture(
 /// `name` if it is a package name: dot-separated segments of letters, digits and underscores,
 /// each starting with a letter, at least two (Android's rule), so it is safe in a shell line.
 pub fn package_name(name: &str) -> Result<&str, String> {
-    let segment = |s: &str| s.starts_with(|c: char| c.is_ascii_alphabetic()) && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if name.split('.').count() >= 2 && name.split('.').all(segment) {
-        Ok(name)
-    } else {
-        Err(format!("`{name}` isn't a package name (like com.example.app)"))
-    }
+    sim_core::wear::package_name(name)
 }
 
 /// `url` if it starts with a scheme (`https:`, `myapp:`).
@@ -409,7 +404,7 @@ pub(crate) fn launcher_component(out: &str, package: &str) -> Option<String> {
 }
 
 /// What `am start` reports as an error (it exits 0 either way): the first `Error` line.
-fn am_error(out: &str) -> Option<String> {
+pub(crate) fn am_error(out: &str) -> Option<String> {
     out.lines().map(str::trim).find(|l| l.starts_with("Error") && !l.starts_with("Error type")).map(str::to_owned)
 }
 

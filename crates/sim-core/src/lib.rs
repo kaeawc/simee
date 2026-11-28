@@ -43,6 +43,7 @@ pub mod stream;
 pub mod stylus;
 pub mod support;
 pub mod vhal;
+pub mod wear;
 pub mod window;
 pub mod worker;
 pub mod xr;
