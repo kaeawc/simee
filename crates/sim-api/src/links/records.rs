@@ -20,6 +20,10 @@ use crate::params::{opt_bool, str_param};
 /// Each member's copy of its links, in its state directory.
 pub const LINKS_FILE: &str = "links.json";
 
+/// The lock a `link` call holds on each member from finding its record to saving it
+/// (`links.lock`; the file's own write lock is `links.json.lock`).
+pub const LINK_LOCK: &str = "links";
+
 /// A device as a kept link sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Dev {
@@ -43,6 +47,9 @@ pub(crate) trait RecordHost {
     fn read(&mut self, dev: &Dev) -> Result<Vec<Record>, String>;
     /// Reads `dev`'s copy, applies `change` and writes it back, under the file's lock.
     fn update(&mut self, dev: &Dev, change: &mut dyn FnMut(&mut Vec<Record>)) -> Result<(), String>;
+    /// Holds `dev`'s link lock (not its file's: [`RecordHost::update`] takes that) until the guard
+    /// drops, so a `link` finds or creates its record and saves it with no other `link` between.
+    fn hold(&mut self, dev: &Dev) -> Result<Box<dyn std::any::Any>, String>;
     /// Forwards a free host port to `port` in the running `dev`: the host port.
     fn forward(&mut self, dev: &Dev, port: u16) -> Result<u16, String>;
     fn remove_forward(&mut self, dev: &Dev, host_port: u16) -> Result<(), String>;
@@ -117,37 +124,32 @@ fn wanted_ports(p: &Value, devs: &[Dev]) -> Result<Option<Vec<(String, u16)>>, S
     Ok(Some(out))
 }
 
-/// Every copy `devs` hold, merged.
-fn copies(host: &mut dyn RecordHost, devs: &[Dev]) -> Result<Vec<Record>, String> {
+/// Every copy `devs` hold, merged. A device whose copy can't be read (an AVD whose config doesn't
+/// parse, a `.ini` left after its `.avd` was removed) is skipped with a warning, as a record that
+/// doesn't parse is: one such device doesn't hide every other link.
+fn copies(host: &mut dyn RecordHost, devs: &[Dev]) -> Vec<Record> {
     let mut all = Vec::new();
     for d in devs {
-        all.extend(host.read(d)?);
-    }
-    Ok(link::merge(all))
-}
-
-/// The records `dev` is in: its own copy, each merged with its peers' copies.
-pub(crate) fn of_device(host: &mut dyn RecordHost, dev: &Dev) -> Result<Vec<Record>, String> {
-    let own = host.read(dev)?;
-    let mut all = own.clone();
-    for r in &own {
-        for m in &r.members {
-            let Some(platform) = Platform::parse(&m.platform) else { continue };
-            if platform == dev.platform && m.device.eq_ignore_ascii_case(&dev.id) {
-                continue;
-            }
-            if let Some(peer) = host.device(platform, &m.device)? {
-                all.extend(host.read(&peer)?.into_iter().filter(|p| p.id == r.id));
-            }
+        match host.read(d) {
+            Ok(copy) => all.extend(copy),
+            Err(e) => eprintln!("simee: {}'s links skipped: {e}", d.name),
         }
     }
-    Ok(link::merge(all))
+    link::merge(all)
+}
+
+/// The records `dev` is in: its own copy and every peer's, merged. A peer's copy finds a link
+/// `dev`'s own copy lost (a write that failed, an iOS `erase` before simee kept the file).
+pub(crate) fn of_device(host: &mut dyn RecordHost, dev: &Dev) -> Result<Vec<Record>, String> {
+    let mut all = host.read(dev)?;
+    all.extend(every(host)?);
+    Ok(link::merge(all).into_iter().filter(|r| r.has(dev.platform, &dev.id)).collect())
 }
 
 /// Every record any device holds.
 pub(crate) fn every(host: &mut dyn RecordHost) -> Result<Vec<Record>, String> {
     let devs = host.all()?;
-    copies(host, &devs)
+    Ok(copies(host, &devs))
 }
 
 /// The record `id` names (any case), or the error naming it.
@@ -254,6 +256,12 @@ pub(crate) fn link(host: &mut dyn RecordHost, kind: LinkKind, devs: &[Dev], role
             .into());
     }
     let ids: Vec<(Platform, &str)> = devs.iter().map(|d| (d.platform, d.id.as_str())).collect();
+    // Two `link` calls on the same members would each find no record and make one: hold every
+    // member's link lock, in `save`'s order, from the reads to the save.
+    let mut _held = Vec::new();
+    for d in sorted(devs) {
+        _held.push(host.hold(d)?);
+    }
     let mut each = Vec::new();
     for d in devs {
         each.push(host.read(d)?);
@@ -350,8 +358,14 @@ fn establish(
         if let (false, Some(h), Some(i)) = (kept, f.host_port, dev_of(&f.device))
             && devs[i].running
         {
-            // Best effort: the adb server drops it with the device's next boot anyway.
-            let _ = host.remove_forward(&devs[i], h);
+            // Only a forward the adb server still has as this one: after a reboot the host port
+            // may be another forward's. Best effort: the next boot drops it anyway.
+            if live[i].is_none() {
+                live[i] = host.forwards(&devs[i]).ok();
+            }
+            if live[i].as_ref().is_some_and(|l| l.contains(&(h, f.port))) {
+                let _ = host.remove_forward(&devs[i], h);
+            }
         }
     }
     r.params.forwards = next;
@@ -361,10 +375,8 @@ fn establish(
 /// Writes `r` into every member's copy, in sorted member order (so two calls take the locks in
 /// the same order), replacing the one there. A failure says whether any copy was written.
 fn save(host: &mut dyn RecordHost, r: &Record, devs: &[Dev]) -> Result<(), (bool, String)> {
-    let mut order: Vec<&Dev> = devs.iter().collect();
-    order.sort_by(|a, b| (a.platform.as_str(), a.id.to_ascii_lowercase()).cmp(&(b.platform.as_str(), b.id.to_ascii_lowercase())));
     let (mut saved, mut failed) = (Vec::new(), Vec::new());
-    for d in order {
+    for d in sorted(devs) {
         let mut change = |links: &mut Vec<Record>| {
             links.retain(|l| l.id != r.id);
             links.push(r.clone());
@@ -384,6 +396,16 @@ fn save(host: &mut dyn RecordHost, r: &Record, devs: &[Dev]) -> Result<(), (bool
     }
 }
 
+/// A member's forwards as `adb forward --list` has them, (host port, device port) each.
+type Live = Result<Vec<(u16, u16)>, String>;
+
+/// `devs` in the one order every call takes their locks in: platform, then id in any case.
+fn sorted(devs: &[Dev]) -> Vec<&Dev> {
+    let mut order: Vec<&Dev> = devs.iter().collect();
+    order.sort_by(|a, b| (a.platform.as_str(), a.id.to_ascii_lowercase()).cmp(&(b.platform.as_str(), b.id.to_ascii_lowercase())));
+    order
+}
+
 /// `unlink` of records: removes each one's forwards (on the members that run) and every member's
 /// copy. The ids unlinked, and one teardown entry per record (`error` when a step failed).
 pub(crate) fn unlink(host: &mut dyn RecordHost, targets: &[Record]) -> Result<(Vec<Value>, Vec<Value>), String> {
@@ -391,12 +413,24 @@ pub(crate) fn unlink(host: &mut dyn RecordHost, targets: &[Record]) -> Result<(V
     for r in targets {
         let members = members_of(host, r)?;
         let mut errors = Vec::new();
+        // Each running member's forwards, read once: a saved host port the adb server no longer
+        // has as this forward (a reboot dropped it, maybe another forward has the port now) is
+        // left alone.
+        let mut live: Vec<Option<Live>> = vec![None; members.len()];
         for f in &r.params.forwards {
             let Some(h) = f.host_port else { continue };
-            let dev = members.iter().find(|(m, _)| m.device.eq_ignore_ascii_case(&f.device)).and_then(|(_, d)| d.as_ref());
-            if let Some(dev) = dev.filter(|d| d.running)
-                && let Err(e) = host.remove_forward(dev, h)
-            {
+            let Some(i) = members.iter().position(|(m, _)| m.device.eq_ignore_ascii_case(&f.device)) else { continue };
+            let Some(dev) = members[i].1.as_ref().filter(|d| d.running) else { continue };
+            let now = live[i].get_or_insert_with(|| host.forwards(dev));
+            match now {
+                Ok(l) if !l.contains(&(h, f.port)) => continue,
+                Ok(_) => {}
+                Err(e) => {
+                    errors.push(format!("{}'s forwards (adb forward --list): {e}", dev.name));
+                    continue;
+                }
+            }
+            if let Err(e) = host.remove_forward(dev, h) {
                 errors.push(format!("removing {}'s forward tcp:{h}: {e}", dev.name));
             }
         }
@@ -540,10 +574,14 @@ pub(crate) mod fake {
         pub listening: BTreeMap<String, Vec<u16>>,
         /// Every forward added or removed and every file written, in order.
         pub calls: Vec<String>,
+        /// Every member whose link lock a `link` took, in order.
+        pub held: Vec<String>,
         /// What adding a forward fails with.
         pub refuse_forward: Option<String>,
         /// The devices whose copies can't be written.
         pub refuse_update: Vec<String>,
+        /// The devices whose copies can't be read (an AVD whose config doesn't parse).
+        pub refuse_read: Vec<String>,
         next_port: u16,
         next_id: u32,
     }
@@ -590,6 +628,9 @@ pub(crate) mod fake {
             Ok(self.devs.clone())
         }
         fn read(&mut self, dev: &Dev) -> Result<Vec<Record>, String> {
+            if self.refuse_read.contains(&dev.id) {
+                return Err(format!("{}'s config can't be read", dev.name));
+            }
             Ok(self.copy(dev.platform, &dev.id))
         }
         fn update(&mut self, dev: &Dev, change: &mut dyn FnMut(&mut Vec<Record>)) -> Result<(), String> {
@@ -604,6 +645,10 @@ pub(crate) mod fake {
                 None => self.files.remove(&key(dev.platform, &dev.id)),
             };
             Ok(())
+        }
+        fn hold(&mut self, dev: &Dev) -> Result<Box<dyn std::any::Any>, String> {
+            self.held.push(dev.id.clone());
+            Ok(Box::new(()))
         }
         fn forward(&mut self, dev: &Dev, port: u16) -> Result<u16, String> {
             assert!(dev.running && dev.platform == Platform::Android, "forwards only on a running Android device");

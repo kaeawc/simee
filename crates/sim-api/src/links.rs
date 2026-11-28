@@ -10,7 +10,7 @@
 //! `links.json` (`records.rs`, #535). Wear OS, Android Automotive and network links (#445, #439,
 //! #427) come later and are refused with the reason.
 
-mod records;
+pub(crate) mod records;
 
 use serde_json::{Value, json};
 use sim_core::form_factor::FormFactor;
@@ -243,6 +243,10 @@ impl RecordHost for Hosts<'_> {
         let mut links = self.read_file(dev, &dir)?;
         change(&mut links);
         sim_android::write_state_file(&dir, records::LINKS_FILE, records::file_text(&links).as_deref())
+    }
+    fn hold(&mut self, dev: &Dev) -> Result<Box<dyn std::any::Any>, String> {
+        let dir = self.state_dir(dev)?;
+        Ok(Box::new(sim_android::StateLock::take(&dir, records::LINK_LOCK)?))
     }
     fn forward(&mut self, dev: &Dev, port: u16) -> Result<u16, String> {
         self.adb(dev)?.forward(port)
@@ -996,6 +1000,9 @@ mod tests {
         fn update(&mut self, dev: &Dev, change: &mut dyn FnMut(&mut Vec<Record>)) -> Result<(), String> {
             self.rec.update(dev, change)
         }
+        fn hold(&mut self, dev: &Dev) -> Result<Box<dyn std::any::Any>, String> {
+            self.rec.hold(dev)
+        }
         fn forward(&mut self, dev: &Dev, port: u16) -> Result<u16, String> {
             self.rec.forward(dev, port)
         }
@@ -1217,6 +1224,51 @@ mod tests {
         assert!(e.contains("lnk-00000001 wasn't saved"), "{e}");
         assert!(h.rec.forwards.is_empty(), "nothing records the forward, so it went");
         assert_eq!(h.rec.changes(), ["forward xr 8080 -> 41001", "remove xr 41001"]);
+    }
+
+    #[test]
+    fn a_device_whose_copy_cant_be_read_hides_no_other_link() {
+        let mut h = both();
+        let link = on(&mut h, "link", json!({"devices": ["xr", "pixel"], "ports": {"xr": [8080]}})).expect("linked")["link"].clone();
+        h.rec.refuse_read = vec!["wear".into()];
+        assert_eq!(on(&mut h, "links", json!({})).expect("links"), json!([link]), "wear is skipped, not the listing");
+        let id = link["id"].as_str().expect("id");
+        assert!(on(&mut h, "link_status", json!({"link": id})).is_ok());
+        assert!(on(&mut h, "link", json!({"link": id})).is_ok());
+    }
+
+    #[test]
+    fn a_member_whose_own_copy_is_gone_finds_its_links_in_its_peers_copies() {
+        let mut h = both();
+        let link = on(&mut h, "link", json!({"devices": ["xr", "pixel"], "ports": {"xr": [8080]}})).expect("linked")["link"].clone();
+        h.rec.files.remove(&records::fake::key(Platform::Android, "pixel"));
+        assert_eq!(on(&mut h, "links", json!({"device": "pixel"})).expect("of pixel"), json!([link]));
+        assert_eq!(on(&mut h, "link_status", json!({"device": "pixel"})).expect("status")["link"]["id"], link["id"]);
+        let out = on(&mut h, "unlink", json!({"device": "pixel"})).expect("unlinked");
+        assert_eq!(out["unlinked"], json!([link["id"]]));
+        assert!(h.rec.copy(Platform::Android, "xr").is_empty(), "the peer's copy goes too");
+        assert!(h.rec.forwards.is_empty());
+    }
+
+    #[test]
+    fn unlink_removes_only_forwards_the_adb_server_still_has_as_the_links() {
+        let mut h = both();
+        let link = on(&mut h, "link", json!({"devices": ["xr", "pixel"], "ports": {"xr": [8080]}})).expect("linked")["link"].clone();
+        // xr rebooted (its forward dropped) and another forward got the host port.
+        h.rec.forwards = vec![("xr".into(), 41001, 9999)];
+        let calls = h.rec.changes().len();
+        let out = on(&mut h, "unlink", json!({"link": link["id"]})).expect("unlinked");
+        assert_eq!(out["teardown"], json!([{"id": link["id"]}]), "no error for a forward already gone");
+        assert_eq!(h.rec.changes().len(), calls, "the other forward on 41001 is left alone");
+        assert_eq!(h.rec.forwards.len(), 1);
+    }
+
+    #[test]
+    fn link_holds_every_members_link_lock_in_one_order() {
+        let mut h = both();
+        on(&mut h, "link", json!({"devices": ["xr", "pixel"], "ports": {"xr": [8080]}})).expect("linked");
+        on(&mut h, "link", json!({"devices": ["pixel", "xr"]})).expect("again");
+        assert_eq!(h.rec.held, ["pixel", "xr", "pixel", "xr"], "sorted, whatever order the call names them in");
     }
 
     #[test]

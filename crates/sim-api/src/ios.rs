@@ -1956,7 +1956,18 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         // A device that stops (or is erased, which removes its socket) takes its camera feed with it.
         "shutdown" | "erase" => {
             let d = s.device(p)?;
-            ok(if method == "shutdown" { d.shutdown() } else { d.erase() })?;
+            // Erasing wipes `<data>/`, the device's `links.json` with it: keep the links
+            // (docs/design/device-links.md, "Persistence").
+            let links_dir = std::path::PathBuf::from(d.data_path()).join("simee");
+            let links_file = crate::links::records::LINKS_FILE;
+            let kept = if method == "erase" { std::fs::read_to_string(links_dir.join(links_file)).ok() } else { None };
+            let done = ok(if method == "shutdown" { d.shutdown() } else { d.erase() });
+            if let Some(text) = kept {
+                sim_android::StateLock::take(&links_dir, links_file)
+                    .and_then(|_lock| sim_android::write_state_file(&links_dir, links_file, Some(&text)))
+                    .map_err(|e| format!("{} was erased but its links weren't kept: {e}", d.info().name))?;
+            }
+            done?;
             crate::camera::ios_stopped(&d.info().udid);
             Ok(Value::Null)
         }
