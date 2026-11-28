@@ -63,8 +63,15 @@ impl Blk {
 }
 
 impl Drop for Blk {
+    /// The machine is stopping (a signal, the console's `kill`, a power-off or a reset): the
+    /// worker finishes the request it is serving, then the disk syncs once, so what the guest
+    /// wrote is on the drive when emu exits (#388).
     fn drop(&mut self) {
         self.stop_worker();
+        let mut disk = self.disk.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(e) = disk.sync() {
+            eprintln!("emu: syncing disk {} at stop: {e}", self.serial);
+        }
     }
 }
 
@@ -628,6 +635,32 @@ mod tests {
         // A device-writable buffer in a write request fails it before anything is written.
         assert_eq!(send(&mut w, &mut drv, T_OUT, 0, true).0, S_IOERR);
         assert_eq!(std::fs::read(&path).expect("read")[..512], image[..512]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_stopping_device_syncs_its_disk_once_its_worker_has_stopped() {
+        let path = std::env::temp_dir().join(format!("emu-blk-stop-{}", std::process::id()));
+        std::fs::write(&path, vec![0u8; 8192]).expect("write");
+        let mem = Arc::new(GuestRam::new(RAM_BASE, 0x10_0000).expect("ram"));
+        let irq = Arc::new(Interrupt::new(Arc::new(TestLine::default())));
+        let mut drv = Driver::new(16);
+        let mut blk = Blk::new(Disk::persistent(&path).expect("open"), "vdb");
+        blk.activate(Activation { mem: mem.clone(), irq, queues: vec![Some(drv.cfg)], features: 0 }).expect("activate");
+        let buf = RAM_BASE + 0x30000;
+        mem.write(buf, &[5u8; 512]).expect("w");
+        mem.write(RAM_BASE + 0x21000, &[0xff]).expect("status");
+        request(&mem, &mut drv, T_OUT, 3, (buf, 512, false));
+        blk.notify(0);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while status(&mem) != S_OK {
+            assert!(std::time::Instant::now() < until, "the worker never served the request");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let disk = blk.disk.clone();
+        drop(blk);
+        assert_eq!(disk.lock().expect("disk").syncs(), 1, "the stop synced the disk once");
+        assert_eq!(std::fs::read(&path).expect("read")[3 * 512..4 * 512], [5u8; 512]);
         let _ = std::fs::remove_file(path);
     }
 
