@@ -186,10 +186,11 @@ fn link_json(host: &mut dyn PairHost, pair: &Pair) -> Result<Value, String> {
 
 /// `link`: pairs a watch with a phone, or returns the pair they already make; `link` (an id)
 /// names a pair that exists instead. `active: true` makes it its phone's active one
-/// (`pair_activate`).
+/// (`pair_activate`). A pair this call made whose activation fails is unpaired again, so the
+/// failed call leaves the set as it found it.
 fn link(host: &mut dyn PairHost, p: &Value) -> Result<Value, String> {
     let activate = opt_bool(p, "active")? == Some(true);
-    let pair = match str_param(p, "link") {
+    let (pair, made) = match str_param(p, "link") {
         Some(id) => {
             let pair = find_pair(host, id)?;
             for udid in [&pair.watch, &pair.phone] {
@@ -197,21 +198,30 @@ fn link(host: &mut dyn PairHost, p: &Value) -> Result<Value, String> {
                     return Err(format!("link {} is broken: {udid} no longer exists; `unlink` it", pair.id));
                 }
             }
-            pair
+            (pair, false)
         }
         None => pair_devices(host, p)?,
     };
-    if activate && !pair.active {
-        host.activate(&pair.id)?;
+    if activate
+        && !pair.active
+        && let Err(e) = host.activate(&pair.id)
+    {
+        if !made {
+            return Err(e);
+        }
+        return Err(match host.unpair(&pair.id) {
+            Ok(()) => format!("activating the new link failed, so it was unpaired again (nothing was linked): {e}"),
+            Err(u) => format!("activating the new link {} failed ({e}), and unpairing it again failed too ({u}): `unlink` it", pair.id),
+        });
     }
     // Activating one pair makes the phone's others inactive: read it as CoreSimulator has it now.
     let pair = host.pairs()?.into_iter().find(|q| q.id == pair.id).unwrap_or(pair);
     Ok(json!({"link": link_json(host, &pair)?}))
 }
 
-/// The pair `devices` make: the one CoreSimulator already has, or a new one, after the member
-/// rules and CoreSimulator's own check.
-fn pair_devices(host: &mut dyn PairHost, p: &Value) -> Result<Pair, String> {
+/// The pair `devices` make, and whether this call made it: the one CoreSimulator already has, or a
+/// new one, after the member rules and CoreSimulator's own check.
+fn pair_devices(host: &mut dyn PairHost, p: &Value) -> Result<(Pair, bool), String> {
     let kind = opt_kind(p)?;
     let mut sims = Vec::new();
     for q in strings(p, "devices") {
@@ -231,7 +241,7 @@ fn pair_devices(host: &mut dyn PairHost, p: &Value) -> Result<Pair, String> {
     let (watch, phone) = (at(Role::Watch), at(Role::Phone));
     let pairs = host.pairs()?;
     match link::existing_pair(&watch.udid, &phone.udid, &pairs) {
-        Ok(Some(same)) => return Ok(same.clone()),
+        Ok(Some(same)) => return Ok((same.clone(), false)),
         Ok(None) => {}
         Err(other) => {
             let holder = host.device(&other.phone)?.map_or_else(|| other.phone.clone(), |s| s.name);
@@ -239,7 +249,7 @@ fn pair_devices(host: &mut dyn PairHost, p: &Value) -> Result<Pair, String> {
         }
     }
     host.can_pair(&watch.udid, &phone.udid)?;
-    host.pair(&watch.udid, &phone.udid)
+    Ok((host.pair(&watch.udid, &phone.udid)?, true))
 }
 
 /// `unlink`: removes the pair `link` names, or every pair of `device` (of `kind`). CoreSimulator
@@ -374,6 +384,10 @@ mod tests {
         refuse: Option<String>,
         /// Unpairing shuts the watch down (as CoreSimulator's log strings suggest it does).
         unpair_shuts_down: bool,
+        /// What `setActiveDevicePair` fails with.
+        refuse_activate: Option<String>,
+        /// What unpairing fails with.
+        refuse_unpair: Option<String>,
         next: u32,
     }
 
@@ -433,6 +447,9 @@ mod tests {
         }
         fn activate(&mut self, id: &str) -> Result<(), String> {
             self.calls.push(format!("activate {id}"));
+            if let Some(e) = &self.refuse_activate {
+                return Err(e.clone());
+            }
             let phone = self.pairs.iter().find(|p| p.id == id).map(|p| p.phone.clone()).ok_or("no such pair")?;
             for p in self.pairs.iter_mut().filter(|p| p.phone == phone) {
                 p.active = p.id == id;
@@ -441,6 +458,9 @@ mod tests {
         }
         fn unpair(&mut self, id: &str) -> Result<(), String> {
             self.calls.push(format!("unpair {id}"));
+            if let Some(e) = &self.refuse_unpair {
+                return Err(e.clone());
+            }
             let i = self.pairs.iter().position(|p| p.id == id).ok_or("no such pair")?;
             let pair = self.pairs.remove(i);
             if self.unpair_shuts_down {
@@ -522,6 +542,32 @@ mod tests {
         let back = run(&mut set, "link", &json!({"link": id, "active": true})).expect("by id");
         assert_eq!(back["link"]["active"], true);
         assert_eq!(set.changes().last().copied(), Some(format!("activate {id}").as_str()));
+    }
+
+    #[test]
+    fn a_new_pair_whose_activation_fails_is_unpaired_again() {
+        let mut set = FakeSet::standard();
+        let first = link_of(&mut set, &[WATCH, PHONE], json!({})).expect("first")["id"].as_str().expect("id").to_owned();
+        set.refuse_activate = Some("activate failed: the phone is busy".into());
+        let e = link_of(&mut set, &[WATCH2, PHONE], json!({"active": true})).expect_err("activation fails");
+        assert!(e.contains("unpaired again") && e.contains("the phone is busy"), "{e}");
+        let made = "FA1A0000-0000-4000-8000-000000000002";
+        assert_eq!(set.changes()[1..], [format!("pair {WATCH2} {PHONE}"), format!("activate {made}"), format!("unpair {made}")]);
+        assert_eq!(set.pairs.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), [first.as_str()], "only the pair that was there");
+
+        // A pair that was there before the call stays, whatever its activation does.
+        set.pairs[0].active = false;
+        let e = run(&mut set, "link", &json!({"link": first, "active": true})).expect_err("by id");
+        assert_eq!(e, "activate failed: the phone is busy");
+        assert_eq!(set.pairs.len(), 1);
+        assert_eq!(set.changes().iter().filter(|c| c.starts_with("unpair")).count(), 1, "only the new pair was unpaired");
+
+        // When unpairing fails too, the error names the pair left behind.
+        set.refuse_unpair = Some("unpair failed".into());
+        let e = link_of(&mut set, &[WATCH2, PHONE], json!({"active": true})).expect_err("both fail");
+        let left = "FA1A0000-0000-4000-8000-000000000003";
+        assert!(e.contains(left) && e.contains("unpair failed") && e.contains("`unlink` it"), "{e}");
+        assert_eq!(set.pairs.len(), 2);
     }
 
     #[test]

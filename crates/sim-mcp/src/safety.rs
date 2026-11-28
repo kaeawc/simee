@@ -30,10 +30,11 @@ use crate::policy::{AdmissionMode, ClientPolicy, Policy};
 use crate::tools::{self, VIEW_TOOL};
 
 /// The tools every client confirms: they delete a device or data that nothing replaces (a file, an
-/// app and its data, a container, the keychain, a preference), kill a process, or (for `shutdown`)
-/// stop a device this client didn't boot. A policy may add tools (`confirm`).
+/// app and its data, a container, the keychain, a preference), kill a process, (for `shutdown`)
+/// stop a device this client didn't boot, or (`unlink`) unpair a watch, which CoreSimulator may shut
+/// down and erase as it does. A policy may add tools (`confirm`).
 pub const CONFIRM: &[&str] =
-    &["delete", "erase", "kill", "clear_container", "reset_keychain", "rm", "uninstall", "prefs_delete", "shutdown"];
+    &["delete", "erase", "kill", "clear_container", "reset_keychain", "rm", "uninstall", "prefs_delete", "shutdown", "unlink"];
 
 /// The tools that confirm only for some arguments: `prefs_batch` when an op deletes a key, and
 /// `console` for a command that stops the emulator or deletes a snapshot.
@@ -155,6 +156,17 @@ impl Safety {
         policy.allows_device(&device.udid, &device.name, created)
     }
 
+    /// Whether `client` may touch every member of the links a link method acts on beyond the
+    /// devices it names ([`linked_members`]), as the refusal that says why not.
+    fn permit_links(&self, backend: &dyn Backend, client: &str, policy: &ClientPolicy, method: &str, params: &Value) -> Result<(), String> {
+        for member in linked_members(backend, method, params).map_err(|e| unresolved_refusal(method, &e))? {
+            if !self.may_touch(client, policy, &member) {
+                return Err(device_refusal(policy, method, &member.udid, Some(&member)));
+            }
+        }
+        Ok(())
+    }
+
     /// Looks at a call before it runs.
     pub fn check(&self, backend: &dyn Backend, client: &str, tool: &str, args: &Value) -> Verdict {
         let policy = self.policy_for(client);
@@ -196,6 +208,9 @@ impl Safety {
                     Ok(d) => return Verdict::Refuse(device_refusal(&policy, tool, query, Some(d))),
                     Err(e) => return Verdict::Refuse(unresolved_refusal(tool, e)),
                 }
+            }
+            if let Err(refusal) = self.permit_links(backend, client, &policy, tool, args) {
+                return Verdict::Refuse(refusal);
             }
         }
         let known: Vec<Resolved> = resolved.iter().filter_map(|(_, r)| r.as_ref().ok().cloned()).collect();
@@ -433,7 +448,7 @@ fn device_param(tool: &str) -> Option<bool> {
 /// The devices a call names, as the client wrote them. A tool that needs a `device` and gets none
 /// means the booted one; one that only filters by it (`streams`) means all, which names none.
 fn device_queries(tool: &str, args: &Value) -> Vec<String> {
-    if tool == "boot_many" {
+    if matches!(tool, "boot_many" | "link") {
         return args.get("devices").and_then(Value::as_array).into_iter().flatten().filter_map(|v| v.as_str().map(str::to_owned)).collect();
     }
     let Some(required) = device_param(tool) else { return Vec::new() };
@@ -464,6 +479,53 @@ fn named_devices(tool: &str, args: &Value) -> Vec<String> {
     named
 }
 
+/// The members of the links a link method acts on that the call doesn't name: the link `link` (an
+/// id) names, and for `unlink` and `link_status` by `device`, every link of that device (an `unlink`
+/// removes them all, and a status shows the other member). They are read from `links` in the call's
+/// set, since an id says no device. An id that isn't among them can't be checked, so it is an error.
+fn linked_members(backend: &dyn Backend, method: &str, params: &Value) -> Result<Vec<Resolved>, String> {
+    if !matches!(method, "link" | "unlink" | "link_status") {
+        return Ok(Vec::new());
+    }
+    let id = params.get("link").and_then(Value::as_str);
+    let device = params.get("device").and_then(Value::as_str).filter(|_| method != "link");
+    if id.is_none() && device.is_none() {
+        return Ok(Vec::new());
+    }
+    let mut query = json!({});
+    if let Some(set) = params.get("set").filter(|s| !s.is_null()) {
+        query["set"] = set.clone();
+    }
+    let listed = backend.call("links", &query)?;
+    let rows = listed.as_array().map(Vec::as_slice).unwrap_or_default();
+    let member_ids = |row: &Value| -> Vec<String> {
+        row["members"].as_array().into_iter().flatten().filter_map(|m| m["device"].as_str().map(str::to_owned)).collect()
+    };
+    let touched: Vec<&Value> = match (id, device) {
+        (Some(id), _) => {
+            let found: Vec<&Value> = rows.iter().filter(|r| r["id"].as_str().is_some_and(|i| i.eq_ignore_ascii_case(id))).collect();
+            if found.is_empty() {
+                return Err(format!("no link `{id}` to check its devices against"));
+            }
+            found
+        }
+        (None, Some(query)) => {
+            let udid = resolve(backend, query)?.udid;
+            rows.iter().filter(|r| member_ids(r).contains(&udid)).collect()
+        }
+        (None, None) => Vec::new(),
+    };
+    Ok(touched
+        .into_iter()
+        .flat_map(|row| row["members"].as_array().cloned().unwrap_or_default())
+        .filter_map(|m| {
+            let udid = m["device"].as_str()?.to_owned();
+            let name = m["name"].as_str().map_or_else(|| udid.clone(), str::to_owned);
+            Some(Resolved { udid, name, running: m["running"] == true })
+        })
+        .collect())
+}
+
 /// `tool`'s effect on its devices, as a clause the user reads: `erase iPhone 17 (UDID)`.
 fn what_it_does(tool: &str, args: &Value, targets: &[(String, Result<Resolved, String>)], sometimes: Option<Destructive>) -> String {
     let label = |q: &str, r: &Result<Resolved, String>| match r {
@@ -485,6 +547,10 @@ fn what_it_does(tool: &str, args: &Value, targets: &[(String, Result<Resolved, S
         "clear_container" => format!("empty `{}` on {on}: an app's data is deleted", text("path")),
         "reset_keychain" => format!("delete every keychain item on {on}"),
         "shutdown" => format!("shut down {on}, which this client didn't boot"),
+        "unlink" => match args.get("link").and_then(Value::as_str) {
+            Some(id) => format!("unlink `{id}`: CoreSimulator may shut its watch down and erase it"),
+            None => format!("unlink every link of {on}: CoreSimulator may shut each watch down and erase it"),
+        },
         "rm" => format!("remove `{}` from the data of {on}: files are deleted", text("path")),
         "uninstall" => format!("uninstall `{}` from {on}, with its data", text("bundle_id")),
         "prefs_delete" => format!("delete the preference `{}` in `{}` of `{}` on {on}", text("key"), text("store"), text("bundle_id")),
@@ -646,6 +712,9 @@ impl Guard {
         for query in queries {
             self.permit(method, &query)?;
         }
+        // A link is named by its id, and an unlink by device removes every link of it: each member
+        // of each is judged.
+        self.safety.permit_links(&*self.inner, &self.client, &self.policy, method, params)?;
         // A capture is named by its id, which says no device: it is the client's own to stop or not.
         if method == "audio_capture_stop" {
             let id = params.get("capture_id").and_then(Value::as_str).unwrap_or("");
@@ -684,6 +753,12 @@ impl Backend for Guard {
                 "devices_usage" => {
                     if let Some(rows) = result.get_mut("devices").and_then(Value::as_array_mut) {
                         rows.retain(|r| self.visible(r, "id"));
+                    }
+                }
+                // A link shows both its members: one the client may not see hides it.
+                "links" => {
+                    if let Some(rows) = result.as_array_mut() {
+                        rows.retain(|r| r["members"].as_array().into_iter().flatten().all(|m| self.visible(m, "device")));
                     }
                 }
                 _ => {}
