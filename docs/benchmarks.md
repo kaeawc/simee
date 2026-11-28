@@ -1379,3 +1379,8 @@ Claims that would belong in the README once someone runs them:
   median of 3 boots each on the same host and day (an earlier sample on API 36 showed no
   difference, but its boots and command weren't recorded).
 - A farm of SDK emulators on the same host, to compare with the emu farm above.
+- Android `settle` (#420): time from `boot` to settled on an API 34 and an API 36 phone, cold
+  and from a golden, and the guest's idle CPU it settles at; and what the Android `slim` profile
+  saves per entry (settle time, idle CPU, `dumpsys meminfo` total PSS), applied to a clone of
+  one golden against an unprofiled clone, median of 3 each. An entry that saves nothing
+  measurable comes out of the profile.

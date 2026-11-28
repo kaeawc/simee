@@ -497,6 +497,8 @@ mod tests {
             (Platform::Android, "boot") => text(crate::android::boot_options(p)),
             (Platform::Android, "boot_many") => text(crate::android::boot_many_options(p)),
             (Platform::Android, "import") => text(crate::android::import_allows_mismatch(p)),
+            // Android's `settle` reads what iOS's does.
+            (Platform::Android, "settle") => text(crate::settle::options(p)),
             // It needs a platform to read the rest.
             (_, "admission_check") => text(crate::methods::check_params(&{
                 let mut p = p.clone();
