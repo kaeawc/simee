@@ -284,9 +284,9 @@ pub fn stop_streams() {
 }
 
 /// How long a shutdown gives the calls in flight to finish, or to stop at a safe point, before it
-/// stops the streams and exits anyway.
-#[cfg(unix)]
-const DRAIN: Duration = Duration::from_secs(10);
+/// stops the streams and exits anyway. On every host (callers outside this crate size their own
+/// drain by it), though only unix has the signals that start one.
+pub const DRAIN: Duration = Duration::from_secs(10);
 
 /// Listens on `path` (replacing a stale socket) and serves connections until SIGINT or SIGTERM
 /// (#388). Then it shuts down in order: calls in flight get up to 10 s (each stops at its next
