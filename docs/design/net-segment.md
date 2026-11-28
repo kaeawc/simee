@@ -43,8 +43,17 @@ and those are resource overlays of a system image, which simee does not modify.
 
 - **One directory per segment**, mode `0700`: `<base>/<name>/m<k>.sock`, member `k` in `0..16`.
   Each emu process binds its own socket; every datagram is one Ethernet frame. The relay trusts
-  whoever can write the directory, so emu refuses one that isn't a directory of its own user's (a
-  link, a file, another uid) and tightens one of the user's own that is open to others.
+  whoever can write the directory, and swapping a parent for another user's is as good as writing
+  the directory, so emu checks the whole path (`net::segment::secure_dir`), as ssh's StrictModes
+  does for a key: the path is resolved once and that resolved path is used from then on; every
+  parent up to `/` must be owned by this user or root and not writable by group or others (a
+  root-owned sticky `/tmp` is the exception, and so is a group-writable directory of the user's
+  whose group is theirs alone); the segment directory must be this user's, not a link or a file,
+  and **not writable by others** (refused as found, not chmodded: sockets planted while it was
+  open would stay; one that others can only read is set to `0700`); and every entry in it must be
+  this user's. The default base is private to the user (`sim_core::segment::default_root`:
+  `$XDG_RUNTIME_DIR/simee/seg`, else `~/.simee/run/seg`), where there is nothing to refuse. A base
+  of `/tmp/...` works when `/tmp/...` is made by the user.
 - **Addresses are derived**: member `k` of subnet `n` is `10.77.n.(k+1)/24` with MAC
   `52:55:0a:4d:n:(k+1)`. The subnet is the lowest free of 254; the NAT's 10.0.2.0/24 is untouched.
 - **Routing** (`net::segment::route`): a frame to a MAC that a member owns goes to that member; a
@@ -71,11 +80,12 @@ Where the issue left a choice, the simplest fit with the existing code:
 2. **Directory of sockets, no daemon**, as `device-links.md` says.
 3. **Subnet 10.77.n.0/24**, lowest free, derived addresses; no DHCP, no gateway (L2 only).
 4. **At most 16 members** per segment, 254 segments.
-5. **Socket path limit**: 100 bytes (macOS's `sun_path`), checked when the segment is planned, so a
+5. **Socket path limit**: 100 bytes (macOS's `sun_path`), checked when the segment is planned and again on the resolved path (`/tmp` is `/private/tmp` on a Mac), so a
    long directory is refused with a reason instead of failing at boot.
 6. **MTU 1500**: macOS's `net.local.dgram.maxdgram` is 2048 by default, so jumbo frames aren't relayed.
 7. **Apple silicon only for now**; software mode refuses the flag.
-8. **Guest address by command, not by image change**: simee doesn't edit system images.
+8. **Where segments live**: `$XDG_RUNTIME_DIR/simee/seg`, else `~/.simee/run/seg`, both per user; emu accepts any path that passes its checks.
+9. **Guest address by command, not by image change**: simee doesn't edit system images.
 
 ## Not verified (`needs-device`)
 

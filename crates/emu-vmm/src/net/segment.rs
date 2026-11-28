@@ -14,9 +14,15 @@
 //!
 //! Sockets are the process's own, in a directory made `0700`: no more reach than the console and
 //! display sockets next to it. A frame is accepted whatever its source address, since only
-//! processes of the same user can write to the directory, so [`SegmentPort::open`] refuses a
-//! directory that is someone else's, or a link or a file, and takes back one of this user's that
-//! is open to others.
+//! processes of the same user can write to the directory, and the trust has to hold for the whole
+//! path, not just its last part: whoever owns or can write to a parent can swap the directory for
+//! their own and take a member's frames. So [`SegmentPort::open`] resolves the path once, walks
+//! every parent up to `/` as ssh's StrictModes does (each owned by this user or root, none
+//! writable by group or others, a root-owned sticky directory like `/tmp` excepted), refuses a
+//! segment directory that isn't this user's, is a link or a file, or that others can write to
+//! (anything they planted while it was open stays), refuses entries that aren't this user's, and
+//! uses the resolved path from then on. `sim_core::segment::default_root` puts segments in a
+//! per-user private directory, where none of this has anything to refuse.
 use std::collections::VecDeque;
 use std::io;
 #[cfg(unix)]
@@ -95,20 +101,23 @@ fn peers_in<'a>(names: impl IntoIterator<Item = &'a str>, own: u8) -> Vec<u8> {
 enum DirCheck {
     /// Ours and private.
     Fine,
-    /// Ours, but open to group or others: `chmod 0700` it.
+    /// Ours, readable by group or others but not writable by them: `chmod 0700` it.
     Tighten,
     Refuse(String),
 }
 
-/// Judges a directory by what `lstat` says: its type, owner and mode, against the user running
-/// emu. Anyone who can write to the directory can forge frames or take a member's socket, so
-/// only a directory of this user's counts.
+/// Judges the segment directory by what `lstat` says: its type, owner and mode, against the user
+/// running emu. Anyone who can write to it can forge frames or take a member's socket, and
+/// refusing (rather than chmodding) a directory they could write to leaves nothing they planted
+/// in it while it was open.
 #[cfg_attr(not(unix), allow(dead_code))]
 fn judge_dir(is_dir: bool, owner: u32, mode: u32, me: u32) -> DirCheck {
     if !is_dir {
         DirCheck::Refuse("is not a directory (or is a link to one)".into())
     } else if owner != me {
         DirCheck::Refuse(format!("belongs to uid {owner}, not to this user (uid {me})"))
+    } else if mode & 0o022 != 0 {
+        DirCheck::Refuse("is writable by others, who may have left sockets in it (remove it and let emu make it)".into())
     } else if mode & 0o077 != 0 {
         DirCheck::Tighten
     } else {
@@ -116,18 +125,69 @@ fn judge_dir(is_dir: bool, owner: u32, mode: u32, me: u32) -> DirCheck {
     }
 }
 
-/// Makes sure `dir` is this user's own private directory, as it was made or found.
+/// Judges a parent of the segment directory, as ssh's StrictModes does a key's: owned by this user
+/// or root, and not writable by group or others (those could rename the directory below it away).
+/// Exceptions: a root-owned sticky directory (`/tmp`), where others can only rename their own
+/// entries, and a group-writable directory of this user's whose group is theirs alone (a
+/// user-private group, as some systems give a home directory).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn judge_ancestor(is_dir: bool, owner: u32, group: u32, mode: u32, me: u32, my_group: u32) -> Result<(), String> {
+    if !is_dir {
+        return Err("is not a directory".into());
+    }
+    if owner != me && owner != 0 {
+        return Err(format!("belongs to uid {owner}, who could swap the directory below it for their own"));
+    }
+    let sticky_root = mode & 0o1000 != 0 && owner == 0;
+    let others = mode & 0o002 != 0;
+    let group_ok = owner == me && group == my_group;
+    let group = mode & 0o020 != 0 && !group_ok;
+    if (others || group) && !sticky_root {
+        return Err("is writable by others, who could swap the directory below it for their own (chmod go-w)".into());
+    }
+    Ok(())
+}
+
+/// Judges an entry found in the segment directory: only this user's own.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn judge_entry(owner: u32, me: u32) -> Result<(), String> {
+    if owner == me { Ok(()) } else { Err(format!("belongs to uid {owner}, not to this user (uid {me})")) }
+}
+
+/// Makes sure `dir` is this user's own private directory, as it was made or found, with only
+/// trusted parents and entries, and returns its resolved path (no links in it), the one to use.
 #[cfg(unix)]
-fn secure_dir(dir: &std::path::Path) -> io::Result<()> {
+fn secure_dir(dir: &std::path::Path) -> io::Result<std::path::PathBuf> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    let meta = std::fs::symlink_metadata(dir)?;
+    let refuse = |what: &std::path::Path, why: String| {
+        io::Error::new(ErrorKind::PermissionDenied, format!("the segment directory {}: {} {why}", dir.display(), what.display()))
+    };
     let me = rustix::process::geteuid().as_raw();
-    match judge_dir(meta.file_type().is_dir(), meta.uid(), meta.mode(), me) {
-        DirCheck::Fine => Ok(()),
-        DirCheck::Tighten => std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)),
-        DirCheck::Refuse(why) => Err(io::Error::new(ErrorKind::PermissionDenied, format!("the segment directory {} {why}", dir.display()))),
+    let my_group = rustix::process::getegid().as_raw();
+    // The leaf first, before it is resolved: a link there is refused, not followed.
+    let meta = std::fs::symlink_metadata(dir)?;
+    if let DirCheck::Refuse(why) = judge_dir(meta.file_type().is_dir(), meta.uid(), meta.mode(), me) {
+        return Err(refuse(dir, why));
     }
+    // Then every name in the path resolved once (macOS's /tmp is a link to /private/tmp), and
+    // the parents of what it resolves to.
+    let real = std::fs::canonicalize(dir)?;
+    for parent in real.ancestors().skip(1) {
+        let m = std::fs::symlink_metadata(parent)?;
+        judge_ancestor(m.file_type().is_dir(), m.uid(), m.gid(), m.mode(), me, my_group).map_err(|why| refuse(parent, why))?;
+    }
+    let meta = std::fs::symlink_metadata(&real)?;
+    match judge_dir(meta.file_type().is_dir(), meta.uid(), meta.mode(), me) {
+        DirCheck::Fine => {}
+        DirCheck::Tighten => std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700))?,
+        DirCheck::Refuse(why) => return Err(refuse(&real, why)),
+    }
+    for entry in std::fs::read_dir(&real)?.flatten() {
+        let m = std::fs::symlink_metadata(entry.path())?;
+        judge_entry(m.uid(), me).map_err(|why| refuse(&entry.path(), why))?;
+    }
+    Ok(real)
 }
 
 /// What the device's worker and the segment's thread share.
@@ -181,7 +241,10 @@ impl SegmentPort {
 
         spec.validate().map_err(|e| io::Error::new(ErrorKind::InvalidInput, e))?;
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&spec.dir)?;
-        secure_dir(&spec.dir)?;
+        // From here on the resolved path, which no link in a parent can redirect; it can be longer
+        // than the one given (`/tmp` is `/private/tmp` on a Mac), so it is checked again.
+        let spec = &SegmentSpec { dir: secure_dir(&spec.dir)?, ..spec.clone() };
+        spec.validate().map_err(|e| io::Error::new(ErrorKind::InvalidInput, e))?;
         let path = spec.socket();
         let sock = match UnixDatagram::bind(&path) {
             Ok(s) => s,
@@ -635,30 +698,164 @@ mod tests {
     #[test]
     fn a_directory_is_judged_by_type_owner_and_mode() {
         use DirCheck::*;
+        let why = |c: DirCheck| match c {
+            Refuse(w) => w,
+            other => panic!("{other:?}"),
+        };
         assert_eq!(judge_dir(true, 501, 0o40700, 501), Fine);
         assert_eq!(judge_dir(true, 501, 0o40500, 501), Fine, "tighter than 0700 is still private");
-        assert_eq!(judge_dir(true, 501, 0o40755, 501), Tighten);
-        assert_eq!(judge_dir(true, 501, 0o40777, 501), Tighten);
-        assert_eq!(judge_dir(true, 501, 0o40710, 501), Tighten, "group access counts");
-        assert!(matches!(judge_dir(true, 502, 0o40700, 501), Refuse(w) if w.contains("uid 502")), "someone else's, even at 0700");
+        assert_eq!(judge_dir(true, 501, 0o40755, 501), Tighten, "readable by others, but nobody else can plant anything");
+        assert_eq!(judge_dir(true, 501, 0o40710, 501), Tighten, "group access to read counts");
+        for open in [0o40777, 0o40775, 0o40757, 0o40722, 0o41777] {
+            assert!(why(judge_dir(true, 501, open, 501)).contains("writable by others"), "{open:o}");
+        }
+        assert!(why(judge_dir(true, 502, 0o40700, 501)).contains("uid 502"), "someone else's, even at 0700");
         assert!(matches!(judge_dir(true, 0, 0o40755, 501), Refuse(_)), "root's too");
         assert!(matches!(judge_dir(false, 501, 0o100600, 501), Refuse(_)), "a file, or a link");
     }
 
     #[test]
-    fn an_existing_directory_open_to_others_is_taken_back_and_a_link_or_file_is_refused() {
+    fn a_parent_is_judged_like_ssh_judges_the_path_to_a_key() {
+        let ok = |owner, group, mode| judge_ancestor(true, owner, group, mode, 501, 20);
+        assert!(ok(0, 0, 0o40755).is_ok(), "/ and /Users");
+        assert!(ok(501, 20, 0o40700).is_ok(), "ours, private");
+        assert!(ok(501, 20, 0o40755).is_ok(), "ours, readable");
+        assert!(ok(0, 0, 0o41777).is_ok(), "/tmp: root's and sticky");
+        assert!(ok(501, 20, 0o40775).is_ok(), "ours with a group that is ours alone");
+        for (owner, group, mode, what) in [
+            (502, 20, 0o40755, "another user's"),
+            (502, 20, 0o40700, "another user's, private"),
+            (0, 0, 0o40777, "world-writable and not sticky"),
+            (0, 0, 0o40775, "root's, group-writable"),
+            (0, 0, 0o40757, "root's, others-writable"),
+            (501, 20, 0o40777, "ours but world-writable"),
+            (501, 20, 0o41777, "ours and sticky: the sticky exception is root's /tmp"),
+            (501, 80, 0o40775, "ours, writable by a group that isn't ours alone"),
+            (502, 0, 0o41777, "another user's sticky directory"),
+        ] {
+            assert!(ok(owner, group, mode).is_err(), "{what}");
+        }
+        assert!(judge_ancestor(false, 0, 0, 0o100644, 501, 20).is_err(), "not a directory");
+        let why = ok(502, 20, 0o40755).expect_err("refused");
+        assert!(why.contains("uid 502") && why.contains("swap"), "{why}");
+    }
+
+    #[test]
+    fn only_entries_of_this_user_are_trusted() {
+        assert!(judge_entry(501, 501).is_ok());
+        assert!(judge_entry(502, 501).expect_err("refused").contains("uid 502"));
+        assert!(judge_entry(0, 501).is_err(), "root's too: it isn't ours to have left there");
+    }
+
+    /// A fresh `/tmp` directory with `mode`, which tests put segments under.
+    fn parent(name: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let d = dir(name);
+        std::fs::create_dir_all(&d).expect("parent");
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        d
+    }
+
+    fn as_root() -> bool {
+        rustix::process::geteuid().is_root()
+    }
+
+    fn chown(path: &Path, uid: u32) {
+        rustix::fs::chown(path, Some(rustix::process::Uid::from_raw(uid)), None).expect("chown");
+    }
+
+    #[test]
+    fn a_parent_others_can_write_is_refused_and_one_they_cannot_is_fine() {
+        // The segment's own directory is ours and 0700, but someone who can write /tmp/x could
+        // rename it away and put theirs in its place.
+        let open_parent = parent("wparent", 0o777);
+        let err = SegmentPort::open(&spec(&open_parent.join("pair"), 3, 0)).err().expect("refused");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        let text = err.to_string();
+        assert!(text.contains(&open_parent.display().to_string()) && text.contains("writable by others"), "{text}");
+        assert!(!has_members(&open_parent.join("pair")), "nothing was bound");
+
+        let group_open = parent("gparent", 0o775);
+        let ours = SegmentPort::open(&spec(&group_open.join("pair"), 3, 0));
+        // Ours with our own group: the user-private-group exception; any other group is refused.
+        let meta = std::fs::metadata(&group_open).expect("meta");
+        let own_group = std::os::unix::fs::MetadataExt::gid(&meta) == rustix::process::getegid().as_raw();
+        assert_eq!(ours.is_ok(), own_group, "{:?}", ours.err());
+
+        let closed = parent("cparent", 0o755);
+        drop(SegmentPort::open(&spec(&closed.join("pair"), 3, 0)).expect("a parent others can only read"));
+        for p in [open_parent, group_open, closed] {
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
+
+    #[test]
+    fn a_parent_of_another_user_is_refused_even_when_nobody_else_can_write_it() {
+        if !as_root() {
+            return; // handing a directory to another uid needs root; the judgement itself is tested above
+        }
+        let p = parent("uparent", 0o755);
+        chown(&p, 12345);
+        let err = SegmentPort::open(&spec(&p.join("pair"), 3, 0)).err().expect("refused");
+        assert!(err.to_string().contains("uid 12345"), "{err}");
+        let _ = std::fs::remove_dir_all(p);
+    }
+
+    #[test]
+    fn the_resolved_path_is_the_one_used() {
+        let real = parent("rparent", 0o700);
+        let link = dir("rlink");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        // A link in a parent is followed once, and every later send and bind uses where it led.
+        let port = SegmentPort::open(&spec(&link.join("pair"), 3, 0)).expect("open");
+        let resolved = std::fs::canonicalize(&real).expect("canon").join("pair");
+        assert_eq!(port.spec.dir, resolved);
+        assert!(has_members(&real.join("pair")));
+        drop(port);
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&real);
+    }
+
+    #[test]
+    fn an_existing_directory_others_can_write_is_refused_and_left_as_it_was() {
         use std::os::unix::fs::PermissionsExt;
         let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o777;
-        let d = dir("shared");
-        std::fs::create_dir_all(&d).expect("dir");
-        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o777)).expect("chmod");
-        let a = join(&d, 0);
-        assert_eq!(mode(&d), 0o700, "ours, so tightened");
-        drop(a);
+        let d = parent("shared", 0o777);
+        // Someone left a socket in it while it was open: making it private would keep that.
+        let planted = std::os::unix::net::UnixDatagram::bind(d.join("m1.sock")).expect("planted");
+        let err = SegmentPort::open(&spec(&d, 3, 0)).err().expect("refused");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("writable by others"), "{err}");
+        assert_eq!(mode(&d), 0o777, "not chmodded: refused as found");
+        assert!(d.join("m1.sock").exists(), "and not cleaned up under the owner's feet");
+        drop(planted);
+        let _ = std::fs::remove_dir_all(&d);
 
+        // Readable by others but not writable: nobody could have planted anything; taken back.
+        let readable = parent("readable", 0o755);
+        let a = join(&readable, 0);
+        assert_eq!(mode(&readable), 0o700);
+        drop(a);
+        let _ = std::fs::remove_dir_all(&readable);
+    }
+
+    #[test]
+    fn an_entry_that_is_not_ours_is_refused() {
+        if !as_root() {
+            return; // as above: another uid's file needs root to make
+        }
+        let d = parent("entries", 0o700);
+        std::fs::write(d.join("m1.sock"), b"").expect("planted");
+        chown(&d.join("m1.sock"), 12345);
+        let err = SegmentPort::open(&spec(&d, 3, 0)).err().expect("refused");
+        assert!(err.to_string().contains("m1.sock") && err.to_string().contains("uid 12345"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_link_or_a_file_where_the_directory_should_be_is_refused() {
         // A link to a directory (another user's, say) is not followed.
-        let target = dir("shared-target");
-        std::fs::create_dir_all(&target).expect("target");
+        let target = parent("shared-target", 0o700);
         let link = dir("shared-link");
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
         let err = SegmentPort::open(&spec(&link, 3, 0)).err().expect("refused");
@@ -666,7 +863,6 @@ mod tests {
         assert!(err.to_string().contains("not a directory"), "{err}");
         assert!(!has_members(&target), "nothing was bound through the link");
 
-        // A file where the directory should be.
         let file = dir("shared-file");
         std::fs::write(&file, b"x").expect("file");
         assert!(SegmentPort::open(&spec(&file, 3, 0)).is_err());

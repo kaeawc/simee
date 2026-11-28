@@ -38,6 +38,17 @@ pub const RULE_PRIORITY: u32 = 500;
 /// The longest segment name (it is a directory name).
 pub const MAX_NAME: usize = 32;
 
+/// Where segments live unless told otherwise: a directory only this user can reach, so the relay's
+/// trust in whoever can write there (`emu_vmm::net::segment`) holds without a check to fail.
+/// `$XDG_RUNTIME_DIR/simee/seg` (the session's own `0700` directory on Linux), else
+/// `~/.simee/run/seg`; `None` when neither names an absolute path. `var` reads the environment.
+pub fn default_root(var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let absolute = |key: &str| var(key).filter(|v| Path::new(v).is_absolute());
+    absolute("XDG_RUNTIME_DIR")
+        .map(|d| Path::new(&d).join("simee").join("seg"))
+        .or_else(|| absolute("HOME").map(|h| Path::new(&h).join(".simee").join("run").join("seg")))
+}
+
 /// Whether `name` is usable as a segment's directory name: lowercase letters, digits, `-` and
 /// `_`, starting with a letter or digit.
 pub fn valid_name(name: &str) -> bool {
@@ -274,6 +285,28 @@ mod tests {
 
     fn base() -> PathBuf {
         PathBuf::from("/tmp/simee/seg")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn segments_live_in_a_per_user_directory_by_default() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).to_string())
+        };
+        let both = env(&[("XDG_RUNTIME_DIR", "/run/user/1000"), ("HOME", "/home/u")]);
+        assert_eq!(default_root(both), Some(PathBuf::from("/run/user/1000/simee/seg")), "the session's own directory wins");
+        assert_eq!(default_root(env(&[("HOME", "/Users/u")])), Some(PathBuf::from("/Users/u/.simee/run/seg")));
+        assert_eq!(
+            default_root(env(&[("XDG_RUNTIME_DIR", "run/user"), ("HOME", "/h")])),
+            Some(PathBuf::from("/h/.simee/run/seg")),
+            "a relative path isn't trusted"
+        );
+        assert_eq!(default_root(env(&[("HOME", "")])), None);
+        assert_eq!(default_root(env(&[])), None);
+        // A planned segment under it is a valid one.
+        let root = default_root(env(&[("HOME", "/Users/someone")])).expect("root");
+        let plan = SegmentPlan::of("pair", &root, &[], &["a", "b"]).expect("plan");
+        assert!(plan.members.iter().all(|m| m.spec.validate().is_ok()));
     }
 
     #[test]
