@@ -97,8 +97,9 @@ fn avd_snapshot(words: &[&str]) -> String {
             format!("KO: Unable to load snapshot: Snapshots are not supported with the current graphics settings. ({SNAPSHOT_RENDERER})")
         }
         // Stock's message names `list` here.
-        ["del" | "delete"] => "KO: Argument missing, try 'avd snapshot list <name>'".into(),
-        ["del" | "delete", ..] => "OK".into(),
+        // The names come from `sim_core::console`, which the MCP server reads to ask before a delete.
+        [name] if sim_core::console::is_snapshot_delete(name) => "KO: Argument missing, try 'avd snapshot list <name>'".into(),
+        [name, ..] if sim_core::console::is_snapshot_delete(name) => "OK".into(),
         _ => sub_help(ABOUT, SUBCOMMANDS, "KO:  bad sub-command"),
     }
 }
@@ -611,7 +612,7 @@ fn session(stream: TcpStream, info: &ConsoleInfo) -> std::io::Result<()> {
             // prints everything it reads, so an extra OK leaks into answers like `avd name`.
             ("quit" | "exit", _) => return Ok(()),
             (_, false) => "KO: unknown command, try 'help'".to_string(),
-            ("kill", true) => {
+            (kill, true) if kill == sim_core::console::KILL => {
                 out.write_all(b"OK: killing emulator, bye bye\r\n")?;
                 // While the guest still runs: a folded foldable's forced size goes with emu.
                 if let Some(fold) = &info.fold {
@@ -1030,6 +1031,10 @@ mod tests {
             run(&info, "avd snapshot load am_capture"),
             "KO: Unable to load snapshot: Snapshots are not supported with the current graphics settings. (gfxstream)"
         );
+        // Every name the MCP server asks about before a delete is one this console deletes by.
+        for name in sim_core::console::SNAPSHOT_DELETE {
+            assert_eq!(run(&info, &format!("avd snapshot {name} am_capture")), "OK", "{name}");
+        }
         assert_eq!(run(&info, "avd snapshot del am_capture"), "OK");
         assert_eq!(run(&info, "avd snapshot delete am_capture"), "OK");
         assert_eq!(run(&info, "avd snapshot list"), "There is no snapshot available.\nOK");

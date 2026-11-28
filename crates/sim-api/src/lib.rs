@@ -19,6 +19,7 @@
 
 mod android;
 mod android_files;
+mod android_net;
 mod camera;
 #[cfg_attr(not(unix), allow(dead_code))]
 mod camera_device;
@@ -57,6 +58,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use camera::source_device;
 pub use forward::{HANDSHAKE_TIMEOUT, IN_CALLER, forwards, identity};
 pub use ios::{flush_input, track_input};
 pub use methods::{METHODS, Session, call as call_method, platforms};

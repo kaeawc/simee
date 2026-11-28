@@ -10,8 +10,9 @@ look at their screens, read their logs, and watch them change.
 | Resources | Devices, runtimes, form factors, camera sources, each device's info, screen, screenshot, apps, logs and processes, and an app's preferences by template |
 | Subscriptions | Change notifications for those resources and for the resource list, throttled by kind, by re-reading them only while subscribed |
 | Prompts | Common workflows (boot and install, reproduce a bug, audit contrast, find slowness, test across form factors) that name the tools to call and their toolsets |
-| Tasks | `boot`, `boot_many`, `create`, `clone`, `install`, `settle`, `erase`, `shutdown`, `export`, `import`, `mem_leaks`, `mem_heap` as pollable, cancellable tasks |
+| Tasks | `boot`, `boot_many`, `create`, `clone`, `install`, `settle`, `wait_idle`, `erase`, `shutdown`, `export`, `import`, `mem_leaks`, `mem_heap` as pollable, cancellable tasks |
 | App | `device_view`: a device's screen with tap, swipe, type and button controls, in the conversation |
+| Safety | Confirmations for destructive tools, a per-client device and toolset policy, a read-only mode, host admission for boots and an audit log ([mcp-safety.md](mcp-safety.md)) |
 
 The default transport is stdio: nothing on the network can reach it. `simee mcp --http` serves the
 same server over HTTP for agents in other processes, containers or machines ([Over HTTP](#over-http)).
@@ -161,7 +162,7 @@ in `SIMEE_MCP_TOOLSETS` (commas between names; `all` for every tool). Unset, it 
 | `lifecycle` | Devices: `form_factors`, `devices`, `runtimes`, `device_types`, `create`, `delete`, `boot`, `boot_many`, `admission_check`, `settle`, `profile`, `clone`, `export`, `import`, `shutdown`, `erase`, `info` |
 | `apps` | `open_url`, `install`, `uninstall`, `launch`, `terminate`, `apps`, `privacy`, `push` |
 | `input` | `tap`, `swipe`, `touch`, `button`, `type`, `key`, `rotate`, `fold`, `xr`, `touchpad`, `stylus`, `rotary`, `watch_gesture`, `remote_swipe`, `pointer`, `biometric` |
-| `observe` | `screen`, `screenshot`, `contrast_check`, `logs`, `device_view` |
+| `observe` | `screen`, `screenshot`, `wait_idle`, `contrast_check`, `logs`, `device_view` |
 | `settings` | `appearance`, `location`, `status_bar`, `clear_status_bar`, `content_size`, `increase_contrast`, `dynamic_island`, `backlight`, `keyboard_language`, `hardware_keyboard`, `memory_warning`, `notify`, `carplay`, `vehicle` |
 | `debug` | `ca_debug`, `ca_debug_state`, `exec`, `processes`, `kill`, `connections`, `traffic`, `mem_leaks`, `mem_heap`, `mem_vmmap`, `mem_history`, `crash_reports`, `console` |
 | `files` | `containers`, `ls`, `read`, `write`, `rm`, `du`, `clear_container`, `defaults_read`, `defaults_write`, `reset_keychain` |
@@ -199,8 +200,9 @@ reverse):
 | `camera_sources` | Android, iOS (the host's cameras and the synthetic sources; needs no device) |
 | `camera_link`, `camera_unlink`, `camera_links` | Android, iOS (iOS: device-wide shim injection, needs `simee serve`; see [camera.md](camera.md)) |
 | `prefs_stores`, `prefs_read`, `prefs_write`, `prefs_delete`, `prefs_batch`, `prefs_watch` | Android, iOS (iOS is implemented; Android answers "not yet available") |
+| `connections`, `traffic`, `network_shape`, `network_state`, `network_clear` | Android, iOS (Android: the emulator console's `network speed` and `network delay`, airplane mode for offline, and the guest's socket tables and per-uid counters over adb; loss, rules, proxy and inject are iOS's) |
 | `containers`, `ls`, `read`, `write`, `rm`, `du`, `clear_container` | Android, iOS (Android: in an app's container, through `run-as` for a debuggable app, root otherwise; `adb root` only with `root: true`, `pm clear` only with `pm_clear: true`) |
-| `erase`, `appearance`, `privacy`, `push`, `status_bar`, `clear_status_bar`, `content_size`, `increase_contrast`, `dynamic_island`, `backlight`, `keyboard_language`, `hardware_keyboard`, `ca_debug`, `ca_debug_state`, `reset_keychain`, `memory_warning`, `notify`, `biometric`, `logs`, `connections`, `traffic`, `defaults_read`, `defaults_write`, `crash_reports`, `network_shape`, `network_state`, `network_flows`, `network_clear`, `network_env`, `audio_state`, `audio_volume`, `audio_route`, `audio_capture_start`, `audio_capture_stop`, `audio_mute`, `watch_gesture`, `remote_swipe`, `pointer`, `carplay` | iOS |
+| `wait_idle`, `erase`, `appearance`, `privacy`, `push`, `status_bar`, `clear_status_bar`, `content_size`, `increase_contrast`, `dynamic_island`, `backlight`, `keyboard_language`, `hardware_keyboard`, `ca_debug`, `ca_debug_state`, `reset_keychain`, `memory_warning`, `notify`, `biometric`, `logs`, `defaults_read`, `defaults_write`, `crash_reports`, `network_flows`, `network_env`, `audio_state`, `audio_volume`, `audio_route`, `audio_capture_start`, `audio_capture_stop`, `audio_mute`, `watch_gesture`, `remote_swipe`, `pointer`, `carplay` | iOS |
 | `mem_leaks`, `mem_heap`, `mem_vmmap`, `mem_history` | iOS (the host's memory tools on one app; Android answers that they aren't available there) |
 
 A test keeps this page honest: it fails if a tool isn't named here.
@@ -331,7 +333,7 @@ context.
 ## Tasks
 
 A client that declares `io.modelcontextprotocol/tasks` gets a task, instead of a blocked call, for
-`boot`, `boot_many`, `create`, `clone`, `install`, `settle`, `erase`, `shutdown`, `export`, `import`, `mem_leaks` and
+`boot`, `boot_many`, `create`, `clone`, `install`, `settle`, `wait_idle`, `erase`, `shutdown`, `export`, `import`, `mem_leaks` and
 `mem_heap` (seconds each; see their notes in docs/api.md): the result
 has `resultType: "task"`, a `taskId`, `pollIntervalMs` (1 s) and `ttlMs` (an hour). The methods are
 a list in `crates/sim-mcp/src/tools.rs`; every other tool answers inline.
@@ -583,8 +585,8 @@ takes milliseconds). Reproduce: `cargo test --release -p simee-mcp http_call_ove
 
 ## Limits and what is not here
 
-- Completions, logging, sampling and elicitation are not offered; the specification deprecates
-  three of them.
+- Completions, logging and sampling are not offered; the specification deprecates three of them.
+  Elicitation is used, and only to confirm a destructive call ([mcp-safety.md](mcp-safety.md)).
 - Cancelling stops `boot`, `boot_many`, `create`, `clone` and `import` at their next safe point
   and undoes what they half did; it doesn't stop an install, erase, settle or memory tool already
   running (above).

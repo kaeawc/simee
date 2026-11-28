@@ -22,6 +22,8 @@ extend-ignore-re = [
 ]
 
 [default.extend-words]
+# passt, the project (and Debian/Fedora package) that ships pasta, the container network's uplink.
+passt = "passt"
 # RTP's single-time aggregation packet (RFC 6184 STAP-A/STAP-B).
 stap = "stap"
 # V4L2's stream parameters (VIDIOC_S_PARM, struct v4l2_streamparm).

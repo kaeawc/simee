@@ -9,7 +9,9 @@ simee
 simee-android
 simee-api
 simee-audio
+simee-bundle
 simee-camera
+simee-core
 simee-coresim
 simee-emu
 simee-emu-avd
