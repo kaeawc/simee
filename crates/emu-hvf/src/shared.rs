@@ -1,16 +1,16 @@
 //! A file mapped shared and writable: memory this process writes and other processes read through
 //! the file (`pread`), with no copy on this side. The display server's frame ring lives in one.
-//! Builds on any unix host.
+//! Builds on unix (`mmap`) and Windows (a file mapping).
 use std::fs::File;
 use std::io;
-use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// `len` bytes of a file, mapped `MAP_SHARED` read-write. Other processes see writes through the
+/// `len` bytes of a file, mapped shared (`MAP_SHARED`; a file mapping on Windows) read-write. Other processes see writes through the
 /// page cache as soon as they're made (reads of the file, or their own mappings). The file must
-/// not be truncated below `len` while mapped (a process that does so gets `SIGBUS` here); the
-/// owner creates it privately (`O_EXCL`, mode 0600) so only the same user could.
+/// not be truncated below `len` while mapped (a process that does so gets `SIGBUS` here, and
+/// Windows refuses the truncation); the owner creates it privately (`O_EXCL`, mode 0600) so only
+/// the same user could.
 pub struct SharedMap {
     ptr: NonNull<u8>,
     len: usize,
@@ -29,13 +29,8 @@ impl SharedMap {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty shared mapping"));
         }
         file.set_len(len as u64)?;
-        // SAFETY: a fresh shared mapping of the file's first `len` bytes (the file now has exactly
-        // that length) with no address hint; the result is checked before use.
-        let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, file.as_raw_fd(), 0) };
-        if p == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        let ptr = NonNull::new(p.cast::<u8>()).ok_or_else(|| io::Error::other("mmap returned null"))?;
+        let p = map(file, len)?;
+        let ptr = NonNull::new(p).ok_or_else(|| io::Error::other("mmap returned null"))?;
         Ok(SharedMap { ptr, len })
     }
 
@@ -80,17 +75,53 @@ impl SharedMap {
 
 impl Drop for SharedMap {
     fn drop(&mut self) {
-        // SAFETY: `ptr`/`len` are exactly what mmap returned, and no slice borrowed from the
+        // SAFETY: `ptr`/`len` are exactly what `map` returned, and no slice borrowed from the
         // mapping outlives `self`.
-        unsafe { libc::munmap(self.ptr.as_ptr().cast(), self.len) };
+        unsafe { unmap(self.ptr.as_ptr(), self.len) };
     }
+}
+
+#[cfg(unix)]
+fn map(file: &File, len: usize) -> io::Result<*mut u8> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a fresh shared mapping of the file's first `len` bytes (the file has at least that
+    // length) with no address hint; the result is checked before use.
+    let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, file.as_raw_fd(), 0) };
+    if p == libc::MAP_FAILED { Err(io::Error::last_os_error()) } else { Ok(p.cast()) }
+}
+
+/// # Safety
+/// `ptr`/`len` are exactly what `map` returned, and nothing uses the mapping afterwards.
+#[cfg(unix)]
+unsafe fn unmap(ptr: *mut u8, len: usize) {
+    // SAFETY: the caller's contract.
+    unsafe { libc::munmap(ptr.cast(), len) };
+}
+
+#[cfg(windows)]
+fn map(file: &File, len: usize) -> io::Result<*mut u8> {
+    crate::win::map_file(file, len)
+}
+
+/// # Safety
+/// `ptr` is exactly what `map` returned, and nothing uses the mapping afterwards.
+#[cfg(windows)]
+unsafe fn unmap(ptr: *mut u8, _len: usize) {
+    // SAFETY: the caller's contract.
+    unsafe { crate::win::unmap_view(ptr) };
 }
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::FileExt;
-
     use super::*;
+
+    /// `pread` of exactly `buf.len()` bytes: what a client of the ring does.
+    fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) {
+        #[cfg(unix)]
+        std::os::unix::fs::FileExt::read_exact_at(file, buf, offset).expect("pread");
+        #[cfg(windows)]
+        assert_eq!(std::os::windows::fs::FileExt::seek_read(file, buf, offset).expect("pread"), buf.len());
+    }
 
     #[test]
     fn writes_are_visible_through_the_file() {
@@ -105,10 +136,10 @@ mod tests {
         // Another reader of the file (a client's pread) sees both, with no msync.
         let reader = std::fs::File::open(&path).expect("reopen");
         let mut buf = [0u8; 4];
-        reader.read_exact_at(&mut buf, 5000).expect("pread");
+        read_at(&reader, &mut buf, 5000);
         assert_eq!(buf, [1, 2, 3, 4]);
         let mut seq = [0u8; 8];
-        reader.read_exact_at(&mut seq, 8).expect("pread seq");
+        read_at(&reader, &mut seq, 8);
         assert_eq!(u64::from_ne_bytes(seq), 0xdead_beef);
         assert_eq!(&map.as_slice()[5000..5004], &[1, 2, 3, 4]);
         drop(map);

@@ -8,6 +8,7 @@
 //! output is the same either way.
 
 mod doctor;
+mod mcp_install;
 mod stream_cli;
 
 use std::io::Write;
@@ -449,7 +450,11 @@ enum Cmd {
     /// a tool, devices as resources, long operations as tasks, a device view as an app. Configure
     /// it in the agent's MCP settings as the command `simee mcp` (see docs/mcp.md). With `--http`,
     /// serve MCP's Streamable HTTP transport instead, at `http://ADDR/mcp`.
+    #[command(args_conflicts_with_subcommands = true)]
     Mcp {
+        /// `install` writes a client's MCP config; `config` prints it (docs/mcp-clients.md).
+        #[command(subcommand)]
+        action: Option<mcp_install::McpAction>,
         /// Serve Streamable HTTP on ADDR (default 127.0.0.1:8377). Every request needs a bearer
         /// token (see `--token-file`); a non-loopback ADDR also needs TLS (`--tls-cert` and
         /// `--tls-key`, or `--tls-self-signed`) or `--insecure-remote`.
@@ -598,6 +603,10 @@ fn main() -> Result<()> {
             let code = sim_api::serve(&path)?;
             std::process::exit(code);
         }
+        Cmd::Mcp { action: Some(action), .. } => {
+            let stdout = std::io::stdout();
+            return mcp_install::run(action, &mcp_install::Host::current()?, &mut stdout.lock());
+        }
         Cmd::Mcp { http: None, .. } => {
             mcp_shutdown_on_signal()?;
             // Methods run in this process, on the server's own threads: nothing but protocol
@@ -607,7 +616,7 @@ fn main() -> Result<()> {
             served?;
             return Ok(());
         }
-        Cmd::Mcp { http: Some(addr), token_file, no_auth, insecure_remote, tls } => {
+        Cmd::Mcp { http: Some(addr), token_file, no_auth, insecure_remote, tls, .. } => {
             let config = mcp_http_config(addr, token_file.clone(), *no_auth, *insecure_remote, tls)?;
             mcp_shutdown_on_signal()?;
             let served = sim_mcp::http::serve(std::sync::Arc::new(sim_mcp::ApiBackend::new()), config);
@@ -1418,9 +1427,11 @@ mod tests {
     #[test]
     fn camera_file_sources_are_sent_as_absolute_paths() {
         let cwd = std::env::current_dir().expect("cwd");
+        // `/abs/clip.mov` has no drive on Windows, so it isn't absolute there.
+        let abs = std::env::temp_dir().join("clip.mov").display().to_string();
         for kind in ["image", "video"] {
             assert_eq!(camera_source(&format!("{kind}:clip.mov")), format!("{kind}:{}", cwd.join("clip.mov").display()));
-            assert_eq!(camera_source(&format!("{kind}:/abs/clip.mov")), format!("{kind}:/abs/clip.mov"));
+            assert_eq!(camera_source(&format!("{kind}:{abs}")), format!("{kind}:{abs}"));
         }
         assert_eq!(camera_source("qr:hello"), "qr:hello");
         assert_eq!(camera_source("webcam:0"), "webcam:0");
@@ -1559,6 +1570,7 @@ mod tests {
         (String::from_utf8(out).expect("utf-8"), String::from_utf8(err).expect("utf-8"), result.err().map(|e| e.to_string()))
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_server_and_this_process_print_the_same_bytes() {
         let root = android_root("forward");
@@ -1598,6 +1610,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     /// A command's stdout as bytes (a PNG isn't UTF-8) and its error, run through `transport`.
     fn output_bytes(transport: &mut Transport, args: &[&str]) -> (Vec<u8>, Option<String>) {
         let cli = Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).expect("arguments");
@@ -1606,6 +1619,7 @@ mod tests {
         (out, result.err().map(|e| e.to_string()))
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_screenshot_to_stdout_is_the_png_here_and_on_a_server() {
         let root = android_root("stdout");
@@ -1634,6 +1648,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_stale_socket_falls_back_to_this_process() {
         let root = android_root("stale");
@@ -1646,6 +1661,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_required_server_that_cant_be_used_fails_the_command_with_why() {
         let root = android_root("require");
@@ -1724,9 +1740,18 @@ mod tests {
         let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
         assert!(matches!(parse(&["mcp"]), Ok(Cmd::Mcp { http: None, token_file: None, no_auth: false, insecure_remote: false, .. })));
         let mut transport = Transport::local();
-        let stdio = Cmd::Mcp { http: None, token_file: None, no_auth: false, insecure_remote: false, tls: McpTls::default() };
+        let stdio = Cmd::Mcp { action: None, http: None, token_file: None, no_auth: false, insecure_remote: false, tls: McpTls::default() };
         let e = run(stdio, &mut transport, &mut Vec::new(), &mut Vec::new()).expect_err("served by main, not run");
         assert!(e.to_string().contains("`mcp` don't run through a transport"));
+    }
+
+    #[test]
+    fn mcp_install_and_config_are_subcommands_that_do_not_mix_with_serving_flags() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
+        assert!(matches!(parse(&["mcp", "install", "cursor", "--dry-run"]), Ok(Cmd::Mcp { action: Some(_), http: None, .. })));
+        assert!(matches!(parse(&["mcp", "config", "claude-desktop"]), Ok(Cmd::Mcp { action: Some(_), .. })));
+        assert!(parse(&["mcp", "--http", "install", "cursor"]).is_err());
+        assert!(parse(&["mcp", "install", "nonsense"]).is_err());
     }
 
     #[test]
@@ -1812,8 +1837,10 @@ mod tests {
     }
 
     /// A fake server's reply to a method: its result or its error.
+    #[cfg(unix)]
     type Answer = fn(&str) -> std::result::Result<Value, String>;
 
+    #[cfg(unix)]
     /// A server on `socket` that records each method it is sent and answers with `answer`; `None`
     /// never answers (a wedged server).
     fn fake_server(socket: &std::path::Path, answer: Option<Answer>) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
@@ -1885,6 +1912,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_server_that_never_answers_runs_the_command_here() {
         let root = android_root("wedged");
@@ -1901,6 +1929,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn another_build_or_an_old_server_runs_the_command_here() {
         let root = android_root("skew");
@@ -1934,6 +1963,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn boot_runs_here_even_with_a_matching_server() {
         let root = android_root("boot");
@@ -1967,6 +1997,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn camera_commands_link_swap_and_unlink_through_the_api() {
         let root = android_root("camera");
@@ -2025,6 +2056,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     fn android_backend(root: &std::path::Path) -> sim_android::Android {
         let env = emu_avd::Env { sdk_root: Some(root.join("sdk")), avd_home: root.join("avd") };
         let mut android = sim_android::Android::new(env);
@@ -2036,7 +2068,8 @@ mod tests {
     fn path_parameters_are_made_absolute() {
         let here = std::env::current_dir().expect("cwd");
         assert_eq!(absolute("shot.png"), here.join("shot.png").display().to_string());
-        assert_eq!(absolute("/tmp/x.png"), "/tmp/x.png");
+        let abs = std::env::temp_dir().join("x.png").display().to_string();
+        assert_eq!(absolute(&abs), abs);
     }
 
     #[test]

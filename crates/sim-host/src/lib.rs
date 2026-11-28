@@ -6,7 +6,8 @@
 //!
 //! macOS reads sysctls, `NSProcessInfo` and IOKit through `sim-coresim` (this crate forbids
 //! `unsafe`); Linux reads `/proc` and `/sys`; `statvfs` comes from rustix. Each reading is
-//! independent: one that is unavailable is `None` in the snapshot, never an error.
+//! independent: one that is unavailable is `None` in the snapshot, never an error. Windows reads
+//! nothing yet: every reading is `None` there.
 
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -274,6 +275,13 @@ pub fn machine() -> Machine {
 /// The data volume: macOS keeps user data on its own volume under the sealed system volume.
 pub const DATA_VOLUME: &str = if cfg!(target_os = "macos") { "/System/Volumes/Data" } else { "/" };
 
+/// `statvfs` is unix's; the volume's size and free space on Windows are not read yet.
+#[cfg(not(unix))]
+fn disk(_path: &str) -> Option<Disk> {
+    None
+}
+
+#[cfg(unix)]
 fn disk(path: &str) -> Option<Disk> {
     let s = rustix::fs::statvfs(path).ok()?;
     let unit = if s.f_frsize > 0 { s.f_frsize } else { s.f_bsize };

@@ -1,5 +1,5 @@
-//! virtio-rng: entropy from the host's `/dev/urandom`.
-use std::io::Read;
+//! virtio-rng: entropy from the host's random source (`sim_core::entropy`: the kernel's on unix,
+//! `ProcessPrng` on Windows, where there is no `/dev/urandom`).
 use std::sync::Arc;
 
 use super::queue::Queue;
@@ -8,12 +8,11 @@ use emu_hvf::GuestRam;
 
 pub struct Rng {
     active: Option<(Arc<GuestRam>, Arc<Interrupt>, Queue)>,
-    urandom: Option<std::fs::File>,
 }
 
 impl Rng {
     pub fn new() -> Rng {
-        Rng { active: None, urandom: std::fs::File::open("/dev/urandom").ok() }
+        Rng { active: None }
     }
 }
 
@@ -48,9 +47,8 @@ impl VirtioDevice for Rng {
         while let Ok(Some(chain)) = q.pop(mem) {
             let want: usize = chain.writable().map(|d| d.len as usize).sum::<usize>().min(4096);
             let mut buf = vec![0u8; want];
-            if let Some(f) = self.urandom.as_mut() {
-                let _ = f.read_exact(&mut buf);
-            }
+            // A failure leaves zeros, as an unreadable /dev/urandom did.
+            let _ = sim_core::entropy::fill(&mut buf);
             let n = chain.write_all(mem, &buf).unwrap_or(0);
             let _ = q.add_used(mem, chain.head, n);
             used = true;

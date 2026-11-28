@@ -6,6 +6,10 @@
 mod bootconfig;
 pub mod bundle;
 mod cache;
+#[cfg(unix)]
+pub mod clone;
+#[cfg(not(unix))]
+#[path = "clone_copy.rs"]
 pub mod clone;
 pub mod golden;
 pub mod gpu;
@@ -199,13 +203,16 @@ fn held_lock(dir: &Path) -> Option<PathBuf> {
         if matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)) {
             return Some(path);
         }
+        // Held by us now if the lock was free: Windows' locks are mandatory, so reading the file
+        // below by another handle fails until it is let go (unix's are advisory).
+        let _ = f.unlock();
         // A PID lock (stock's filelock: the PID, then NUL) whose process is alive. A stale one
         // from a crash names a dead PID (or, rarely, a reused one: refusing then is safe).
         let pid = std::fs::read(&path).ok().and_then(|b| {
             let digits: String = b.iter().take_while(|c| c.is_ascii_digit()).map(|&c| c as char).collect();
             digits.parse::<i32>().ok()
         });
-        if pid.and_then(rustix::process::Pid::from_raw).is_some_and(|p| rustix::process::test_kill_process(p).is_ok()) {
+        if pid.is_some_and(pid_alive) {
             return Some(path);
         }
     }
@@ -468,6 +475,35 @@ impl Avd {
     }
 }
 
+/// The named AVD profiles `emu -create-avd -profile NAME` takes ([`NewAvd::with_profile`]).
+pub const PROFILES: [&str; 1] = ["software-lite"];
+
+/// The software-lite profile's screen: 540x960 at 240 dpi, 56% of the default 720x1280's pixels.
+pub const SOFTWARE_LITE_LCD: (u32, u32, u32) = (540, 960, 240);
+
+/// The software-lite profile's refresh rate, `hw.lcd.vsync`.
+pub const SOFTWARE_LITE_VSYNC_HZ: u32 = 30;
+
+/// Whether profile `name` ([`PROFILES`]) can shape an AVD of an image with tag `tag` (`default`,
+/// `google_apis`, `android-tv`, ...), with the reason when it can't. It needs no image, so
+/// `emu -provision` asks before it downloads one.
+pub fn check_profile(name: &str, tag: &str) -> Result<()> {
+    match name {
+        "software-lite" => {
+            let kind = android_profile(|k| (k == "tag.id").then(|| tag.to_owned())).kind;
+            if kind.form_factor == FormFactor::Phone {
+                Ok(())
+            } else {
+                Err(Error::Config(format!(
+                    "profile software-lite shrinks a phone's screen; '{tag}' images are a {:?} with a screen of their own",
+                    kind.form_factor
+                )))
+            }
+        }
+        other => Err(Error::Config(format!("unknown AVD profile '{other}' (profiles: {})", PROFILES.join(", ")))),
+    }
+}
+
 /// What `create_avd` writes. Defaults favour cheap, fast boots: a small screen boots markedly
 /// faster than a large one, and more than 2 GB of RAM makes cold boots slower, not faster.
 #[derive(Clone, Debug)]
@@ -495,7 +531,8 @@ impl NewAvd {
     pub fn new(name: &str, sysdir: &str) -> NewAvd {
         NewAvd {
             name: name.to_string(),
-            sysdir: sysdir.trim_end_matches('/').to_string() + "/",
+            // `image.sysdir.N` always has `/`, whatever joined the path (a `\` on Windows).
+            sysdir: sysdir.replace('\\', "/").trim_end_matches('/').to_string() + "/",
             lcd: (720, 1280, 320),
             ram_mb: 2048,
             cores: 4,
@@ -507,11 +544,32 @@ impl NewAvd {
         }
     }
 
+    /// The AVD with profile `name` applied ([`PROFILES`]).
+    ///
+    /// `software-lite` is for software mode (x86_64 Linux without KVM), where the guest's CPU and
+    /// the frames SwiftShader draws share the host's cores: a 540x960 screen at 240 dpi and a 30 Hz
+    /// display (`hw.lcd.vsync=30`). It takes the screen, so apps see a smaller, slower display;
+    /// RAM and vCPUs stay as they were (docs/android.md "Software mode" has what it saves). Only
+    /// phone images have a screen to shrink: the other form factors are refused.
+    pub fn with_profile(mut self, name: &str) -> Result<NewAvd> {
+        let tag = self.sysdir.trim_matches('/').split('/').nth(2).unwrap_or_default().to_owned();
+        check_profile(name, &tag)?;
+        match name {
+            "software-lite" => {
+                self.lcd = SOFTWARE_LITE_LCD;
+                self.extra.retain(|(k, _)| k != "hw.lcd.vsync");
+                self.extra.push(("hw.lcd.vsync".to_owned(), SOFTWARE_LITE_VSYNC_HZ.to_string()));
+                Ok(self)
+            }
+            other => unreachable!("check_profile accepts only PROFILES, not '{other}'"),
+        }
+    }
+
     /// An AVD shaped like its system image's own kind, from the tag in `sysdir`
     /// (`system-images/android-34/android-wear/arm64-v8a`): a round watch for Wear OS, a TV with a
     /// D-pad, a headset for Android XR, a phone for mobile images.
     pub fn for_image(name: &str, sysdir: &str) -> NewAvd {
-        let tag = sysdir.trim_matches('/').split('/').nth(2).unwrap_or_default().to_owned();
+        let tag = sysdir.replace('\\', "/").trim_matches('/').split('/').nth(2).unwrap_or_default().to_owned();
         let profile = sim_core::form_factor::android_profile(|k| (k == "tag.id").then(|| tag.clone()));
         NewAvd::for_profile(name, sysdir, &profile.kind.image_profile(&tag))
     }
@@ -787,8 +845,20 @@ impl Running {
 
     /// Whether its process still exists.
     pub fn alive(&self) -> bool {
-        rustix::process::Pid::from_raw(self.pid).is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
+        pid_alive(self.pid)
     }
+}
+
+/// Whether process `pid` exists (`kill(pid, 0)`; a process of another user counts).
+#[cfg(unix)]
+fn pid_alive(pid: i32) -> bool {
+    rustix::process::Pid::from_raw(pid).is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
+}
+
+/// Whether process `pid` exists and hasn't exited.
+#[cfg(windows)]
+fn pid_alive(pid: i32) -> bool {
+    u32::try_from(pid).is_ok_and(emu_hvf::host::process_alive)
 }
 
 /// What the host says about a process, for [`Env::stock_instances_among_with`].
@@ -1092,6 +1162,8 @@ mod tests {
         assert!(me.alive());
     }
 
+    // Unix mode bits decide what can be listed or searched.
+    #[cfg(unix)]
     #[test]
     fn has_avd_stats_one_pointer_instead_of_listing_the_home() {
         use std::os::unix::fs::PermissionsExt;
@@ -1123,6 +1195,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_listing_with_a_link_or_a_failed_read_is_not_cacheable() {
         let tmp = std::env::temp_dir().join(format!("emu-avd-readavds-{}", std::process::id()));
@@ -1268,6 +1341,65 @@ mod tests {
     }
 
     #[test]
+    fn software_lite_is_a_smaller_screen_at_30_hz_and_nothing_else() {
+        let tmp = std::env::temp_dir().join(format!("emu-avd-lite-{}", std::process::id()));
+        let sdk = tmp.join("sdk");
+        let sys = "system-images/android-36/default/x86_64";
+        std::fs::create_dir_all(sdk.join(sys)).expect("mkdir");
+        std::fs::write(sdk.join(sys).join("kernel-ranchu"), b"k").expect("write");
+        let env = Env { sdk_root: Some(sdk), avd_home: tmp.join("avd") };
+        let plain = NewAvd::for_image("plain", sys);
+        env.create_avd(&plain).expect("create plain");
+        env.create_avd(&NewAvd::for_image("lite", sys).with_profile("software-lite").expect("phone image")).expect("create lite");
+        let (plain, lite) = (env.load("plain").expect("plain"), env.load("lite").expect("lite"));
+        assert_eq!((plain.lcd(), plain.vsync_hz()), ((720, 1280, 320), 60), "the default profile is unchanged");
+        assert_eq!((lite.lcd(), lite.vsync_hz()), ((540, 960, 240), 30));
+        let text = std::fs::read_to_string(lite.dir.join("config.ini")).expect("config");
+        assert_eq!(text.lines().filter(|l| l.starts_with("hw.lcd.vsync=")).count(), 1, "one vsync line: {text}");
+        assert!(text.contains("hw.lcd.vsync=30\n"));
+        // Nothing but the screen and the refresh rate differs from a plain phone AVD.
+        let keys = |a: &Avd| {
+            let mut kv: Vec<(String, String)> = a.config.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            kv.retain(|(k, _)| !k.starts_with("hw.lcd.") && !k.starts_with("AvdId") && !k.starts_with("avd.ini"));
+            kv
+        };
+        assert_eq!(keys(&plain), keys(&lite), "RAM, vCPUs and the rest stay as they were");
+        assert_eq!((lite.cpus(), lite.ram_bytes()), (4, 2 << 30));
+        // The settled user data depends on the screen, not the refresh rate: lite gets its own golden.
+        let shape = |a: &Avd| golden::SHAPE_KEYS.map(|k| a.get(k).map(str::to_owned));
+        assert_ne!(shape(&plain), shape(&lite));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn a_profile_is_checked_against_the_tag_alone() {
+        assert!(check_profile("software-lite", "default").is_ok());
+        assert!(check_profile("software-lite", "google_apis_playstore").is_ok());
+        let err = check_profile("software-lite", "android-tv").expect_err("tv").to_string();
+        assert!(err.contains("android-tv") && err.contains("software-lite"), "{err}");
+        assert!(check_profile("fast", "default").expect_err("unknown").to_string().contains("software-lite"));
+    }
+
+    #[test]
+    fn software_lite_replaces_a_vsync_and_refuses_other_form_factors() {
+        let mut spec = NewAvd::for_image("x", "system-images/android-36/google_apis/x86_64");
+        spec.extra.push(("hw.lcd.vsync".into(), "120".into()));
+        let spec = spec.with_profile("software-lite").expect("phone");
+        assert_eq!(
+            spec.extra.iter().filter(|(k, _)| k == "hw.lcd.vsync").collect::<Vec<_>>(),
+            [&("hw.lcd.vsync".to_string(), "30".to_string())]
+        );
+        assert_eq!(spec.lcd, SOFTWARE_LITE_LCD);
+        for tag in ["android-wear", "android-tv", "android-automotive"] {
+            let err =
+                NewAvd::for_image("x", &format!("system-images/android-34/{tag}/x86_64")).with_profile("software-lite").expect_err(tag);
+            assert!(err.to_string().contains(tag) && err.to_string().contains("software-lite"), "{err}");
+        }
+        let err = NewAvd::for_image("x", "system-images/android-36/default/x86_64").with_profile("fast").expect_err("unknown");
+        assert!(err.to_string().contains("software-lite"), "the error lists the profiles: {err}");
+    }
+
+    #[test]
     fn clones_copy_the_goldens_simee_disks_and_nothing_else() {
         let tmp = std::env::temp_dir().join(format!("emu-avd-clone-{}", std::process::id()));
         let sdk = tmp.join("sdk");
@@ -1387,6 +1519,16 @@ mod tests {
         drop(f);
         assert!(!port_claimed(&dir, 5600), "released");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_system_image_dir_joined_with_backslashes_is_written_with_slashes() {
+        let sysdir = "system-images/android-34/android-tv/arm64-v8a/";
+        assert_eq!(NewAvd::new("x", r"system-images\android-34\android-tv\arm64-v8a/").sysdir, sysdir);
+        assert_eq!(NewAvd::new("x", sysdir).sysdir, sysdir, "slashes are left alone");
+        let tv = NewAvd::for_image("x", r"system-images\android-34\android-tv\arm64-v8a/");
+        assert_eq!(tv.sysdir, sysdir);
+        assert_ne!(tv.lcd, NewAvd::new("x", sysdir).lcd, "the tag was read through the backslashes: a TV, not a phone");
     }
 
     #[test]

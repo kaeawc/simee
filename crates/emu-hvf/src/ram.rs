@@ -12,6 +12,7 @@ pub struct MemError {
 }
 
 /// Most iovecs one `preadv`/`pwritev` takes (macOS and Linux both define `IOV_MAX` as 1024).
+#[cfg(unix)]
 const IOV_MAX: usize = 1024;
 
 /// A host address range backing guest-visible memory, handed to native libraries (the GPU
@@ -87,19 +88,14 @@ impl GuestRam {
         if len == 0 || !len.is_multiple_of(0x4000) || !base.is_multiple_of(0x4000) {
             return Err(Error::Invalid("guest RAM base and size must be non-zero multiples of 16 KiB"));
         }
-        // SAFETY: anonymous private mapping with no address hint; the result is checked.
-        let ptr = unsafe {
-            libc::mmap(std::ptr::null_mut(), len as usize, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0)
-        };
-        if ptr == libc::MAP_FAILED {
-            return Err(Error::Mmap(len as usize));
-        }
-        Ok(GuestRam { ptr: ptr.cast(), len, base, hv_flags: AtomicU64::new(0), shared: false })
+        let ptr = sys::alloc(len as usize).ok_or(Error::Mmap(len as usize))?;
+        Ok(GuestRam { ptr, len, base, hv_flags: AtomicU64::new(0), shared: false })
     }
 
     /// Maps `len` bytes of `fd` from `offset` as guest RAM at `base`, shared: the memory another
     /// process (a vhost-user frontend such as QEMU) gives its guest, so device threads here read
     /// and write what the guest sees. The mapping stays valid after `fd` is closed.
+    #[cfg(unix)]
     pub fn map_shared(base: u64, len: u64, fd: std::os::fd::BorrowedFd<'_>, offset: u64) -> Result<GuestRam> {
         use std::os::fd::AsRawFd;
         // SAFETY: sysconf has no preconditions.
@@ -259,54 +255,40 @@ impl GuestRam {
     /// Reads `len` bytes from `file` at `offset` straight into guest memory at `addr` (no
     /// intermediate buffer). Short reads at end of file zero-fill the rest.
     pub fn read_from_file(&self, addr: u64, len: usize, file: &std::fs::File, offset: u64) -> std::io::Result<()> {
-        use std::os::fd::AsRawFd;
         let off = self.offset(addr, len).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let mut done = 0usize;
         while done < len {
-            // SAFETY: the destination range lies inside the mapping (checked above); pread writes
-            // at most `len - done` bytes there.
-            let n = unsafe {
-                libc::pread(file.as_raw_fd(), self.ptr.add(off + done).cast(), len - done, (offset + done as u64) as libc::off_t)
+            // SAFETY: the destination range lies inside the mapping (checked above); the read
+            // writes at most `len - done` bytes there.
+            let n = match unsafe { sys::pread(file, self.ptr.add(off + done), len - done, offset + done as u64) } {
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                other => other?,
             };
-            if n < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(err);
-            }
             if n == 0 {
                 // Past end of file: the rest reads as zeroes, like a sparse disk.
                 // SAFETY: same range as above.
                 unsafe { std::ptr::write_bytes(self.ptr.add(off + done), 0, len - done) };
                 break;
             }
-            done += n as usize;
+            done += n;
         }
         Ok(())
     }
 
     /// Writes `len` bytes of guest memory at `addr` to `file` at `offset` (no intermediate buffer).
     pub fn write_to_file(&self, addr: u64, len: usize, file: &std::fs::File, offset: u64) -> std::io::Result<()> {
-        use std::os::fd::AsRawFd;
         let off = self.offset(addr, len).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let mut done = 0usize;
         while done < len {
             // SAFETY: the source range lies inside the mapping (checked above).
-            let n = unsafe {
-                libc::pwrite(file.as_raw_fd(), self.ptr.add(off + done).cast(), len - done, (offset + done as u64) as libc::off_t)
+            let n = match unsafe { sys::pwrite(file, self.ptr.add(off + done), len - done, offset + done as u64) } {
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                other => other?,
             };
-            if n < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(err);
-            }
             if n == 0 {
                 return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "pwrite wrote nothing"));
             }
-            done += n as usize;
+            done += n;
         }
         Ok(())
     }
@@ -326,6 +308,27 @@ impl GuestRam {
         self.vectored(segs, file, offset, true)
     }
 
+    /// Windows has no `preadv`: every range is checked first, then each goes through the
+    /// positional read or write one after the other.
+    #[cfg(windows)]
+    fn vectored(&self, segs: &[(u64, usize)], file: &std::fs::File, offset: u64, write: bool) -> std::io::Result<()> {
+        let invalid = |e: MemError| std::io::Error::new(std::io::ErrorKind::InvalidInput, e);
+        for &(addr, len) in segs {
+            self.offset(addr, len).map_err(invalid)?;
+        }
+        let mut pos = offset;
+        for &(addr, len) in segs {
+            if write {
+                self.write_to_file(addr, len, file, pos)?;
+            } else {
+                self.read_from_file(addr, len, file, pos)?;
+            }
+            pos += len as u64;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
     fn vectored(&self, segs: &[(u64, usize)], file: &std::fs::File, offset: u64, write: bool) -> std::io::Result<()> {
         use std::os::fd::AsRawFd;
         let invalid = |e: MemError| std::io::Error::new(std::io::ErrorKind::InvalidInput, e);
@@ -471,7 +474,18 @@ impl GuestRam {
 impl GuestRam {
     /// How many bytes of the host pages behind guest `[addr, addr + len)` are resident
     /// (`mincore`), counting whole host pages; `None` when the range is outside the RAM or the
+    /// call fails. Tells whether freed memory really went back to the host. Always `None` on
+    /// Windows, which has no equivalent this crate reads yet.
+    #[cfg(windows)]
+    pub fn resident(&self, addr: u64, len: u64) -> Option<u64> {
+        let _ = self.offset(addr, len as usize).ok()?;
+        None
+    }
+
+    /// How many bytes of the host pages behind guest `[addr, addr + len)` are resident
+    /// (`mincore`), counting whole host pages; `None` when the range is outside the RAM or the
     /// call fails. Tells whether freed memory really went back to the host.
+    #[cfg(unix)]
     pub fn resident(&self, addr: u64, len: u64) -> Option<u64> {
         let off = self.offset(addr, len as usize).ok()?;
         // SAFETY: sysconf has no preconditions.
@@ -489,6 +503,13 @@ impl GuestRam {
 
 /// Replaces `n` bytes of anonymous memory at `host` with fresh zero-fill-on-demand pages, which
 /// releases the old ones. On failure the old pages stay mapped.
+#[cfg(windows)]
+fn replace_pages(host: *mut u8, n: usize) -> Result<()> {
+    // SAFETY: `host..host + n` is page aligned and inside the allocation `GuestRam::new` made.
+    if unsafe { crate::win::recommit(host, n) } { Ok(()) } else { Err(Error::Mmap(n)) }
+}
+
+#[cfg(unix)]
 fn replace_pages(host: *mut u8, n: usize) -> Result<()> {
     // SAFETY: `host..host + n` is page aligned and lies inside a private anonymous mapping this
     // module owns; MAP_FIXED replaces exactly that range in place, so no other mapping is touched
@@ -534,8 +555,14 @@ pub fn phys_footprint() -> Option<u64> {
     (rc == 0).then_some(info.ri_phys_footprint)
 }
 
+/// Not read on Windows yet.
+#[cfg(windows)]
+pub fn phys_footprint() -> Option<u64> {
+    None
+}
+
 /// Resident set size of the calling process in bytes, from `/proc/self/statm`.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn phys_footprint() -> Option<u64> {
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
@@ -552,8 +579,77 @@ impl MemError {
 
 impl Drop for GuestRam {
     fn drop(&mut self) {
-        // SAFETY: `ptr`/`len` are exactly what mmap returned.
-        unsafe { libc::munmap(self.ptr.cast(), self.len as usize) };
+        // SAFETY: `ptr`/`len` are exactly what `sys::alloc` or `GuestRam::map_shared` returned.
+        unsafe { sys::free(self.ptr, self.len as usize) };
+    }
+}
+
+#[cfg(unix)]
+mod sys {
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::AsRawFd;
+
+    pub(super) fn alloc(len: usize) -> Option<*mut u8> {
+        // SAFETY: anonymous private mapping with no address hint; the result is checked.
+        let ptr =
+            unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
+        (ptr != libc::MAP_FAILED).then_some(ptr.cast())
+    }
+
+    /// # Safety
+    /// `ptr`/`len` are exactly what a mapping call returned, and nothing uses it afterwards.
+    pub(super) unsafe fn free(ptr: *mut u8, len: usize) {
+        // SAFETY: the caller's contract.
+        unsafe { libc::munmap(ptr.cast(), len) };
+    }
+
+    /// # Safety
+    /// `ptr..ptr + len` is writable memory.
+    pub(super) unsafe fn pread(file: &File, ptr: *mut u8, len: usize, offset: u64) -> io::Result<usize> {
+        // SAFETY: the caller's contract; the descriptor is owned by `file`, which outlives the call.
+        let n = unsafe { libc::pread(file.as_raw_fd(), ptr.cast(), len, offset as libc::off_t) };
+        usize::try_from(n).map_err(|_| io::Error::last_os_error())
+    }
+
+    /// # Safety
+    /// `ptr..ptr + len` is readable memory.
+    pub(super) unsafe fn pwrite(file: &File, ptr: *const u8, len: usize, offset: u64) -> io::Result<usize> {
+        // SAFETY: the caller's contract; the descriptor is owned by `file`, which outlives the call.
+        let n = unsafe { libc::pwrite(file.as_raw_fd(), ptr.cast(), len, offset as libc::off_t) };
+        usize::try_from(n).map_err(|_| io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+mod sys {
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::fs::FileExt;
+
+    pub(super) fn alloc(len: usize) -> Option<*mut u8> {
+        crate::win::alloc_zeroed(len)
+    }
+
+    /// # Safety
+    /// `ptr` is exactly what `alloc` returned, and nothing uses it afterwards.
+    pub(super) unsafe fn free(ptr: *mut u8, _len: usize) {
+        // SAFETY: the caller's contract.
+        unsafe { crate::win::release(ptr) };
+    }
+
+    /// # Safety
+    /// `ptr..ptr + len` is writable memory.
+    pub(super) unsafe fn pread(file: &File, ptr: *mut u8, len: usize, offset: u64) -> io::Result<usize> {
+        // SAFETY: the caller's contract.
+        file.seek_read(unsafe { std::slice::from_raw_parts_mut(ptr, len) }, offset)
+    }
+
+    /// # Safety
+    /// `ptr..ptr + len` is readable memory.
+    pub(super) unsafe fn pwrite(file: &File, ptr: *const u8, len: usize, offset: u64) -> io::Result<usize> {
+        // SAFETY: the caller's contract.
+        file.seek_write(unsafe { std::slice::from_raw_parts(ptr, len) }, offset)
     }
 }
 
@@ -659,6 +755,8 @@ mod tests {
         assert!(ram.discard(B + 0xf_c000, 0x8000).is_err(), "past the end");
     }
 
+    // Residency is read with `mincore` and `/proc`, which Windows lacks here.
+    #[cfg(unix)]
     #[test]
     fn discard_returns_pages_to_the_host() {
         const B: u64 = 0x4000_0000;
@@ -676,6 +774,7 @@ mod tests {
         assert!(ram.resident(B, LEN).is_some_and(|r| r > 0 && r <= 0x4000), "one page back after a read");
     }
 
+    #[cfg(unix)]
     #[test]
     fn resident_counts_touched_pages() {
         const B: u64 = 0x4000_0000;
