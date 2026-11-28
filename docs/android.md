@@ -530,12 +530,12 @@ audio capture stop                                  # finishes the file, then th
 
 The bytes are the guest's own, in the guest's format (rate, channels and sample format are in
 the WAV header, and in `status` once the guest has played something; 24-bit samples are a
-`WAVE_FORMAT_EXTENSIBLE` WAV, 24 bits in a 32-bit word). With no capture running a buffer costs
+`WAVE_FORMAT_EXTENSIBLE` WAV, left-justified in a 32-bit word as that format says, so the WAV's samples are the guest's shifted up a byte; a raw capture keeps the guest's words as written). With no capture running a buffer costs
 one atomic load. With one running it is copied into a 1 MiB queue that a writer thread drains;
 the guest never waits for it, and frames the queue can't take (a slow socket) are dropped and
 counted. A capture holds what the guest plays, not wall-clock time: silence the guest doesn't
 queue isn't in it. A stream that changes format mid-capture has its new frames dropped and
-counted. A file's WAV sizes are filled in on `stop`; a socket's say "unknown". Software mode
+counted. A socket reader that pauses (a write that times out after 2 s) costs the frames it didn't take, counted as dropped; the capture ends only when the peer closes. A file's WAV sizes are filled in on `stop`, when emu exits (power-off, `kill`, SIGINT/SIGTERM) and once a second while capturing, so a file from an emu that was killed hard opens with at most about a second of audio missing, plus whatever was still queued; a socket's say "unknown". Software mode
 (QEMU) has no tap. Not yet: the `audio_capture_start`/`audio_capture_stop` API methods for
 Android (#265).
 

@@ -513,16 +513,21 @@ fn audio(info: &ConsoleInfo, words: &[&str]) -> String {
                 (Some("raw"), _) | (None, true) => Container::Raw,
                 _ => return USAGE.into(),
             };
-            let sink = if socket {
-                sim_core::net::UnixStream::connect(path).map(|s| {
-                    // A reader that stops reading must not hold the writer (and `stop`) forever.
-                    let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(2)));
-                    Sink::Stream(Box::new(s))
-                })
-            } else {
-                std::fs::File::create(path).map(|f| Sink::Seekable(Box::new(f)))
+            // Opened only once the tap knows no capture is running: a refused start leaves the
+            // running capture's file alone.
+            let open = || {
+                let sink = if socket {
+                    sim_core::net::UnixStream::connect(path).map(|s| {
+                        // A reader that stops reading drops frames (counted); it never holds `stop` for long.
+                        let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+                        Sink::Stream(Box::new(s))
+                    })
+                } else {
+                    std::fs::File::create(path).map(|f| Sink::Seekable(Box::new(f)))
+                };
+                sink.map_err(|e| format!("cannot open {path}: {e}"))
             };
-            match sink.map_err(|e| format!("cannot open {path}: {e}")).and_then(|s| tap.start(s, container)) {
+            match tap.start_with(open, container) {
                 Ok(()) => "OK".into(),
                 Err(e) => format!("KO: {e}"),
             }
@@ -1056,6 +1061,20 @@ mod tests {
             assert_eq!(wav, [emu_vmm::audio::tap::wav_header(pcm, 4), vec![1, 0, 2, 0]].concat());
         }
         let _ = std::fs::remove_file(&path);
+        // A refused second start leaves the running capture's file alone.
+        {
+            assert_eq!(run(&info, &start), "OK");
+            info.audio
+                .offer(emu_vmm::audio::tap::PcmFormat { rate: 8_000, channels: 1, format: emu_vmm::audio::Format::S16 }, &[1, 0, 2, 0]);
+            while info.audio.status().captured_frames < 2 {
+                std::thread::yield_now();
+            }
+            assert_eq!(run(&info, &start), "KO: already capturing; stop it first");
+            run(&info, "audio capture stop");
+            let wav = std::fs::read(&path).expect("capture file");
+            assert_eq!(wav.len(), 44 + 4, "the first capture's samples survived the refused start");
+            let _ = std::fs::remove_file(&path);
+        }
         assert!(run(&info, "audio capture start /nonexistent-dir/x.wav").starts_with("KO: cannot open /nonexistent-dir/x.wav: "));
         assert_eq!(run(&info, "audio capture start x.wav mp3"), usage);
         assert_eq!(run(&info, "audio"), usage);

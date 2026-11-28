@@ -9,11 +9,13 @@
 //! A capture holds what the guest plays, not wall-clock time: silence the guest doesn't queue is
 //! not in it. A stream that changes format mid-capture has the frames in the new format dropped
 //! (and counted), because one WAV file or raw stream has one format.
-use std::io::{Seek, SeekFrom, Write};
+use std::borrow::Cow;
+use std::io::{ErrorKind, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use super::Format;
 
@@ -140,10 +142,17 @@ impl Tap {
 
     /// Starts copying what the guest plays into `sink`. Err when one is already running.
     pub fn start(&self, sink: Sink, container: Container) -> Result<(), String> {
+        self.start_with(|| Ok(sink), container)
+    }
+
+    /// Like [`start`](Tap::start), but `open` makes the sink only after the check that no capture
+    /// is running, under the same lock: a refused start never creates or truncates a file.
+    pub fn start_with(&self, open: impl FnOnce() -> Result<Sink, String>, container: Container) -> Result<(), String> {
         let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
         if running.is_some() {
             return Err("already capturing; stop it first".into());
         }
+        let sink = open()?;
         let shared = Arc::new(Shared::default());
         let (tx, rx) = channel();
         let writer = {
@@ -253,35 +262,113 @@ pub fn wav_header(f: PcmFormat, data_len: u32) -> Vec<u8> {
     h
 }
 
+/// How often a WAV file's sizes are rewritten while capturing, so a capture that is never
+/// finalized (a kill, a crash) still opens with at most this much audio missing.
+const PATCH_EVERY: Duration = Duration::from_secs(1);
+
+/// How many times in a row a stream may stall in the middle of a frame before the capture gives up.
+const MID_FRAME_STALLS: u32 = 3;
+
+fn is_stall(e: &std::io::Error) -> bool {
+    matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+}
+
+/// Writes `bytes` to a stream whose writes may time out, and returns how many were written. A
+/// timeout at a `unit` boundary (a whole frame) ends the write there: the rest is the caller's to
+/// drop. A timeout inside a unit retries, because half a frame would shift every sample after it.
+/// Only a real error (a closed peer) is an Err.
+fn write_stream(w: &mut dyn Write, bytes: &[u8], unit: usize) -> std::io::Result<usize> {
+    let (mut done, mut stalls) = (0, 0);
+    while done < bytes.len() {
+        match w.write(&bytes[done..]) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(n) => (done, stalls) = (done + n, 0),
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) if is_stall(&e) => {
+                if done % unit == 0 {
+                    break;
+                }
+                stalls += 1;
+                if stalls >= MID_FRAME_STALLS {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(done)
+}
+
+/// Samples as a WAV holds them. S24 is 24 bits in the low bytes of a 32-bit word in the guest's
+/// stream; the header declares 24 valid bits in 32, which WAVE_FORMAT_EXTENSIBLE left-justifies,
+/// so each word moves up a byte (the padding byte, which may hold anything, is dropped).
+fn wav_samples(format: Format, data: &[u8]) -> Cow<'_, [u8]> {
+    if format != Format::S24 {
+        return Cow::Borrowed(data);
+    }
+    Cow::Owned(data.as_chunks::<4>().0.iter().flat_map(|w| (u32::from_le_bytes(*w) << 8).to_le_bytes()).collect())
+}
+
+/// Rewrites a WAV file's header with the sizes so far and returns to the end.
+fn patch_sizes(w: &mut dyn WriteSeek, f: PcmFormat, data_bytes: u64) -> std::io::Result<()> {
+    w.seek(SeekFrom::Start(0))?;
+    w.write_all(&wav_header(f, u32::try_from(data_bytes).unwrap_or(u32::MAX - 1)))?;
+    w.seek(SeekFrom::End(0))?;
+    w.flush()
+}
+
 /// The writer thread: drains the queue into `sink` until the sender is dropped.
 fn write_capture(rx: Receiver<Chunk>, mut sink: Sink, container: Container, shared: &Shared) {
     let mut format: Option<PcmFormat> = None;
     let mut data_bytes: u64 = 0;
+    let mut patched = (Instant::now(), 0u64);
     let fail = |e: std::io::Error| shared.state.lock().unwrap_or_else(|p| p.into_inner()).error = Some(e.to_string());
-    let put = |sink: &mut Sink, bytes: &[u8]| match sink {
-        Sink::Seekable(w) => w.write_all(bytes),
-        Sink::Stream(w) => w.write_all(bytes),
-    };
-    for chunk in rx {
+    loop {
+        let chunk = match rx.recv_timeout(PATCH_EVERY) {
+            Ok(c) => c,
+            Err(RecvTimeoutError::Timeout) => {
+                if let (Sink::Seekable(w), Some(f), Container::Wav) = (&mut sink, format, container)
+                    && patched.1 != data_bytes
+                {
+                    let _ = patch_sizes(w.as_mut(), f, data_bytes);
+                    patched = (Instant::now(), data_bytes);
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         let len = chunk.data.len();
-        let frames = (len / chunk.format.frame_bytes()) as u64;
+        let frame = chunk.format.frame_bytes();
+        let frames = (len / frame) as u64;
         if format.is_some_and(|f| f != chunk.format) {
             shared.dropped.fetch_add(frames, Ordering::Relaxed);
         } else {
-            let first = format.is_none();
             let mut res = Ok(());
-            if first {
+            if format.is_none() {
                 format = Some(chunk.format);
                 shared.state.lock().unwrap_or_else(|p| p.into_inner()).format = format;
                 if container == Container::Wav {
-                    res = put(&mut sink, &wav_header(chunk.format, u32::MAX));
+                    let header = wav_header(chunk.format, u32::MAX);
+                    res = match &mut sink {
+                        Sink::Seekable(w) => w.write_all(&header),
+                        // The header is not droppable: a stall in it retries.
+                        Sink::Stream(w) => write_stream(w.as_mut(), &header, header.len() + 1).map(|_| ()),
+                    };
                 }
             }
-            res = res.and_then(|()| put(&mut sink, &chunk.data));
-            match res {
-                Ok(()) => {
-                    data_bytes += len as u64;
-                    shared.captured.fetch_add(frames, Ordering::Relaxed);
+            let samples =
+                if container == Container::Wav { wav_samples(chunk.format.format, &chunk.data) } else { Cow::Borrowed(&chunk.data[..]) };
+            let written = res.and_then(|()| match &mut sink {
+                Sink::Seekable(w) => w.write_all(&samples).map(|()| samples.len()),
+                Sink::Stream(w) => write_stream(w.as_mut(), &samples, frame),
+            });
+            match written {
+                Ok(n) => {
+                    data_bytes += n as u64;
+                    let wrote = (n / frame) as u64;
+                    shared.captured.fetch_add(wrote, Ordering::Relaxed);
+                    // A stalled reader: what it didn't take is dropped and counted.
+                    shared.dropped.fetch_add(frames - wrote, Ordering::Relaxed);
                 }
                 Err(e) => {
                     fail(e);
@@ -289,6 +376,12 @@ fn write_capture(rx: Receiver<Chunk>, mut sink: Sink, container: Container, shar
                     shared.dropped.fetch_add(frames, Ordering::Relaxed);
                     return;
                 }
+            }
+            if let (Sink::Seekable(w), Some(f), Container::Wav) = (&mut sink, format, container)
+                && patched.0.elapsed() >= PATCH_EVERY
+            {
+                let _ = patch_sizes(w.as_mut(), f, data_bytes);
+                patched = (Instant::now(), data_bytes);
             }
         }
         shared.queued.fetch_sub(len, Ordering::AcqRel);
@@ -300,10 +393,7 @@ fn write_capture(rx: Receiver<Chunk>, mut sink: Sink, container: Container, shar
             if format.is_none() {
                 w.write_all(&wav_header(f, 0))?;
             }
-            w.seek(SeekFrom::Start(0))?;
-            w.write_all(&wav_header(f, u32::try_from(data_bytes).unwrap_or(u32::MAX - 1)))?;
-            w.seek(SeekFrom::End(0))?;
-            w.flush()
+            patch_sizes(w.as_mut(), f, data_bytes)
         })(),
         (Sink::Stream(w), Container::Wav) if format.is_none() => w.write_all(&wav_header(f, u32::MAX)).and_then(|()| w.flush()),
         (Sink::Seekable(w), _) => w.flush(),
@@ -517,5 +607,137 @@ mod tests {
         tap.start(Sink::Seekable(Box::new(empty.clone())), Container::Wav).expect("start");
         tap.stop();
         assert_eq!(empty.bytes(), wav_header(S16, 0));
+    }
+
+    #[test]
+    fn a_refused_start_never_opens_its_sink() {
+        let tap = Tap::default();
+        tap.start(Sink::Stream(Box::new(Mem::default())), Container::Raw).expect("start");
+        let mut opened = false;
+        let err = tap.start_with(
+            || {
+                opened = true;
+                Ok(Sink::Stream(Box::new(Mem::default())))
+            },
+            Container::Raw,
+        );
+        assert!(err.is_err() && !opened, "the second start is refused before its file is created");
+        tap.stop();
+        // A sink that can't be opened is the caller's error and leaves the tap idle.
+        assert_eq!(tap.start_with(|| Err("nope".into()), Container::Raw), Err("nope".into()));
+        assert!(!tap.is_active());
+    }
+
+    #[test]
+    fn s24_samples_are_left_justified_in_a_wav_and_untouched_raw() {
+        let s24 = PcmFormat { rate: 48_000, channels: 1, format: Format::S24 };
+        // 0x123456 and -2 (0xfffffe) in the low 24 bits; the first has garbage padding.
+        let guest = [0x56, 0x34, 0x12, 0x7f, 0xfe, 0xff, 0xff, 0x00];
+        let tap = Tap::default();
+        let wav = Mem::default();
+        tap.start(Sink::Seekable(Box::new(wav.clone())), Container::Wav).expect("start");
+        tap.offer(s24, &guest);
+        tap.stop();
+        let bytes = wav.bytes();
+        let data = &bytes[68..];
+        assert_eq!(data, [0x00, 0x56, 0x34, 0x12, 0x00, 0xfe, 0xff, 0xff]);
+        // Read as the header says (32-bit container, 24 valid bits, left-justified): the sample values.
+        let values: Vec<i32> = data.chunks(4).map(|w| i32::from_le_bytes(w.try_into().expect("4")) >> 8).collect();
+        assert_eq!(values, [0x123456, -2]);
+        assert_eq!(u32_at(&bytes, 64), 8, "the data size is the shifted length");
+
+        let raw = Mem::default();
+        tap.start(Sink::Stream(Box::new(raw.clone())), Container::Raw).expect("start");
+        tap.offer(s24, &guest);
+        tap.stop();
+        assert_eq!(raw.bytes(), guest, "a raw capture is what the guest wrote");
+    }
+
+    /// A stream whose writes time out for the first `stalls` calls, and take only `first` bytes of the
+    /// very first one when set: a reader that paused.
+    struct Stalling {
+        out: Mem,
+        stalls: usize,
+        partial_first: Option<usize>,
+    }
+
+    impl Write for Stalling {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if let Some(n) = self.partial_first.take() {
+                return self.out.write(&b[..n.min(b.len())]);
+            }
+            if self.stalls > 0 {
+                self.stalls -= 1;
+                return Err(ErrorKind::TimedOut.into());
+            }
+            self.out.write(b)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_stalled_reader_drops_frames_and_the_capture_goes_on() {
+        let tap = Tap::default();
+        let out = Mem::default();
+        tap.start(Sink::Stream(Box::new(Stalling { out: out.clone(), stalls: 1, partial_first: None })), Container::Raw).expect("start");
+        tap.offer(S16, &[1; 8]);
+        // Wait until the writer has handled the first buffer (it stalled and dropped it).
+        while tap.status().dropped_frames == 0 {
+            std::thread::yield_now();
+        }
+        tap.offer(S16, &[2; 8]);
+        let status = tap.stop().expect("running");
+        assert_eq!(status.error, None, "a timeout is not the end of the capture");
+        assert_eq!((status.captured_frames, status.dropped_frames), (2, 2));
+        assert_eq!(out.bytes(), [2; 8]);
+    }
+
+    #[test]
+    fn a_stall_inside_a_frame_finishes_the_frame_so_the_stream_stays_aligned() {
+        let tap = Tap::default();
+        let out = Mem::default();
+        // 6 bytes of 4-byte frames get through, then one timeout, then the reader resumes.
+        let sink = Stalling { out: out.clone(), stalls: 1, partial_first: Some(6) };
+        tap.start(Sink::Stream(Box::new(sink)), Container::Raw).expect("start");
+        tap.offer(S16, &[3; 12]);
+        let status = tap.stop().expect("running");
+        assert_eq!(status.error, None);
+        assert_eq!(out.bytes(), [3; 12], "the half frame was completed, not cut");
+        assert_eq!((status.captured_frames, status.dropped_frames), (3, 0));
+    }
+
+    #[test]
+    fn a_closed_peer_still_ends_the_capture() {
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let tap = Tap::default();
+        tap.start(Sink::Stream(Box::new(Closed)), Container::Raw).expect("start");
+        tap.offer(S16, &[0; 8]);
+        let status = tap.stop().expect("running");
+        assert!(status.error.is_some());
+    }
+
+    #[test]
+    fn a_wav_file_never_finalized_still_has_its_sizes() {
+        let tap = Tap::default();
+        let file = Mem::default();
+        tap.start(Sink::Seekable(Box::new(file.clone())), Container::Wav).expect("start");
+        let pcm = [5u8; 16];
+        tap.offer(S16, &pcm);
+        // Past the patch interval, with the capture still running (as if emu were killed now).
+        std::thread::sleep(PATCH_EVERY + Duration::from_millis(600));
+        let live = file.bytes();
+        assert_eq!(live, [wav_header(S16, 16), pcm.to_vec()].concat(), "readable without a stop");
+        tap.stop();
+        assert_eq!(file.bytes(), live);
     }
 }
