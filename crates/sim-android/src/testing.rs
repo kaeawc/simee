@@ -25,22 +25,33 @@ pub struct FakeEmulator {
     pub cameras: Arc<Mutex<Vec<(String, String)>>>,
     /// A facing (`back`, `front`) whose `camera link` fails with `KO`; None: none does.
     pub camera_link_fails: Arc<Mutex<Option<String>>>,
+    /// The NAT's conditions, as `network status` reports them: a test can seed them (a loss the
+    /// API's integer percent can't ask for).
+    pub network: Arc<Mutex<sim_core::network::Conditions>>,
+    /// While true, `network loss` fails with `KO` (an emu that has the command but errs).
+    pub loss_fails: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Starts a fake emulator for AVD `avd` and advertises it in `android`'s running dir, so the AVD
 /// lists as booted. `screenshot <path>` writes a 2x1 PNG; `car get`/`car list` answer with
 /// vehicle HAL readings.
 pub fn fake_emulator(android: &Android, avd: &str) -> FakeEmulator {
-    fake(android, avd, false)
+    fake(android, avd, false, false)
 }
 
 /// [`fake_emulator`] as the stock emulator: advertised without `emulator=simee`, and simee's own
-/// console commands (`fold status`) get stock's refusal.
+/// console commands (`fold status`, `network loss`) get stock's refusal.
 pub fn fake_stock_emulator(android: &Android, avd: &str) -> FakeEmulator {
-    fake(android, avd, true)
+    fake(android, avd, true, false)
 }
 
-fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
+/// [`fake_emulator`] as a simee emu built before `network loss`: advertised `emulator=simee`, but
+/// its console answers `network loss` with stock's `KO:  bad sub-command`.
+pub fn fake_old_emulator(android: &Android, avd: &str) -> FakeEmulator {
+    fake(android, avd, false, true)
+}
+
+fn fake(android: &Android, avd: &str, stock: bool, no_loss: bool) -> FakeEmulator {
     let console = Arc::new(Mutex::new(Vec::new()));
     let fold_status: Arc<Mutex<Option<String>>> = Arc::default();
     let status = fold_status.clone();
@@ -51,6 +62,9 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
     let (links, fails) = (cameras.clone(), camera_link_fails.clone());
     // `network speed|delay|status`, shared by every console session as the emulator's NAT is.
     let network: Arc<Mutex<sim_core::network::Conditions>> = Arc::default();
+    let shared_network = network.clone();
+    let loss_fails: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+    let loss_broken = loss_fails.clone();
     // The advertised adb port is the console's plus one, so the console must not be on 65535 (an
     // ephemeral port the OS hands out now and then): bind again, keeping the unusable one held so
     // the next bind gets another.
@@ -70,6 +84,7 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
             // A thread per connection, so concurrent clients are served concurrently.
             let (log, status, turned) = (log.clone(), status.clone(), turned.clone());
             let (links, fails, network) = (links.clone(), fails.clone(), network.clone());
+            let loss_broken = loss_broken.clone();
             std::thread::spawn(move || {
                 let mut out = stream.try_clone().expect("clone");
                 let _ = out.write_all(b"Android Console: type 'help' for a list of commands\r\nOK\r\n");
@@ -132,6 +147,15 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
                             true => "OK".to_owned(),
                             false => "KO: invalid <delay> argument, see 'help network delay' for valid values".to_owned(),
                         },
+                        // simee's own: stock's console has no such sub-command.
+                        ["network", "loss", ..] if stock || no_loss => "KO:  bad sub-command".to_owned(),
+                        ["network", "loss", ..] if loss_broken.load(std::sync::atomic::Ordering::SeqCst) => {
+                            "KO: network loss failed".to_owned()
+                        }
+                        ["network", "loss", loss @ ..] => match network.lock().expect("network").set_loss(&loss.join(" ")) {
+                            Ok(()) => "OK".to_owned(),
+                            Err(why) => format!("KO: invalid <loss> argument: {why}; use <percent> or <up>:<down>"),
+                        },
                         ["screenshot", path] => {
                             let frame = Frame { width: 2, height: 1, rgba: vec![9, 9, 9, 255, 8, 8, 8, 255] };
                             std::fs::write(path, sim_core::frame::encode_png(&frame).expect("png")).expect("write png");
@@ -167,7 +191,7 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
     let emulator = if stock { "" } else { "emulator=simee\n" };
     let ad = format!("port.serial={port}\nport.adb={}\navd.name={avd}\n{emulator}", port + 1);
     std::fs::write(running.join(format!("pid_{}.ini", std::process::id())), ad).expect("advertise");
-    FakeEmulator { console, display, fold_status, rotation, cameras, camera_link_fails }
+    FakeEmulator { console, display, fold_status, rotation, cameras, camera_link_fails, network: shared_network, loss_fails }
 }
 
 /// `lines` once it holds `n` entries (or after 5 s, whatever it holds).
@@ -190,7 +214,9 @@ pub fn wait_for(lines: &Mutex<Vec<String>>, n: usize) -> Vec<String> {
 /// script first). `ps` lists a guest's processes (init, zygote, system_server, the native daemons,
 /// apps); `kill` succeeds (logged only: no host process is signalled) except on pids 520
 /// (surfaceflinger) and 530 (cameraserver), which need `su 0` (present for `-9`, missing for 530's
-/// `-15`); and an `exec` line, and its stop, run on the host's `sh`. Airplane mode is a file
+/// `-15`); an `exec` line, and its stop, run on the host's `sh`; and the audio commands keep a
+/// media stream (index 5 of 0..25, unmuted at first) that `dumpsys audio` reports
+/// ([`FakeAdb::image`] makes it an API 34 or an API 29 image). Airplane mode is a file
 /// beside the script that `cmd connectivity airplane-mode` (or `settings put`) sets; `sdk` beside it sets the API level (36 without it) and `settings get` reads; the
 /// network listings (`sim_android::net`) answer with a root listing of the kernel's socket tables
 /// and an eBPF per-uid stats dump. The settle probe
@@ -242,6 +268,13 @@ impl FakeAdb {
         let text = std::fs::read_to_string(&self.log).unwrap_or_default();
         text.lines().map(|l| l.split_once(' ').and_then(|(_, rest)| rest.split_once(' ')).map_or(l, |(_, r)| r).to_owned()).collect()
     }
+
+    /// Makes the fake answer as another kind of image from now on: `api34` (its `cmd audio` has
+    /// no `adj-mute`), `old-media` (no `cmd media_session volume`: only the `media` tool, as on
+    /// API 29), `fixed-volume` (a volume set is ignored), `mute-ignored` (so is a mute).
+    pub fn image(&self, kind: &str) {
+        std::fs::write(self.log.with_file_name(kind), b"").expect("image flag");
+    }
 }
 
 const FAKE_ADB: &str = r#"echo "$*" >> "$(dirname "$0")/adb.log"
@@ -273,6 +306,77 @@ ps_rows() {
 ' 4321   310  7.9 120332   00:42 com.example.app         com.example.app' \
 ' 4400   310  7.9  60112   00:40 com.example.app:remote  com.example.app:remote' \
 ' 4500   310  0.0  50000   00:30 com.google.android.gms.persistent com.google.android.gms.persistent'
+}
+# The media stream's volume index (0..25, 5 at first) and mute, kept beside the script.
+here="$(dirname "$0")"
+music_volume() { cat "$here/music.volume" 2>/dev/null || echo 5; }
+music_muted() { [ -e "$here/music.muted" ] && echo true || echo false; }
+# What the guest's VolumeCtrl (`cmd media_session volume`, `media volume`) prints for --stream 3.
+volume_ctrl() {
+  printf '[V] will control stream=3\n'
+  case "$1" in
+    "--stream 3 --get") ;;
+    "--stream 3 --set "*" --get")
+      n=${1#--stream 3 --set }; n=${n% --get}
+      if [ "$n" -gt 25 ] 2>/dev/null || [ "$n" -lt 0 ] 2>/dev/null; then
+        printf '[V] will set volume\n[V] will get volume\n[V] Connecting to AudioService\n'
+        echo "Error: invalid volume index $n for stream 3 (should be in [0..25])" >&2; return 0
+      fi
+      [ -e "$here/fixed-volume" ] || echo "$n" > "$here/music.volume"; printf '[V] will set volume\n';;
+    *) echo "fake adb: unhandled volume: $1" >&2; return 2;;
+  esac
+  printf '[V] will get volume\n[V] Connecting to AudioService\n[V] volume is %s in range [0..25]\n' "$(music_volume)"
+}
+# An API 34 guest's `dumpsys audio` (trimmed): focus, the stream volumes, the ringer.
+dumpsys_audio() {
+  cat <<EOF
+MediaFocusControl dump time: 10:42:01 AM
+
+Audio Focus stack entries (last is top of stack):
+  source:android.os.BinderProxy@1f2e3d -- pack: com.example.zeta -- client: android.media.AudioManager@5a6b7c8com.example.zeta.Player@9d8e7f -- gain: GAIN_TRANSIENT -- flags:  -- loss: LOSS -- notified: true -- limbo: false -- uid: 10191 -- attr: AudioAttributes: usage=USAGE_MEDIA content=CONTENT_TYPE_MUSIC flags=0x800 tags= bundle=null -- sdk:34
+  source:android.os.BinderProxy@2a3b4c -- pack: com.example.app -- client: android.media.AudioManager@6b7c8d9com.example.app.Player@1a2b3c -- gain: GAIN -- flags:  -- loss: none -- notified: true -- limbo: false -- uid: 10190 -- attr: AudioAttributes: usage=USAGE_MEDIA content=CONTENT_TYPE_MUSIC flags=0x800 tags= bundle=null -- sdk:34
+
+No external focus policy
+
+Stream volumes (device: index)
+- STREAM_VOICE_CALL:
+   Muted: false
+   Muted Internally: false
+   Min: 1
+   Max: 5
+   streamVolume:4
+   Current: 2 (speaker): 4, 40000000 (default): 4
+   Devices: speaker(2)
+   Volume Group: AUDIO_STREAM_VOICE_CALL
+
+- STREAM_RING:
+   Muted: false
+   Muted Internally: false
+   Min: 0
+   Max: 7
+   streamVolume:5
+   Current: 2 (speaker): 5, 40000000 (default): 5
+   Devices: speaker(2)
+   Volume Group: AUDIO_STREAM_RING
+
+- STREAM_MUSIC:
+   Muted: $(music_muted)
+   Muted Internally: false
+   Min: 0
+   Max: 25
+   streamVolume:$(music_volume)
+   Current: 2 (speaker): $(music_volume), 4000000 (usb_headset): 12, 40000000 (default): 15
+   Devices: speaker(2)
+   Volume Group: AUDIO_STREAM_MUSIC
+
+- mute affected streams = 0x2f
+- user mutable streams = 0x2f
+
+Ringer mode:
+- mode (internal) = NORMAL
+- mode (external) = VIBRATE
+- zen mode:0
+EOF
 }
 # The network listings' tables: an API 36 guest's /proc/net, fds, ps and pm (trimmed).
 net_owners() {
@@ -369,10 +473,24 @@ shell)
     "kill -"*" 520"|"kill -"*" 530") echo "/system/bin/sh: kill: ${2##* }: Operation not permitted" >&2; exit 1;;
     "su 0 kill -9 520"|"su 0 kill -9 530") ;;
     "su 0 kill -15 530") echo "/system/bin/sh: su: inaccessible or not found" >&2; exit 127;;
+    # The audio methods: VolumeCtrl through `cmd media_session` (API 30 on) or the `media` tool.
+    "cmd media_session volume "*)
+      if [ -e "$here/old-media" ]; then echo "No shell command implementation."; exit 255; fi
+      volume_ctrl "${2#cmd media_session volume }";;
+    "media volume "*)
+      if [ ! -e "$here/old-media" ]; then echo "/system/bin/sh: media: inaccessible or not found" >&2; exit 127; fi
+      volume_ctrl "${2#media volume }";;
+    "dumpsys audio") dumpsys_audio;;
+    "getprop ro.build.version.sdk") if [ -e "$here/sdk" ]; then cat "$here/sdk"; elif [ -e "$here/api34" ]; then echo 34; else echo 36; fi;;
+    # `cmd audio adj-mute` arrived in API 35. AOSP 13 and 14's AudioManagerShellCommand has no
+    # default case: an unknown command prints nothing and exits 0.
+    "cmd audio adj-mute 3"|"cmd audio adj-unmute 3")
+      verb=${2#cmd audio }; verb=${verb% 3}
+      if [ -e "$here/api34" ] || [ -e "$here/mute-ignored" ]; then exit 0; fi
+      if [ "$verb" = adj-mute ]; then touch "$here/music.muted"; else rm -f "$here/music.muted"; fi;;
     # Every other signal succeeds, and is only logged: the fake never signals a host process.
     "kill -"*) ;;
     "settings get global airplane_mode_on") cat "$(dirname "$0")/airplane" 2>/dev/null || echo 0;;
-    "getprop ro.build.version.sdk") cat "$(dirname "$0")/sdk" 2>/dev/null || echo 36;;
     "settings put global airplane_mode_on "*) echo "${2##* }" > "$(dirname "$0")/airplane";;
     "am broadcast -a android.intent.action.AIRPLANE_MODE"*) echo "Broadcast completed: result=0";;
     "cmd connectivity airplane-mode enable") echo 1 > "$(dirname "$0")/airplane";;

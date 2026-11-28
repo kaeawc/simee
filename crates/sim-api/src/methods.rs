@@ -400,16 +400,17 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ("info", "device; iOS: set?", "Paths and identity"),
     (
         "network_shape",
-        "device, preset?(offline|3g|edge|lte|lossy|very-bad|none), offline?, latency_ms?, down_kbps?, up_kbps?; iOS: loss_pct?, port_base?, port_count?, rules?([{pattern, offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?}]), proxy?(default true), inject?(false|true|\"launchd\"|\"boot\"), set?",
+        "device, preset?(offline|3g|edge|lte|lossy|very-bad|none), offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?; iOS: port_base?, port_count?, rules?([{pattern, offline?, latency_ms?, down_kbps?, up_kbps?, loss_pct?}]), proxy?(default true), inject?(false|true|\"launchd\"|\"boot\"), set?",
         "Shape the device's network without root. proxy: a shaping HTTP/SOCKS proxy set in the device's configd_sim. inject: an in-process socket shaper; \"boot\" reboots the device with it in launchd's environment so every process, WebKit included, is shaped live by the profile. \
-         Android: the emulator's NAT through its console (`network speed <up>:<down>` kbit/s, `network delay <ms>`; what isn't given keeps the device's value, and only what changes is sent) and offline as airplane mode (`cmd connectivity airplane-mode`), returning the commands sent; \
-         loss_pct (so lossy and very-bad), rules, port ranges, proxy and inject are refused there, as its console shapes speed and latency only",
+         Android: the emulator's NAT through its console (`network speed <up>:<down>` kbit/s, `network delay <ms>`, and simee's `network loss <pct>`; what isn't given keeps the device's value, and only what changes is sent) and offline as airplane mode (`cmd connectivity airplane-mode`), returning the commands sent; \
+         loss_pct means different things per platform: on iOS the percent of new connections that time out, on Android the percent of the guest's TCP, UDP and ICMP packets dropped in each direction. On Android it (so lossy and very-bad) is refused on the stock emulator, whose console has no loss command, and rules, port ranges, proxy and inject are refused on Android",
     ),
     (
         "network_state",
         "device; iOS: set?",
         "Current profile, proxy port and injection state (Android: the console's `network status`, as network_status, and airplane \
-         mode as offline; a latency range set from the console reads as its mean; proxy_port null, injected false)",
+         mode as offline; a latency range set from the console reads as its mean, as does a loss that differs each way; proxy_port \
+         null, injected false)",
     ),
     (
         "network_flows",
@@ -420,23 +421,46 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     (
         "network_clear",
         "device; iOS: set?",
-        "Remove shaping: clear the device proxy, stop the proxy, remove injection (Android: `network speed full`, `network delay none` \
-         and airplane mode off)",
+        "Remove shaping: clear the device proxy, stop the proxy, remove injection (Android: `network speed full`, `network delay none`, \
+         `network loss none` under simee's emu, and airplane mode off)",
     ),
-    ("audio_state", "device, set?", "Device audio settings (routed host UIDs, volume) and every host audio device"),
-    ("audio_volume", "device, level(0-100), set?", "Device output volume (100 = unity); applies to audio clients started afterwards"),
+    (
+        "audio_state",
+        "device; iOS: set?",
+        "Device audio settings. iOS: the routed host UIDs and volume, and every host audio device. Android: from `dumpsys audio`, \
+         the media stream's volume (as audio_volume's level) and mute, every stream's index, range, mute and output devices, the \
+         ringer mode and the audio focus stack with its owner; no host devices (emu plays on the host's default output)",
+    ),
+    (
+        "audio_volume",
+        "device, level(0-100); iOS: set?",
+        "Device output volume. iOS: 100 = unity, for audio clients started afterwards. Android: the media stream's volume index, \
+         the level scaled to its range, live (`cmd media_session volume`, or `media volume` on older images)",
+    ),
     (
         "audio_route",
         "device, scope(input|output), uid | \"default\", set?",
-        "Pin the device's input or output to a host device (any device, including loopback); applies to clients started afterwards",
+        "Pin the device's input or output to a host device (any device, including loopback); applies to clients started afterwards. \
+         Android: not available: emu's sound card uses the host's default output and input, with no \
+         per-device route, and the guest has one output, the card",
     ),
     (
         "audio_capture_start",
         "device, path?(.wav), mute?, set?",
-        "Capture this device's audio output with a process tap (no driver); mute silences it on the host meanwhile; returns capture_id",
+        "Capture this device's audio output with a process tap (no driver); mute silences it on the host meanwhile; returns capture_id. \
+         Android: not available yet: emu's sound card feeds one host sink, the host's output, and has no tap to record from (#265)",
     ),
-    ("audio_capture_stop", "capture_id", "Stop a capture: frames, duration_ms, rms, peak, dbfs, path"),
-    ("audio_mute", "device, on, set?", "Silence (or restore) this device's audio on the host: a per-device null sink"),
+    (
+        "audio_capture_stop",
+        "capture_id",
+        "Stop a capture: frames, duration_ms, rms, peak, dbfs, path. Android: not available, as audio_capture_start",
+    ),
+    (
+        "audio_mute",
+        "device, on; iOS: set?",
+        "Silence (or restore) this device's audio; returns whether it is muted. iOS: on the host, a per-device null sink. Android: \
+         mutes the guest's media stream (`cmd audio adj-mute`, API 35 and later; earlier images have no command for it)",
+    ),
     // Device cameras (#323): host cameras, virtual cameras and synthetic sources (`sim-camera`).
     (
         "camera_sources",
@@ -644,6 +668,10 @@ const ALL_PLATFORMS: &[&str] = &[
     "camera_link",
     "camera_unlink",
     "camera_links",
+    // Android: the guest's media stream, over adb (#417).
+    "audio_state",
+    "audio_volume",
+    "audio_mute",
 ];
 /// Methods only Android devices have.
 const ANDROID_ONLY: &[&str] = &["console", "xr", "vehicle", "touchpad", "export", "import"];
