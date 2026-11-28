@@ -87,6 +87,9 @@ sha1_smol = { version = "1", default-features = false }
 # C toolchain, so `scripts/check.sh` lints the Linux target from macOS too.
 blake3 = { version = "1", default-features = false, features = ["std"] }
 lz4_flex = { version = "0.14", default-features = false, features = ["safe-encode", "safe-decode"] }
+# Bundle tree paths compared as a case- and normalization-insensitive volume (APFS's default)
+# compares names (sim-bundle). Pure Rust tables.
+unicode-normalization = { version = "0.1", default-features = false }
 # Host audio for emu's virtio-snd card (CoreAudio on macOS; emu-vmm only, macOS only).
 cpal = { version = "0.18", default-features = false }
 # Linux KVM (emu-kvm only): the rust-vmm ioctl wrappers Firecracker and Cloud Hypervisor use,

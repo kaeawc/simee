@@ -70,8 +70,9 @@ pub trait Service {
     /// Every device's name in the set.
     fn names(&self) -> std::result::Result<Vec<String>, String>;
     fn runtimes(&self) -> std::result::Result<Vec<Runtime>, String>;
-    /// Creates a device (shut down, never booted) of `device_type` on `runtime` (identifiers).
-    fn create(&self, name: &str, device_type: &str, runtime: &str) -> std::result::Result<Simulator, String>;
+    /// Creates a device (shut down, never booted) of `device_type` (an identifier) on `runtime`:
+    /// the installed runtime with its identifier and build, never another build of it.
+    fn create(&self, name: &str, device_type: &str, runtime: &Runtime) -> std::result::Result<Simulator, String>;
     fn delete(&self, udid: &str) -> std::result::Result<(), String>;
 }
 
@@ -113,14 +114,35 @@ fn mode(meta: &fs::Metadata) -> Option<u32> {
 /// and temporary directories.
 const HOST_ROOTS: [&str; 6] = ["/Users/", "/Volumes/", "/private/var/folders/", "/var/folders/", "/private/tmp/", "/tmp/"];
 
+/// Whether absolute link target `t` is under one of [`HOST_ROOTS`] (or is one).
+fn names_host(t: &str) -> bool {
+    HOST_ROOTS.iter().any(|h| t.starts_with(h) || t == h.trim_end_matches('/'))
+}
+
+/// Whether a link at `rel` (relative to the data directory) to the relative `target` climbs out
+/// of the data directory as written (a `..` past its root), without looking at the disk.
+fn leaves_data(rel: &str, target: &str) -> bool {
+    let mut depth = rel.matches('/').count();
+    for c in target.split('/') {
+        match c {
+            "" | "." => {}
+            ".." if depth == 0 => return true,
+            ".." => depth -= 1,
+            _ => depth += 1,
+        }
+    }
+    false
+}
+
 /// What the bundle holds for a symlink at `rel` (relative to the data directory `root`) to
-/// `target`: a relative target as it is; an absolute one into the data directory as the same
-/// place relative to the link; another absolute one as it is, unless it names the host (under
-/// the device's own directory or [`HOST_ROOTS`]), which is `None`: left out.
+/// `target`: a relative target as it is, unless it climbs out of the data directory; an absolute
+/// one into the data directory as the same place relative to the link; another absolute one as
+/// it is, unless it names the host (under the device's own directory or [`HOST_ROOTS`]). `None`
+/// is left out: an import refuses a bundle that holds one ([`link_refusal`]).
 fn portable_target(root: &Path, rel: &str, target: &Path) -> Option<String> {
     let t = target.to_str()?;
     if !target.is_absolute() {
-        return Some(t.to_owned());
+        return (!leaves_data(rel, t)).then(|| t.to_owned());
     }
     if let Ok(inside) = target.strip_prefix(root) {
         let up = "../".repeat(rel.matches('/').count());
@@ -132,10 +154,25 @@ fn portable_target(root: &Path, rel: &str, target: &Path) -> Option<String> {
         });
     }
     let device_dir = root.parent().filter(|d| d.parent().is_some());
-    if device_dir.is_some_and(|d| target.starts_with(d)) || HOST_ROOTS.iter().any(|h| t.starts_with(h)) {
+    if device_dir.is_some_and(|d| target.starts_with(d)) || names_host(t) {
         return None;
     }
     Some(t.to_owned())
+}
+
+/// Why an import refuses tree entry `e`, a symlink an export would have left out: one that
+/// climbs out of `data/` or names a host path ([`HOST_ROOTS`]). The device's daemons run as the
+/// host user and would read and write through it.
+fn link_refusal(e: &Entry) -> Option<String> {
+    let (EntryKind::Symlink, Some(t)) = (e.kind, &e.target) else { return None };
+    let rel = e.path.strip_prefix(DATA).and_then(|r| r.strip_prefix('/')).unwrap_or("");
+    let out = if t.starts_with('/') { names_host(t) } else { leaves_data(rel, t) };
+    out.then(|| {
+        format!(
+            "the bundle's symlink `{}` points at `{t}`, outside the device's data, which an export never writes; it isn't imported",
+            e.path
+        )
+    })
 }
 
 /// The data directory `root` as bundle contents: every regular file a disk at `data/<path>`,
@@ -334,11 +371,14 @@ pub fn import(svc: &dyn Service, reader: Reader, name: &str) -> Result<Imported>
     if !m.tree.iter().any(|e| e.path == DATA && e.kind == EntryKind::Dir) {
         return Err(Error::Refused(format!("the bundle has no {DATA}/ directory")));
     }
+    if let Some(why) = m.tree.iter().find_map(link_refusal) {
+        return Err(Error::Refused(why));
+    }
     let runtime = find_runtime(&svc.runtimes().map_err(Error::Refused)?, id)?;
     if svc.names().map_err(Error::Refused)?.iter().any(|n| n == name) {
         return Err(Error::Refused(format!("a device named `{name}` already exists in this set")));
     }
-    let made = svc.create(name, &id.device_type, &runtime.identifier).map_err(Error::Refused)?;
+    let made = svc.create(name, &id.device_type, &runtime).map_err(Error::Refused)?;
     let placed = place(reader, &m.tree, &made.data_dir).and_then(|x| Ok((x, svc.device(&made.udid).map_err(Error::Refused)?)));
     match placed {
         Ok((extracted, device)) => Ok(Imported { device, runtime, extracted, manifest: m }),
@@ -374,25 +414,25 @@ fn place(reader: Reader, tree: &[Entry], data_dir: &Path) -> Result<Extracted> {
 
 /// Makes `tree`'s directories and symlinks under `dest` (where the files were extracted) and
 /// gives each file and directory its mode, directories last and deepest first, so a read-only
-/// one is set after what is in it.
+/// one is set after what is in it. Every path is reached through directory fds without
+/// following a link (`beneath`), so even a tree that got past [`Manifest::validate`] can't make
+/// this write, link or chmod outside `dest`.
 #[cfg(unix)]
 fn apply_tree(dest: &Path, tree: &[Entry]) -> Result<()> {
-    let set = |p: &Path, m: u32| fs::set_permissions(p, fs::Permissions::from_mode(m)).map_err(io(p));
+    let root = crate::beneath::Beneath::new(dest)?;
     for e in tree.iter().filter(|e| e.kind == EntryKind::Dir) {
-        let p = dest.join(&e.path);
-        fs::create_dir_all(&p).map_err(io(&p))?;
+        root.mkdir_all(&e.path)?;
     }
     for e in tree {
-        let p = dest.join(&e.path);
         match (e.kind, &e.target, e.mode) {
-            (EntryKind::Symlink, Some(t), _) => std::os::unix::fs::symlink(t, &p).map_err(io(&p))?,
-            (EntryKind::File, _, Some(m)) => set(&p, m)?,
+            (EntryKind::Symlink, Some(t), _) => root.symlink(&e.path, t)?,
+            (EntryKind::File, _, Some(m)) => root.chmod(&e.path, m, false)?,
             _ => {}
         }
     }
     for e in tree.iter().rev().filter(|e| e.kind == EntryKind::Dir) {
         if let Some(m) = e.mode {
-            set(&dest.join(&e.path), m)?;
+            root.chmod(&e.path, m, true)?;
         }
     }
     Ok(())

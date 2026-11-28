@@ -40,11 +40,11 @@ impl Service for Bundles<'_> {
             .collect())
     }
 
-    fn create(&self, name: &str, device_type: &str, runtime: &str) -> Result<Simulator, String> {
+    fn create(&self, name: &str, device_type: &str, runtime: &Runtime) -> Result<Simulator, String> {
         if !self.0.device_types().map_err(|e| e.to_string())?.iter().any(|t| t.identifier.eq_ignore_ascii_case(device_type)) {
             return Err(format!("this host has no device type {device_type} (the Xcode that made the bundle's may)"));
         }
-        self.0.create(name, device_type, runtime).map(|d| simulator(&d)).map_err(|e| e.to_string())
+        self.0.create_on_build(name, device_type, &runtime.identifier, &runtime.build).map(|d| simulator(&d)).map_err(|e| e.to_string())
     }
 
     fn delete(&self, udid: &str) -> Result<(), String> {

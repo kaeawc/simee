@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use sim_core::platform::Platform;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::{Error, Result};
 
@@ -217,6 +218,19 @@ pub fn safe_path(path: &str) -> bool {
         && path.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
 }
 
+/// The most bytes (logical, holes included) a bundle's disks and files may add up to: an import
+/// reads every byte back to check its hash, so a sparse disk of a petabyte would take days.
+pub const MAX_SIZE: u64 = 1 << 40;
+
+/// `path` as a case-insensitive, normalization-insensitive volume (APFS's default, HFS+)
+/// compares names: canonically decomposed (NFD), case-folded, without the code points HFS+
+/// ignores. Two paths that fold alike are one file there. It folds at least as much as the
+/// volume does, so it may join names the volume keeps apart, never the reverse.
+pub(crate) fn fold(path: &str) -> String {
+    let ignorable = |c: &char| matches!(*c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}');
+    path.nfd().flat_map(char::to_uppercase).flat_map(char::to_lowercase).filter(|c| !ignorable(c)).nfd().collect()
+}
+
 /// Whether `h` is a BLAKE3 hash as the manifest writes it: 64 lowercase hex digits.
 pub fn is_hash(h: &str) -> bool {
     h.len() == 64 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -263,6 +277,7 @@ impl Manifest {
             return bad(format!("chunk_size {} is not a power of two from 4 KiB to 64 MiB", self.chunk_size));
         }
         let mut seen = BTreeSet::new();
+        let mut folded = BTreeMap::new();
         for path in self.disks.iter().map(|d| &d.path).chain(self.files.iter().map(|f| &f.path)) {
             if !safe_path(path) {
                 return Err(Error::Path(path.clone()));
@@ -270,6 +285,13 @@ impl Manifest {
             if !seen.insert(path.as_str()) {
                 return bad(format!("`{path}` appears twice"));
             }
+            if let Some(other) = folded.insert(fold(path), path) {
+                return bad(format!("`{other}` and `{path}` are one file on a case-insensitive volume"));
+            }
+        }
+        let total = self.disks.iter().map(|d| d.size).chain(self.files.iter().map(|f| f.size)).try_fold(0u64, u64::checked_add);
+        if total.is_none_or(|t| t > MAX_SIZE) {
+            return bad(format!("the disks and files add up to more than {MAX_SIZE} bytes"));
         }
         for d in &self.disks {
             if !is_hash(&d.blake3) {
@@ -309,19 +331,25 @@ impl Manifest {
         self.validate_tree(&seen)
     }
 
-    /// The tree's checks: each entry's path is safe and appears once; a file entry is a disk or
-    /// file of the bundle and no other entry is; a symlink has a target and no mode, and nothing
-    /// lies under one (extracting through a link would write outside the destination).
+    /// The tree's checks: each entry's path is safe and appears once, also as a case- and
+    /// normalization-insensitive volume compares names ([`fold`]); a file entry is a disk or file
+    /// of the bundle and no other entry is; a symlink has a target and no mode, and nothing lies
+    /// under one in any spelling that folds alike (extracting through a link would write outside
+    /// the destination, and on such a volume `data/l/x` goes through a link `data/L`).
     fn validate_tree(&self, stored: &BTreeSet<&str>) -> Result<()> {
         let bad = |s: String| Err(Error::Manifest(s));
         let mut paths = BTreeSet::new();
-        let mut links = BTreeSet::new();
+        let mut folded = BTreeMap::new();
+        let mut links = BTreeMap::new();
         for e in &self.tree {
             if !safe_path(&e.path) {
                 return Err(Error::Path(e.path.clone()));
             }
             if !paths.insert(e.path.as_str()) {
                 return bad(format!("tree: `{}` appears twice", e.path));
+            }
+            if let Some(other) = folded.insert(fold(&e.path), e.path.as_str()) {
+                return bad(format!("tree: `{other}` and `{}` are one path on a case-insensitive volume", e.path));
             }
             let is_stored = stored.contains(e.path.as_str());
             if (e.kind == EntryKind::File) != is_stored {
@@ -330,7 +358,7 @@ impl Manifest {
             }
             match (e.kind, &e.target, e.mode) {
                 (EntryKind::Symlink, Some(t), None) if !t.is_empty() && !t.contains('\0') => {
-                    links.insert(e.path.as_str());
+                    links.insert(fold(&e.path), e.path.as_str());
                 }
                 (EntryKind::Symlink, ..) => return bad(format!("tree: the symlink `{}` needs a target and no mode", e.path)),
                 (_, Some(_), _) => return bad(format!("tree: `{}` has a target but isn't a symlink", e.path)),
@@ -345,16 +373,23 @@ impl Manifest {
         }
         if !links.is_empty() {
             for p in paths.iter().chain(stored.iter()) {
-                let mut at = *p;
+                let f = fold(p);
+                let mut at = f.as_str();
                 while let Some((parent, _)) = at.rsplit_once('/') {
-                    if links.contains(parent) {
-                        return bad(format!("tree: `{p}` lies under the symlink `{parent}`"));
+                    if let Some(link) = links.get(parent) {
+                        return bad(format!("tree: `{p}` lies under the symlink `{link}`"));
                     }
                     at = parent;
                 }
             }
         }
         Ok(())
+    }
+
+    /// The bytes an extract writes: the disks' stored extents and the files (zeros stay holes).
+    pub fn stored_bytes(&self) -> u64 {
+        let disks = self.disks.iter().flat_map(|d| d.extents.iter().filter(|e| e.hash.is_some()).map(|e| e.len));
+        disks.chain(self.files.iter().map(|f| f.size)).fold(0, u64::saturating_add)
     }
 
     /// Every stored chunk's hash, once, in the order the manifest first names it.

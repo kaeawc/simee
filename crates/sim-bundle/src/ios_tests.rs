@@ -66,8 +66,9 @@ impl Service for Fake {
         Ok(self.runtimes.clone())
     }
 
-    fn create(&self, name: &str, device_type: &str, runtime: &str) -> std::result::Result<Simulator, String> {
-        assert_eq!((device_type, runtime), (TYPE, RUNTIME));
+    fn create(&self, name: &str, device_type: &str, runtime: &Runtime) -> std::result::Result<Simulator, String> {
+        assert_eq!((device_type, runtime.identifier.as_str()), (TYPE, RUNTIME));
+        assert!(self.runtimes.contains(runtime), "{runtime:?} is one of the host's, its build included");
         let udid = format!("0D5A6F1E-0000-4000-8000-{:012}", self.devices.borrow().len());
         let d = self.add(&udid, name, true);
         // What a new device's data directory holds before its first boot: replaced by the import.
@@ -362,4 +363,184 @@ fn caches_and_temporary_directories_are_left_out_where_ios_purges_them() {
     for rel in ["Library", "Library/Preferences", "Caches", "Media/tmp", "Containers/Data/Application/A1/Documents/tmp"] {
         assert!(!left_out(rel), "{rel}");
     }
+}
+
+fn dir(path: &str) -> Entry {
+    Entry { path: path.into(), kind: EntryKind::Dir, mode: Some(0o755), target: None }
+}
+
+fn link(path: &str, target: &str) -> Entry {
+    Entry { path: path.into(), kind: EntryKind::Symlink, mode: None, target: Some(target.into()) }
+}
+
+/// The NFC and NFD spellings of `été`, which APFS treats as one name.
+const NFC: &str = "\u{e9}t\u{e9}";
+const NFD: &str = "e\u{301}te\u{301}";
+
+#[test]
+fn paths_fold_as_a_case_and_normalization_insensitive_volume_compares_them() {
+    use crate::manifest::fold;
+    assert_eq!(fold("data/Library/Prefs"), fold("DATA/library/PREFS"));
+    assert_eq!(fold(&format!("data/{NFC}")), fold(&format!("data/{NFD}")));
+    assert_eq!(fold(&format!("data/{}", NFC.to_uppercase())), fold(&format!("data/{NFD}")));
+    assert_eq!(fold("data/a\u{200d}b"), fold("data/ab"), "a code point HFS+ ignores");
+    assert_ne!(fold("data/a"), fold("data/b"));
+    assert_eq!(fold("data/a/b").matches('/').count(), 2, "folding keeps the components");
+}
+
+/// A tree whose entry reaches a symlink by another case or Unicode normalization of its path
+/// (which a case-insensitive APFS volume follows), or that holds two entries that fold alike, is
+/// refused as the manifest is read, whichever comes first in the tree.
+#[test]
+fn a_tree_that_reaches_a_link_by_another_spelling_is_refused() {
+    let root = scratch("fold");
+    let fake = Fake::new(&root.join("set"), vec![runtime("23B80")]);
+    let src = fake.add(SOURCE, "golden", true);
+    populate(&src.data_dir);
+    let ex = export(&fake, SOURCE, &root.join("golden.tar"), &Options::default()).expect("export");
+    let refused = |extra: Vec<Entry>| {
+        let mut m = ex.manifest.clone();
+        m.tree.extend(extra);
+        Manifest::parse(&m.to_json()).expect_err("refused").to_string()
+    };
+    // The review's case: `data/l/evil` goes through the link `data/L` on APFS.
+    let err = refused(vec![link("data/L", "../../../../../../LaunchAgents"), link("data/l/evil", "/etc/hosts")]);
+    assert!(err.contains("`data/l/evil` lies under the symlink `data/L`"), "{err}");
+    let err = refused(vec![link(&format!("data/{NFC}"), "/etc"), dir(&format!("data/{NFD}")), dir(&format!("data/{NFD}/x"))]);
+    assert!(err.contains("are one path on a case-insensitive volume"), "{err}");
+    let err = refused(vec![link(&format!("data/{NFC}"), "/etc"), dir(&format!("data/{NFD}/x"))]);
+    assert!(err.contains(&format!("`data/{NFD}/x` lies under the symlink `data/{NFC}`")), "{err}");
+    // The link after its sibling, and after an entry under it.
+    let err = refused(vec![dir("data/docs"), link("data/Docs", "/etc")]);
+    assert!(err.contains("`data/docs` and `data/Docs` are one path"), "{err}");
+    let err = refused(vec![dir("data/m/x"), link("data/M", "/etc")]);
+    assert!(err.contains("`data/m/x` lies under the symlink `data/M`"), "{err}");
+    // Two directories alike when folded, no link at all.
+    let err = refused(vec![dir("data/Docs"), dir("data/DOCS")]);
+    assert!(err.contains("are one path"), "{err}");
+    fs::remove_dir_all(root).ok();
+}
+
+/// Defence in depth: even a tree that got past validation writes, links and chmods nothing
+/// outside its destination. Every directory is opened without following a link, by the bundle's
+/// spelling or (on a case-insensitive volume) another.
+#[test]
+fn applying_a_tree_writes_nothing_through_a_link() {
+    let root = scratch("nofollow");
+    let (dest, outside) = (root.join("dest"), root.join("outside"));
+    fs::create_dir_all(&dest).expect("dest");
+    fs::create_dir_all(&outside).expect("outside");
+    fs::write(outside.join("victim"), b"v").expect("victim");
+    fs::set_permissions(outside.join("victim"), fs::Permissions::from_mode(0o600)).expect("chmod");
+    let out = outside.to_str().expect("utf-8");
+    apply_tree(&dest, &[dir("data"), link("data/L", out), link(&format!("data/{NFC}"), out)]).expect("links");
+    let through = |tree: &[Entry]| match apply_tree(&dest, tree) {
+        Err(Error::ThroughLink(at)) => Some(at),
+        Err(e) => panic!("{e}"),
+        Ok(()) => None,
+    };
+    for tree in [
+        vec![link("data/L/evil", "/etc/hosts")],
+        vec![dir("data/L/sub")],
+        vec![Entry { path: "data/L/victim".into(), kind: EntryKind::File, mode: Some(0o777), target: None }],
+        vec![Entry { path: "data/L".into(), kind: EntryKind::Dir, mode: Some(0o777), target: None }],
+    ] {
+        assert_eq!(through(&tree).as_deref(), Some("data/L"), "{tree:?}");
+    }
+    // Another case or normalization: refused on a case-insensitive volume, a directory of its
+    // own on a case-sensitive one. Never a write outside.
+    for tree in [vec![link("data/l/evil", "/etc/hosts")], vec![dir(&format!("data/{NFD}/x"))]] {
+        through(&tree);
+    }
+    let b = crate::beneath::Beneath::new(&dest).expect("dest");
+    assert!(matches!(b.create("data/L/new"), Err(Error::ThroughLink(at)) if at == "data/L"));
+    let _ = b.create(&format!("data/{NFD}/new"));
+    let _ = b.create("data/l/new");
+    let names: Vec<_> = fs::read_dir(&outside).expect("outside").map(|e| e.expect("entry").file_name()).collect();
+    assert_eq!(names, ["victim"], "nothing was written outside");
+    assert_eq!(fs::metadata(outside.join("victim")).expect("victim").permissions().mode() & 0o7777, 0o600);
+    fs::remove_dir_all(root).ok();
+}
+
+/// Links an export leaves out (to a host path, or climbing out of `data/`) are refused on
+/// import: the device's daemons, running as the host user, would read and write through them.
+#[test]
+fn imports_refuse_links_out_of_the_data_directory() {
+    let root = scratch("links");
+    let fake = Fake::new(&root.join("set"), vec![runtime("23B80")]);
+    let src = fake.add(SOURCE, "golden", true);
+    populate(&src.data_dir);
+    symlink("../../device.plist", src.data_dir.join("Library/up")).expect("climbing link");
+    symlink("../Library/..", src.data_dir.join("Library/root")).expect("the data root");
+    let to = root.join("golden-dir");
+    let ex = export(&fake, SOURCE, &to, &Options::default()).expect("export");
+    assert!(ex.manifest.dropped.contains(&"data/Library/up (a symlink to a host path)".to_owned()), "{:?}", ex.manifest.dropped);
+    assert!(ex.manifest.tree.iter().any(|e| e.path == "data/Library/root"), "a link to the data root stays");
+    for (path, target) in [
+        ("data/Library/agents", "/Users/someone/Library/LaunchAgents"),
+        ("data/Library/tmp", "/tmp"),
+        ("data/up", ".."),
+        ("data/Library/up", "../Preferences/../../../device.plist"),
+    ] {
+        let mut m = ex.manifest.clone();
+        m.tree.push(link(path, target));
+        fs::write(to.join(crate::MANIFEST), m.to_json()).expect("manifest");
+        let err = import(&fake, Reader::open(&to).expect("opens"), "copy").expect_err("refused").to_string();
+        assert!(err.contains(&format!("symlink `{path}` points at `{target}`")), "{err}");
+    }
+    assert_eq!(fake.devices.borrow().len(), 1, "nothing was made");
+    // A bundle whose disks add up to more than an import would read back is refused as it opens.
+    let mut m = ex.manifest.clone();
+    m.disks[0].size = crate::MAX_SIZE + 1;
+    m.disks[0].extents = vec![crate::Extent::zero(0, crate::MAX_SIZE + 1)];
+    let err = Manifest::parse(&m.to_json()).expect_err("too big").to_string();
+    assert!(err.contains("add up to more than"), "{err}");
+    fs::remove_dir_all(root).ok();
+}
+
+const LOW_FD_CHILD: &str = "SIM_BUNDLE_LOW_FD_CHILD";
+
+/// With `RLIMIT_NOFILE` lowered below the number of files (a simee launchd starts has 256), an
+/// export and an import of both forms still work: each file is opened, copied or hashed, and
+/// closed in turn. The limit is lowered in a child process (this test binary, running only this
+/// test), so other tests keep theirs.
+#[test]
+fn export_and_import_stream_more_files_than_the_open_file_limit() {
+    if std::env::var_os(LOW_FD_CHILD).is_none() {
+        let module = module_path!().split_once("::").map_or("", |(_, m)| m);
+        let name = format!("{module}::export_and_import_stream_more_files_than_the_open_file_limit");
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", &name, "--test-threads=1"])
+            .env(LOW_FD_CHILD, "1")
+            .output()
+            .expect("run the child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+        return;
+    }
+    const LIMIT: u64 = 64;
+    const FILES: usize = 300;
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    setrlimit(Resource::Nofile, Rlimit { current: Some(LIMIT), maximum: getrlimit(Resource::Nofile).maximum }).expect("setrlimit");
+    let root = scratch("fds");
+    let fake = Fake::new(&root.join("set"), vec![runtime("23B80")]);
+    let src = fake.add(SOURCE, "golden", true);
+    let file = |i: usize| src.data_dir.join(format!("Library/Preferences/d{}/f{i}.plist", i % 10));
+    for i in 0..FILES {
+        fs::create_dir_all(file(i).parent().expect("parent")).expect("dirs");
+        fs::write(file(i), format!("preference {i}")).expect("write");
+    }
+    // The limit holds: these files can't all be open at once.
+    let all: std::io::Result<Vec<fs::File>> = (0..FILES).map(|i| fs::File::open(file(i))).collect();
+    assert!(all.is_err(), "{FILES} files opened under a limit of {LIMIT}");
+    for (to, name) in [("golden.tar", "copy"), ("golden-dir", "copy-dir")] {
+        let to = root.join(to);
+        let ex = export(&fake, SOURCE, &to, &Options::default()).expect("export");
+        assert_eq!(ex.manifest.disks.len(), FILES);
+        let im = import(&fake, Reader::open(&to).expect("open"), name).expect("import");
+        assert_eq!(im.extracted.chunks, FILES as u64);
+        let rel = file(FILES - 1).strip_prefix(&src.data_dir).expect("under").to_path_buf();
+        assert_eq!(fs::read(im.device.data_dir.join(rel)).expect("read"), format!("preference {}", FILES - 1).as_bytes());
+    }
+    fs::remove_dir_all(root).ok();
 }

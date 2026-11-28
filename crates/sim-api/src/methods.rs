@@ -147,8 +147,11 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          matches (allow_mismatch: use another installed revision of the same API, tag and ABI, named in `mismatch`); drops \
          config.ini keys holding host paths (listed in `dropped`); keeps the exported device's guest identity (ro.serialno, \
          android_id). iOS: finds the runtime by identifier and build and refuses, naming what to install, when it isn't \
-         installed; creates a simulator of the bundle's device type in the set and puts the bundle's data directory in as \
-         its own (a new UDID; the keychain and app data come along)",
+         installed; creates a simulator of the bundle's device type on that exact build in the set and puts the bundle's \
+         data directory in as its own (a new UDID; the keychain and app data come along). It refuses a tree with two paths \
+         that are one on a case-insensitive volume (case and Unicode normalization folded) or a path under a symlink in any \
+         such spelling, and a symlink to a host path or out of data/; it writes nothing through a symlink. An iOS bundle \
+         carries app executables and data its apps trust: import one as you would run its code",
     ),
     ("shutdown", "device; iOS: set?", "Shut down"),
     (
