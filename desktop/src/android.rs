@@ -569,8 +569,14 @@ mod tests {
         let screen = Screen::connect("pixel", dir.clone(), 1080, console(Outbox::default())).expect("connect");
         let (mut at, mut soak) = (Vec::new(), Vec::new());
         for n in 1..=8u32 {
+            let before = screen.pixels.signature().1;
             next.send(n).expect("send");
-            wait_until("the frame", || screen.pixels.size() == (w, h) && shown(&screen) == u64::from(n));
+            // Waits on the frame's generation, which reads no pixels: polling `shown` here would
+            // hold the previous frame's buffer while this frame replaced it, so it wouldn't come
+            // back and the next frame would need a new one. Once the generation moves, no frame
+            // arrives until the next send, so reading the pixels below races with nothing.
+            wait_until("the frame", || screen.pixels.signature().1 > before);
+            assert_eq!((screen.pixels.size(), shown(&screen)), ((w, h), u64::from(n)), "frame {n} shown");
             at.push(screen.pixels.with_rgba(|_, _, px| px.as_ptr() as usize).expect("a frame"));
             soak.push(Vec::<u8>::with_capacity(len));
         }

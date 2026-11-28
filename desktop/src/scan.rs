@@ -245,7 +245,10 @@ mod tests {
         assert_eq!(woken.load(Ordering::Relaxed), 1, "unchanged scans don't wake the window");
         assert!(scanner.take().is_none());
         scanner.ask(Some("pixel_9"));
-        wait_for("asked scan posted", || woken.load(Ordering::Relaxed) == 2);
+        // At least once: a scan that read `asked` just before the ask but the selection just
+        // after it posts the new selection as news, then the ask posts it again, so the count
+        // can pass 2 between two looks.
+        wait_for("asked scan posted", || woken.load(Ordering::Relaxed) >= 2);
         assert_eq!(scanner.take().and_then(|s| s.selected).as_deref(), Some("pixel_9"));
         drop(scanner);
         let stopped = scans.load(Ordering::Relaxed);
