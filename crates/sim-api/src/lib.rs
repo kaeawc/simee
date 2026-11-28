@@ -18,6 +18,7 @@
 //! macOS hosts; elsewhere they fail with a clear reason.
 
 mod android;
+mod android_net;
 mod camera;
 #[cfg_attr(not(unix), allow(dead_code))]
 mod camera_device;

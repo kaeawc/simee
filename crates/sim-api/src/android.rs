@@ -417,6 +417,9 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
         }
         "install" | "uninstall" | "launch" | "terminate" | "apps" | "open_url" => app(&android, &d, method, p),
         "processes" | "kill" | "exec" => debug(&android, &d, method, p),
+        "network_shape" | "network_state" | "network_clear" | "connections" | "traffic" => {
+            crate::android_net::call(&android, &d, method, p)
+        }
         "location" => {
             let (lat, lon) = (crate::params::need_f64(p, "latitude")?, crate::params::need_f64(p, "longitude")?);
             null(d.set_location(lat, lon))

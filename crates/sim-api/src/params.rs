@@ -106,6 +106,41 @@ pub fn err<E: ToString>(e: E) -> String {
     e.to_string()
 }
 
+/// `network_shape`'s profile: `preset` (else `base`, what the device has now), then each field
+/// given over it. iOS shapes all of it; Android refuses what its emulator can't shape first.
+pub fn shape_profile(p: &Value, base: sim_netshape::Profile) -> Result<sim_netshape::Profile, String> {
+    let mut profile = match str_param(p, "preset") {
+        Some(name) => sim_netshape::Profile::preset(name).ok_or_else(|| format!("unknown preset `{name}`"))?,
+        None => base,
+    };
+    let num = |key: &str| p.get(key).and_then(Value::as_u64);
+    if let Some(v) = p.get("offline").and_then(Value::as_bool) {
+        profile.offline = v;
+    }
+    if let Some(v) = num("latency_ms") {
+        profile.latency_ms = v as u32;
+    }
+    if let Some(v) = num("down_kbps") {
+        profile.down_kbps = v as u32;
+    }
+    if let Some(v) = num("up_kbps") {
+        profile.up_kbps = v as u32;
+    }
+    if let Some(v) = num("loss_pct") {
+        profile.loss_pct = (v as u32).min(100);
+    }
+    if let Some(v) = num("port_base") {
+        profile.port_base = u16::try_from(v).map_err(err)?;
+    }
+    if let Some(v) = num("port_count") {
+        profile.port_count = u16::try_from(v).map_err(err)?;
+    }
+    if let Some(rules) = p.get("rules") {
+        profile.rules = serde_json::from_value(rules.clone()).map_err(|e| format!("bad rules: {e}"))?;
+    }
+    Ok(profile)
+}
+
 /// The optional `platform` parameter.
 pub fn opt_platform(p: &Value) -> Result<Option<Platform>, String> {
     str_param(p, "platform").map(|v| Platform::parse(v).ok_or_else(|| format!("unknown platform `{v}` (android or ios)"))).transpose()
@@ -424,6 +459,39 @@ fn bytes_field(bytes: Cow<'_, [u8]>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `network_shape`'s profile, as iOS has always read it (#416 moved it here for Android to
+    /// share): a preset replaces the base, each field then overrides it, loss is capped at 100.
+    #[test]
+    fn the_shape_profile_reads_as_ios_always_did() {
+        use sim_netshape::Profile;
+        let base = Profile { latency_ms: 7, down_kbps: 9, ..Profile::default() };
+        assert_eq!(shape_profile(&json!({}), base.clone()), Ok(base.clone()), "nothing asked keeps the base");
+        assert_eq!(shape_profile(&json!({"preset": "3g"}), base.clone()), Ok(Profile::preset("3g").expect("3g")));
+        let p = shape_profile(
+            &json!({"preset": "lte", "latency_ms": 80, "up_kbps": 1, "loss_pct": 400, "offline": true, "port_base": 40000, "port_count": 10}),
+            base.clone(),
+        )
+        .expect("profile");
+        assert_eq!(
+            p,
+            Profile {
+                offline: true,
+                latency_ms: 80,
+                down_kbps: 12_000,
+                up_kbps: 1,
+                loss_pct: 100,
+                port_base: 40000,
+                port_count: 10,
+                rules: vec![]
+            }
+        );
+        let ruled = shape_profile(&json!({"rules": [{"pattern": "example.com", "offline": true}]}), base.clone()).expect("rules");
+        assert_eq!((ruled.rules.len(), ruled.rules[0].offline), (1, Some(true)));
+        assert_eq!(shape_profile(&json!({"preset": "warp"}), base.clone()), Err("unknown preset `warp`".into()));
+        assert!(shape_profile(&json!({"port_base": 70000}), base.clone()).is_err());
+        assert!(shape_profile(&json!({"rules": "x"}), base).expect_err("bad rules").starts_with("bad rules: "));
+    }
 
     #[test]
     fn the_device_set_is_the_set_param_then_the_environment_then_the_default() {

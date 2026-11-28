@@ -35,39 +35,6 @@ fn with_proxies<T>(f: impl FnOnce(&mut std::collections::HashMap<String, sim_net
     f(guard.get_or_insert_with(Default::default))
 }
 
-fn profile_from(p: &Value, base: sim_netshape::Profile) -> Result<sim_netshape::Profile, String> {
-    let mut profile = match str_param(p, "preset") {
-        Some(name) => sim_netshape::Profile::preset(name).ok_or_else(|| format!("unknown preset `{name}`"))?,
-        None => base,
-    };
-    let num = |key: &str| p.get(key).and_then(Value::as_u64);
-    if let Some(v) = p.get("offline").and_then(Value::as_bool) {
-        profile.offline = v;
-    }
-    if let Some(v) = num("latency_ms") {
-        profile.latency_ms = v as u32;
-    }
-    if let Some(v) = num("down_kbps") {
-        profile.down_kbps = v as u32;
-    }
-    if let Some(v) = num("up_kbps") {
-        profile.up_kbps = v as u32;
-    }
-    if let Some(v) = num("loss_pct") {
-        profile.loss_pct = (v as u32).min(100);
-    }
-    if let Some(v) = num("port_base") {
-        profile.port_base = u16::try_from(v).map_err(err)?;
-    }
-    if let Some(v) = num("port_count") {
-        profile.port_count = u16::try_from(v).map_err(err)?;
-    }
-    if let Some(rules) = p.get("rules") {
-        profile.rules = serde_json::from_value(rules.clone()).map_err(|e| format!("bad rules: {e}"))?;
-    }
-    Ok(profile)
-}
-
 /// A local port nothing listens on.
 fn closed_port() -> Result<u16, String> {
     let l = std::net::TcpListener::bind("127.0.0.1:0").map_err(err)?;
@@ -2146,7 +2113,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "network_shape" => {
             let d = s.device(p)?;
             let udid = d.info().udid;
-            let profile = profile_from(p, sim_netshape::read_profile(&udid))?;
+            let profile = crate::params::shape_profile(p, sim_netshape::read_profile(&udid))?;
             let use_proxy = p.get("proxy").and_then(Value::as_bool).unwrap_or(true);
             // inject: false | true (launchd setenv: new processes) | "boot" (reboot: every process).
             let inject_mode = match p.get("inject") {
