@@ -336,7 +336,9 @@ mod tests {
     fn the_spec_argument_round_trips() {
         let spec = SegmentSpec { dir: base().join("pair"), subnet: 7, member: 1 };
         let text = spec.to_string();
-        assert_eq!(text, "dir=/tmp/simee/seg/pair,subnet=7,member=1");
+        // The directory prints as the host spells it (backslashes on Windows).
+        assert_eq!(text, format!("dir={},subnet=7,member=1", spec.dir.display()));
+        assert!(text.starts_with("dir=") && text.ends_with(",subnet=7,member=1"));
         assert_eq!(text.parse::<SegmentSpec>(), Ok(spec.clone()));
         assert_eq!(spec.ip(), Ipv4Addr::new(10, 77, 7, 2));
         assert_eq!(spec.mac(), mac_for(7, 1));
