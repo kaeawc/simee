@@ -141,7 +141,7 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   privacy service names, geometry,
   gesture planning, HID usages and buttons (per form factor: the Siri Remote, crown steps, watch
   gestures, orientations and the Purple orientation message), `carplay.rs` (StarkConfig, runtime
-  gate), `goldfish.rs` (stock emulator key names, the `qwerty2` key set, sensor masks), `xr.rs`
+  gate), `goldfish.rs` (stock emulator key names, the `qwerty2` key set, sensor masks), `console.rs` (what console commands end or delete, whose names emu's console parser shares), `xr.rs`
   (Android XR commands and the `xr_service` messages), `vhal.rs` (the vehicle HAL's
   `EmulatorMessage` codec, property names and values), `network.rs` (the stock console's
   `network speed|delay` presets, parsing and `network status` report), `framebuffer.rs` (which
@@ -212,8 +212,10 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   `select.rs` (KVM, then container, then TCG; `-backend` overrides; `choose` is the one call
   `apps/emu` makes), `image.rs` (the official Redroid image pinned by SHA-256; a download only on
   request), `launch.rs` (the namespaces, id maps, mounts and `/init` arguments as data, run
-  through `unshare(1)`), `helper.rs` (`pivot_root` and parent-death, via rustix's safe wrappers).
-  Tests use fake trees; `SIMEE_E2E_CONTAINER=1` runs the launcher against the host's kernel.
+  through `unshare(1)`; container root is a subordinate id, never the user's uid or root's),
+  `net.rs` (the container's own network namespace: pasta, slirp4netns or a veth pair, adb only on
+  `127.0.0.1`), `helper.rs` (`pivot_root`, `become-root` and parent-death, via rustix's safe
+  wrappers). Tests use fake trees; `SIMEE_E2E_CONTAINER=1` runs the launcher against the host's kernel.
 - `crates/emu-avd` — `Env` (SDK/AVD paths), `Avd` (config, `profile()`), `NewAvd`
   (`for_profile`), running-instance advertisements (`Running`), `BootConfig`, ini parsing.
 - `crates/emu-sdk` — Java-free provisioning: repository manifests, verified downloads, the
@@ -236,7 +238,9 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   annotations, results, which methods are tasks), `resources.rs` (`simee://` URIs), `tasks.rs` (the
   Tasks extension), `watch.rs` (polled change notifications), `app.rs` + `app.html` (the device
   view, an MCP App), `backend.rs` (`Backend`: `sim-api` in production, a fake in tests; worker
-  threads). Parameter schemas come from `sim-api`'s `schema.rs`. Docs: `docs/mcp.md`.
+  threads). Agent safety (docs/mcp-safety.md): `safety.rs` (confirmations,
+  the policy's guarded backend, which devices a call names), `policy.rs`, `audit.rs`, `drain.rs` (stop
+  taking calls on SIGINT/SIGTERM and wait for those in flight). Parameter schemas come from `sim-api`'s `schema.rs`. Docs: `docs/mcp.md`.
 - `apps/simee` — CLI: argument parsing and output formatting over `sim-api`'s methods;
   `tests/e2e.rs` runs against a booted iOS device when `SIMEE_E2E_UDID` is set,
   `tests/e2e_android.rs` against a running AVD when `SIMEE_E2E_AVD` is; `tests/mcp.rs` runs
