@@ -19,9 +19,10 @@ runner = "scripts/sign-run.sh"
 
 # Windows: the C runtime is linked in, so `simee.exe` and `emu.exe` run without the Visual C++
 # redistributable installed. Hosts build with the same flags (no `--target`), so build scripts and
-# proc macros do too.
+# proc macros do too. The main thread's stack is 8 MiB, what macOS and Linux give it: Windows'
+# default of 1 MiB overflows `simee`'s command dispatch in a debug build.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/STACK:8388608"]
 
 [env]
 RUST_BACKTRACE = { value = "short", force = false }

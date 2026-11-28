@@ -467,7 +467,8 @@ impl NewAvd {
     pub fn new(name: &str, sysdir: &str) -> NewAvd {
         NewAvd {
             name: name.to_string(),
-            sysdir: sysdir.trim_end_matches('/').to_string() + "/",
+            // `image.sysdir.N` always has `/`, whatever joined the path (a `\` on Windows).
+            sysdir: sysdir.replace('\\', "/").trim_end_matches('/').to_string() + "/",
             lcd: (720, 1280, 320),
             ram_mb: 2048,
             cores: 4,
@@ -483,7 +484,7 @@ impl NewAvd {
     /// (`system-images/android-34/android-wear/arm64-v8a`): a round watch for Wear OS, a TV with a
     /// D-pad, a headset for Android XR, a phone for mobile images.
     pub fn for_image(name: &str, sysdir: &str) -> NewAvd {
-        let tag = sysdir.trim_matches('/').split('/').nth(2).unwrap_or_default().to_owned();
+        let tag = sysdir.replace('\\', "/").trim_matches('/').split('/').nth(2).unwrap_or_default().to_owned();
         let profile = sim_core::form_factor::android_profile(|k| (k == "tag.id").then(|| tag.clone()));
         NewAvd::for_profile(name, sysdir, &profile.kind.image_profile(&tag))
     }
@@ -1381,6 +1382,16 @@ mod tests {
         drop(f);
         assert!(!port_claimed(&dir, 5600), "released");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_system_image_dir_joined_with_backslashes_is_written_with_slashes() {
+        let sysdir = "system-images/android-34/android-tv/arm64-v8a/";
+        assert_eq!(NewAvd::new("x", r"system-images\android-34\android-tv\arm64-v8a/").sysdir, sysdir);
+        assert_eq!(NewAvd::new("x", sysdir).sysdir, sysdir, "slashes are left alone");
+        let tv = NewAvd::for_image("x", r"system-images\android-34\android-tv\arm64-v8a/");
+        assert_eq!(tv.sysdir, sysdir);
+        assert_ne!(tv.lcd, NewAvd::new("x", sysdir).lcd, "the tag was read through the backslashes: a TV, not a phone");
     }
 
     #[test]
