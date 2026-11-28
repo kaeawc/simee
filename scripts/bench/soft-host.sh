@@ -52,7 +52,7 @@ set -uo pipefail
 QEMU_VERSION=11.1.3
 QEMU_SHA256=5a8289c7940dc77d3873c81a6c29ba3afe1446fc9d36e77fa1658cdbecb84b22
 
-cache=${SIMEE_BENCH_CACHE:-$HOME/.cache/simee-bench}
+cache=${SIMEE_BENCH_CACHE:-${HOME:-${TMPDIR:-/tmp}}/.cache/simee-bench}
 qemu=${EMU_QEMU:-}
 build_qemu=0
 image=system-images/android-36/default/x86_64
