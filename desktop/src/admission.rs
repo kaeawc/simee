@@ -5,8 +5,9 @@
 //! that is some but not all), or cancel. It never blocks silently: a check that fails or can't
 //! start boots anyway and says why in the status bar, and every sheet can be overridden.
 //!
-//! "Don't ask again this session" is remembered per platform and form factor, in memory only:
-//! the next boot of that kind skips the check until the window quits. The sheet's "why" link
+//! "Don't ask again this session" is remembered per platform and form factor, in memory only,
+//! when the sheet's choice boots (never on Cancel, #585): the next boot of that kind skips the
+//! check until the window quits. While a check runs the status line says so. The sheet's "why" link
 //! shows the [resource panel](crate::resources), whose gauges carry the host's verdict now.
 //!
 //! The check runs on a thread of its own (it samples the host and lists the running devices), so
@@ -286,12 +287,14 @@ impl Gate {
 pub fn apply(s: &mut State, d: Decision) -> Vec<String> {
     match d {
         Decision::Proceed { devices, note } => {
-            if note.is_some() {
-                s.status = note;
-            }
+            // Always: a "Checking…" line left from the click must not outlive its check, whether the
+            // boot goes ahead with a note or without one (the boot then reports its own status).
+            s.status = note;
             devices
         }
         Decision::Ask(sheet) => {
+            // The check has landed: the sheet speaks for it now.
+            s.status = None;
             s.admission.sheet = Some(sheet);
             Vec::new()
         }
@@ -307,7 +310,12 @@ pub fn ask(s: &mut State, info: &DeviceInfo) -> Vec<String> {
     }
     match s.admission.ask(Request::one(info)) {
         Some(d) => apply(s, d),
-        None => Vec::new(),
+        // The check runs: the status line says so until its sheet or boot lands, so the click
+        // never looks like nothing, nor like the last boot's refusal still on the line (#585).
+        None => {
+            s.status = Some(format!("Checking whether the host can take {}…", info.name));
+            Vec::new()
+        }
     }
 }
 
@@ -323,19 +331,22 @@ pub fn poll(s: &mut State) -> bool {
 }
 
 /// A sheet button: boots what it says (remembering "don't ask again" for the kind) or cancels.
+/// "Don't ask again" goes with a choice that boots only (#585): Cancel (or Escape) cancels this
+/// boot and remembers nothing, ticked or not, so the next boot of the kind asks again.
 pub fn choose(s: &mut State, choice: Choice) {
     let Some(sheet) = s.admission.sheet.take() else { return };
     let n = match choice {
         Choice::BootAnyway => sheet.request.devices.len(),
         Choice::Boot(n) => n,
         Choice::Cancel => {
-            s.status = Some(format!("Boot cancelled: the host says {}", sheet.verdict));
+            s.status = Some(format!("Boot cancelled: the host says {}. The next boot asks again", sheet.verdict));
             return;
         }
     };
     if sheet.dont_ask {
         s.admission.skip.insert(sheet.request.kind());
     }
+    s.status = None;
     s.actions.push(Action::BootNow(sheet.request.ids(n)));
 }
 
@@ -406,6 +417,8 @@ fn scrim(sheet: &Sheet, t: Theme) -> El {
         .key("admission-dont-ask")
         .role("switch")
         .label(format!("Don't ask again for {kind} this session"))
+        .help("Applies when you boot from this sheet; Cancel remembers nothing")
+        .checked(sheet.dont_ask)
         .gap(8.0)
         .center_y()
         .on_press(|s: &mut State| {
@@ -438,7 +451,6 @@ fn scrim(sheet: &Sheet, t: Theme) -> El {
         .fill(t.card)
         .border(1.0, t.card_border)
         .shadow(8.0, 24.0, Color::BLACK.alpha(0.5))
-        .modal(false, |s: &mut State| choose(s, Choice::Cancel))
         .child(
             row()
                 .w_full()
@@ -453,12 +465,17 @@ fn scrim(sheet: &Sheet, t: Theme) -> El {
         .child(why)
         .child(dont_ask)
         .child(buttons);
+    // The modal is the whole scrim, with a title-bar band of its own at the top: a modal blocks the
+    // title bar's `.window_drag()` beneath it, so without the band the window couldn't be moved or
+    // zoomed while the sheet is up (#588). The traffic lights are AppKit's, outside Rune's hit-test.
     col()
         .key("admission-scrim")
         .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
         .fill(Color::BLACK.alpha(0.45))
         .items_center()
-        .pt(36.0)
+        .modal(false, |s: &mut State| choose(s, Choice::Cancel))
+        .child(crate::panes::drag_band(row().key("admission-drag-band").w_full().h(crate::panes::TITLE_H).min_h(crate::panes::TITLE_H)))
+        .child(el().h(36.0 - crate::panes::TITLE_H))
         .child(card)
 }
 
@@ -742,6 +759,33 @@ mod tests {
             rt.pointer_up(x, y);
             rt.frame(1.0 / 60.0);
             assert!(rt.state.actions.is_empty(), "the window behind ignores input");
+        }
+
+        /// #588: a modal blocks the title bar's own drag band, so the sheet's scrim has one of its
+        /// own: with the sheet up, a press in the title bar's blank middle still moves the window and
+        /// a double press zooms it. macOS only: elsewhere the native frame's caption does both.
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn the_window_still_drags_and_zooms_under_the_sheet() {
+            use rune::TitlebarAction;
+            let mut rt = runtime(scene);
+            assert!(rt.state.admission.sheet.is_some());
+            let band = rt.elements().into_iter().find(|e| e.key.as_deref() == Some("admission-drag-band")).expect("band");
+            assert_eq!(band.rect, [0.0, 0.0, 1240.0, crate::panes::TITLE_H], "over the title bar");
+            let (x, y) = (620.0, crate::panes::TITLE_H / 2.0);
+            rt.pointer_move(x, y);
+            rt.pointer_down(x, y);
+            assert_eq!(rt.take_titlebar_action(), Some(TitlebarAction::Drag), "a press drags");
+            rt.pointer_up(x, y);
+            rt.pointer_down(x, y);
+            assert_eq!(rt.take_titlebar_action(), Some(TitlebarAction::DoubleClick), "a double press zooms");
+            rt.pointer_up(x, y);
+            // The pane toggles under the scrim stay shut to presses: the sheet is still modal.
+            let (tx, ty) = rt.find("sidebar-toggle").expect("toggle");
+            rt.pointer_down(tx, ty);
+            rt.pointer_up(tx, ty);
+            rt.frame(1.0 / 60.0);
+            assert!(rt.state.admission.sheet.is_some() && rt.state.actions.is_empty());
         }
 
         #[test]

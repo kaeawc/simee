@@ -1,6 +1,7 @@
 //! The window's side panes: the device list on the left and the platform panel (the inspector)
 //! on the right. Each has a drag handle on its inner edge (double-click puts the default width
-//! back) and shows and hides from the stage toolbar's sidebar buttons, the View menu (macOS) or a
+//! back) and shows and hides from its button in the title bar ([`title_bar`]: the list's beside
+//! the traffic lights, the panel's at the window's top-right), the View menu (macOS) or a
 //! shortcut: ⌘⌥S the sidebar, ⌘⌥I the inspector, ⌘⌥R the resource panel in it. Their widths and
 //! visibility, the selected device and tab, and the window's frame persist through
 //! [`crate::settings`].
@@ -19,7 +20,7 @@ use std::cell::RefCell;
 use std::time::Duration;
 
 use rune::tok::Theme;
-use rune::{Cursor, Drag, El, Key, KeyEvent, Phase, Tx, el, row};
+use rune::{Cursor, Drag, El, Key, KeyEvent, Phase, Tx, col, el, row};
 
 use crate::State;
 use crate::debug::Tab;
@@ -83,8 +84,12 @@ pub const STAGE_MIN: f32 = 420.0;
 /// The drag handle's width; it straddles the pane's inner edge.
 pub const HANDLE: f32 = 8.0;
 
-/// The traffic lights' clearance at the top of whatever is leftmost.
-const TITLE_BAR: f32 = 22.0;
+/// The title bar's height: the band across the window's top that the macOS traffic lights sit in
+/// (AppKit's titlebar is 28 points), with the panes' toggles ([`title_bar`]).
+pub const TITLE_H: f32 = 28.0;
+
+/// The panes' toggles' gap from the traffic lights and from the window's right edge.
+pub const TOGGLE_INSET: f32 = 8.0;
 
 /// `width` for `side`, in its range: a width that isn't a number (or 0, unset) is the default.
 /// With the window's width known (`window_w` > 0), a wider pane leaves the stage at least
@@ -239,6 +244,8 @@ pub struct Panes {
     pub keep_window: Option<String>,
     /// The window opened at a saved position: the first live poll checks it's on a display.
     pub check_position: Option<(i32, i32)>,
+    /// The stage toolbar's overflow menu is open (`crate::view`'s toolbar).
+    pub toolbar_menu: bool,
 }
 
 /// The debug panel's tab as the settings name it.
@@ -348,26 +355,58 @@ pub fn narrow_note(s: &State) -> Option<&'static str> {
     }
 }
 
-/// The window's layout: the sidebar, its handle, the stage, and the inspector with its handle,
-/// each pane at its width or left out while hidden (or collapsed for room).
-pub fn layout(s: &State, t: Theme, sidebar: El, stage: El, platform: El) -> El {
-    let mut root = row().key("window").w_full().h_full().fill(t.bg).on_layout(|s: &mut State, r: [f32; 4]| {
-        s.panes.window_w = r[2];
-        fit(s);
-    });
-    let sidebar_shown = shown(s, Side::Sidebar);
-    if sidebar_shown {
+/// The window's layout: the title bar, and under it the sidebar, its handle, the stage, and the
+/// inspector with its handle, each pane at its width or left out while hidden (or collapsed for
+/// room). `leading` is what the traffic lights take of the title bar (`Cx::titlebar_inset`).
+pub fn layout(s: &State, t: Theme, leading: f32, sidebar: El, stage: El, platform: El) -> El {
+    let mut panes = row().key("panes").w_full().grow(1.0).min_h(0.0);
+    if shown(s, Side::Sidebar) {
         let w = shown_width(s, Side::Sidebar);
-        root = root.child(sidebar.w(w).min_w(w).child(handle(Side::Sidebar).pin(None, Some(0.0), Some(-HANDLE / 2.0), Some(0.0))));
+        panes = panes.child(sidebar.w(w).min_w(w).child(handle(Side::Sidebar).pin(None, Some(0.0), Some(-HANDLE / 2.0), Some(0.0))));
     }
-    // With the sidebar hidden the stage is leftmost, under the traffic lights.
-    root = root.child(if sidebar_shown { stage } else { stage.pt(16.0 + TITLE_BAR) });
+    panes = panes.child(stage);
     if shown(s, Side::Inspector) {
         let w = shown_width(s, Side::Inspector);
         let panel = crate::resources::inspector(s, t, platform);
-        root = root.child(panel.w(w).min_w(w).child(handle(Side::Inspector).pin(Some(-HANDLE / 2.0), Some(0.0), None, Some(0.0))));
+        panes = panes.child(panel.w(w).min_w(w).child(handle(Side::Inspector).pin(Some(-HANDLE / 2.0), Some(0.0), None, Some(0.0))));
     }
-    root
+    col()
+        .key("window")
+        .w_full()
+        .h_full()
+        .fill(t.bg)
+        .on_layout(|s: &mut State, r: [f32; 4]| {
+            s.panes.window_w = r[2];
+            fit(s);
+        })
+        .child(title_bar(s, t, leading))
+        .child(panes)
+}
+
+/// The title bar (#588): the list's toggle beside the traffic lights and the panel's at the
+/// window's top-right, as a macOS app's unified toolbar has them. Neither moves with the panes or
+/// the stage, and both are there whatever the stage shows (no device, one shut down or booting,
+/// one out in its own window) and however crowded its toolbar is. The rest of the band moves the
+/// window: macOS's own titlebar drag is off (`Chrome::drag_regions`), so the toggles take presses.
+pub fn title_bar(s: &State, t: Theme, leading: f32) -> El {
+    let bar = row()
+        .key("title-bar")
+        .w_full()
+        .h(TITLE_H)
+        .min_h(TITLE_H)
+        .pl(leading.max(0.0) + TOGGLE_INSET)
+        .pr(TOGGLE_INSET)
+        .center_y()
+        .fill(t.card);
+    drag_band(bar).child(pane_toggle(s, Side::Sidebar, t)).child(el().grow(1.0)).child(pane_toggle(s, Side::Inspector, t))
+}
+
+/// Marks a title-bar band as moving (and zooming) the window. macOS only: the content runs under
+/// a transparent titlebar there and its own drag is off (`Chrome::drag_regions`). Linux and
+/// Windows keep their native frame's caption, so a second drag strip below it is left out and
+/// their window behaves as before this bar.
+pub fn drag_band(band: El) -> El {
+    if cfg!(target_os = "macos") { band.window_drag() } else { band }
 }
 
 /// A pane's drag handle: a strip on its inner edge. Dragging sets the width (cancelling puts it
@@ -557,16 +596,17 @@ pub fn remember_app(handle: rune::AppHandle<State>) {
     APP.with(|cell| *cell.borrow_mut() = Some(handle));
 }
 
-/// The stage toolbar's button for `side` (macOS's sidebar.left and sidebar.right): at the
-/// toolbar's leading end for the list and its trailing end for the panel, so each stays in
-/// reach while its pane is hidden.
-pub fn toolbar_toggle(s: &State, side: Side, t: Theme) -> El {
+/// The title bar's button for `side` (macOS's sidebar.left and sidebar.right), pressed while
+/// its pane is on screen; its tooltip says what a press does and the shortcut.
+pub fn pane_toggle(s: &State, side: Side, t: Theme) -> El {
     let (key, glyph, item) = match side {
         Side::Sidebar => ("sidebar-toggle", &crate::icons::SIDEBAR_LEFT, ViewItem::Sidebar),
         Side::Inspector => ("inspector-toggle", &crate::icons::SIDEBAR_RIGHT, ViewItem::Inspector),
     };
     let label = format!("{} (⌘⌥{})", item.title(s), item.key().to_ascii_uppercase());
-    crate::debug::icon_button(key, glyph, &label, false, t, move |s: &mut State| toggle(s, side, Cause::Button))
+    crate::view::toggle_button(key, glyph, &label, shown(s, side), None, t)
+        .h(24.0)
+        .on_press(move |s: &mut State| toggle(s, side, Cause::Button))
 }
 
 /// Retitles the View menu when what it says changed.
@@ -817,28 +857,96 @@ mod tests {
         rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key)).and_then(|e| e.label).unwrap_or_default()
     }
 
-    /// #559, #560: the stage toolbar's buttons hide and show each pane with the mouse alone. The
-    /// list's button leads the toolbar, so it's still there (at the window's left) to bring the
-    /// list back; the panel's ends it.
+    fn help(rt: &Runtime<State>, key: &str) -> String {
+        rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key)).and_then(|e| e.help).unwrap_or_default()
+    }
+
+    /// Where the two toggles are: each one's target rect.
+    fn toggles(rt: &Runtime<State>) -> ([f32; 4], [f32; 4]) {
+        let at = |k| target(rt, k).unwrap_or_else(|| panic!("{k} is on screen"));
+        (at("sidebar-toggle"), at("inspector-toggle"))
+    }
+
+    /// Both toggles in the title bar, at their fixed places in a window `w` wide: the list's at
+    /// the leading end (past the traffic lights), the panel's `TOGGLE_INSET` from the right edge.
+    fn assert_in_place(rt: &Runtime<State>, w: f32, what: &str) {
+        let (left, right) = toggles(rt);
+        for r in [left, right] {
+            assert!(r[1] >= 0.0 && r[1] + r[3] <= TITLE_H + 0.5, "{what}: in the title bar: {r:?}");
+        }
+        assert!(left[0] >= TOGGLE_INSET - 0.5 && left[0] < 120.0, "{what}: beside the traffic lights: {left:?}");
+        assert!((right[0] + right[2] - (w - TOGGLE_INSET)).abs() < 0.5, "{what}: at the top-right: {right:?}");
+    }
+
+    /// #559, #560, #588: the title bar's buttons hide and show each pane with the mouse alone,
+    /// stay where they are while the panes come and go, and show which is open: pressed (the
+    /// accent fill) while its pane shows, with the shortcut in the tooltip.
     #[test]
-    fn the_toolbar_buttons_hide_and_show_the_panes() {
+    fn the_title_bar_buttons_hide_and_show_the_panes() {
         let mut rt = runtime(crate::demo);
         assert_eq!(label(&rt, "sidebar-toggle"), "Hide Device List (⌘⌥S)");
+        assert_eq!(help(&rt, "sidebar-toggle"), "Hide Device List (⌘⌥S)", "the tooltip names the shortcut");
         assert_eq!(label(&rt, "inspector-toggle"), "Hide Panel (⌘⌥I)");
+        let pressed = |rt: &Runtime<State>, k: &str| {
+            rt.elements().into_iter().find(|e| e.key.as_deref() == Some(k)).is_some_and(|e| e.fill == rune::tok::accent(0, true))
+        };
+        assert!(pressed(&rt, "sidebar-toggle") && pressed(&rt, "inspector-toggle"), "both panes open");
+        let home = toggles(&rt);
+        assert_in_place(&rt, 1240.0, "both shown");
         press(&mut rt, "sidebar-toggle");
         assert!(target(&rt, "device-list").is_none(), "the list is hidden");
-        let back = target(&rt, "sidebar-toggle").expect("the button stays on the stage");
-        assert!(back[0] < 40.0, "at the window's left edge: {back:?}");
         assert_eq!(label(&rt, "sidebar-toggle"), "Show Device List (⌘⌥S)");
+        assert!(!pressed(&rt, "sidebar-toggle") && pressed(&rt, "inspector-toggle"));
         press(&mut rt, "inspector-toggle");
         assert!(target(&rt, "debug-panel").is_none());
-        let right = target(&rt, "inspector-toggle").expect("the panel's button stays");
-        assert!(right[0] + right[2] > 1240.0 - 40.0, "at the window's right edge: {right:?}");
+        assert!(!pressed(&rt, "inspector-toggle"));
+        assert_eq!(toggles(&rt), home, "neither moved with the panes");
         press(&mut rt, "sidebar-toggle");
         press(&mut rt, "inspector-toggle");
         assert!(target(&rt, "device-list").is_some() && target(&rt, "debug-panel").is_some());
+        assert_eq!(toggles(&rt), home);
         assert!(rt.state.panes.changes.iter().all(|c| c.cause == Cause::Button) && rt.state.panes.changes.len() == 4);
         assert!(rt.state.actions.is_empty(), "the buttons queue nothing for the device");
+    }
+
+    /// #588: both toggles are there and in place whatever the stage shows (no device, one shut
+    /// down, one booting, one in its own window, a running one with a crowded toolbar), at the
+    /// default size and the minimum window width, and each still works there.
+    #[test]
+    fn the_pane_toggles_are_always_there() {
+        fn no_device(s: &mut State) {
+            crate::demo(s);
+            s.selected = None;
+        }
+        fn booting(s: &mut State) {
+            panel_empty_scene(s);
+            s.devices.iter_mut().filter(|d| d.udid == "B2").for_each(|d| d.state = sim_core::device::DeviceState::Booting);
+        }
+        type Scene = fn(&mut State);
+        let scenes: [(&str, Scene); 7] = [
+            ("demo", crate::demo),
+            ("no device", no_device),
+            ("shut down", panel_empty_scene),
+            ("booting", booting),
+            ("popped out", crate::popout::scene),
+            ("crowded", crate::view::crowded_toolbar_scene),
+            ("lists hidden", panes_hidden_scene),
+        ];
+        for (name, scene) in scenes {
+            for w in [1240.0, 1000.0] {
+                let mut rt = runtime(scene);
+                rt.set_viewport((w, 560.0), 2.0);
+                settle(&mut rt);
+                assert_in_place(&rt, w, &format!("{name} at {w}"));
+                let list = rt.state.prefs.current.sidebar.visible;
+                press(&mut rt, "sidebar-toggle");
+                assert_ne!(rt.state.prefs.current.sidebar.visible, list, "{name} at {w}: the list's toggle works");
+                let panel = rt.state.prefs.current.inspector.visible;
+                press(&mut rt, "inspector-toggle");
+                assert_ne!(rt.state.prefs.current.inspector.visible, panel, "{name} at {w}: the panel's toggle works");
+                assert_in_place(&rt, w, &format!("{name} at {w}, toggled"));
+            }
+        }
     }
 
     /// The View menu's items (macOS's menu bar) do what the buttons do, titled for what they'll
@@ -899,6 +1007,7 @@ mod tests {
         rt.set_viewport((560.0, 870.0), 2.0);
         settle(&mut rt);
         assert!(target(&rt, "device-list").is_none() && target(&rt, "sidebar-toggle").is_some());
+        assert_in_place(&rt, 560.0, "both collapsed for room");
         rt.set_viewport((1240.0, 870.0), 2.0);
         settle(&mut rt);
         assert!(target(&rt, "device-list").is_some() && target(&rt, "debug-panel").is_some());
