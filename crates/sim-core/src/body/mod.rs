@@ -11,17 +11,25 @@
 //! density, so a body's screen rect is the screen simee draws. The table ([`all`]) has one row per
 //! device type with published dimensions and says where each number came from ([`Source`]); a type
 //! it doesn't know gets a generic body derived from the screen it reports ([`for_apple_type`],
-//! [`for_android`]). Dimensions only: no logos, no vendor assets. TVs, car head units and headsets
-//! have no body ([`has_body`]).
+//! [`for_android`]). Dimensions only: no logos, no vendor assets.
+//!
+//! Phones, tablets and foldables are in `table`; each other form factor has a module of its own
+//! (`watch`, `tv`, `car`, `headset`) that says whether it has bodies yet ([`has_body`]) and
+//! builds its rows and generic bodies, with parts a phone has no use for (straps, a stand, a
+//! knob, lenses) as [`Body::extras`]. TVs, car head units and headsets have no body yet.
 //!
 //! [`Kind::profile`]: crate::form_factor::Kind::profile
 //! [`fold::devices`]: crate::fold::devices
 //! [`duo`]: crate::duo
 
+mod car;
+mod headset;
 mod mesh;
 mod table;
 #[cfg(test)]
 mod tests;
+mod tv;
+mod watch;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -281,6 +289,23 @@ impl FoldBody {
     }
 }
 
+/// A rounded box on the body that is none of the parts above: a strap, a stand, a knob, a lens, a
+/// light seal, a key strip. Drawn as its own part (a closed, outward-facing box), with the
+/// panel its centre is on; it may stand off the body (a TV's stand) or sink into it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Block {
+    /// What it is, for its material: one of the solid roles, never `Shell`, `Screen` or `Cutout`.
+    pub role: Role,
+    /// Its centre, body coordinates, mm.
+    pub center: [f32; 3],
+    /// Width (x), height (y) and depth (z), mm.
+    pub size: [f32; 3],
+    /// Its outline's corners (in the x/y plane).
+    pub corner: Corner,
+    /// The radius its front and back edges are rounded over, mm.
+    pub bevel: f32,
+}
+
 /// A device type's body.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Body {
@@ -303,6 +328,8 @@ pub struct Body {
     pub buttons: Vec<Button>,
     pub crown: Option<Crown>,
     pub fold: Option<FoldBody>,
+    /// Parts beyond the above ([`Block`]): straps, a stand, a knob, lenses.
+    pub extras: Vec<Block>,
 }
 
 impl Body {
@@ -339,10 +366,16 @@ impl Body {
     }
 }
 
-/// Whether a form factor has a body: phones, tablets, foldables and watches. TVs, car head units
-/// (CarPlay is a display on an iPhone) and headsets don't.
+/// Whether a form factor has a body: phones, tablets and foldables always; each other form factor
+/// once its module says so (watches do; TVs, car head units and headsets don't yet).
 pub fn has_body(form_factor: FormFactor) -> bool {
-    matches!(form_factor, FormFactor::Phone | FormFactor::Tablet | FormFactor::Foldable | FormFactor::Watch)
+    match form_factor {
+        FormFactor::Phone | FormFactor::Tablet | FormFactor::Foldable => true,
+        FormFactor::Watch => watch::ENABLED,
+        FormFactor::Tv => tv::ENABLED,
+        FormFactor::Auto => car::ENABLED,
+        FormFactor::Vision => headset::ENABLED,
+    }
 }
 
 /// Every body in the table, built once.
@@ -369,7 +402,7 @@ pub fn for_apple_type(info: &DeviceTypeInfo) -> Option<Arc<Body>> {
     }
     let form_factor = info.form_factor.filter(|f| has_body(*f))?;
     let density = Density::Scale(info.screen_scale.round().max(1.0) as u32);
-    let shape = if form_factor == FormFactor::Tv { Shape::Rectangle } else { Shape::Rounded };
+    let shape = table::reference_shape(Platform::Ios, form_factor);
     generic(Platform::Ios, form_factor, px, density, shape, None, table::HingeSpec::default())
 }
 
@@ -425,7 +458,10 @@ fn generic(
     }
     static GENERIC: OnceLock<Mutex<HashMap<String, Arc<Body>>>> = OnceLock::new();
     let mut map = GENERIC.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
-    let body =
-        map.entry(id).or_insert_with_key(|id| Arc::new(table::generic(id, platform, form_factor, px, density, shape, folded, hinge)));
-    Some(Arc::clone(body))
+    if let Some(b) = map.get(&id) {
+        return Some(Arc::clone(b));
+    }
+    let body = Arc::new(table::generic(&id, platform, form_factor, px, density, shape, folded, hinge)?);
+    map.insert(id, Arc::clone(&body));
+    Some(body)
 }

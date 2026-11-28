@@ -17,6 +17,11 @@ fn kind(platform: Platform, form_factor: FormFactor) -> Kind {
     Kind::new(platform, form_factor).expect("supported")
 }
 
+/// The form factors with a body that simee creates AVDs of.
+fn bodied() -> Vec<FormFactor> {
+    FormFactor::ALL.into_iter().filter(|f| has_body(*f) && Kind::new(Platform::Android, *f).is_ok()).collect()
+}
+
 /// An Apple device type as CoreSimulator reports it (screen in pixels).
 fn apple_type(id: &str, name: &str, family: &str, (w, h): (u32, u32), scale: u32) -> DeviceTypeInfo {
     DeviceTypeInfo {
@@ -53,7 +58,7 @@ fn every_device_type_simee_lists_gets_a_body() {
         }
     }
     // The AVD form factors simee creates are rows of the table, marked generic.
-    for f in [FormFactor::Phone, FormFactor::Tablet, FormFactor::Foldable, FormFactor::Watch] {
+    for f in bodied() {
         let b = for_profile(&kind(Platform::Android, f).profile()).expect("body");
         assert!(all().iter().any(|row| Arc::ptr_eq(row, &b)), "{f:?} is a table row");
         assert!(matches!(b.source, Source::Generic(_)), "{f:?}");
@@ -114,7 +119,8 @@ fn unknown_types_get_a_generic_body_from_the_screen_they_report() {
     assert!(matches!(b.source, Source::Generic(_)) && b.shows((1179, 2556)));
     let known = apple_type("iPhone-17-Pro", "iPhone 17 Pro", "iPhone", (1206, 2622), 3);
     assert_eq!(for_apple_type(&known).map(|b| b.id.clone()).as_deref(), Some("iPhone-17-Pro"));
-    assert!(for_apple_type(&apple_type("Apple-TV-4K-3rd-generation-4K", "Apple TV 4K", "Apple TV", (3840, 2160), 1)).is_none());
+    let tv = for_apple_type(&apple_type("Apple-TV-4K-3rd-generation-4K", "Apple TV 4K", "Apple TV", (3840, 2160), 1));
+    assert_eq!(tv.is_some(), has_body(FormFactor::Tv));
     // An AVD on a custom screen, and a square watch.
     let custom = kind(Platform::Android, FormFactor::Phone).profile().with_screen(1080, 2400, Density::Dpi(420));
     let b = for_android("custom", &custom).expect("generic body");
@@ -147,7 +153,7 @@ fn screens_match_the_screen_simee_reports() {
     // The pixels are simee's own: reference profiles, foldable definitions, the iPhone Duo. The
     // screen drawn on the body has the shape simee reports (its aspect, and at the density a
     // generic body assumes, its size in millimetres).
-    for f in [FormFactor::Phone, FormFactor::Tablet, FormFactor::Foldable, FormFactor::Watch] {
+    for f in bodied() {
         let p = kind(Platform::Android, f).profile();
         let b = for_profile(&p).expect("body");
         let main = b.screen(Display::Main).or(b.screen(Display::Inner)).expect("screen");
@@ -247,6 +253,13 @@ fn closed_volume(m: &Mesh, parts: &[Part]) -> Result<f32, String> {
     Ok(volume)
 }
 
+/// The box a part's vertices fill.
+fn part_bounds(m: &Mesh, part: &Part) -> ([f32; 3], [f32; 3]) {
+    m.part_indices(part).iter().map(|&i| m.positions[i as usize]).fold(([f32::MAX; 3], [f32::MIN; 3]), |(lo, hi), p| {
+        (std::array::from_fn(|k| lo[k].min(p[k])), std::array::from_fn(|k| hi[k].max(p[k])))
+    })
+}
+
 fn bodies_to_mesh() -> Vec<Arc<Body>> {
     let mut out = all().to_vec();
     out.push(for_apple_type(&apple_type("iPhone-18-Pro", "iPhone 18 Pro", "iPhone", (1206, 2622), 3)).expect("generic"));
@@ -254,6 +267,7 @@ fn bodies_to_mesh() -> Vec<Arc<Body>> {
     square.shape = Shape::Rectangle;
     out.push(for_profile(&square).expect("square watch"));
     out.extend(unlisted_foldables());
+    out.extend(with_extras());
     out
 }
 
@@ -323,9 +337,25 @@ fn meshes_are_well_formed() {
             let slab = p.size[0] * p.size[1] * b.size[2];
             assert!(v > 0.6 * slab && v <= slab * 1.001, "{id} panel {panel}: volume {v} of {slab}");
         }
-        for part in m.parts.iter().filter(|p| matches!(p.role, Role::Bump | Role::Button | Role::Crown)) {
+        for part in m.parts.iter().filter(|p| !matches!(p.role, Role::Shell | Role::Screen(_) | Role::Cutout)) {
             let v = closed_volume(&m, &[*part]).unwrap_or_else(|e| panic!("{id} {:?}: {e}", part.role));
             assert!(v > 0.0, "{id} {:?} faces out", part.role);
+        }
+        // Each extra block is the last parts, in order: its own role and panel, watertight,
+        // facing out, and about the box it describes.
+        let extras = &m.parts[m.parts.len() - b.extras.len()..];
+        for (x, part) in b.extras.iter().zip(extras) {
+            let what = format!("{id} {:?} at {:?}", x.role, x.center);
+            assert!(!matches!(x.role, Role::Shell | Role::Screen(_) | Role::Cutout), "{what}: a block is a solid part");
+            assert_eq!((part.role, part.panel), (x.role, b.panel_at([x.center[0], x.center[1]])), "{what}");
+            let v = closed_volume(&m, &[*part]).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let cube = x.size[0] * x.size[1] * x.size[2];
+            assert!(v > 0.5 * cube && v <= cube * 1.001, "{what}: volume {v} of {cube}");
+            let (lo, hi) = part_bounds(&m, part);
+            for k in 0..3 {
+                let (want_lo, want_hi) = (x.center[k] - x.size[k] / 2.0, x.center[k] + x.size[k] / 2.0);
+                assert!((lo[k] - want_lo).abs() < 1e-3 && (hi[k] - want_hi).abs() < 1e-3, "{what}: axis {k} spans {lo:?}..{hi:?}");
+            }
         }
         // Each triangle winds the way its normals face.
         for part in &m.parts {
@@ -609,4 +639,118 @@ fn the_iphone_duo_inner_screen_lies_on_its_side() {
     assert_eq!(onto_face([1.0, 0.5])[1], 1.0);
     // Its 2007x2853 pixels fill the 2853x2007 face turned: the frame's aspect is the face's flipped.
     assert!(close(2007.0 / 2853.0, h / w, EXACT));
+}
+
+/// FNV-1a over a body's every field (its `Debug`, whose f32s print exactly; a body with no
+/// extras prints as it did before `extras` existed) and its mesh's bits: equal fingerprints are
+/// the same body and the same triangles.
+pub(super) fn fingerprint(b: &Body) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for &x in bytes {
+            h = (h ^ u64::from(x)).wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    eat(format!("{b:?}").replace(", extras: []", "").as_bytes());
+    let m = mesh(b);
+    for v in m.positions.iter().chain(&m.normals) {
+        v.iter().for_each(|c| eat(&c.to_bits().to_le_bytes()));
+    }
+    m.uvs.iter().for_each(|v| v.iter().for_each(|c| eat(&c.to_bits().to_le_bytes())));
+    m.indices.iter().for_each(|i| eat(&i.to_le_bytes()));
+    m.parts.iter().for_each(|p| eat(format!("{p:?}").as_bytes()));
+    h
+}
+
+#[test]
+fn phone_tablet_and_foldable_bodies_are_unchanged_by_the_split() {
+    // As they were before each form factor got its module (#500); the watches' own pin is in
+    // watch.rs. None of the form factor modules may change these.
+    let before: [(&str, u64); 26] = [
+        ("iPhone-17-Pro", 0xd093af151d72e8d3),
+        ("iPhone-17-Pro-Max", 0xb06f426ad92e4164),
+        ("iPhone-17", 0x6b83a9e1f21ce0f4),
+        ("iPhone-Air", 0x096947610a67f745),
+        ("iPhone-16e", 0x6d798dcc1313c57a),
+        ("iPhone-16", 0xef0981547d3a7ae5),
+        ("iPhone-16-Plus", 0x7911de4cf2b9d540),
+        ("iPhone-16-Pro", 0x6a070335970014ee),
+        ("iPhone-16-Pro-Max", 0x3cead82f457ece80),
+        ("iPhone-SE-3rd-generation", 0x5c87fdb115a2b350),
+        ("iPad-Pro-11-inch-M4", 0x17c7c58109f16db5),
+        ("iPad-Pro-13-inch-M4", 0xe8e25a6641218e79),
+        ("iPad-Air-11-inch-M3", 0x91bfaab073614946),
+        ("iPad-Air-13-inch-M3", 0x73048cf9c5674d92),
+        ("iPad-mini-A17-Pro", 0xf97f13bd9f07c3d2),
+        ("iPad-A16", 0x4bd26dc04a05442a),
+        ("pixel_fold", 0x1f8b7d48e1d8f4c3),
+        ("surface_duo", 0xc226fae94453ab39),
+        ("iPhone-Duo", 0x56b8745fd4bfcb50),
+        ("android-phone-720x1280-320dpi-rounded", 0xb83b5db9e9d1f2b2),
+        ("android-tablet-2560x1600-320dpi-rounded", 0x4921fd00dc078c0a),
+        ("android-foldable-2208x1840-420dpi-rectangle-folded-1080x2092", 0x814c5f14d7e6b1bc),
+        ("ios-phone-1206x2622-3x-rounded", 0x8294654427b16679),
+        ("android-foldable-1080x2640-420dpi-rectangle-folded-720x748-horizontal-hinge-0-180-gap0", 0x6f7de05030587255),
+        ("android-foldable-1080x2640-420dpi-rectangle-folded-720x748-vertical-hinge-0-120-gap0", 0x01faf8a0eb1737f9),
+        ("android-foldable-1080x2640-420dpi-rectangle-folded-720x748-vertical-hinge-0-360-gap84", 0xc160af820cdaf96b),
+    ];
+    let mut bodies: Vec<Arc<Body>> = all().to_vec();
+    bodies.push(for_apple_type(&apple_type("iPhone-18-Pro", "iPhone 18 Pro", "iPhone", (1206, 2622), 3)).expect("generic"));
+    bodies.extend(unlisted_foldables());
+    let got: HashMap<&str, u64> = bodies.iter().map(|b| (b.id.as_str(), fingerprint(b))).collect();
+    for (id, want) in before {
+        assert_eq!(got.get(id), Some(&want), "{id}");
+    }
+}
+
+#[test]
+fn has_body_is_what_each_form_factor_module_says() {
+    assert!([FormFactor::Phone, FormFactor::Tablet, FormFactor::Foldable].into_iter().all(has_body));
+    let modules = [
+        (FormFactor::Watch, watch::ENABLED),
+        (FormFactor::Tv, tv::ENABLED),
+        (FormFactor::Auto, car::ENABLED),
+        (FormFactor::Vision, headset::ENABLED),
+    ];
+    for (f, enabled) in modules {
+        assert_eq!(has_body(f), enabled, "{f:?}");
+        // A form factor with no body has no row, and no generic body on either platform.
+        if !enabled {
+            assert!(all().iter().all(|b| b.form_factor != f), "{f:?} has rows but no body");
+            for platform in Platform::ALL {
+                if let Ok(k) = Kind::new(platform, f) {
+                    assert!(for_profile(&k.profile()).is_none(), "{f:?} on {platform:?}");
+                }
+            }
+        }
+    }
+}
+
+/// A body with one block of each extra role: on both panels of a foldable, standing off its
+/// faces and its sides, round and square, sunk into it and clear of it.
+fn with_extras() -> Vec<Arc<Body>> {
+    let mut fold = (*get("pixel_fold").expect("pixel fold")).clone();
+    fold.id = "test-extras-fold".into();
+    let [w, h, t] = fold.size;
+    let round = |d: f32| Corner { radius: d / 2.0, exponent: 2.0 };
+    let square = Corner { radius: 2.0, exponent: 3.0 };
+    fold.extras = vec![
+        Block { role: Role::Stand, center: [-w / 4.0, -h / 2.0 - 10.0, 0.0], size: [40.0, 20.0, 30.0], corner: square, bevel: 1.0 },
+        Block { role: Role::Knob, center: [w / 4.0, 0.0, t / 2.0 + 3.0], size: [12.0, 12.0, 6.0], corner: round(12.0), bevel: 1.5 },
+        Block { role: Role::Lens, center: [w / 4.0, h / 4.0, -t / 2.0 - 0.5], size: [20.0, 14.0, 1.5], corner: round(14.0), bevel: 0.4 },
+        Block { role: Role::Trim, center: [0.0, 0.0, -t / 2.0 - 1.0], size: [w + 6.0, h + 6.0, 2.0], corner: square, bevel: 0.0 },
+    ];
+    let mut watch = (*get("Apple-Watch-Series-10-46mm").expect("watch")).clone();
+    watch.id = "test-extras-watch".into();
+    let [ww, wh, wt] = watch.size;
+    watch.extras = [1.0, -1.0]
+        .map(|s| Block {
+            role: Role::Strap,
+            center: [0.0, s * (wh / 2.0 + 15.0), 0.0],
+            size: [ww - 14.0, 32.0, wt * 0.4],
+            corner: Corner { radius: 3.0, exponent: 2.0 },
+            bevel: 1.0,
+        })
+        .to_vec();
+    vec![Arc::new(fold), Arc::new(watch)]
 }
