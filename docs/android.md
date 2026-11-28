@@ -414,7 +414,11 @@ so far, and what it doesn't:
   namespace. Either way the state directory is handed to that range. The unprivileged process has
   an uid the map doesn't contain, so `unshare --keep-caps` keeps its capabilities across `exec`
   and the helper's `become-root` waits for the maps, clears the supplementary groups and becomes
-  uid and gid 0 before the script runs. `chown` and `rm` on the container's files run in a short
+  uid and gid 0, in a first `unshare` that makes every namespace but the pid one; a second
+  `unshare --pid --fork` then runs the script. A subordinate range must have 65,536 ids and must
+  not contain the user's own uid or gid (all of the user's `/etc/subuid` and `/etc/subgid` lines
+  are read, and the first range that qualifies is used); when none does, the fix names a range
+  after the highest one in the file. `chown` and `rm` on the container's files run in a short
   admin namespace where the user is root and container id `n` is id `n + 1` (no guest code runs
   there; the user's uid appears in that map only). The script mounts an overlay of the
   unpacked image over a per-device writable layer, a `/dev` tmpfs with the nodes Redroid's init
@@ -425,8 +429,11 @@ so far, and what it doesn't:
   (`androidboot.redroid_width|height|dpi|gpu_mode`, `androidboot.use_memfd=true`). The helper is
   `emu` itself under a hidden subcommand (`helper::main`) or the crate's `simee-container-helper`
   binary, and it also sets `PR_SET_PDEATHSIG` so a crashed `emu` takes the container down with it
-  (start containers from a thread that outlives them: the kernel ties the signal to the thread);
-  dropping a `Container` kills it. Removing a rootfs the container made runs `rm` in the admin
+  (start containers from a thread that outlives them: the kernel ties the signal to the thread).
+  The kernel clears that signal on a credential change and on any `exec` that gains capabilities,
+  so it is set again in `become-root` (checking the launcher is still the parent) and in `pivot`
+  just before `/init` (checking that the launcher's control pipe, which stays open, isn't hung up);
+  the launcher-death test runs the whole chain. Dropping a `Container` kills it. Removing a rootfs the container made runs `rm` in the admin
   namespace.
 - **Network and adb (`net.rs`).** The pinned image's adbd listens on port 5555 on every address and
   the image ships with adb authentication off (`ro.adb.secure=0`, in
@@ -439,8 +446,10 @@ so far, and what it doesn't:
   direction off: `-T none -U none -u none --no-map-gw`, because pasta's defaults forward every port the
   guest binds on every host address and splice the guest's loopback to the host's), then
   `slirp4netns` (`--disable-host-loopback`; the forward is added through its API socket), then,
-  for root, a veth pair (a /30 from 100.64.0.0/10 per container, a proxy thread on the loopback
-  port). Root prefers pasta to the veth pair because it gives the guest an uplink without changing
+  for root, a veth pair (a /30 per container from the first of 10.233.0.0/16, 10.234.0.0/16,
+  10.235.0.0/16, 172.29.0.0/16 and 192.168.233.0/24 that the host has no route into, read from
+  `/proc/net/route`: not Tailscale's 100.64.0.0/10, behind which a tailnet peer could be hidden;
+  refused with the list when every candidate is routed; a proxy thread on the loopback port). Root prefers pasta to the veth pair because it gives the guest an uplink without changing
   the host's routing or firewall. The veth pair has no uplink (the guest reaches the host's end of
   the pair and nothing further; services the host binds on all addresses are reachable from it
   there). Authentication: `AdbAuth::Keys` sets `ro.adb.secure=1` as an init argument and writes the
@@ -459,7 +468,8 @@ so far, and what it doesn't:
   (this VM has no `/dev/net/tun`): the guest's namespace differs from the host's, it has only `lo`
   and `eth0`, the host listens on the adb port on `127.0.0.1` and nowhere else, a connection from
   the host reaches a listener in the guest over the pair, and the listener is gone when the
-  container stops.
+  container stops. Killing the launcher takes the whole container tree with it, as root and as an
+  unprivileged user (it failed before `pivot` set the signal again: `/init` outlived `unshare`).
 - **Not verified:** a boot. No binder host has run this launcher, so whether Redroid's `/init`
   starts unprivileged in this namespace set (as a subordinate id, with `eth0` configured by the
   uplink), and how long it takes, are open; so is whether `ro.adb.secure=1` as an init argument

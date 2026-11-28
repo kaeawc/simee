@@ -80,6 +80,9 @@ impl HostView for PretendNet {
     fn euid(&self) -> u32 {
         self.0.euid()
     }
+    fn egid(&self) -> u32 {
+        self.0.egid()
+    }
     fn arch(&self) -> String {
         self.0.arch()
     }
@@ -150,7 +153,12 @@ fn run(p: &Plan, argv: &[String], net: bool) -> (bool, String, String) {
     } else {
         (launch::spawn_isolated(&p.idmap, &script, Some(&p.helper), Stdio::piped(), Stdio::piped()).expect("spawn"), None)
     };
+    // Hold the control pipe open until the container is done, as `Container` does: `pivot` treats a
+    // pipe with no writer as a dead launcher, and `wait_with_output` would close it at once.
+    let mut child = child;
+    let control = child.stdin.take();
     let out = child.wait_with_output().expect("wait");
+    drop(control);
     (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
 }
 
@@ -316,6 +324,142 @@ fn real_host_the_container_has_its_own_network_and_adb_only_on_loopback() {
     child.wait().expect("wait");
     drop(net);
     assert!(listeners_on(port).is_empty(), "the forward outlived the container: {:?}", listeners_on(port));
+}
+
+/// The `/proc/<pid>/stat` state letter (`S`, `R`, `Z`...), `None` when the process is gone.
+fn proc_state(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| s.rsplit(')').next().and_then(|r| r.split_whitespace().next().map(String::from)))
+}
+
+/// `root` and everything below it, by host pid.
+fn family(root: u32) -> Vec<u32> {
+    let mut parent_of = vec![];
+    for e in std::fs::read_dir("/proc").expect("/proc").flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+        let ppid = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| s.rsplit(')').next().and_then(|r| r.split_whitespace().nth(1).and_then(|p| p.parse::<u32>().ok())));
+        if let Some(ppid) = ppid {
+            parent_of.push((pid, ppid));
+        }
+    }
+    let mut all = vec![root];
+    let mut i = 0;
+    while i < all.len() {
+        let at = all[i];
+        all.extend(parent_of.iter().filter(|(_, pp)| *pp == at).map(|(p, _)| *p));
+        i += 1;
+    }
+    all
+}
+
+const LAUNCHER_DIR: &str = "SIMEE_TEST_LAUNCHER_DIR";
+
+/// Not a test by itself: the launcher process for [`real_host_a_container_dies_with_its_launcher_through_the_whole_chain`],
+/// which runs this test binary again with `LAUNCHER_DIR` set. It starts a container the way
+/// `launch::start` does (the helper, `unshare`, the id maps), prints its pid and waits.
+#[test]
+fn real_host_launcher_child() {
+    let Some(dir) = std::env::var_os(LAUNCHER_DIR) else { return };
+    let tmp = PathBuf::from(dir);
+    let (p, _, net) = plan_in(&tmp, tmp.join("rootfs"));
+    let p = if probe(&FsView).get(simee_emu_container::probe::Feature::Binder).is_some_and(|c| c.ok()) { p } else { without_binder(&p) };
+    let mut p = p;
+    if !net {
+        p.steps.retain(|s| !matches!(s, Step::Run(_)));
+    }
+    p.prepare_host().expect("state dir");
+    let sh = std::fs::canonicalize("/bin/sh").expect("sh").display().to_string();
+    // The container's `/init` environment has a minimal PATH: the stand-in names `sleep` in full.
+    let sleep = std::fs::canonicalize("/bin/sleep").expect("sleep").display().to_string();
+    let script = p.script_with(&[sh, "-c".into(), format!("echo started; exec {sleep} 600")]);
+    let (child, _net) = if net {
+        let (c, n) = launch::spawn_container(&p, &script, run_dir(&p), Stdio::null(), Stdio::inherit()).expect("spawn");
+        (c, Some(n))
+    } else {
+        (launch::spawn_isolated(&p.idmap, &script, Some(&p.helper), Stdio::null(), Stdio::inherit()).expect("spawn"), None)
+    };
+    println!("LAUNCHED {}", child.id());
+    // The thread that started the container must outlive it (the parent-death signal follows it).
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+}
+
+/// The real chain (the helper's `die-with-parent`, `unshare`, and for an unprivileged user
+/// `become-root` and a second `unshare` for the pid namespace): killing the launcher takes every
+/// process of the container with it. The credential change in `become-root` clears the
+/// parent-death signal, and it has to be set again.
+#[test]
+fn real_host_a_container_dies_with_its_launcher_through_the_whole_chain() {
+    if !enabled() {
+        return;
+    }
+    let tmp = tmp("chain");
+    shell_rootfs(&tmp.join("rootfs"));
+    let exe = std::env::current_exe().expect("test exe");
+    /// Kills the launcher however the test ends, so a failed assertion leaves nothing running.
+    struct Launcher(std::process::Child);
+    impl Drop for Launcher {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut launcher = Launcher(
+        Command::new(exe)
+            .args(["--exact", "real_host_launcher_child", "--nocapture", "--test-threads=1"])
+            .env(LAUNCHER_DIR, &tmp)
+            .env("SIMEE_E2E_CONTAINER", "1")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("the launcher"),
+    );
+    let mut out = std::io::BufReader::new(launcher.0.stdout.take().expect("stdout"));
+    let unshare_pid = loop {
+        let mut line = String::new();
+        let n = std::io::BufRead::read_line(&mut out, &mut line).expect("launcher output");
+        assert!(n > 0, "the launcher exited before it started the container");
+        // libtest's own "test name ... " precedes the marker on the same line.
+        if let Some((_, pid)) = line.trim().split_once("LAUNCHED ") {
+            break pid.parse::<u32>().expect("a pid");
+        }
+    };
+    // Wait for the container's `/init` stand-in (`sleep`): setup is done once it runs.
+    let comm = |pid: u32| std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default().trim().to_string();
+    let mut tree = vec![];
+    for _ in 0..1000 {
+        tree = family(unshare_pid);
+        if tree.iter().any(|p| comm(*p) == "sleep") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        tree.iter().any(|p| comm(*p) == "sleep"),
+        "the container never reached its init: {:?}",
+        tree.iter().map(|p| (*p, comm(*p))).collect::<Vec<_>>()
+    );
+    eprintln!("container processes: {:?}", tree.iter().map(|p| (*p, comm(*p))).collect::<Vec<_>>());
+
+    launcher.0.kill().expect("kill the launcher");
+    launcher.0.wait().expect("reap the launcher");
+    // Each is gone, or a zombie waiting to be reaped: poll for the kernel's answer.
+    let mut left = tree.clone();
+    for _ in 0..5000 {
+        left.retain(|p| !matches!(proc_state(*p).as_deref(), None | Some("Z")));
+        if left.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(
+        left.is_empty(),
+        "the container outlived its launcher: {:?}",
+        left.iter().map(|p| (*p, comm(*p), proc_state(*p))).collect::<Vec<_>>()
+    );
 }
 
 #[test]

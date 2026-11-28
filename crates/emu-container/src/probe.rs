@@ -21,6 +21,8 @@ pub trait HostView {
     fn memfd_create(&self) -> bool;
     /// The effective user id.
     fn euid(&self) -> u32;
+    /// The effective group id.
+    fn egid(&self) -> u32;
     /// The CPU architecture as Rust names it (`x86_64`, `aarch64`).
     fn arch(&self) -> String;
     /// The device names a binderfs mount holds once mounted (in a throwaway user namespace, so no
@@ -320,8 +322,9 @@ fn user_namespaces(view: &dyn HostView) -> Check {
     ok(Feature::UserNamespaces, "available to unprivileged processes")
 }
 
-/// The first `/etc/subuid`-style line for `uid` or its login name: `(start, count)`.
-pub fn subordinate_range(view: &dyn HostView, file: &str, uid: u32) -> Option<(u32, u32)> {
+/// Every `(start, count)` that `file` (`/etc/subuid`, `/etc/subgid`) grants `uid`, by number or by
+/// login name, in file order: a user can have several lines.
+pub fn subordinate_ranges(view: &dyn HostView, file: &str, uid: u32) -> Vec<(u32, u32)> {
     let name = view.read("/etc/passwd").and_then(|p| {
         p.lines().find_map(|l| {
             let mut f = l.split(':');
@@ -329,16 +332,84 @@ pub fn subordinate_range(view: &dyn HostView, file: &str, uid: u32) -> Option<(u
             (id.parse::<u32>().ok()? == uid).then(|| name.to_string())
         })
     });
-    view.read(file)?.lines().find_map(|l| {
-        let mut f = l.split(':');
-        let who = f.next()?;
-        let (start, count) = (f.next()?.trim().parse().ok()?, f.next()?.trim().parse().ok()?);
-        (who == uid.to_string() || Some(who) == name.as_deref()).then_some((start, count))
-    })
+    view.read(file)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split(':');
+            let who = f.next()?;
+            let (start, count) = (f.next()?.trim().parse().ok()?, f.next()?.trim().parse().ok()?);
+            (who == uid.to_string() || Some(who) == name.as_deref()).then_some((start, count))
+        })
+        .collect()
 }
 
 /// Android needs more than the one uid an unprivileged user namespace maps by default.
-const MIN_SUBORDINATE_IDS: u32 = 65536;
+pub const MIN_SUBORDINATE_IDS: u32 = 65536;
+
+/// Why none of a user's subordinate ranges will do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RangeProblem {
+    /// The file has no line for the user.
+    None,
+    /// Every range is smaller than Android needs; the largest has this many ids.
+    TooSmall(u32),
+    /// Every range of enough ids contains the user's own id, which container ids must never
+    /// reach (the container's ids would include the user's).
+    ContainsOwn(u32),
+}
+
+impl fmt::Display for RangeProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RangeProblem::None => f.write_str("has no range for this user"),
+            RangeProblem::TooSmall(n) => write!(f, "gives this user {n} ids; Android needs {MIN_SUBORDINATE_IDS}"),
+            RangeProblem::ContainsOwn(own) => write!(f, "only has ranges that contain the user's own id {own}"),
+        }
+    }
+}
+
+/// The first of `ranges` that has enough ids and doesn't contain `own` (the user's own uid or gid,
+/// or 0 for root).
+pub fn pick_range(ranges: &[(u32, u32)], own: u32) -> std::result::Result<(u32, u32), RangeProblem> {
+    let mut large = false;
+    for &(start, count) in ranges.iter().filter(|r| r.1 >= MIN_SUBORDINATE_IDS) {
+        large = true;
+        if !(u64::from(start)..u64::from(start) + u64::from(count)).contains(&u64::from(own)) {
+            return Ok((start, count));
+        }
+    }
+    match (ranges.iter().map(|r| r.1).max(), large) {
+        (None, _) => Err(RangeProblem::None),
+        (Some(n), false) => Err(RangeProblem::TooSmall(n)),
+        (Some(_), true) => Err(RangeProblem::ContainsOwn(own)),
+    }
+}
+
+/// The ids `file` hasn't given anyone: from 100000 or the end of the highest range in it,
+/// whichever is higher, for [`MIN_SUBORDINATE_IDS`] ids. `(first, last)`, as `usermod` takes them.
+pub fn suggest_range(view: &dyn HostView, file: &str) -> (u32, u32) {
+    let end = view
+        .read(file)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split(':').skip(1);
+            let (start, count): (u32, u32) = (f.next()?.trim().parse().ok()?, f.next()?.trim().parse().ok()?);
+            Some(start.saturating_add(count))
+        })
+        .max()
+        .unwrap_or(0);
+    let first = end.max(100_000);
+    (first, first.saturating_add(MIN_SUBORDINATE_IDS - 1))
+}
+
+/// The `usermod` command that grants the user a range `file` (`/etc/subuid` or `/etc/subgid`;
+/// `kind` is `uid` or `gid`) gives no one else.
+pub fn subid_fix(view: &dyn HostView, file: &str, kind: &str) -> String {
+    let (first, last) = suggest_range(view, file);
+    format!("sudo usermod --add-sub{kind}s {first}-{last} $USER")
+}
 
 fn subordinate_ids(view: &dyn HostView) -> Check {
     let euid = view.euid();
@@ -356,23 +427,9 @@ fn subordinate_ids(view: &dyn HostView) -> Check {
             );
         }
     }
-    for (file, kind) in [("/etc/subuid", "uid"), ("/etc/subgid", "gid")] {
-        match subordinate_range(view, file, euid) {
-            Some((_, count)) if count >= MIN_SUBORDINATE_IDS => {}
-            Some((_, count)) => {
-                return missing(
-                    Feature::SubordinateIds,
-                    format!("{file} gives this user {count} {kind}s; Android needs {MIN_SUBORDINATE_IDS}"),
-                    format!("sudo usermod --add-sub{kind}s 100000-165535 $USER"),
-                );
-            }
-            None => {
-                return missing(
-                    Feature::SubordinateIds,
-                    format!("{file} has no range for this user"),
-                    format!("sudo usermod --add-sub{kind}s 100000-165535 $USER"),
-                );
-            }
+    for (file, kind, own) in [("/etc/subuid", "uid", euid), ("/etc/subgid", "gid", view.egid())] {
+        if let Err(problem) = pick_range(&subordinate_ranges(view, file, euid), own) {
+            return missing(Feature::SubordinateIds, format!("{file} {problem}"), subid_fix(view, file, kind));
         }
     }
     ok(Feature::SubordinateIds, "newuidmap, newgidmap and subordinate ranges are set up")
@@ -462,6 +519,10 @@ impl HostView for FsView {
         rustix::process::geteuid().as_raw()
     }
 
+    fn egid(&self) -> u32 {
+        rustix::process::getegid().as_raw()
+    }
+
     fn arch(&self) -> String {
         std::env::consts::ARCH.to_string()
     }
@@ -503,6 +564,7 @@ pub(crate) mod fake {
         pub tools: BTreeSet<String>,
         pub memfd: bool,
         pub euid: u32,
+        pub egid: u32,
         pub arch: String,
         /// What a test mount of binderfs holds; `None` is "couldn't be tried".
         pub binderfs: Option<Vec<String>>,
@@ -523,6 +585,10 @@ pub(crate) mod fake {
         }
         pub fn euid(mut self, euid: u32) -> Self {
             self.euid = euid;
+            self
+        }
+        pub fn egid(mut self, egid: u32) -> Self {
+            self.egid = egid;
             self
         }
 
@@ -574,6 +640,9 @@ pub(crate) mod fake {
         }
         fn euid(&self) -> u32 {
             self.euid
+        }
+        fn egid(&self) -> u32 {
+            self.egid
         }
         fn arch(&self) -> String {
             self.arch.clone()
@@ -728,6 +797,7 @@ mod tests {
     fn unprivileged() -> FakeView {
         FakeView::container_host()
             .euid(1000)
+            .egid(1000)
             .file("/etc/passwd", "root:x:0:0::/root:/bin/bash\nci:x:1000:1000::/home/ci:/bin/bash\n")
             .file("/etc/subuid", "ci:100000:65536\n")
             .file("/etc/subgid", "1000:100000:65536\n")
@@ -741,9 +811,9 @@ mod tests {
         let r = probe(&unprivileged());
         assert!(r.usable(), "{:?}", r.explain());
         // subuid by login name, subgid by numeric id: both forms are read
-        assert_eq!(subordinate_range(&unprivileged(), "/etc/subuid", 1000), Some((100000, 65536)));
-        assert_eq!(subordinate_range(&unprivileged(), "/etc/subgid", 1000), Some((100000, 65536)));
-        assert_eq!(subordinate_range(&unprivileged(), "/etc/subuid", 1001), None);
+        assert_eq!(subordinate_ranges(&unprivileged(), "/etc/subuid", 1000), [(100000, 65536)]);
+        assert_eq!(subordinate_ranges(&unprivileged(), "/etc/subgid", 1000), [(100000, 65536)]);
+        assert!(subordinate_ranges(&unprivileged(), "/etc/subuid", 1001).is_empty());
     }
 
     #[test]
@@ -757,6 +827,57 @@ mod tests {
         let v = unprivileged().file("/etc/subgid", "someone-else:100000:65536\n");
         assert!(fix_of(&probe(&v), Feature::SubordinateIds).contains("--add-subgids"));
         assert!(!probe(&v).usable());
+    }
+
+    #[test]
+    fn every_line_for_the_user_is_read_and_a_large_enough_range_is_picked() {
+        let v = unprivileged().file("/etc/subuid", "ci:100000:1000\nother:300000:65536\nci:200000:65536\n1000:400000:70000\n");
+        // Both the login name and the numeric id count, in file order.
+        assert_eq!(subordinate_ranges(&v, "/etc/subuid", 1000), [(100000, 1000), (200000, 65536), (400000, 70000)]);
+        assert_eq!(pick_range(&subordinate_ranges(&v, "/etc/subuid", 1000), 1000), Ok((200000, 65536)), "skips the small first line");
+        assert!(probe(&v).usable(), "{:?}", probe(&v).explain());
+        // Only small ones: the largest is reported.
+        assert_eq!(pick_range(&[(1, 10), (50, 3000)], 7), Err(RangeProblem::TooSmall(3000)));
+        assert_eq!(pick_range(&[], 7), Err(RangeProblem::None));
+    }
+
+    #[test]
+    fn a_range_that_contains_the_users_own_id_is_never_picked() {
+        // The user's uid is 1000 and gid 1000: a range straddling either would map them into the
+        // container.
+        assert_eq!(pick_range(&[(999, 65536)], 1000), Err(RangeProblem::ContainsOwn(1000)));
+        assert_eq!(pick_range(&[(1000, 65536)], 1000), Err(RangeProblem::ContainsOwn(1000)), "starting at it");
+        assert_eq!(pick_range(&[(4000, 65536)], 69536), Ok((4000, 65536)), "ending just before it (4000..69535)");
+        assert_eq!(pick_range(&[(4000, 65536)], 69535), Err(RangeProblem::ContainsOwn(69535)), "its last id");
+        assert_eq!(pick_range(&[(500, 65536), (70000, 65536)], 1000), Ok((70000, 65536)), "the next one");
+        let uid = unprivileged().file("/etc/subuid", "ci:0:65536\n");
+        let r = probe(&uid);
+        assert!(!r.usable());
+        let line = r.get(Feature::SubordinateIds).map(Check::line).expect("check");
+        assert!(line.contains("own id 1000") && line.contains("--add-subuids"), "{line}");
+        let gid = unprivileged().file("/etc/subgid", "ci:900:65536\n");
+        let line = probe(&gid).get(Feature::SubordinateIds).map(Check::line).expect("check");
+        assert!(line.contains("/etc/subgid") && line.contains("own id 1000") && line.contains("--add-subgids"), "{line}");
+        // A gid that differs from the uid is checked against the gid.
+        let odd = unprivileged().egid(70000).file("/etc/subgid", "ci:500:65536\n");
+        assert!(probe(&odd).get(Feature::SubordinateIds).is_some_and(Check::ok), "500..66035 holds the uid 1000 but not the gid 70000");
+    }
+
+    #[test]
+    fn the_suggested_range_overlaps_nothing_in_the_file() {
+        let v = unprivileged().file("/etc/subuid", "alice:100000:65536\nbob:165536:65536\n#c\nbad line\n");
+        assert_eq!(suggest_range(&v, "/etc/subuid"), (231072, 296607));
+        assert_eq!(subid_fix(&v, "/etc/subuid", "uid"), "sudo usermod --add-subuids 231072-296607 $USER");
+        // An empty or missing file starts at 100000; a file with only low ranges does too.
+        assert_eq!(suggest_range(&v, "/etc/missing"), (100000, 165535));
+        let low = unprivileged().file("/etc/subgid", "x:1000:2000\n");
+        assert_eq!(suggest_range(&low, "/etc/subgid"), (100000, 165535));
+        // A range that ends past u32 can't overflow the suggestion.
+        let huge = unprivileged().file("/etc/subgid", "x:4294967000:1000\n");
+        assert_eq!(suggest_range(&huge, "/etc/subgid").0, u32::MAX);
+        // The probe's fix is that command, computed for the file at fault.
+        let v = unprivileged().file("/etc/subuid", "ci:100000:1000\nbob:101000:65536\n").file("/etc/subgid", "ci:5000000:65536\n");
+        assert_eq!(fix_of(&probe(&v), Feature::SubordinateIds), "sudo usermod --add-subuids 166536-232071 $USER");
     }
 
     #[test]

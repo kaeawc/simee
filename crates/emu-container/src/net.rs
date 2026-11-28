@@ -19,7 +19,9 @@
 //!   so the guest can't reach the host's own loopback services.
 //! - **slirp4netns**: the same for hosts without pasta; the port is added through its API socket.
 //! - **a veth pair**, root only, for hosts with neither (or no `/dev/net/tun`, which both need):
-//!   a /30 from 100.64.0.0/10 per container, with a proxy thread listening on the loopback port.
+//!   a /30 per container from the first candidate range the host has no route into ([`VETH_POOLS`];
+//!   not Tailscale's 100.64.0.0/10, which a tailnet peer could hide behind), with a proxy thread
+//!   listening on the loopback port.
 //!   It has no uplink: the guest reaches the host's side of the pair and nothing further, because
 //!   forwarding and masquerading would change the host's firewall. Services the host binds on all
 //!   addresses are reachable from the guest at the pair's host address.
@@ -119,12 +121,58 @@ pub struct VethAddrs {
 /// Prefix length of the pair's subnet.
 pub const VETH_PREFIX: u8 = 30;
 
+/// Where a veth pair's /30 may come from, in order: ranges set aside for private use that no
+/// common setup claims (Docker's bridges start at 172.17, LANs sit in 192.168.0/1, Tailscale in
+/// 100.64.0.0/10, Kubernetes' service range is 10.96). The first one the host has no route into is
+/// used.
+pub const VETH_POOLS: [(Ipv4Addr, u8); 5] = [
+    (Ipv4Addr::new(10, 233, 0, 0), 16),
+    (Ipv4Addr::new(10, 234, 0, 0), 16),
+    (Ipv4Addr::new(10, 235, 0, 0), 16),
+    (Ipv4Addr::new(172, 29, 0, 0), 16),
+    (Ipv4Addr::new(192, 168, 233, 0), 24),
+];
+
+/// The host's IPv4 routes as `(destination, mask)`, from `/proc/net/route`'s text. The default
+/// route (mask 0) is left out: it overlaps everything and means nothing here.
+pub fn parse_routes(proc_net_route: &str) -> Vec<(u32, u32)> {
+    // The columns are the kernel's raw network-order words printed as hex, so the bytes are
+    // the address as it reads.
+    let word = |h: &str| u32::from_str_radix(h, 16).ok().map(|v| u32::from_be_bytes(v.to_ne_bytes()));
+    proc_net_route
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let (dest, mask) = (word(f.get(1)?)?, word(f.get(7)?)?);
+            (mask != 0).then_some((dest, mask))
+        })
+        .collect()
+}
+
 /// The pair's addresses for a container whose adb port is `adb_port`: block number `adb_port` of
-/// the /30s in 100.64.0.0/10 (shared address space, which no LAN uses), so two containers on one
-/// host never share a subnet (their adb ports differ).
-pub fn veth_addrs(adb_port: u16) -> VethAddrs {
-    let base = u32::from(Ipv4Addr::new(100, 64, 0, 0)) + 4 * u32::from(adb_port);
-    VethAddrs { host: Ipv4Addr::from(base + 1), guest: Ipv4Addr::from(base + 2) }
+/// the /30s of the first of [`VETH_POOLS`] that no route in `routes` reaches into, so two
+/// containers on one host never share a subnet (their adb ports differ). The error lists what
+/// was tried.
+pub fn veth_addrs(adb_port: u16, routes: &[(u32, u32)]) -> Result<VethAddrs> {
+    let block_mask = !0u32 << (32 - u32::from(VETH_PREFIX));
+    for (base, prefix) in VETH_POOLS {
+        let blocks = 1u32 << (VETH_PREFIX - prefix);
+        let block = u32::from(base) + 4 * (u32::from(adb_port) % blocks);
+        // A route and the /30 overlap when they agree on the bits both fix.
+        let taken = routes.iter().any(|&(dest, mask)| {
+            let common = mask & block_mask;
+            block & common == dest & common
+        });
+        if !taken {
+            return Ok(VethAddrs { host: Ipv4Addr::from(block + 1), guest: Ipv4Addr::from(block + 2) });
+        }
+    }
+    let tried: Vec<String> = VETH_POOLS.iter().map(|(a, p)| format!("{a}/{p}")).collect();
+    Err(Error::Net(format!(
+        "the host has a route into every range a veth pair may use ({}); remove one of those routes, or install pasta or slirp4netns (with /dev/net/tun) to avoid the pair",
+        tried.join(", ")
+    )))
 }
 
 /// What a container's network is, as data.
@@ -133,6 +181,8 @@ pub struct NetPlan {
     pub uplink: Uplink,
     /// The host's loopback port that reaches the guest's adbd.
     pub adb_port: u16,
+    /// The pair's addresses: set exactly when the uplink is [`Uplink::Veth`].
+    pub veth: Option<VethAddrs>,
 }
 
 /// A long-running process that serves the namespace for as long as the container lives.
@@ -166,25 +216,27 @@ pub struct Attach {
 }
 
 impl NetPlan {
-    pub fn new(uplink: Uplink, adb_port: u16) -> Result<NetPlan> {
+    /// `proc_net_route` is the host's `/proc/net/route`, which a veth pair's addresses must not
+    /// overlap.
+    pub fn new(uplink: Uplink, adb_port: u16, proc_net_route: &str) -> Result<NetPlan> {
         if adb_port == 0 {
             return Err(Error::Invalid("the adb port must be a loopback port, not 0".into()));
         }
-        Ok(NetPlan { uplink, adb_port })
+        let veth = (uplink == Uplink::Veth).then(|| veth_addrs(adb_port, &parse_routes(proc_net_route))).transpose()?;
+        Ok(NetPlan { uplink, adb_port, veth })
     }
 
     /// The plan for the host `view` describes; the error says what to install.
     pub fn for_host(view: &dyn HostView, adb_port: u16) -> Result<NetPlan> {
         let uplink = Uplink::choose(view).map_err(|m| Error::Net(format!("{} (fix: {})", m.why, m.fix)))?;
-        NetPlan::new(uplink, adb_port)
+        NetPlan::new(uplink, adb_port, &view.read("/proc/net/route").unwrap_or_default())
     }
 
     /// The commands the container's setup script runs in its own namespace, before `/init`.
     pub fn guest_commands(&self) -> Vec<Vec<String>> {
         let ip = |args: &[&str]| ["ip"].iter().chain(args).map(|s| s.to_string()).collect::<Vec<_>>();
         let mut cmds = vec![ip(&["link", "set", "lo", "up"])];
-        if self.uplink == Uplink::Veth {
-            let a = veth_addrs(self.adb_port);
+        if let Some(a) = self.veth {
             cmds.push(ip(&["addr", "add", &format!("{}/{VETH_PREFIX}", a.guest), "dev", GUEST_IFNAME]));
             cmds.push(ip(&["link", "set", GUEST_IFNAME, "up"]));
         }
@@ -258,7 +310,7 @@ impl NetPlan {
                 }
             }
             Uplink::Veth => {
-                let a = veth_addrs(self.adb_port);
+                let a = self.veth.expect("a veth plan has its addresses");
                 let host_if = format!("sveth{}", self.adb_port);
                 let ip = |args: &[&str]| ["ip"].iter().chain(args).map(|s| s.to_string()).collect::<Vec<_>>();
                 Attach {
@@ -500,14 +552,14 @@ mod tests {
 
     #[test]
     fn the_adb_port_must_be_a_real_port() {
-        assert!(NetPlan::new(Uplink::Pasta, 0).is_err());
-        assert_eq!(NetPlan::new(Uplink::Pasta, 5555).expect("plan").adb_port, 5555);
+        assert!(NetPlan::new(Uplink::Pasta, 0, "").is_err());
+        assert_eq!(NetPlan::new(Uplink::Pasta, 5555, "").expect("plan").adb_port, 5555);
     }
 
     #[test]
     fn pasta_forwards_the_loopback_port_and_nothing_else() {
         let dir = Path::new("/run/avd");
-        let a = NetPlan::new(Uplink::Pasta, 5557).expect("plan").attach(4242, dir);
+        let a = NetPlan::new(Uplink::Pasta, 5557, "").expect("plan").attach(4242, dir);
         let d = a.daemon.expect("pasta runs as a daemon");
         let argv = d.argv.join(" ");
         assert_eq!(d.argv[0], "pasta");
@@ -530,7 +582,7 @@ mod tests {
     #[test]
     fn slirp4netns_adds_one_loopback_forward_through_its_api() {
         let dir = Path::new("/run/avd");
-        let a = NetPlan::new(Uplink::Slirp4netns, 5557).expect("plan").attach(4242, dir);
+        let a = NetPlan::new(Uplink::Slirp4netns, 5557, "").expect("plan").attach(4242, dir);
         let d = a.daemon.expect("slirp4netns runs as a daemon");
         let argv = d.argv.join(" ");
         assert!(argv.contains("--disable-host-loopback") && argv.contains("--configure"), "{argv}");
@@ -548,13 +600,13 @@ mod tests {
 
     #[test]
     fn the_veth_pair_moves_its_peer_into_the_container_and_proxies_on_loopback() {
-        let plan = NetPlan::new(Uplink::Veth, 5557).expect("plan");
+        let plan = NetPlan::new(Uplink::Veth, 5557, "").expect("plan");
         let a = plan.attach(4242, Path::new("/run/avd"));
         let a_s: Vec<String> = a.setup.iter().map(|c| c.join(" ")).collect();
         assert_eq!(a_s[0], "ip link add sveth5557 type veth peer name eth0 netns 4242");
-        assert!(a_s[1].starts_with("ip addr add 100.64.") && a_s[1].ends_with("/30 dev sveth5557"), "{a_s:?}");
+        assert!(a_s[1].starts_with("ip addr add 10.233.") && a_s[1].ends_with("/30 dev sveth5557"), "{a_s:?}");
         assert_eq!(a_s[2], "ip link set sveth5557 up");
-        let addrs = veth_addrs(5557);
+        let addrs = plan.veth.expect("addresses");
         let (listen, to) = a.proxy.expect("a proxy");
         assert_eq!(listen, "127.0.0.1:5557".parse().expect("addr"), "the host side listens on loopback only");
         assert_eq!(to, SocketAddr::from((addrs.guest, 5555)));
@@ -569,7 +621,7 @@ mod tests {
     #[test]
     fn user_mode_uplinks_leave_the_guests_interface_to_the_tool() {
         for uplink in [Uplink::Pasta, Uplink::Slirp4netns] {
-            let g = NetPlan::new(uplink, 5557).expect("plan").guest_commands();
+            let g = NetPlan::new(uplink, 5557, "").expect("plan").guest_commands();
             assert_eq!(g, vec![["ip", "link", "set", "lo", "up"].map(String::from).to_vec()], "{uplink:?}");
         }
     }
@@ -577,25 +629,92 @@ mod tests {
     #[test]
     fn every_uplink_publishes_only_on_loopback() {
         for uplink in [Uplink::Pasta, Uplink::Slirp4netns, Uplink::Veth] {
-            let a = NetPlan::new(uplink, 40000).expect("plan").attach(1, Path::new("/d"));
+            let a = NetPlan::new(uplink, 40000, "").expect("plan").attach(1, Path::new("/d"));
             let text = format!("{a:?}");
             assert!(!text.contains("0.0.0.0") && !text.contains("::"), "{uplink:?}: {text}");
             assert!(text.contains("127.0.0.1"), "{uplink:?} names the loopback address: {text}");
         }
     }
 
+    /// What `/proc/net/route` prints (little-endian hex words), for a host on Tailscale and Docker.
+    const ROUTES: &str = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+eth0\t00000000\t0100A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
+eth0\t0000A8C0\t00000000\t0001\t0\t0\t100\t0000FFFF\t0\t0\t0\n\
+docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n\
+tailscale0\t00004064\t00000000\t0001\t0\t0\t0\t0000C0FF\t0\t0\t0\n";
+
     #[test]
-    fn veth_subnets_are_distinct_slash_30s_in_shared_address_space() {
-        let (a, b) = (veth_addrs(5557), veth_addrs(5559));
+    fn routes_are_read_from_proc_net_route_without_the_default() {
+        let r = parse_routes(ROUTES);
+        assert_eq!(r.len(), 3, "the default route is left out: {r:?}");
+        assert!(r.contains(&(u32::from(Ipv4Addr::new(192, 168, 0, 0)), 0xFFFF_0000)), "{r:?}");
+        assert!(r.contains(&(u32::from(Ipv4Addr::new(172, 17, 0, 0)), 0xFFFF_0000)), "{r:?}");
+        // Tailscale's 100.64.0.0/10 (what the pair used to take from).
+        assert!(r.contains(&(u32::from(Ipv4Addr::new(100, 64, 0, 0)), 0xFFC0_0000)), "{r:?}");
+        assert!(parse_routes("").is_empty() && parse_routes("Iface\tDestination\n").is_empty());
+        assert!(parse_routes("x\neth0\tzz\n").is_empty(), "a garbled line is skipped");
+    }
+
+    #[test]
+    fn veth_subnets_are_distinct_slash_30s_in_a_private_range_the_host_doesnt_route() {
+        let routes = parse_routes(ROUTES);
+        let (a, b) = (veth_addrs(5557, &routes).expect("a"), veth_addrs(5559, &routes).expect("b"));
         assert_ne!(a.host, b.host);
         for p in [1u16, 5555, 5557, 40000, 65535] {
-            let v = veth_addrs(p);
+            let v = veth_addrs(p, &routes).expect("addresses");
             let (h, g) = (u32::from(v.host), u32::from(v.guest));
             assert_eq!(g, h + 1);
             assert_eq!(h & 3, 1, "host is .1 of its /30");
-            assert_eq!(h >> 22, u32::from(Ipv4Addr::new(100, 64, 0, 0)) >> 22, "{p}: inside 100.64.0.0/10");
+            assert_eq!(v.host.octets()[..2], [10, 233], "the first pool the host doesn't route: {v:?}");
         }
-        assert_eq!(veth_addrs(5557).host, Ipv4Addr::new(100, 64, 86, 213));
+        // 5557 % 16384 = 5557: block 5557 of 10.233.0.0/16.
+        assert_eq!(veth_addrs(5557, &routes).expect("addresses").host, Ipv4Addr::new(10, 233, 86, 213));
+        // Never Tailscale's range, whatever the routes.
+        for p in [0u16, 1, 65535] {
+            let h = veth_addrs(p, &[]).expect("addresses").host;
+            assert!(h.octets()[0] != 100, "{h}");
+        }
+    }
+
+    #[test]
+    fn a_pool_the_host_routes_into_is_skipped_and_all_taken_is_refused_with_the_list() {
+        let net = |a: [u8; 4], mask: u32| (u32::from(Ipv4Addr::from(a)), mask);
+        // A route over all of 10.233.0.0/16, and a /32 inside 10.234's block for this port.
+        let taken_233 = [net([10, 233, 0, 0], 0xFFFF_0000)];
+        assert_eq!(veth_addrs(5557, &taken_233).expect("next pool").host.octets()[..2], [10, 234]);
+        let in_234 = [net([10, 233, 0, 0], 0xFFFF_0000), net([10, 234, 86, 213], 0xFFFF_FFFF)];
+        assert_eq!(veth_addrs(5557, &in_234).expect("third pool").host.octets()[..2], [10, 235]);
+        // A route elsewhere in the same pool, off this block, leaves it usable.
+        let elsewhere = [net([10, 233, 0, 0], 0xFFFF_FF00)];
+        assert_eq!(veth_addrs(5557, &elsewhere).expect("same pool").host.octets()[..2], [10, 233]);
+        // A broad route (10.0.0.0/8) takes every 10.x pool; 172.29 is next.
+        let ten = [net([10, 0, 0, 0], 0xFF00_0000)];
+        assert_eq!(veth_addrs(5557, &ten).expect("172.29").host.octets()[..2], [172, 29]);
+        // Everything routed: refused, naming each range.
+        let all = [net([10, 0, 0, 0], 0xFF00_0000), net([172, 16, 0, 0], 0xFFF0_0000), net([192, 168, 0, 0], 0xFFFF_0000)];
+        let e = veth_addrs(5557, &all).expect_err("all taken").to_string();
+        for (a, p) in VETH_POOLS {
+            assert!(e.contains(&format!("{a}/{p}")), "{e}");
+        }
+        assert!(e.contains("pasta or slirp4netns"), "{e}");
+    }
+
+    #[test]
+    fn the_plan_reads_the_hosts_routes() {
+        let on_tailscale = view(&["ip"], true, 0).file("/proc/net/route", ROUTES);
+        let plan = NetPlan::for_host(&on_tailscale, 5557).expect("plan");
+        assert_eq!(plan.uplink, Uplink::Veth);
+        assert_eq!(plan.veth.expect("addresses").host, Ipv4Addr::new(10, 233, 86, 213));
+        // A host that routes every candidate can't have the pair: refused at plan time.
+        let all = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n\
+eth0\t0000000A\t00000000\t0001\t0\t0\t0\t000000FF\n\
+eth0\t000010AC\t00000000\t0001\t0\t0\t0\t0000F0FF\n\
+eth0\t0000A8C0\t00000000\t0001\t0\t0\t0\t0000FFFF\n";
+        let e = NetPlan::for_host(&view(&["ip"], true, 0).file("/proc/net/route", all), 5557).expect_err("all routed").to_string();
+        assert!(e.contains("route into every range"), "{e}");
+        // User-mode uplinks don't use the pair's addresses, whatever the routes.
+        let pasta = view(&["ip", "pasta"], true, 1000).file("/proc/net/route", all);
+        assert_eq!(NetPlan::for_host(&pasta, 5557).expect("plan").veth, None);
     }
 
     #[test]
@@ -627,7 +746,9 @@ mod tests {
         assert_eq!(&back, b"HELLO");
         server.join().expect("server");
         drop(fwd);
-        assert!(TcpStream::connect(listen).is_err(), "nothing listens once the forwarder is dropped");
+        // Nothing listens once the forwarder is dropped: the port can be bound again. (Connecting to
+        // it would also succeed against any other test's listener that was handed the same port.)
+        TcpListener::bind(listen).expect("the forwarder's port is free once it is dropped");
     }
 
     fn sh(script: &str) -> Child {

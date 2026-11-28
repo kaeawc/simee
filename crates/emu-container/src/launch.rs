@@ -19,7 +19,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::net::{NetPlan, Session};
-use crate::probe::{HostView, subordinate_range};
+use crate::probe::{HostView, pick_range, subid_fix, subordinate_ranges};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -149,17 +149,19 @@ impl IdMap {
     /// ranges, and the error says how to get them.
     pub fn for_host(view: &dyn HostView, gid: u32) -> Result<IdMap> {
         let uid = view.euid();
-        let range = |file: &str, who: u32| subordinate_range(view, file, who).filter(|&(_, n)| n >= MAPPED_IDS);
+        // The ranges the user is granted, the first with enough ids that doesn't contain the
+        // user's own id (for root, 0: a range holding it would map the container onto host root).
+        let range = |file: &str, own: u32| pick_range(&subordinate_ranges(view, file, uid), own);
         if uid == 0 {
             return Ok(IdMap::Root {
                 uid: range("/etc/subuid", 0).map_or(DEDICATED_RANGE, |(s, _)| (s, MAPPED_IDS)),
                 gid: range("/etc/subgid", 0).map_or(DEDICATED_RANGE, |(s, _)| (s, MAPPED_IDS)),
             });
         }
-        let need = |file: &str| {
-            range(file, uid).ok_or_else(|| Error::Map(format!("{file} has no range of {MAPPED_IDS} ids for uid {uid}: `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER`")))
+        let need = |file: &str, kind: &str, own: u32| {
+            range(file, own).map_err(|problem| Error::Map(format!("{file} {problem}: `{}`", subid_fix(view, file, kind))))
         };
-        Ok(IdMap::Rootless { uid, gid, sub_uid: need("/etc/subuid")?, sub_gid: need("/etc/subgid")? })
+        Ok(IdMap::Rootless { uid, gid, sub_uid: need("/etc/subuid", "uid", uid)?, sub_gid: need("/etc/subgid", "gid", gid)? })
     }
 
     /// The host ids that container root (and so every file the container creates as root) has:
@@ -681,23 +683,29 @@ pub fn prepare_dir(idmap: &IdMap, dir: &Path) -> Result<()> {
 /// For an unprivileged user the process `unshare` starts has an uid that isn't in the container's
 /// map (container root is a subordinate id, not the user), so it would lose its capabilities at
 /// `exec`: `--keep-caps` keeps them, and the helper's `become-root` waits for the maps and takes
-/// the namespace's uid 0 before the script runs. That needs the `helper`.
+/// the namespace's uid 0. That needs the `helper`, and splits the work in two `unshare`s so the
+/// credential change comes before the pid namespace: `become-root` clears the parent-death signal
+/// with it and sets it again, checking that this process (`std::process::id()`, the launcher) is
+/// still its parent, which only means something outside the new pid namespace.
 pub fn unshare_command(idmap: &IdMap, helper: Option<&Helper>, script: &str, net: bool) -> Result<Vec<String>> {
     let mut argv = vec!["unshare".to_string()];
-    argv.extend(NAMESPACES.iter().map(|s| s.to_string()));
+    let rootless = matches!(idmap, IdMap::Rootless { .. });
+    // The pid namespace comes from the second `unshare` for an unprivileged user.
+    argv.extend(NAMESPACES.iter().filter(|ns| !(rootless && **ns == "--pid")).map(|s| s.to_string()));
     if net {
         argv.push("--net".into());
     }
-    let rootless = matches!(idmap, IdMap::Rootless { .. });
+    let pid_ns = ["--fork".to_string(), "--kill-child".to_string()];
     if rootless {
-        argv.push("--keep-caps".into());
-    }
-    argv.extend(["--fork".into(), "--kill-child".into(), "--".into()]);
-    if rootless {
+        argv.extend(["--keep-caps".into(), "--".into()]);
         let helper =
             helper.ok_or_else(|| Error::Invalid("an unprivileged container needs the helper: it becomes the namespace's root".into()))?;
-        argv.extend(helper.argv(&["become-root".to_string(), "--".to_string()]));
+        let request = ["become-root".to_string(), "--parent".into(), std::process::id().to_string(), "--".into()];
+        argv.extend(helper.argv(&request));
+        argv.extend(["unshare".into(), "--pid".into()]);
     }
+    argv.extend(pid_ns);
+    argv.push("--".into());
     argv.extend(["sh".into(), "-c".into(), script.into(), "simee-container".into()]);
     Ok(argv)
 }
@@ -738,7 +746,11 @@ pub fn spawn_isolated(idmap: &IdMap, script: &str, helper: Option<&Helper>, stdo
 
 /// [`spawn_isolated`] with the network namespace of `plan`: once the namespaces exist and their
 /// ids are mapped, the uplink is attached (`dir` is where its files go: somewhere the launching
-/// user can write) and only then is the container released, so `/init` finds its `eth0`.
+/// user can write) and only then is the container released, so `/init` finds its `eth0`. The
+/// child's `stdin` is the launcher's control pipe and must stay open while the container runs (the
+/// pivot refuses to start on a hung-up pipe: [`crate::helper`]): `Container` holds it, and a caller
+/// that waits on the child itself must keep `child.stdin` rather than call `wait_with_output`
+/// straight away.
 pub fn spawn_container(plan: &Plan, script: &str, dir: &Path, stdout: Stdio, stderr: Stdio) -> Result<(Child, Session)> {
     let argv = unshare_command(&plan.idmap, Some(&plan.helper), script, true)?;
     spawn_in(&plan.idmap, Role::Container, argv, Some(&plan.helper), stdout, stderr, |pid| {
@@ -812,8 +824,10 @@ fn map_and_release<T>(
     let attached = attach(child.id())?;
     let stdin = child.stdin.as_mut().ok_or_else(|| Error::Map("no stdin to release the container with".into()))?;
     stdin.write_all(b"go\n").map_err(io("releasing the container"))?;
-    // Closing stdin: the script reads one line and never again.
-    drop(child.stdin.take());
+    // The script reads one line and never again. The pipe stays open, though: the container's
+    // pivot checks that it isn't hung up, which is how a container started in the instant its
+    // launcher died notices (the helper's docs). It closes with the `Child`, and
+    // `wait_with_output` closes it too.
     Ok(attached)
 }
 
@@ -1258,7 +1272,7 @@ mod tests {
         assert_eq!(veth.net.uplink, crate::net::Uplink::Veth, "root without pasta");
         let g = steps(&veth);
         assert_eq!(g[0], "ip link set lo up");
-        assert!(g[1].starts_with("ip addr add 100.64.") && g[1].ends_with("/30 dev eth0"), "{g:?}");
+        assert!(g[1].starts_with("ip addr add 10.233.") && g[1].ends_with("/30 dev eth0"), "{g:?}");
         assert_eq!(g[2], "ip link set eth0 up");
         let script = veth.script();
         assert!(script.contains("step 'ip' 'link' 'set' 'lo' 'up'"), "{script}");
@@ -1472,35 +1486,69 @@ mod tests {
         let map = IdMap::Rootless { uid: 1000, gid: 1000, sub_uid: (100000, 65536), sub_gid: (100000, 65536) };
         let cmd = unshare_command(&map, Some(&helper()), "true", true).expect("command");
         let at = |flag: &str| cmd.iter().position(|a| a == flag).unwrap_or_else(|| panic!("{flag} missing: {cmd:?}"));
-        assert!(at("--user") < at("--keep-caps") && at("--keep-caps") < at("--fork"), "--keep-caps comes with --user: {cmd:?}");
+        // Stage one: the user, mount, uts, ipc, cgroup and network namespaces, with the
+        // capabilities kept; no pid namespace yet.
         let dashdash = at("--");
-        assert_eq!(cmd[dashdash + 1..dashdash + 5], ["/usr/bin/emu", "__container-helper", "become-root", "--"]);
-        assert_eq!(cmd[dashdash + 5..dashdash + 7], ["sh", "-c"]);
-        assert_eq!(
-            crate::helper::parse(&cmd[dashdash + 3..]),
-            Ok(crate::helper::Request::BecomeRoot { command: vec!["sh".into(), "-c".into(), "true".into(), "simee-container".into()] })
-        );
+        assert!(at("--user") < at("--keep-caps") && at("--keep-caps") < dashdash, "--keep-caps comes with --user: {cmd:?}");
+        assert!(!cmd[..dashdash].contains(&"--pid".to_string()) && !cmd[..dashdash].contains(&"--fork".to_string()), "{cmd:?}");
+        for ns in ["--user", "--mount", "--uts", "--ipc", "--cgroup", "--net"] {
+            assert!(cmd[..dashdash].contains(&ns.to_string()), "{ns}: {cmd:?}");
+        }
+        assert_eq!(cmd[dashdash + 1..dashdash + 3], ["/usr/bin/emu", "__container-helper"]);
+        // The helper becomes root, then runs stage two: the pid namespace and the script.
+        let request = crate::helper::parse(&cmd[dashdash + 3..]).expect("a helper request");
+        let crate::helper::Request::BecomeRoot { parent, command } = request else { panic!("become-root expected") };
+        assert_eq!(parent, std::process::id(), "it re-arms the parent-death signal for this launcher");
+        assert_eq!(command, ["unshare", "--pid", "--fork", "--kill-child", "--", "sh", "-c", "true", "simee-container"]);
         // Without the helper there is nothing to become root.
         let e = unshare_command(&map, None, "true", true).expect_err("needs the helper").to_string();
         assert!(e.contains("needs the helper"), "{e}");
     }
 
     #[test]
-    fn id_maps_are_derived_from_the_host() {
-        assert!(matches!(IdMap::for_host(&host(), 0).expect("root"), IdMap::Root { .. }));
-        let user = host()
-            .euid(1000)
-            .file("/etc/passwd", "ci:x:1000:1000::/home/ci:/bin/sh\n")
-            .file("/etc/subuid", "ci:100000:65536\n")
-            .file("/etc/subgid", "ci:300000:70000\n");
+    fn root_keeps_the_one_stage_chain_and_the_launcher_supervises_either() {
+        let cmd = unshare_command(&root_map(), Some(&helper()), "true", true).expect("command");
+        assert!(cmd.contains(&"--pid".to_string()) && cmd.iter().filter(|a| *a == "unshare").count() == 1, "{cmd:?}");
+        assert!(!cmd.iter().any(|a| a == "become-root"), "root needs no become-root: {cmd:?}");
+        // Both are wrapped by `die-with-parent` for the launcher, outermost.
+        let map = IdMap::Rootless { uid: 1000, gid: 1000, sub_uid: (100000, 65536), sub_gid: (100000, 65536) };
+        for idmap in [&root_map(), &map] {
+            let inner = unshare_command(idmap, Some(&helper()), "true", true).expect("command");
+            let argv = supervised(&helper(), 77, &inner);
+            assert_eq!(argv[2..6], ["die-with-parent", "--parent", "77", "--"]);
+            assert_eq!(argv[6], "unshare");
+        }
+    }
+
+    #[test]
+    fn every_subordinate_line_is_read_and_the_ranges_never_contain_the_users_own_ids() {
+        let user = |sub: &str, subg: &str| {
+            host().euid(1000).file("/etc/passwd", "ci:x:1000:1001::/home/ci:/bin/sh\n").file("/etc/subuid", sub).file("/etc/subgid", subg)
+        };
+        // A small first line and a large second one: the second is used.
+        let v = user("ci:100000:1000\nci:200000:65536\n", "ci:300000:70000\n");
         assert_eq!(
-            IdMap::for_host(&user, 1000).expect("rootless"),
-            IdMap::Rootless { uid: 1000, gid: 1000, sub_uid: (100000, 65536), sub_gid: (300000, 70000) }
+            IdMap::for_host(&v, 1001).expect("rootless"),
+            IdMap::Rootless { uid: 1000, gid: 1001, sub_uid: (200000, 65536), sub_gid: (300000, 70000) }
         );
-        let short = user.clone().file("/etc/subuid", "ci:100000:1000\n");
-        assert!(IdMap::for_host(&short, 1000).expect_err("too few").to_string().contains("usermod --add-subuids"));
-        let none = host().euid(1000);
-        assert!(matches!(IdMap::for_host(&none, 1000), Err(Error::Map(_))));
+        // The first range holds the uid, so the next one is taken.
+        let v = user("ci:0:65536\nci:200000:65536\n", "ci:300000:70000\n");
+        let IdMap::Rootless { sub_uid, .. } = IdMap::for_host(&v, 1001).expect("rootless") else { panic!("rootless") };
+        assert_eq!(sub_uid, (200000, 65536));
+        // Only ranges holding the uid, or the gid: refused, naming the file and a range that
+        // overlaps nothing in it.
+        let e =
+            IdMap::for_host(&user("ci:1000:65536\nroot:100000:65536\n", "ci:300000:70000\n"), 1001).expect_err("holds the uid").to_string();
+        assert!(e.contains("/etc/subuid") && e.contains("own id 1000"), "{e}");
+        assert!(e.contains("usermod --add-subuids 165536-231071"), "after root's range, not 100000: {e}");
+        let e = IdMap::for_host(&user("ci:100000:65536\n", "ci:1001:65536\n"), 1001).expect_err("holds the gid").to_string();
+        assert!(e.contains("/etc/subgid") && e.contains("own id 1001") && e.contains("--add-subgids 100000-165535"), "{e}");
+        // Root skips a range that holds 0 (the container would map onto host root).
+        let root = host().file("/etc/passwd", "root:x:0:0::/root:/bin/sh\n").file("/etc/subuid", "root:0:65536\nroot:524288:65536\n");
+        let IdMap::Root { uid, .. } = IdMap::for_host(&root, 0).expect("root") else { panic!("root") };
+        assert_eq!(uid, (524288, 65536));
+        let only_zero = host().file("/etc/passwd", "root:x:0:0::/root:/bin/sh\n").file("/etc/subuid", "root:0:65536\n");
+        assert_eq!(IdMap::for_host(&only_zero, 0).expect("root"), IdMap::Root { uid: DEDICATED_RANGE, gid: DEDICATED_RANGE });
     }
 
     #[test]
