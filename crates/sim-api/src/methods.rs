@@ -134,7 +134,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          Android: an AVD that has booted under simee (its simee disks, config.ini without host paths, boot.prop) and \
          its system image's identity. iOS: the simulator's data directory (settings, apps and their containers, keychain) \
          as data/, its directories, symlinks and modes in the manifest's tree, without the contents of Library/Caches \
-         and tmp (listed in `left_out`) or the symlinks an import refuses (in `dropped`), and its device type and runtime \
+         and tmp (listed in `left_out`) or the symlinks an import refuses and the names holding an ignorable character (a zero-width joiner, a variation selector), which are dropped, a directory with its subtree, each listed in `dropped`, and its device type and runtime \
          (identifier and build); only reads the device, refusing one that is booted or a `to` inside it. Captures disks, \
          not RAM (resume is a cold boot). Returns sizes, the identity and the secrets inventory",
     ),

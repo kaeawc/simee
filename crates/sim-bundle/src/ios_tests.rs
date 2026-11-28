@@ -694,3 +694,53 @@ fn export_and_import_stream_more_files_than_the_open_file_limit() {
     }
     fs::remove_dir_all(root).ok();
 }
+
+/// A tree path is at most 1023 bytes, so the check for a path under a link is linear: a 2 MB path
+/// is refused at once, and the longest legal one (many components, a link at the first) is
+/// checked in a blink.
+#[test]
+fn long_paths_are_refused_and_the_under_a_link_check_is_linear() {
+    let root = scratch("longpath");
+    let fake = Fake::new(&root.join("set"), vec![runtime("23B80")]);
+    let src = fake.add(SOURCE, "golden", true);
+    populate(&src.data_dir);
+    let ex = export(&fake, SOURCE, &root.join("golden.tar"), &Options::default()).expect("export");
+    let check = |extra: Vec<Entry>| {
+        let mut m = ex.manifest.clone();
+        m.tree.extend(extra);
+        let start = Instant::now();
+        let r = Manifest::parse(&m.to_json()).map(|_| ()).map_err(|e| e.to_string());
+        (r, start.elapsed())
+    };
+    let huge = format!("data/{}", "a/".repeat(1 << 20));
+    let (r, took) = check(vec![link("data/l", "x"), dir(huge.trim_end_matches('/'))]);
+    assert!(r.expect_err("refused").contains("unsafe path"), "a 2 MB path");
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    assert!(!crate::safe_path(&"a".repeat(1024)) && crate::safe_path(&"a".repeat(1023)));
+    // A legal path of 1023 bytes, 500-odd components, under a link at its first: found, fast.
+    let long = format!("data/l/{}", "a/".repeat(507)) + "a";
+    assert!(long.len() <= crate::MAX_TARGET);
+    let (r, took) = check(vec![link("data/l", "x"), dir(&long)]);
+    assert!(r.expect_err("under the link").contains("lies under the symlink `data/l`"));
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    fs::remove_dir_all(root).ok();
+}
+
+/// CoreSimulator makes `data/Library/Logs` a link to the host's `~/Library/Logs/CoreSimulator/<UDID>`
+/// at boot, so a target through it leaves `data/` even when the tree has no such name.
+#[test]
+fn library_logs_counts_as_a_host_link() {
+    let tree = [
+        dir("data"),
+        dir("data/Library"),
+        link("data/Library/x", "Logs/../../DiagnosticReports"),
+        link("data/Library/y", "logs/CoreSimulator"),
+        link("data/Library/z", "../Library/Logs"),
+        link("data/Library/Logs2", "../Library"),
+        link("data/Library/ok", "../Library/Preferences"),
+        link("data/Other/Logs", "../Library"),
+        link("data/Logs", "Library"),
+    ];
+    let refused: Vec<&str> = refused_links(&tree).iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(refused, ["data/Library/x", "data/Library/y", "data/Library/z"]);
+}

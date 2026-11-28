@@ -133,6 +133,19 @@ const HOST_ROOTS: [&str; 12] = [
 /// The firmlink that is the data volume's root: `/System/Volumes/Data/Users` is `/Users`.
 const DATA_VOLUME: &str = "/System/Volumes/Data";
 
+/// Paths under the data directory that CoreSimulator turns into a link to the host when a device
+/// boots (`Library/Logs` becomes `~/Library/Logs/CoreSimulator/<UDID>`). An export drops that link
+/// and the bundle's tree has no such name, but once the imported device boots a target that goes
+/// through it resolves on the host, so a walk treats each as an absolute host link.
+const HOST_LINKS: [[&str; 2]; 1] = [["Library", "Logs"]];
+
+/// Whether `trail` (names from the data directory, in the tree's or the target's spelling) is one
+/// of [`HOST_LINKS`], as a volume compares names.
+fn host_linked(trail: &[&str]) -> bool {
+    let fold = crate::manifest::fold;
+    trail.len() == 2 && HOST_LINKS.iter().any(|h| fold(trail[0]) == fold(h[0]) && fold(trail[1]) == fold(h[1]))
+}
+
 /// The most links one path may follow, as the kernel's `MAXSYMLINKS` on macOS: a target that
 /// takes more of the tree's own links is refused.
 const MAX_HOPS: usize = 32;
@@ -265,10 +278,15 @@ fn leaves_data(names: &Names, rel: &str, target: &str, budget: &mut usize) -> bo
     let mut parts = rel.split('/');
     parts.next_back();
     let mut at: Vec<Option<usize>> = Vec::new();
+    let mut trail: Vec<&str> = Vec::new();
     for c in parts {
         match names.child(at.last().copied().unwrap_or(Some(ROOT)), c) {
             Ok(n) => at.push(n),
             Err(()) => return true,
+        }
+        trail.push(c);
+        if host_linked(&trail) {
+            return true;
         }
     }
     let mut todo: VecDeque<&str> = target.split('/').collect();
@@ -277,6 +295,7 @@ fn leaves_data(names: &Names, rel: &str, target: &str, budget: &mut usize) -> bo
         match c {
             "" | "." => {}
             ".." => {
+                trail.pop();
                 if at.pop().is_none() {
                     return true;
                 }
@@ -285,6 +304,10 @@ fn leaves_data(names: &Names, rel: &str, target: &str, budget: &mut usize) -> bo
                 let Ok(n) = names.child(at.last().copied().unwrap_or(Some(ROOT)), name) else { return true };
                 let Some(t) = n.and_then(|n| names.nodes[n].link) else {
                     at.push(n);
+                    trail.push(name);
+                    if host_linked(&trail) {
+                        return true;
+                    }
                     continue;
                 };
                 hops += 1;

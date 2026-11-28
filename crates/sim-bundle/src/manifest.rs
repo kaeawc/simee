@@ -1,6 +1,6 @@
 //! `manifest.json`: what a bundle holds and how to put it back together.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 use sim_core::platform::Platform;
@@ -209,10 +209,11 @@ impl Extent {
     }
 }
 
-/// Whether `path` is safe to join to a destination directory: relative, `/`-separated, with no
+/// Whether `path` is safe to join to a destination directory: at most [`MAX_TARGET`] bytes, relative, `/`-separated, with no
 /// empty, `.` or `..` component, no backslash, no NUL and no [`ignorable`] code point.
 pub fn safe_path(path: &str) -> bool {
     !path.is_empty()
+        && path.len() <= MAX_TARGET
         && !path.starts_with('/')
         && !path.contains(['\\', '\0'])
         && !path.chars().any(ignorable)
@@ -397,7 +398,7 @@ impl Manifest {
         let bad = |s: String| Err(Error::Manifest(s));
         let mut paths = BTreeSet::new();
         let mut folded = BTreeMap::new();
-        let mut links = BTreeMap::new();
+        let mut links: HashMap<String, &str> = HashMap::new();
         for e in &self.tree {
             if !safe_path(&e.path) {
                 return Err(Error::Path(e.path.clone()));
@@ -435,14 +436,14 @@ impl Manifest {
             return bad(format!("tree: `{p}` is stored but not in the tree"));
         }
         if !links.is_empty() {
+            // The links in one map by folded path, each ancestor prefix looked up by hash: a path of
+            // L bytes costs O(L) (and `safe_path` bounds L), not O(L^2).
             for p in paths.iter().chain(stored.iter()) {
                 let f = fold(p);
-                let mut at = f.as_str();
-                while let Some((parent, _)) = at.rsplit_once('/') {
-                    if let Some(link) = links.get(parent) {
+                for (i, _) in f.match_indices('/') {
+                    if let Some(link) = links.get(&f[..i]) {
                         return bad(format!("tree: `{p}` lies under the symlink `{link}`"));
                     }
-                    at = parent;
                 }
             }
         }
