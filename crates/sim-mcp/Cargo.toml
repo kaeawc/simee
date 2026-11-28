@@ -26,6 +26,7 @@ rustls = { workspace = true, optional = true }
 rcgen = { workspace = true, optional = true }
 ring = { workspace = true, optional = true }
 sim-api.workspace = true
+# Random bytes for tokens and ids (`sim_core::entropy`).
 sim-core.workspace = true
 
 # The HTTP transport's token file: opened without following links, its owner checked against the

@@ -76,5 +76,6 @@ fn input_and_app_commands_succeed() {
 fn unknown_device_fails_cleanly() {
     let out = sim(&["tap", "no-such-device", "1", "1"]);
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("no device matches"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no device matches"), "stderr: {stderr}");
 }

@@ -1,6 +1,8 @@
 //! `simee mcp` end to end, on any host: the real binary as a subprocess speaking MCP on stdio,
 //! with its own SDK, AVD home and `$HOME`, and a fake simee (`sim_android::testing`) standing in
-//! for a running emulator.
+//! for a running emulator. Unix only until the API has a Windows transport: the fake's console and
+//! display are Unix sockets.
+#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;

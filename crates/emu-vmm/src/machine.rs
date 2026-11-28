@@ -1,5 +1,5 @@
 //! The machine: builds the board, its devices and vCPUs, and runs the guest (Apple silicon only).
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -382,9 +382,7 @@ pub struct Outcome {
 
 fn random_bytes<const N: usize>() -> [u8; N] {
     let mut b = [0u8; N];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut b);
-    }
+    let _ = sim_core::entropy::fill(&mut b);
     b
 }
 

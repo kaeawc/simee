@@ -336,9 +336,7 @@ fn prepare_auth(config: &Config, default: impl FnOnce() -> io::Result<PathBuf>) 
 
 /// `n` random bytes from the OS, as hex.
 fn random_hex(n: usize) -> io::Result<String> {
-    let mut bytes = vec![0u8; n];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    sim_core::entropy::hex(n)
 }
 
 /// The effective user, who must own the token file.

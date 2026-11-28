@@ -12,7 +12,7 @@ for both is to match the stock tools exactly and then exceed them.
   the features used; crates reference them with `{ workspace = true }`.
 - `unsafe` lives only in `crates/sim-coresim` (the Objective-C / IOSurface / VideoToolbox boundary),
   `crates/emu-hvf` (Hypervisor.framework and guest RAM), `crates/emu-kvm` (Linux KVM), `crates/emu-gfxstream` (the renderer),
-  `apps/emu`'s `shutdown_signals` (signal masks), `crates/sim-encode`'s `src/linux.rs` (one OpenH264
+  `apps/emu`'s `shutdown_signals` (signal masks) and `host_windows.rs` (the console control handler), `crates/sim-encode`'s `src/linux.rs` (one OpenH264
   `SetOption` call: a runtime bitrate change), `desktop/src/surface.rs` (the zero-copy
   bridge) and `crates/sim-camera`'s `avf.rs` (AVFoundation capture) and `v4l2.rs` (Linux V4L2
   ioctls). Every `unsafe` block carries a `// SAFETY:` comment
@@ -55,6 +55,13 @@ for both is to match the stock tools exactly and then exceed them.
 - Every device, API method and UI element says which platform it belongs to: devices carry
   `platform`, `form_factor` and `sub_platform`; `help` lists each method's platforms. Validate a
   (platform, form factor) pair with `Kind::new`, which explains unsupported combinations.
+- The workspace builds for `x86_64-pc-windows-msvc` (Android devices only; docs/development.md
+  "Windows"). Code that must compile there names `sim_core::hostfs` (positional file I/O, `stat`
+  fields, modes, process groups) and `sim_core::net` (Unix sockets) instead of `std::os::unix`:
+  std's own types on unix, documented stand-ins on Windows. What can't work there yet answers
+  `ErrorKind::Unsupported` and says what is missing, and a test that needs a Unix socket,
+  `/bin/sh` or a hypervisor is gated `#[cfg(unix)]`, never dropped. Check a change from any host
+  with `cargo xwin clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings`.
 - Doctests are disabled; don't rely on them for coverage.
 - `desktop/` and `website/` are separate workspaces (Rune is a large git dependency). Bump the Rune
   `rev` and every `[patch.crates-io]` entry together in both, and commit both `Cargo.lock` files.
@@ -96,6 +103,7 @@ cargo c                      # check --all-targets
 cargo t                      # nextest run (or: cargo test)
 cargo lint                   # clippy --all-targets -D warnings
 cargo fmt --all
+cargo xtask check            # scripts/check.sh's steps, on any host (the Windows way; --quick, --all)
 cd desktop && cargo test     # Rune headless view tests
 ```
 
@@ -139,7 +147,10 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   `network speed|delay` presets, parsing and `network status` report), `framebuffer.rs` (which
   framebuffer port is an Apple device's main display), BGRA→RGBA conversion,
   `Frame` and PNG encoding, `mark/` (the simee mark: the cut, its light, colours and motion
-  states, a seam-free rasterizer and every file in `assets/brand/`; `docs/design/brand.md`). No FFI.
+  states, a seam-free rasterizer and every file in `assets/brand/`; `docs/design/brand.md`),
+  `hostfs.rs` and `net.rs` (the unix-only std calls and Unix sockets, by one name on every host:
+  std's on unix, stand-ins on Windows), `entropy.rs` (OS random bytes: tokens, ids, the guest's
+  rng; Windows has no `/dev/urandom`). No FFI.
 - `crates/sim-coresim` — the service boundary: `Context` (service + device set), `Device`
   (lifecycle, apps, settings, orientation, CarPlay), `Display` (framebuffer surface, capture; main
   or external), `Hid` (touch, buttons, keyboard, the Digital Crown, watch gestures, the Siri
@@ -259,6 +270,8 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   plus each page's static HTML); deployed to Fly by `.github/workflows/website.yml`. `media/` is
   the live demo's MediaMTX relay on Fly (`website-media.yml`), fed by `scripts/live-demo.sh`. Its copy carries no number of its own:
   measured claims come from the README and docs. Docs: `website/README.md`.
+- `xtask/` — `cargo xtask check [--quick|--all]`: `scripts/check.sh`'s steps as a Rust program that
+  runs on every host, Windows included (no bash). `.github/workflows/windows.yml` runs it.
 - `scripts/` — `brand.sh` (redraws `assets/brand/` from `sim_core::mark`), `desktop-app.sh` (the
   desktop as `simee.app` with its icon), `mediamtx.sh` (MediaMTX on free ports by hand), `mediamtx-fetch.sh` (the pinned, SHA-256-checked MediaMTX release: version and hashes live there; CI's `mediamtx` and macOS `lint-test` jobs run `simee-rtc`'s tests against it), `parity.sh`, `ios-matrix.sh` (every iOS feature on one device: the
   `docs/ios-versions.md` table), `automobile-harness.sh`, `automobile-farm.sh` (every device through

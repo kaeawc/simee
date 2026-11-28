@@ -7,12 +7,12 @@ usage: emu -avd NAME [options]
        emu @NAME [options]
        emu -avd NAME -dry-run   (print the boot plan without booting; any host)
        emu -list-avds | -version | -accel-check
-       emu -create-avd NAME -sysdir system-images/android-36/google_apis/arm64-v8a [-lcd 720x1280@320] [-cores N] [-memory MB]
+       emu -create-avd NAME -sysdir system-images/android-36/google_apis/arm64-v8a [-lcd 720x1280@320] [-cores N] [-memory MB] [-profile software-lite]
                   (-create-avd boots the first AVD of an image once and keeps its settled user data to
                    start the image's later AVDs from; -no-golden skips that for a pristine first boot)
        emu -clone-avd NAME -from GOLDEN   (copy-on-write clone of a stopped AVD's settled simee disks)
        emu -delete-avd NAME               (refused while any emulator, simee or stock, runs it)
-       emu -provision API [-tag google_apis] [-abi arm64-v8a] [-no-renderer] [-dry-run] [-create-avd NAME [-lcd WxH@DPI] [-cores N] [-memory MB]]
+       emu -provision API [-tag google_apis] [-abi arm64-v8a] [-no-renderer] [-dry-run] [-create-avd NAME [-lcd WxH@DPI] [-cores N] [-memory MB] [-profile software-lite]]
        emu -provision-renderer [-dry-run]
        emu -list-images [-tag TAG] [-abi arm64-v8a]
 
@@ -24,6 +24,9 @@ provisioning (no Java or sdkmanager; SDK at $ANDROID_HOME, default ~/Library/And
                     $ANDROID_HOME/simee/renderer/<revision>; both then initialize the renderer
                     once, so its Metal shaders are cached before the first boot
   -no-renderer      with -provision: skip the renderer (emu then boots without graphics)
+  -profile NAME     with -create-avd: software-lite makes a phone for software mode (x86_64 Linux
+                    without KVM): 540x960 at 240 dpi and a 30 Hz display (hw.lcd.vsync=30), for a
+                    quieter host (docs/android.md, Software mode); an explicit -lcd wins
   -no-golden        with -create-avd: don't boot the image once to keep a settled golden user data
                     (the new AVD first-boots fresh, as stock's does)
   -tag TAG          default, google_apis (default), google_apis_playstore, android-wear, ...
@@ -155,6 +158,8 @@ pub struct Opts {
     /// `-disk-cache unsafe|fsync`: whether guest disk flushes fsync on the host.
     pub disk_fsync: bool,
     pub create_avd: Option<String>,
+    /// `-profile NAME` (one of `emu_avd::PROFILES`): what `-create-avd` makes.
+    pub profile: Option<String>,
     /// `-clone-avd NAME -from GOLDEN`.
     pub clone_avd: Option<String>,
     pub from: Option<String>,
@@ -261,6 +266,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Opts> {
                 }
             }
             "create-avd" => o.create_avd = Some(value(flag)?),
+            "profile" => {
+                let name = value(flag)?;
+                if !emu_avd::PROFILES.contains(&name.as_str()) {
+                    bail!("-profile takes {}, not '{name}'", emu_avd::PROFILES.join(" or "));
+                }
+                o.profile = Some(name);
+            }
             "clone-avd" => o.clone_avd = Some(value(flag)?),
             "from" => o.from = Some(value(flag)?),
             "delete-avd" => o.delete_avd = Some(value(flag)?),
@@ -293,6 +305,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Opts> {
             f => o.ignored.push(format!("-{f}")),
         }
     }
+    if o.profile.is_some() && o.create_avd.is_none() {
+        bail!("-profile goes with -create-avd (it shapes the AVD that makes)");
+    }
     Ok(o)
 }
 
@@ -300,6 +315,10 @@ impl Opts {
     /// What each camera links to at start: its flag, else `hw.camera.back` / `hw.camera.front`
     /// from config.ini (`config`), else none. A config value that isn't a source is reported and
     /// skipped; flags were checked when parsed.
+    #[cfg_attr(
+        not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))),
+        allow(dead_code)
+    )]
     pub fn camera_links(&self, config: impl Fn(&str) -> Option<String>) -> Vec<(Facing, Option<SourceSpec>)> {
         [(Facing::Back, &self.camera_back), (Facing::Front, &self.camera_front)]
             .into_iter()
@@ -329,6 +348,7 @@ impl Opts {
 /// `virtualscene`, `videoplayback`, `webcam0`, `webcamN` and any other bare word are the test
 /// card, and only an explicit choice (a `-camera-*` flag, the console's `camera link`, or a simee
 /// source id such as `webcam:obs` in the file) links a host camera.
+#[cfg_attr(not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))), allow(dead_code))]
 fn config_link(key: &str, value: &str) -> Result<Option<SourceSpec>, String> {
     let v = value.trim();
     if matches!(v, "" | "none" | "emulated" | "virtualscene") || v.contains(':') {
@@ -422,6 +442,17 @@ mod tests {
         assert_eq!(p("-delete-avd farm-1").delete_avd.as_deref(), Some("farm-1"));
         assert!(!o.no_golden && p("-create-avd small -sysdir x -no-golden").no_golden);
         assert!(p("-provision 36 -create-avd small -no-golden").no_golden);
+    }
+
+    #[test]
+    fn profile_flag() {
+        assert_eq!(p("-create-avd lite -sysdir x -profile software-lite").profile.as_deref(), Some("software-lite"));
+        assert_eq!(p("-provision 36 -create-avd lite -profile software-lite").profile.as_deref(), Some("software-lite"));
+        assert_eq!(p("-create-avd plain -sysdir x").profile, None);
+        let err = parse("-avd pixel -profile software-lite".split(' ').map(String::from)).expect_err("no -create-avd").to_string();
+        assert!(err.contains("-create-avd"), "{err}");
+        let err = parse("-create-avd lite -profile fast".split(' ').map(String::from)).expect_err("unknown profile").to_string();
+        assert!(err.contains("software-lite") && err.contains("fast"), "{err}");
     }
 
     #[test]

@@ -126,6 +126,15 @@ fn replace_dir(src: &Path, dest: &Path) -> Result<()> {
     std::fs::rename(src, dest).map_err(io(dest))
 }
 
+/// Links the directory `target` (relative to `link`'s parent, or absolute) at `link`. On Windows
+/// that is a directory symlink, which needs Developer Mode or an elevated process.
+fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    return std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    return std::os::windows::fs::symlink_dir(target, link);
+}
+
 /// A directory removed on drop.
 struct TempDir(PathBuf);
 
@@ -341,7 +350,10 @@ impl Sdk {
         let current = root.join(renderer::CURRENT);
         let link = root.join(format!(".{}.tmp", renderer::CURRENT));
         let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(d.revision.to_string(), &link).map_err(io(&link))?;
+        symlink_dir(Path::new(&d.revision.to_string()), &link).map_err(io(&link))?;
+        // Windows won't rename a link over another, so there `current` is briefly absent.
+        #[cfg(windows)]
+        let _ = std::fs::remove_dir(&current);
         std::fs::rename(&link, &current).map_err(io(&current))?;
         for old in renderer::installed(&self.root).into_iter().filter(|i| i.dir != dest) {
             self.say(&format!("removing renderer r{}", old.marker.revision));
@@ -462,7 +474,7 @@ mod tests;
 /// file grows by a write past its end or by truncating, so on macOS each zero run is punched out
 /// explicitly. A filesystem without holes keeps the file dense.
 pub fn write_sparse(mut src: impl std::io::Read, dst: &std::fs::File) -> std::io::Result<(u64, u64)> {
-    use std::os::unix::fs::FileExt;
+    use sim_core::hostfs::FileExt;
     const BLOCK: usize = 4096;
     let mut buf = vec![0u8; 1 << 20];
     let (mut offset, mut written) = (0u64, 0u64);
