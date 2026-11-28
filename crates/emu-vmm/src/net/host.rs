@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use rustix::net::{AddressFamily, SocketType, ipproto};
 
+use super::Dns;
+
 fn family(addr: &SocketAddr) -> AddressFamily {
     if addr.is_ipv4() { AddressFamily::INET } else { AddressFamily::INET6 }
 }
@@ -58,15 +60,6 @@ pub fn parse_resolv_conf(text: &str) -> Option<IpAddr> {
         let mut w = l.split_whitespace();
         (w.next() == Some("nameserver")).then(|| w.next()?.parse().ok()).flatten()
     })
-}
-
-/// Where DNS to the guest's resolver address goes.
-#[derive(Clone, Debug)]
-pub enum Dns {
-    /// The host's resolver, from `/etc/resolv.conf` (which macOS keeps current), re-read when
-    /// the host's network may have changed.
-    System,
-    Fixed(SocketAddr),
 }
 
 pub struct Resolver {

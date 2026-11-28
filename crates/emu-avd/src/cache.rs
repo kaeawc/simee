@@ -23,6 +23,7 @@ const SETTLE: Duration = Duration::from_secs(2);
 const MAX_ENTRIES: usize = 4096;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
 struct Stamp {
     mtime: SystemTime,
     /// Seconds and nanoseconds of the change time.
@@ -41,11 +42,21 @@ fn table() -> MutexGuard<'static, HashMap<PathBuf, Entry>> {
     TABLE.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner())
 }
 
+#[cfg(unix)]
 fn stamp(meta: &std::fs::Metadata) -> Option<Stamp> {
     use std::os::unix::fs::MetadataExt;
     Some(Stamp { mtime: meta.modified().ok()?, ctime: (meta.ctime(), meta.ctime_nsec()), len: meta.len(), ino: meta.ino() })
 }
 
+/// Windows has no change time in std (the one a program can't set back), and without it a file
+/// restored with its old size and modification time can't be told from the one remembered: no
+/// stamp, so every call reads the file.
+#[cfg(not(unix))]
+fn stamp(_meta: &std::fs::Metadata) -> Option<Stamp> {
+    None
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
 impl Stamp {
     /// Whether neither time is within [`SETTLE`] of `now` (or after it).
     fn settled(&self, now: SystemTime) -> bool {
@@ -163,12 +174,34 @@ mod reads {
         *table().entry(path.to_path_buf()).or_default() += 1;
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn of(path: &Path) -> usize {
         table().get(path).copied().unwrap_or(0)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(unix)))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn nothing_is_remembered_so_an_edit_is_always_seen() {
+        let dir = std::env::temp_dir().join(format!("emu-avd-cache-windows-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let f = dir.join("config.ini");
+        std::fs::write(&f, "a=1\n").expect("write");
+        let get = |f: &Path| ini(f).expect("ini").expect("a file").get("a").cloned();
+        assert_eq!(get(&f).as_deref(), Some("1"));
+        let before = std::fs::metadata(&f).expect("meta").modified().expect("mtime");
+        std::fs::write(&f, "a=2\n").expect("rewrite, same size");
+        std::fs::File::options().write(true).open(&f).expect("open").set_modified(before).expect("mtime back");
+        assert_eq!(get(&f).as_deref(), Some("2"), "same size and mtime, still read again");
+        assert_eq!(ini(&dir).expect("ini"), None, "a directory isn't an ini file");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;

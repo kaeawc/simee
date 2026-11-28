@@ -2,7 +2,7 @@
 resolver = "3"
 # sim-* crates: the shared core (sim-core, sim-api) and the iOS backend; emu-* crates: the Android
 # backend (an emulator on Hypervisor.framework); apps: the simee CLI and the emu emulator binary.
-members = ["crates/*", "apps/simee", "apps/emu"]
+members = ["crates/*", "apps/simee", "apps/emu", "xtask"]
 # The Rune desktop app is its own workspace: a large git dependency and a GPU stack stay out of
 # `cargo check`/`test` here.
 exclude = ["desktop"]
@@ -62,6 +62,8 @@ crc32fast = { version = "1", default-features = false, features = ["std"] }
 # zlib-rs: ~2x miniz_oxide's inflate on a gzip kernel; runtime_detection lets it use the CPU's
 # crc32 instructions.
 flate2 = { version = "1", default-features = false, features = ["zlib-rs", "runtime_detection"] }
+# Host entropy (sim-core's `entropy`): one call on unix and Windows, which has no /dev/urandom.
+getrandom = { version = "0.4", default-features = false }
 libc = { version = "0.2", default-features = false }
 # Safe syscall wrappers (plain fsync: std's sync_data is F_FULLFSYNC on macOS; the adb bridge's
 # non-blocking send).

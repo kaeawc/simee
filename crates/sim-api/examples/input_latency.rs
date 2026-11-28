@@ -24,8 +24,8 @@
 //! pointer_location 1`) draws crosshairs through the touch at once; on iOS a keyboard key's
 //! preview balloon. scripts/bench/input-latency.sh runs both; docs/research/input-latency.md has
 //! the method and the numbers.
+use sim_core::net::UnixStream;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};

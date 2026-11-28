@@ -3653,6 +3653,7 @@ dependencies = [
 name = "simee-core"
 version = "0.2.0"
 dependencies = [
+ "getrandom 0.4.3",
  "png 0.18.1",
  "serde",
 ]
@@ -3699,6 +3700,15 @@ dependencies = [
  "rustix 1.1.6",
  "simee-bundle",
  "simee-core",
+ "simee-emu-hvf",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "simee-emu-hvf"
+version = "0.2.0"
+dependencies = [
+ "libc",
  "thiserror 2.0.21",
 ]
 

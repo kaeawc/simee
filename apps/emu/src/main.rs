@@ -14,6 +14,8 @@ mod display_server;
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
 mod fold;
 mod golden;
+#[cfg(windows)]
+mod host_windows;
 mod instance;
 mod on_signal;
 mod provision;
@@ -22,18 +24,22 @@ mod software;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vkprobe;
 
+#[cfg(windows)]
+use host_windows::raise_nofile;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 
 /// macOS's `OPEN_MAX`: the most open files `setrlimit` grants a process there whatever its hard
 /// limit says, and room for the NAT's flow caps and the rest of emu.
+#[cfg_attr(not(unix), allow(dead_code))]
 const NOFILE_WANT: u64 = 10240;
 
 /// Raises the soft open-file limit (256 by default on macOS) toward the hard one, up to
 /// [`NOFILE_WANT`]: each of the guest's network flows is a host socket of this process, and
 /// running out also fails the console's and the adb bridge's `accept`. Never lowers it. Returns
 /// the soft limit in force.
+#[cfg(unix)]
 fn raise_nofile() -> u64 {
     use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
     let cur = getrlimit(Resource::Nofile);
@@ -475,6 +481,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_open_file_limit_is_raised_toward_the_hard_limit_and_never_lowered() {
         use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};

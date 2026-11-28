@@ -33,7 +33,7 @@ fn mirror(tag: &str) -> Mirror {
     std::fs::create_dir_all(repo.join("sys-img/android-tv")).expect("mirror dirs");
 
     let tools = stored_zip(&[("platform-tools/source.properties", b"Pkg.Revision=37.0.3\n"), ("platform-tools/adb", b"#!/bin/sh\n")]);
-    let archives: String = ["linux", "macosx"]
+    let archives: String = ["linux", "macosx", "windows"]
         .iter()
         .map(|h| {
             std::fs::write(repo.join(format!("platform-tools-{h}.zip")), &tools).expect("tools zip");
@@ -116,6 +116,9 @@ impl Mirror {
     }
 }
 
+// Unix only: provisioning unpacks the archives with `unzip`, which a Windows host doesn't have
+// (docs/development.md "Windows").
+#[cfg(unix)]
 #[test]
 fn provisions_an_image_into_an_empty_sdk_and_plans_its_avd() {
     let m = mirror("tv");

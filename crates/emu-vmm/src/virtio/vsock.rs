@@ -1473,6 +1473,8 @@ mod tests {
         sent
     }
 
+    // Unix only: it binds the adb bridge, which answers `Unsupported` on Windows.
+    #[cfg(unix)]
     #[test]
     fn a_stalled_adb_client_holds_up_neither_other_pipes_nor_other_sessions() {
         let (mut g, mut stalled, adb) = adb_guest();

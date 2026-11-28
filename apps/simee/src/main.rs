@@ -1427,9 +1427,11 @@ mod tests {
     #[test]
     fn camera_file_sources_are_sent_as_absolute_paths() {
         let cwd = std::env::current_dir().expect("cwd");
+        // `/abs/clip.mov` has no drive on Windows, so it isn't absolute there.
+        let abs = std::env::temp_dir().join("clip.mov").display().to_string();
         for kind in ["image", "video"] {
             assert_eq!(camera_source(&format!("{kind}:clip.mov")), format!("{kind}:{}", cwd.join("clip.mov").display()));
-            assert_eq!(camera_source(&format!("{kind}:/abs/clip.mov")), format!("{kind}:/abs/clip.mov"));
+            assert_eq!(camera_source(&format!("{kind}:{abs}")), format!("{kind}:{abs}"));
         }
         assert_eq!(camera_source("qr:hello"), "qr:hello");
         assert_eq!(camera_source("webcam:0"), "webcam:0");
@@ -1568,6 +1570,7 @@ mod tests {
         (String::from_utf8(out).expect("utf-8"), String::from_utf8(err).expect("utf-8"), result.err().map(|e| e.to_string()))
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_server_and_this_process_print_the_same_bytes() {
         let root = android_root("forward");
@@ -1607,6 +1610,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     /// A command's stdout as bytes (a PNG isn't UTF-8) and its error, run through `transport`.
     fn output_bytes(transport: &mut Transport, args: &[&str]) -> (Vec<u8>, Option<String>) {
         let cli = Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).expect("arguments");
@@ -1615,6 +1619,7 @@ mod tests {
         (out, result.err().map(|e| e.to_string()))
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_screenshot_to_stdout_is_the_png_here_and_on_a_server() {
         let root = android_root("stdout");
@@ -1643,6 +1648,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_stale_socket_falls_back_to_this_process() {
         let root = android_root("stale");
@@ -1655,6 +1661,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_required_server_that_cant_be_used_fails_the_command_with_why() {
         let root = android_root("require");
@@ -1830,8 +1837,10 @@ mod tests {
     }
 
     /// A fake server's reply to a method: its result or its error.
+    #[cfg(unix)]
     type Answer = fn(&str) -> std::result::Result<Value, String>;
 
+    #[cfg(unix)]
     /// A server on `socket` that records each method it is sent and answers with `answer`; `None`
     /// never answers (a wedged server).
     fn fake_server(socket: &std::path::Path, answer: Option<Answer>) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
@@ -1903,6 +1912,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_server_that_never_answers_runs_the_command_here() {
         let root = android_root("wedged");
@@ -1919,6 +1929,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn another_build_or_an_old_server_runs_the_command_here() {
         let root = android_root("skew");
@@ -1952,6 +1963,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn boot_runs_here_even_with_a_matching_server() {
         let root = android_root("boot");
@@ -1985,6 +1997,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn camera_commands_link_swap_and_unlink_through_the_api() {
         let root = android_root("camera");
@@ -2043,6 +2056,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     fn android_backend(root: &std::path::Path) -> sim_android::Android {
         let env = emu_avd::Env { sdk_root: Some(root.join("sdk")), avd_home: root.join("avd") };
         let mut android = sim_android::Android::new(env);
@@ -2054,7 +2068,8 @@ mod tests {
     fn path_parameters_are_made_absolute() {
         let here = std::env::current_dir().expect("cwd");
         assert_eq!(absolute("shot.png"), here.join("shot.png").display().to_string());
-        assert_eq!(absolute("/tmp/x.png"), "/tmp/x.png");
+        let abs = std::env::temp_dir().join("x.png").display().to_string();
+        assert_eq!(absolute(&abs), abs);
     }
 
     #[test]
