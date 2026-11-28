@@ -159,7 +159,7 @@ in `SIMEE_MCP_TOOLSETS` (commas between names; `all` for every tool). Unset, it 
 | Toolset | Tools |
 | --- | --- |
 | `core` (the default) | `devices`, `boot`, `shutdown`, `info`, `screen`, `screenshot`, `tap`, `swipe`, `type`, `key`, `button`, `rotate`, `open_url`, `install`, `uninstall`, `launch`, `terminate`, `apps`, `logs`, `appearance`, `location`, `device_view` |
-| `lifecycle` | Devices: `form_factors`, `devices`, `runtimes`, `device_types`, `create`, `delete`, `boot`, `boot_many`, `admission_check`, `settle`, `profile`, `clone`, `export`, `import`, `shutdown`, `erase`, `info` |
+| `lifecycle` | Devices: `form_factors`, `devices`, `runtimes`, `device_types`, `create`, `delete`, `boot`, `boot_many`, `admission_check`, `settle`, `profile`, `clone`, `export`, `import`, `shutdown`, `erase`, `info`, `link`, `unlink`, `links`, `link_status` |
 | `apps` | `open_url`, `install`, `uninstall`, `launch`, `terminate`, `apps`, `privacy`, `push` |
 | `input` | `tap`, `swipe`, `touch`, `button`, `type`, `key`, `rotate`, `fold`, `xr`, `touchpad`, `stylus`, `rotary`, `watch_gesture`, `remote_swipe`, `pointer`, `biometric` |
 | `observe` | `screen`, `screenshot`, `wait_idle`, `contrast_check`, `logs`, `device_view` |
@@ -204,6 +204,7 @@ reverse):
 | `connections`, `traffic`, `network_shape`, `network_state`, `network_clear` | Android, iOS (Android: the emulator console's `network speed` and `network delay`, simee's `network loss` (not on the stock emulator; `loss_pct` is the percent of packets dropped in each direction, where on iOS it is the percent of new connections that time out), airplane mode for offline, and the guest's socket tables and per-uid counters over adb; rules, proxy and inject are iOS's) |
 | `containers`, `ls`, `read`, `write`, `rm`, `du`, `clear_container` | Android, iOS (Android: in an app's container, through `run-as` for a debuggable app, root otherwise; `adb root` only with `root: true`, `pm clear` only with `pm_clear: true`) |
 | `wait_idle`, `erase`, `appearance`, `privacy`, `push`, `status_bar`, `clear_status_bar`, `content_size`, `increase_contrast`, `dynamic_island`, `backlight`, `keyboard_language`, `hardware_keyboard`, `ca_debug`, `ca_debug_state`, `reset_keychain`, `memory_warning`, `notify`, `biometric`, `logs`, `defaults_read`, `defaults_write`, `crash_reports`, `network_flows`, `network_env`, `audio_route`, `audio_capture_start`, `audio_capture_stop`, `watch_gesture`, `remote_swipe`, `pointer`, `carplay` | iOS |
+| `link`, `unlink`, `links`, `link_status` | iOS (watch-phone: CoreSimulator's device pairs; Android links come with #424, see [design/device-links.md](design/device-links.md)) |
 | `mem_leaks`, `mem_heap`, `mem_vmmap`, `mem_history` | iOS (the host's memory tools on one app; Android answers that they aren't available there) |
 
 A test keeps this page honest: it fails if a tool isn't named here.

@@ -57,6 +57,12 @@ const DEFS: &[(&str, &str)] = &[
         r#"{device: string, platform: string, facing: "back"|"front", source: string, name?: string, live?: string|null,
             state: "linked"|"saved"|"relinked"|"unsaved"|"off"|"source missing"|"permission missing", fix?: string}"#,
     ),
+    (
+        "link",
+        r#"{id: string, kind: "watch-phone"|"car-phone"|"headset-phone"|"network", mechanism: string,
+            state: "pending"|"active"|"broken", reason: string, since: string|null, active: boolean,
+            members: [{device: string, name: string|null, platform: "ios"|"android", role: string, running: boolean}]}"#,
+    ),
     ("prefs_change", r#"store: string, visible: "now"|"after_relaunch", app: "untouched"|"stopped"|"relaunched", note?: string"#),
     ("frame", "{address: string, symbol: string, image?: string, source?: string}"),
     (
@@ -145,6 +151,10 @@ pub const OUTPUTS: &[(&str, &str)] = &[
     ),
     ("shutdown", "null"),
     ("erase", "null"),
+    ("link", "{link: @link}"),
+    ("unlink", "{unlinked: [string], teardown: [{id: string, watch?: string, shut_down?: boolean, error?: string}]}"),
+    ("links", "[@link]"),
+    ("link_status", "{link: @link, checks: [{name: string, ok: boolean, detail: string}]}"),
     ("screen", "{width: number, height: number}"),
     ("screenshot", "{width: number, height: number, png?: string, path?: string}"),
     ("wait_idle", "{waited_ms: number, frames: number, width?: number, height?: number, png?: string, path?: string}"),

@@ -146,6 +146,38 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     ("shutdown", "device; iOS: set?", "Shut down"),
     ("erase", "device, set?", "Erase content and settings (shut down first)"),
+    // Device links (docs/design/device-links.md); iOS watch pairs are CoreSimulator's (#423).
+    (
+        "link",
+        "devices?, kind?(watch-phone|car-phone|headset-phone|network), active?, link?, set?",
+        "Link two devices that work together. iOS: a watch and a phone become a CoreSimulator device pair (as `simctl pair`), kept in \
+         the device set, so it outlives the server and a host reboot. kind is inferred from the form factors (watch-phone); other \
+         form factors (two watches, a watch and an iPad) are refused naming what each device is, and so is a watch already paired \
+         with another phone. Linking a pair that exists returns it. active true makes it the phone's active watch (as \
+         `pair_activate`: a phone may have several watches, one of them active); link (an id) names an existing pair. Returns \
+         `link`: id (the pair's UUID), kind, mechanism (coresim-pair), state (active: both booted and connected; pending: a member \
+         is shut down or the pair isn't connected yet; broken: a member is gone) with reason, active, and members (device, name, \
+         platform, role, running). Android links: not yet (#424)",
+    ),
+    (
+        "unlink",
+        "link?, device?, kind?, set?",
+        "Remove a link (link, an id) or every link of device (of kind). iOS: CoreSimulator unpairs it (as `simctl unpair`) and may \
+         shut the watch down and erase it while doing so. Returns unlinked (the ids) and teardown, one entry per link: id, watch, \
+         and shut_down (the watch ran and was shut down) or error",
+    ),
+    (
+        "links",
+        "device?, kind?, state?(pending|active|broken), set?",
+        "Every link (of one device, of a kind, in a state), each as `link` returns it, its state derived now from the device set and \
+         whether each member runs",
+    ),
+    (
+        "link_status",
+        "link?, device?, set?",
+        "One link (by id, or the one device is in) as `links` shows it, with checks: whether each member exists and runs, whether \
+         CoreSimulator has the pair connected, and whether it is the phone's active watch, each with ok and detail",
+    ),
     (
         "screen",
         "device, display?(main|outer|inner|carplay); iOS: set?",
@@ -1495,6 +1527,8 @@ fn dispatch(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
     }
     match method {
         m if crate::camera::is_method(m) => crate::camera::call(s, m, p),
+        // Each names its devices (`devices`, `device`) or a link: resolved there.
+        m if crate::links::is_method(m) => crate::links::call(s, m, p),
         "help" => Ok(METHODS
             .iter()
             .map(|(m, params, doc)| {

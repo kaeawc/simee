@@ -957,6 +957,48 @@ pub(crate) fn camera_launchctl(s: &mut Session, udid: &str, args: &[String], env
     Ok((out.stdout, out.stderr))
 }
 
+/// The simulator `query` names, as a link sees it; `None` when there is none in the call's set.
+pub(crate) fn link_device(s: &mut Session, query: &str) -> Result<Option<crate::links::Sim>, String> {
+    match s.ctx()?.device(query) {
+        Ok(d) => {
+            let info = d.info();
+            let running = info.state == DeviceState::Booted;
+            Ok(Some(crate::links::Sim { udid: info.udid, name: info.name, form_factor: info.form_factor, running }))
+        }
+        Err(sim_coresim::Error::NotFound(_)) => Ok(None),
+        Err(e) => Err(err(e)),
+    }
+}
+
+/// Every watch-phone pair in the call's set.
+pub(crate) fn link_pairs(s: &mut Session) -> Result<Vec<sim_core::link::Pair>, String> {
+    s.ctx()?.device_pairs().map_err(err)
+}
+
+/// Whether CoreSimulator would pair the two (by UDID), without pairing them.
+pub(crate) fn link_can_pair(s: &mut Session, watch: &str, phone: &str) -> Result<(), String> {
+    let ctx = s.ctx()?;
+    let (watch, phone) = (ctx.device(watch).map_err(err)?, ctx.device(phone).map_err(err)?);
+    ctx.test_pairing(&watch, &phone).map_err(err)
+}
+
+/// Pairs the watch with the phone (by UDID).
+pub(crate) fn link_pair(s: &mut Session, watch: &str, phone: &str) -> Result<sim_core::link::Pair, String> {
+    let ctx = s.ctx()?;
+    let (watch, phone) = (ctx.device(watch).map_err(err)?, ctx.device(phone).map_err(err)?);
+    ctx.create_pair(&watch, &phone).map_err(err)
+}
+
+/// Makes the pair its phone's active one.
+pub(crate) fn link_activate(s: &mut Session, id: &str) -> Result<(), String> {
+    s.ctx()?.activate_pair(id).map_err(err)
+}
+
+/// Removes the pair.
+pub(crate) fn link_unpair(s: &mut Session, id: &str) -> Result<(), String> {
+    s.ctx()?.unpair(id).map_err(err)
+}
+
 /// Runs an input method on its device's worker.
 fn input(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
     let (set, open) = (s.set()?, s.opener());
@@ -2630,6 +2672,9 @@ mod tests {
                 "contrast_check" => p["appearance"] = json!("both"),
                 "watch_gesture" => p["gesture"] = json!("double-tap"),
                 "privacy" => p["action"] = json!("grant"),
+                // A link joins two devices; `links`' state is a link state's name.
+                "link" => p["devices"] = json!(["409409A0-0000-4000-8000-000000000409", "409409A0-0000-4000-8000-000000000410"]),
+                "links" => p["state"] = json!("active"),
                 _ => {}
             }
             let result = crate::methods::call(&mut s, method, &p);
