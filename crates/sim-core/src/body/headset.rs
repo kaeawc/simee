@@ -46,6 +46,8 @@ fn block(role: Role, center: [f32; 3], size: [f32; 3], corner: Corner, bevel: f3
 /// A headset row: the visor's size, and the width the frame spans on its eye-side face.
 struct Headset {
     id: &'static str,
+    /// Other identifiers it answers to: the default visionOS device type is `Apple-Vision-Pro-4K`.
+    aliases: &'static [&'static str],
     name: &'static str,
     platform: Platform,
     source: &'static str,
@@ -59,6 +61,7 @@ struct Headset {
 const HEADSETS: [Headset; 2] = [
     Headset {
         id: "Apple-Vision-Pro",
+        aliases: &["Apple-Vision-Pro-4K"],
         name: "Apple Vision Pro",
         platform: Platform::Ios,
         source: VISION_PRO,
@@ -68,6 +71,7 @@ const HEADSETS: [Headset; 2] = [
     },
     Headset {
         id: "xr_headset_device",
+        aliases: &[],
         name: "Android XR headset",
         platform: Platform::Android,
         source: XR_HEADSET,
@@ -141,7 +145,9 @@ pub(super) fn rows() -> Vec<Body> {
                 cutout: None,
                 published: None,
             };
-            headset(p.id, p.name.to_owned(), p.platform, Source::Generic(p.source), p.size, screen)
+            let mut body = headset(p.id, p.name.to_owned(), p.platform, Source::Generic(p.source), p.size, screen);
+            body.aliases = p.aliases.to_vec();
+            body
         })
         .collect();
     let (w, h, _) = ANDROID_GLASSES_SCREEN;
@@ -248,6 +254,11 @@ mod tests {
         // The full CoreSimulator identifier finds the Vision Pro too.
         assert_eq!(
             get("com.apple.CoreSimulator.SimDeviceType.Apple-Vision-Pro").map(|b| b.id.clone()).as_deref(),
+            Some("Apple-Vision-Pro")
+        );
+        // The simulator's default visionOS type (`Apple-Vision-Pro-4K`) is the same body.
+        assert_eq!(
+            get("com.apple.CoreSimulator.SimDeviceType.Apple-Vision-Pro-4K").map(|b| b.id.clone()).as_deref(),
             Some("Apple-Vision-Pro")
         );
         // The Vision Pro's note says what Apple publishes and that the rest is estimated.

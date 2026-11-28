@@ -1510,8 +1510,10 @@ mod tests {
             if let Some(b) = body {
                 let placed = scene::place(&b, size, sim_core::rotation::Rotation::Deg0).expect("placed");
                 let screen = b.screen(placed.display).expect("the placed screen");
-                // The frame lands on the body screen with its pixels (either orientation), not a fallback.
-                assert!(screen.px == size || screen.px == (size.1, size.0), "{}: {:?} vs {size:?}", d.name, screen.px);
+                // The frame lands on the body screen at its shape (either orientation), not a
+                // fallback: a half-size scene (a headset's) is the same frame at half the pixels.
+                let (px, size) = ((u64::from(screen.px.0), u64::from(screen.px.1)), (u64::from(size.0), u64::from(size.1)));
+                assert!(px.0 * size.1 == px.1 * size.0 || px.0 * size.0 == px.1 * size.1, "{}: {px:?} vs {size:?}", d.name);
             }
         }
         // The glasses' body is built from the glasses' own screen, not the headset's.
