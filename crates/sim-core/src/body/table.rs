@@ -648,6 +648,7 @@ pub(super) struct Spec<'a> {
     /// The system image's tag (`ai-glasses`, `android-xr`, `google_apis`, `google-tv`, ...), or ""
     /// when it isn't known (an Apple device, a profile without an image): what tells a headset
     /// from glasses.
+    #[allow(dead_code, reason = "headset.rs reads it to tell glasses from headsets (#504)")]
     pub image_tag: &'a str,
 }
 

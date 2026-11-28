@@ -23,6 +23,7 @@ pub(super) const ENABLED: bool = true;
 
 /// A headset's frame spans the eyepiece area (a width and height it fits), and the glasses' HUD
 /// fits the lens, whatever dpi simee reports for the screen.
+#[cfg(test)]
 pub(super) const SIZES_BY_DPI: bool = false;
 
 /// The widest and tallest a frame is drawn on a headset's face, mm: the eyepiece area.
