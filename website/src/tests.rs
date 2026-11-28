@@ -171,6 +171,35 @@ fn themes_cycle_and_round_trip() {
 }
 
 #[test]
+fn rune_starts_from_the_theme_the_page_already_shows() {
+    use crate::theme::Theme;
+    // The head script's data-theme wins; localStorage covers a page where it didn't run.
+    assert_eq!(Theme::chosen(Some("dark"), Some("light")), Theme::Dark);
+    assert_eq!(Theme::chosen(None, Some("light")), Theme::Light);
+    assert_eq!(Theme::chosen(Some("bogus"), Some("dark")), Theme::Dark);
+    assert_eq!(Theme::chosen(None, Some("system")), Theme::System);
+    assert_eq!(Theme::chosen(None, None), Theme::System);
+}
+
+/// Every page is `index.html` filled in (scripts/build.sh), so its head script is every page's.
+#[test]
+fn the_saved_theme_applies_before_anything_paints() {
+    let template = include_str!("../index.html");
+    let head = &template[..template.find("</head>").unwrap()];
+    let script = head.find("localStorage.getItem(\"simee-theme\")").expect("the head reads the saved theme");
+    // Before any stylesheet, font or the export's CSS, so the first paint is already themed.
+    for later in ["<style", "<link", "<!-- rune:css -->"] {
+        assert!(head.find(later).is_some_and(|at| at > script), "{later} comes before the theme script");
+    }
+    assert!(head[script..].contains("document.documentElement.dataset.theme = t"));
+    // The static toggle is found by the label Rune exports for it (ui::theme_toggle), and the
+    // build checks every page it writes still has the script.
+    assert!(head.contains("[aria-label^=\"Theme: \"]"));
+    assert!(include_str!("ui.rs").contains(".label(format!(\"Theme: {}\", theme.label()))"));
+    assert!(include_str!("../scripts/build.sh").contains("simee-theme"));
+}
+
+#[test]
 fn code_spans_naming_repo_paths_link_to_them() {
     let md = "rerun with `scripts/bench/android-boot.sh`, see `docs/cli.md`, not `simee list` or [`scripts/x.sh`](https://example.com/y)";
     let out = resolve_links(md, "");

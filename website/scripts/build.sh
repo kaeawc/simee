@@ -92,6 +92,21 @@ while IFS=$'\t' read -r path title description; do
 done <<<"$pages"
 page /404 "Not found · simee" "There's no page here." "$out/404.html" 0
 
+# Every page applies the reader's saved theme (simee-theme) in <head>, before any stylesheet:
+# a page without it paints the system's theme first, then switches.
+python3 - "$out" <<'PY'
+import pathlib, sys
+bad = []
+for page in pathlib.Path(sys.argv[1]).rglob("*.html"):
+    s = page.read_text()
+    at = s.find('localStorage.getItem("simee-theme")')
+    styles = [i for i in (s.find("<style"), s.find("<link")) if i >= 0]
+    if at < 0 or at > s.find("</head>") or any(i < at for i in styles):
+        bad.append(str(page))
+if bad:
+    sys.exit("pages without the theme script first in <head>: " + ", ".join(bad))
+PY
+
 if $dev; then
   printf 'User-agent: *\nDisallow: /\n' >"$out/robots.txt"
 else
