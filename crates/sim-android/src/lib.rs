@@ -10,6 +10,7 @@
 //! an AVD home, and Android has no other stable id for a device that isn't running.
 
 pub mod apps;
+pub mod audio;
 pub mod console;
 pub mod display;
 pub mod host;
