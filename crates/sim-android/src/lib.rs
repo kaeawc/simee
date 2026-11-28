@@ -765,6 +765,17 @@ impl Device {
         self.running.as_ref().ok_or_else(|| format!("{} isn't running; boot it first", self.info.name))
     }
 
+    /// simee's state directory beside the AVD (`<avd>/simee/`), where its camera and device links
+    /// live; `None` when its config can't be read.
+    pub fn state_dir(&self) -> Option<PathBuf> {
+        self.avd.as_ref().map(|a| emu_avd::state_dir(&a.dir))
+    }
+
+    /// Whether it is a pair of Android XR glasses (an `ai-glasses` system image), not a headset.
+    pub fn is_glasses(&self) -> bool {
+        self.avd.as_ref().is_some_and(|a| a.image_tags().split(',').any(|t| sim_core::form_factor::is_glasses_tag(t.trim())))
+    }
+
     /// The running instance, for what only simee's `emu` offers (`what`: the display socket,
     /// simee's console commands). A device the stock emulator runs gets a clear refusal.
     fn running_simee(&self, what: &str) -> Result<&Running, String> {
@@ -1497,21 +1508,23 @@ fn read_cameras(avd_dir: &Path) -> (Vec<(String, String)>, Vec<String>) {
     (links, warnings)
 }
 
-/// Holds an AVD's camera-links lock (an advisory lock file next to the links) until dropped, so
-/// two saves of one AVD run one after the other. A lock file older than [`LOCK_STALE`] is a dead
-/// holder's and is taken over.
-struct CamerasLock(PathBuf);
+/// Holds the lock of one of simee's files in a state directory (an advisory lock file next to it:
+/// `<file>.lock`) until dropped, so two saves of it run one after the other. A lock file older
+/// than [`LOCK_STALE`] is a dead holder's and is taken over. Camera links (`cameras.ini`) and
+/// device links (`links.json`, on both platforms) take it.
+pub struct StateLock(PathBuf);
 
 const LOCK_STALE: Duration = Duration::from_secs(30);
 
-impl CamerasLock {
-    fn take(dir: &Path) -> Result<CamerasLock, String> {
+impl StateLock {
+    /// Takes `dir`'s lock for `file`, creating `dir`; waits up to 10 s for another holder.
+    pub fn take(dir: &Path, file: &str) -> Result<StateLock, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let path = dir.join(format!("{CAMERAS_FILE}.lock"));
+        let path = dir.join(format!("{file}.lock"));
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(_) => return Ok(CamerasLock(path)),
+                Ok(_) => return Ok(StateLock(path)),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     let stale =
                         std::fs::metadata(&path).and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age > LOCK_STALE));
@@ -1529,10 +1542,29 @@ impl CamerasLock {
     }
 }
 
-impl Drop for CamerasLock {
+impl Drop for StateLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+/// Writes `text` to `dir/file` through a temporary file of this call's own, renamed into place, so
+/// a reader never sees half of it (`None`: removes the file). Take the file's [`StateLock`] first.
+pub fn write_state_file(dir: &Path, file: &str, text: Option<&str>) -> Result<(), String> {
+    let path = dir.join(file);
+    let Some(text) = text else {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("{}: {e}", path.display())),
+            _ => Ok(()),
+        };
+    };
+    static SAVES: AtomicU64 = AtomicU64::new(0);
+    let tmp = dir.join(format!("{file}.{}.{}.tmp", std::process::id(), SAVES.fetch_add(1, Ordering::Relaxed)));
+    std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })
 }
 
 /// Replaces the saved camera links of the AVD in `avd_dir` (none: removes the file). Written to a
@@ -1540,7 +1572,7 @@ impl Drop for CamerasLock {
 /// and concurrent saves don't collide.
 pub fn save_cameras(avd_dir: &Path, links: &[(String, String)]) -> Result<(), String> {
     let dir = emu_avd::state_dir(avd_dir);
-    let _lock = CamerasLock::take(&dir)?;
+    let _lock = StateLock::take(&dir, CAMERAS_FILE)?;
     write_cameras(&dir, links)
 }
 
@@ -1548,7 +1580,7 @@ pub fn save_cameras(avd_dir: &Path, links: &[(String, String)]) -> Result<(), St
 /// updates each see the other's, so none is lost. Returns what was saved.
 pub fn update_cameras(avd_dir: &Path, change: impl FnOnce(&mut Vec<(String, String)>)) -> Result<Vec<(String, String)>, String> {
     let dir = emu_avd::state_dir(avd_dir);
-    let _lock = CamerasLock::take(&dir)?;
+    let _lock = StateLock::take(&dir, CAMERAS_FILE)?;
     let mut links = saved_cameras(avd_dir);
     change(&mut links);
     links.sort_by_key(|(f, _)| CAMERA_FACINGS.iter().position(|c| c == f));
@@ -1557,12 +1589,8 @@ pub fn update_cameras(avd_dir: &Path, change: impl FnOnce(&mut Vec<(String, Stri
 }
 
 fn write_cameras(dir: &Path, links: &[(String, String)]) -> Result<(), String> {
-    let path = dir.join(CAMERAS_FILE);
     if links.is_empty() {
-        return match std::fs::remove_file(&path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("{}: {e}", path.display())),
-            _ => Ok(()),
-        };
+        return write_state_file(dir, CAMERAS_FILE, None);
     }
     let mut text = String::new();
     for (facing, source) in links {
@@ -1571,13 +1599,7 @@ fn write_cameras(dir: &Path, links: &[(String, String)]) -> Result<(), String> {
         }
         text.push_str(&format!("{facing}={}\n", source.trim()));
     }
-    static SAVES: AtomicU64 = AtomicU64::new(0);
-    let tmp = dir.join(format!("{CAMERAS_FILE}.{}.{}.tmp", std::process::id(), SAVES.fetch_add(1, Ordering::Relaxed)));
-    std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("{}: {e}", path.display())
-    })
+    write_state_file(dir, CAMERAS_FILE, Some(&text))
 }
 
 /// The last `n` lines of a device's guest console (`<avd>/simee/console.log`). Without
@@ -2814,6 +2836,8 @@ mod tests {
             f.android.create("glasses", "system-images;android-36;ai-glasses;arm64-v8a", Some(FormFactor::Vision)).expect("glasses");
         assert_eq!(glasses.sub_platform.map(|s| s.as_str()), Some("androidxr"));
         assert_eq!(f.android.device("glasses").expect("glasses").screen_size(), Ok((450, 450)));
+        assert!(f.android.device("glasses").expect("glasses").is_glasses() && !d.is_glasses(), "a headset isn't glasses");
+        assert!(d.state_dir().is_some_and(|dir| dir.ends_with("headset.avd/simee")), "{:?}", d.state_dir());
         let err = f.android.create("p", "system-images;android-34;google-xr;arm64-v8a", Some(FormFactor::Phone)).expect_err("phone");
         assert!(err.ends_with("boots Android XR · Vision devices, not phone"), "{err}");
 

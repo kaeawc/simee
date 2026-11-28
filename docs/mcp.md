@@ -208,7 +208,7 @@ reverse):
 | `containers`, `ls`, `read`, `write`, `rm`, `du`, `clear_container` | Android, iOS (Android: in an app's container, through `run-as` for a debuggable app, root otherwise; `adb root` only with `root: true`, `pm clear` only with `pm_clear: true`) |
 | `push`, `notify`, `biometric` | Android, iOS (Android: an FCM message to the app's Firebase receiver, sent as root; an `am broadcast`; the fingerprint sensor through the console's `finger touch`. `reset_keychain` has no Android counterpart; see [android-notify-biometric.md](research/android-notify-biometric.md)) |
 | `wait_idle`, `appearance`, `privacy`, `content_size`, `dynamic_island`, `backlight`, `keyboard_language`, `ca_debug`, `ca_debug_state`, `reset_keychain`, `logs`, `defaults_read`, `defaults_write`, `crash_reports`, `network_flows`, `network_env`, `audio_route`, `audio_capture_start`, `audio_capture_stop`, `watch_gesture`, `remote_swipe`, `pointer`, `carplay` | iOS |
-| `link`, `unlink`, `links`, `link_status` | iOS (watch-phone: CoreSimulator's device pairs; Android links come with #424, see [design/device-links.md](design/device-links.md)) |
+| `link`, `unlink`, `links`, `link_status` | Android, iOS (watch-phone: CoreSimulator's device pairs, iOS; headset-phone: on the host network on iOS, `net-forward` on Android; Wear OS links come with #445, see [design/device-links.md](design/device-links.md)) |
 | `mem_leaks`, `mem_heap`, `mem_vmmap`, `mem_history` | iOS (the host's memory tools on one app; Android answers that they aren't available there) |
 
 A test keeps this page honest: it fails if a tool isn't named here.

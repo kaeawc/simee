@@ -226,7 +226,9 @@ pub fn wait_for(lines: &Mutex<Vec<String>>, n: usize) -> Vec<String> {
 /// profile's `apps.turbo`, `apps.wellbeing` and `partnersetup` (which it refuses to disable) and
 /// not `apps.restore`; what is disabled is kept in `disabled` beside the script. `com.example.app` has
 /// an FCM receiver that a root `am broadcast` reaches (`noroot` beside the script: no `su`), and
-/// `am broadcast -a` succeeds except for the protected `BOOT_COMPLETED`.
+/// `am broadcast -a` succeeds except for the protected `BOOT_COMPLETED`. `forward` keeps the adb
+/// server's forwards (every device's) in `forwards` beside the script, host ports from 41001, and
+/// the TCP tables say 8080 listens.
 pub fn fake_adb(android: &Android) -> FakeAdb {
     let dir = android.env.sdk_root.as_ref().expect("sdk root").join("platform-tools");
     std::fs::create_dir_all(&dir).expect("platform-tools");
@@ -452,7 +454,9 @@ case "$1" in
 # `forward [--no-rebind] tcp:<host> tcp:<device>`, `forward --remove tcp:<host>` and `forward --list`
 # (sim_android::dhu) on one table for every serial, `forwards` beside the script, as adb's server
 # keeps it: `--no-rebind` refuses a host port already forwarded, and while `forward.busy` holds a
-# count above 0 that many more forwards are refused as taken by another program.
+# count above 0 that many more forwards are refused as taken by another program. `forward tcp:0
+# tcp:<device>` (net-forward links) allocates the next host port from 41001 (`forward.next`) and
+# prints it, as adb does.
 forward)
   shift
   f="$d/forwards"
@@ -462,6 +466,10 @@ forward)
     --remove)
       grep -q " $2 " "$f" || { echo "adb: error: listener '$2' not found" >&2; exit 1; }
       grep -v " $2 " "$f" > "$f.$$"; mv "$f.$$" "$f";;
+    tcp:0)
+      n=$(( $(cat "$d/forward.next" 2>/dev/null || echo 41001) ))
+      echo $(( n + 1 )) > "$d/forward.next"
+      echo "$serial tcp:$n $2" >> "$f"; echo "$n";;
     *)
       norebind=""
       [ "$1" = "--no-rebind" ] && norebind=1 && shift
@@ -601,6 +609,8 @@ shell)
     "cmd connectivity airplane-mode disable") echo 0 > "$(dirname "$0")/airplane";;
     # sim_android::net's socket listing, as root (google_apis has su), and its traffic counters.
     *"echo @net:fd;"*) net_sockets;;
+    # sim_android::net's listening ports: the same tables (8080 listens on IPv6).
+    "echo @net:tcp; cat /proc/net/tcp; "*) net_sockets;;
     *"mAppUidStatsMap"*) net_traffic;;
     # exec's argv line runs on the host's sh, as the guest's would run it, in a child that outlives
     # this adb (as adbd's shell outlives an adb client that is stopped). With `exec.slow` beside the
