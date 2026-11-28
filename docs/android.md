@@ -182,8 +182,11 @@ never bundles it and refuses to install it without `-accept-licenses`; `-dry-run
 acceptance. The archive is chosen per host (macOS arm64 and x64, Linux x64, Windows x64; any other
 host is told which have one), stable (r2.0) by default and `-dhu-beta` for r2.1, checked against
 the manifest's size and sha1, unpacked beside its final name, `desktop-head-unit` made executable
-and the directory moved in whole. It lands in the SDK's own `extras/google/auto`, so an install by
-Android Studio's SDK Manager is reused.
+and the directory moved in whole (the replaced copy is set aside under `.downloads`). Archive members
+that are absolute or contain `..` are refused, and so is a program that is a symlink. It lands in the
+SDK's own `extras/google/auto`, so an install by Android Studio's SDK Manager is reused when it is
+the requested revision. simee records the revision and channel it installed in `.simee-dhu`; a
+newer revision, or `-dhu-beta` over a stable install (or the reverse), installs over it.
 
 `crates/emu-sdk` reads Google's repository manifests (`repository2-3.xml`, and
 `sys-img/<tag>/sys-img2-3.xml` per tag), picks the newest stable archive for the host

@@ -7,10 +7,14 @@
 //! install serves both).
 use std::path::{Path, PathBuf};
 
-use crate::{Download, Error, Host, License, Manifest, Result, Sdk};
+use crate::{Download, Error, Host, License, Manifest, Result, Revision, Sdk};
 
 /// The repository package.
 pub const PACKAGE: &str = "extras;google;auto";
+/// The license the package is under, and the one `-accept-licenses` accepts.
+pub const SDK_LICENSE: &str = "android-sdk-license";
+/// What simee records inside an install it made: the revision and channel it picked.
+const MARKER: &str = ".simee-dhu";
 /// The program the package holds.
 pub const EXECUTABLE: &str = "desktop-head-unit";
 
@@ -23,6 +27,13 @@ pub enum Channel {
 }
 
 impl Channel {
+    fn name(self) -> &'static str {
+        match self {
+            Channel::Stable => "stable",
+            Channel::Beta => "beta",
+        }
+    }
+
     /// The manifest channels it draws from; the newest revision among them wins.
     pub fn channels(self) -> &'static [&'static str] {
         match self {
@@ -43,10 +54,59 @@ pub fn executable(sdk_root: &Path) -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
+/// An installed DHU: what could be read of its revision and of the channel it came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Installed {
+    pub revision: Option<Revision>,
+    /// Known only for installs simee made; the SDK Manager's records don't say.
+    pub channel: Option<Channel>,
+}
+
+/// The DHU in `sdk_root`, when its program is there. The revision comes from simee's marker,
+/// else `source.properties` or `package.xml` (an SDK Manager install).
+pub fn installed(sdk_root: &Path) -> Option<Installed> {
+    executable(sdk_root)?;
+    let dir = dir(sdk_root);
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
+    let marked = |key: &str| {
+        let text = read(MARKER)?;
+        text.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('=').map(str::to_owned))
+    };
+    let revision = marked("revision")
+        .and_then(|r| r.parse().ok())
+        .or_else(|| {
+            read("source.properties").and_then(|t| t.lines().find_map(|l| l.trim().strip_prefix("Pkg.Revision=")?.trim().parse().ok()))
+        })
+        .or_else(|| read("package.xml").and_then(|t| package_xml_revision(&t)));
+    let channel = marked("channel").and_then(|c| match c.as_str() {
+        "stable" => Some(Channel::Stable),
+        "beta" => Some(Channel::Beta),
+        _ => None,
+    });
+    Some(Installed { revision, channel })
+}
+
+fn package_xml_revision(xml: &str) -> Option<Revision> {
+    let doc = roxmltree::Document::parse(xml).ok()?;
+    let rev = doc.descendants().find(|n| n.has_tag_name("revision"))?;
+    let part = |name: &str| rev.children().find(|n| n.has_tag_name(name)).and_then(|n| n.text()?.trim().parse::<u32>().ok());
+    Some(Revision { major: part("major")?, minor: part("minor").unwrap_or(0), micro: part("micro").unwrap_or(0), preview: part("preview") })
+}
+
+impl Plan {
+    /// Whether the DHU installed in `sdk_root` is the one this plan would install: the same
+    /// revision and, for an install simee made, the same channel. Anything else (an upgrade,
+    /// `-dhu-beta`, or an install whose revision can't be read) wants an install.
+    pub fn is_installed(&self, sdk_root: &Path) -> bool {
+        installed(sdk_root).is_some_and(|i| i.revision == Some(self.download.revision) && i.channel.is_none_or(|c| c == self.channel))
+    }
+}
+
 /// What a request for the DHU resolved to.
 #[derive(Clone, Debug)]
 pub struct Plan {
     pub download: Download,
+    pub channel: Channel,
     pub license: Option<License>,
 }
 
@@ -63,7 +123,7 @@ pub fn resolve(manifest: &Manifest, host: Host, channel: Channel) -> Result<Plan
         }
         r => r?,
     };
-    Ok(Plan { download, license: manifest.license_of(PACKAGE).cloned() })
+    Ok(Plan { download, channel, license: manifest.license_of(PACKAGE).cloned() })
 }
 
 impl Sdk {
@@ -76,7 +136,12 @@ impl Sdk {
         {
             return Err(Error::License(l.id.clone()));
         }
-        self.install_with(&plan.download, true, |top| make_executable(&top.join(EXECUTABLE)))
+        self.install_with(&plan.download, true, |top| {
+            make_executable(&top.join(EXECUTABLE))?;
+            let marker = top.join(MARKER);
+            let text = format!("revision={}\nchannel={}\n", plan.download.revision, plan.channel.name());
+            std::fs::write(&marker, text).map_err(|e| Error::Io(marker, e))
+        })
     }
 }
 
@@ -84,7 +149,11 @@ impl Sdk {
 /// only has to exist.
 fn make_executable(path: &Path) -> Result<()> {
     let io = |e| Error::Io(path.to_path_buf(), e);
-    let meta = std::fs::metadata(path).map_err(io)?;
+    // The archive is untrusted: a symlink here would send the chmod to its target.
+    let meta = std::fs::symlink_metadata(path).map_err(io)?;
+    if !meta.is_file() {
+        return Err(Error::Command(format!("{} in the archive is not a regular file", path.display())));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

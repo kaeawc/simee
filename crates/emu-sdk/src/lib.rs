@@ -120,24 +120,33 @@ pub fn format_size(bytes: u64) -> String {
 
 /// Moves the unpacked directory `src` to `dest`, replacing whatever is there. The old directory
 /// is set aside first and put back if the move fails, so `dest` is never left half-replaced.
-fn replace_dir(src: &Path, dest: &Path) -> Result<()> {
+fn replace_dir(src: &Path, dest: &Path, aside_dir: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(io(parent))?;
     }
     if dest.symlink_metadata().is_err() {
         return std::fs::rename(src, dest).map_err(io(dest));
     }
-    let mut aside = dest.as_os_str().to_owned();
-    aside.push(format!(".old-{}", std::process::id()));
-    let aside = PathBuf::from(aside);
+    // Under the downloads directory, not beside `dest`: a leftover must not look like a package.
+    std::fs::create_dir_all(aside_dir).map_err(io(aside_dir))?;
+    let name = dest.file_name().unwrap_or_default().to_string_lossy();
+    let aside = aside_dir.join(format!("{name}.old-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&aside);
     std::fs::rename(dest, &aside).map_err(io(dest))?;
     if let Err(e) = std::fs::rename(src, dest) {
         let _ = std::fs::rename(&aside, dest);
         return Err(io(dest)(e));
     }
-    let _ = std::fs::remove_dir_all(&aside);
+    if let Err(e) = std::fs::remove_dir_all(&aside) {
+        eprintln!("warning: could not remove the replaced {} ({e}); delete it by hand", aside.display());
+    }
     Ok(())
+}
+
+/// Whether an archive member name is absolute or climbs out with `..`.
+fn unsafe_member(name: &str) -> bool {
+    let b = name.as_bytes();
+    name.starts_with(['/', '\\']) || (b.len() >= 2 && b[1] == b':') || name.split(['/', '\\']).any(|c| c == "..")
 }
 
 /// Links the directory `target` (relative to `link`'s parent, or absolute) at `link`. On Windows
@@ -340,7 +349,7 @@ impl Sdk {
             self.say(&format!("warning: {} has no source.properties", d.file_name()));
         }
         let dest = self.root.join(d.install_dir());
-        replace_dir(&top, &dest)?;
+        replace_dir(&top, &dest, &self.downloads())?;
         // The unpacked package is the cache; a system image archive is close to 2 GB.
         let _ = std::fs::remove_file(&part);
         Ok(dest)
@@ -364,7 +373,7 @@ impl Sdk {
         std::fs::write(&m, marker.to_string()).map_err(io(&m))?;
 
         let dest = renderer::dir(&self.root, d.revision);
-        replace_dir(&top, &dest)?;
+        replace_dir(&top, &dest, &self.downloads())?;
         let _ = std::fs::remove_file(&part);
 
         // Repoint `current` atomically, then drop superseded revisions (a running emu keeps the
@@ -413,7 +422,11 @@ impl Sdk {
         if !out.status.success() {
             return Err(Error::Command(format!("listing {} failed ({})", archive.display(), out.status)));
         }
-        Ok(String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.is_empty() && !l.ends_with('/')).map(str::to_owned).collect())
+        let names: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
+        if let Some(bad) = names.iter().find(|n| unsafe_member(n)) {
+            return Err(Error::Command(format!("{} holds the member '{bad}', which would leave the install directory", archive.display())));
+        }
+        Ok(names.into_iter().filter(|l| !l.ends_with('/')).collect())
     }
 
     /// Unzips one member to `out` (`unzip -p`), writing only its non-zero 4 KiB blocks: zero runs

@@ -1,5 +1,5 @@
 use super::*;
-use crate::testing::stored_zip;
+use crate::testing::{stored_zip, symlink_zip};
 
 const SYS_IMG: &str = include_str!("../testdata/sys-img2-3.xml");
 const REPO: &str = include_str!("../testdata/repository2-3.xml");
@@ -714,7 +714,7 @@ mod dhu_tests {
 
     fn plan(download: Download) -> dhu::Plan {
         let license = Some(License { id: "android-sdk-license".into(), text: String::new() });
-        dhu::Plan { download, license }
+        dhu::Plan { download, channel: Channel::Stable, license }
     }
 
     fn sdk_in(work: &Path) -> Sdk {
@@ -851,6 +851,113 @@ mod dhu_tests {
         assert!(matches!(e, Error::Verify { what: "sha1", .. }), "{e}");
         assert!(!part.exists());
         sdk.install_dhu(&p, &["android-sdk-license"]).expect("clean retry");
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    fn beta_plan(mut p: dhu::Plan, minor: u32) -> dhu::Plan {
+        p.channel = Channel::Beta;
+        p.download.revision = Revision { major: 2, minor, ..Revision::default() };
+        p
+    }
+
+    #[test]
+    fn an_install_without_package_xml_is_still_detected_and_current() {
+        let work = scratch("dhu-detect");
+        // No package.xml or source.properties: only the program and simee's own record say what is there.
+        let zip = stored_zip(&[(
+            "desktop-head-unit",
+            b"#!/bin/sh
+",
+        )]);
+        let p = plan(served(&work, &zip));
+        let sdk = sdk_in(&work);
+        assert!(!p.is_installed(sdk.root()), "nothing installed yet");
+        sdk.install_dhu(&p, &["android-sdk-license"]).expect("install");
+        assert!(p.is_installed(sdk.root()));
+        let i = dhu::installed(sdk.root()).expect("installed");
+        assert_eq!((i.revision, i.channel), (Some(p.download.revision), Some(Channel::Stable)));
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn a_newer_revision_or_the_beta_channel_installs_over_what_is_there() {
+        let work = scratch("dhu-upgrade");
+        let sdk = sdk_in(&work);
+        let p = plan(served(&work, &dhu_zip()));
+        sdk.install_dhu(&p, &["android-sdk-license"]).expect("install r2.0");
+        let beta = beta_plan(plan(served(&work, &dhu_zip())), 1);
+        assert!(!beta.is_installed(sdk.root()), "r2.1 beta is not r2.0 stable");
+        sdk.install_dhu(&beta, &["android-sdk-license"]).expect("upgrade");
+        assert!(beta.is_installed(sdk.root()) && !p.is_installed(sdk.root()));
+        // The same revision under the other channel is a different request too.
+        let mut same = beta_plan(plan(served(&work, &dhu_zip())), 1);
+        same.channel = Channel::Stable;
+        assert!(!same.is_installed(sdk.root()));
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn an_sdk_manager_install_is_read_from_its_records() {
+        let work = scratch("dhu-studio");
+        let sdk = sdk_in(&work);
+        let dir = dhu::dir(sdk.root());
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("desktop-head-unit"), b"x").expect("exe");
+        let p = plan(served(&work, &dhu_zip()));
+        assert!(!p.is_installed(sdk.root()), "no readable revision: install");
+        std::fs::write(dir.join("source.properties"), "Pkg.Revision=2.0.0\n").expect("props");
+        assert!(p.is_installed(sdk.root()));
+        assert!(!beta_plan(p.clone(), 1).is_installed(sdk.root()));
+        std::fs::remove_file(dir.join("source.properties")).expect("rm");
+        std::fs::write(dir.join("package.xml"), "<p><revision><major>2</major><minor>1</minor></revision></p>").expect("xml");
+        assert!(beta_plan(p, 1).is_installed(sdk.root()), "package.xml revision, any channel");
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn a_member_that_leaves_the_install_directory_is_refused() {
+        for name in ["../evil", "auto/../../evil", "/etc/evil", "\\evil", "C:evil"] {
+            assert!(crate::unsafe_member(name), "{name}");
+        }
+        for name in ["auto/desktop-head-unit", "auto/config/a..b.ini", "auto/"] {
+            assert!(!crate::unsafe_member(name), "{name}");
+        }
+        let work = scratch("dhu-slip");
+        let zip = stored_zip(&[("../evil", b"x"), ("auto/desktop-head-unit", b"#!/bin/sh\n")]);
+        let sdk = sdk_in(&work);
+        let e = sdk.install_dhu(&plan(served(&work, &zip)), &["android-sdk-license"]).expect_err("refused");
+        assert!(e.to_string().contains("../evil"), "{e}");
+        assert!(dhu::executable(sdk.root()).is_none());
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_that_is_a_symlink_is_refused() {
+        let work = scratch("dhu-symlink");
+        let target = work.join("victim");
+        std::fs::write(&target, b"x").expect("victim");
+        std::fs::set_permissions(&target, std::os::unix::fs::PermissionsExt::from_mode(0o600)).expect("mode");
+        // A zip with a symlink member: mode 0120777 in the external attributes.
+        let zip = symlink_zip("desktop-head-unit", target.to_str().expect("utf8"));
+        let sdk = sdk_in(&work);
+        let e = sdk.install_dhu(&plan(served(&work, &zip)), &["android-sdk-license"]).expect_err("symlink refused");
+        assert!(e.to_string().contains("not a regular file"), "{e}");
+        let mode = std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&target).expect("meta").permissions());
+        assert_eq!(mode & 0o777, 0o600, "the target's mode is untouched");
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn replacing_an_install_leaves_no_set_aside_copy_in_the_package_tree() {
+        let work = scratch("dhu-aside");
+        let sdk = sdk_in(&work);
+        let p = plan(served(&work, &dhu_zip()));
+        sdk.install_dhu(&p, &["android-sdk-license"]).expect("install");
+        sdk.install_dhu(&p, &["android-sdk-license"]).expect("reinstall");
+        let names: Vec<_> =
+            std::fs::read_dir(dhu::dir(sdk.root()).parent().expect("parent")).expect("ls").flatten().map(|e| e.file_name()).collect();
+        assert_eq!(names.len(), 1, "{names:?}");
         let _ = std::fs::remove_dir_all(work);
     }
 }

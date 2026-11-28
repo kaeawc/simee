@@ -214,42 +214,55 @@ fn install_renderer(sdk: &Sdk, opts: &Opts, update: bool) -> Result<()> {
 }
 
 /// `-provision-dhu`: install Google's Android Auto Desktop Head Unit on request. Reuses an
-/// install already in `<sdk>/extras/google/auto` (Android Studio's SDK Manager puts it there).
-/// Never runs without `-accept-licenses`; `-dry-run` shows what would be fetched and under which
-/// license, and needs no acceptance.
+/// install already in `<sdk>/extras/google/auto` (Android Studio's SDK Manager puts it there)
+/// when it is the requested revision and channel, and installs over it otherwise (an upgrade,
+/// or `-dhu-beta`). Never installs without `-accept-licenses`; `-dry-run` shows what would be
+/// fetched and under which license, and needs no acceptance.
 pub fn provision_dhu(env: &Env, opts: &Opts) -> Result<()> {
     use emu_sdk::dhu;
     let sdk = sdk(env)?;
     println!("SDK: {}", sdk.root().display());
-    if let Some(exe) = dhu::executable(sdk.root()).filter(|_| sdk.is_installed(&emu_sdk::install_dir(dhu::PACKAGE))) {
-        println!("have {} ({})", dhu::PACKAGE, exe.display());
-        return Ok(());
-    }
     let channel = if opts.dhu_beta { dhu::Channel::Beta } else { dhu::Channel::Stable };
     let plan = dhu::resolve(&sdk.manifest(&emu_sdk::repository_url())?, Host::current(), channel)?;
+    install_dhu(&sdk, &plan, opts)
+}
+
+/// The license ids the user accepted on the command line: `-accept-licenses` accepts the Android
+/// SDK license, which is what the refusal message names.
+fn accepted_licenses(opts: &Opts) -> Vec<&'static str> {
+    if opts.accept_licenses { vec![emu_sdk::dhu::SDK_LICENSE] } else { Vec::new() }
+}
+
+fn install_dhu(sdk: &Sdk, plan: &emu_sdk::dhu::Plan, opts: &Opts) -> Result<()> {
+    use emu_sdk::dhu;
     let d = &plan.download;
-    let license = plan.license.as_ref().map_or("none", |l| l.id.as_str());
     if opts.dry_run {
         println!("{} r{}", dhu::PACKAGE, d.revision);
         println!("  url     {}", d.url);
         println!("  size    {} ({})", d.size, emu_sdk::format_size(d.size));
         println!("  sha1    {}", d.sha1);
-        println!("  license {license}");
+        println!("  license {}", plan.license.as_ref().map_or("none", |l| l.id.as_str()));
         println!("  into    {}", dhu::dir(sdk.root()).display());
         return Ok(());
     }
-    if !opts.accept_licenses {
-        bail!(
-            "{} is under the Android SDK license '{license}', which doesn't allow redistribution, so simee fetches it from \
-             Google only when you accept it: read the terms at https://developer.android.com/studio/terms and rerun with -accept-licenses",
-            dhu::PACKAGE
-        );
+    if plan.is_installed(sdk.root()) {
+        let exe = dhu::executable(sdk.root()).unwrap_or_else(|| dhu::dir(sdk.root()));
+        println!("have {} r{} ({})", dhu::PACKAGE, d.revision, exe.display());
+        return Ok(());
     }
     println!("installing {} r{} ({})", dhu::PACKAGE, d.revision, emu_sdk::format_size(d.size));
-    let accepted: Vec<&str> = plan.license.iter().map(|l| l.id.as_str()).collect();
-    let dest = sdk.install_dhu(&plan, &accepted)?;
-    println!("installed {} r{} at {}", dhu::PACKAGE, d.revision, dest.display());
-    Ok(())
+    match sdk.install_dhu(plan, &accepted_licenses(opts)) {
+        Ok(dest) => {
+            println!("installed {} r{} at {}", dhu::PACKAGE, d.revision, dest.display());
+            Ok(())
+        }
+        Err(emu_sdk::Error::License(id)) => bail!(
+            "{} is under the Android SDK license '{id}', which doesn't allow redistribution, so simee fetches it from \
+             Google only when you accept it: read the terms at https://developer.android.com/studio/terms and rerun with -accept-licenses",
+            dhu::PACKAGE
+        ),
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg(test)]
@@ -273,5 +286,70 @@ mod tests {
         let files = |d: &std::path::Path| std::fs::read_dir(d).map(|r| r.count()).unwrap_or(0);
         assert_eq!(files(&root.join("sdk")), 0, "nothing under the SDK");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A DHU plan served from a local file, under `license`.
+    fn dhu_plan(work: &std::path::Path, license: &str) -> emu_sdk::dhu::Plan {
+        use emu_sdk::{Download, License, Revision, dhu, sha1_hex, testing::stored_zip};
+        let zip = stored_zip(&[("auto/desktop-head-unit", b"#!/bin/sh\n")]);
+        let file = work.join("dhu.zip");
+        std::fs::write(&file, &zip).expect("zip");
+        emu_sdk::dhu::Plan {
+            download: Download {
+                path: dhu::PACKAGE.into(),
+                revision: Revision { major: 2, ..Revision::default() },
+                api_level: None,
+                tags: Vec::new(),
+                url: format!("file://{}", file.display()),
+                size: zip.len() as u64,
+                sha1: sha1_hex(&zip),
+            },
+            channel: dhu::Channel::Stable,
+            license: Some(License { id: license.into(), text: String::new() }),
+        }
+    }
+
+    fn dhu_sandbox(name: &str) -> (PathBuf, Sdk) {
+        let work = std::env::temp_dir().join(format!("emu-provision-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).expect("work");
+        let mut sdk = Sdk::new(work.join("sdk")).expect("sdk");
+        sdk.quiet = true;
+        (work, sdk)
+    }
+
+    #[test]
+    fn the_dhu_is_not_installed_without_accepting_the_license() {
+        let (work, sdk) = dhu_sandbox("dhu-refuse");
+        let plan = dhu_plan(&work, "android-sdk-license");
+        let err = install_dhu(&sdk, &plan, &opts("-provision-dhu")).expect_err("refused").to_string();
+        assert!(err.contains("-accept-licenses") && err.contains("android-sdk-license"), "{err}");
+        assert!(emu_sdk::dhu::executable(sdk.root()).is_none() && !sdk.downloads().exists(), "refused before any download");
+        // -dry-run needs no acceptance and installs nothing.
+        install_dhu(&sdk, &plan, &opts("-provision-dhu -dry-run")).expect("dry run");
+        assert!(emu_sdk::dhu::executable(sdk.root()).is_none());
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn accepting_the_android_sdk_license_installs_the_dhu_and_a_second_run_keeps_it() {
+        let (work, sdk) = dhu_sandbox("dhu-accept");
+        let plan = dhu_plan(&work, "android-sdk-license");
+        install_dhu(&sdk, &plan, &opts("-provision-dhu -accept-licenses")).expect("installed");
+        assert!(plan.is_installed(sdk.root()));
+        // Gone from the archive's source: a second run must not fetch it again.
+        std::fs::remove_file(work.join("dhu.zip")).expect("rm");
+        install_dhu(&sdk, &plan, &opts("-provision-dhu")).expect("already installed, no acceptance needed");
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn accepting_does_not_accept_a_license_other_than_the_one_named() {
+        let (work, sdk) = dhu_sandbox("dhu-other");
+        let plan = dhu_plan(&work, "some-other-license");
+        let err = install_dhu(&sdk, &plan, &opts("-provision-dhu -accept-licenses")).expect_err("not the named license");
+        assert!(err.to_string().contains("some-other-license"), "{err}");
+        assert!(emu_sdk::dhu::executable(sdk.root()).is_none());
+        let _ = std::fs::remove_dir_all(work);
     }
 }
