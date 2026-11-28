@@ -218,6 +218,8 @@ measure() {
   [ -n "$label" ] && sim exec "$clone" launchctl disable "system/$label" >/dev/null 2>&1
   if ! slim_shutdown "$clone"; then
     bench_sample "$arm" "launch until settled, s" "no-shutdown"
+    # Turn the job back on, or every later arm (stock too) would run without it.
+    [ -n "$label" ] && sim exec "$clone" launchctl enable "system/$label" >/dev/null 2>&1
     return
   fi
   [ -n "$settle_cpu" ] && extra=(--settle-cpu "$settle_cpu")
