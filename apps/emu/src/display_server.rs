@@ -202,6 +202,8 @@ fn client(conn: UnixStream, display: Arc<FrameStore>, inputs: Arc<Mutex<Option<e
         match (input, g.as_ref()) {
             (Input::Hello { max_width: mw }, _) => {
                 wants.set_max_width(mw);
+                // A stream waiting for a newer frame notices the new width now, not at its timeout.
+                display.wake();
                 if let Some(writer) = writer.take() {
                     let (display, wants, stop, dir) = (display.clone(), wants.clone(), stop.clone(), dir.clone());
                     let _ = std::thread::Builder::new()
@@ -303,7 +305,13 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
         // Wait for a new frame (woken by the frame, or by `wake` when the client goes away; the
         // 1 s timeout only notices the emulator stopping); then, if it's early, wait until it may
         // go and send the newest by then. A client that was idle gets it at once.
-        let n = display.wait_newer(sent, Duration::from_secs(1));
+        // (Not when a new width is already asked for: a wake that came before this wait is gone.)
+        let asked = wants.max_width.load(Ordering::Relaxed);
+        let n = if sent_mw != 0 && asked != 0 && asked != sent_mw {
+            display.frames()
+        } else {
+            display.wait_newer(sent, Duration::from_secs(1))
+        };
         let mw = wants.max_width.load(Ordering::Relaxed);
         if mw == 0 || (n == sent && mw == sent_mw) {
             continue;
@@ -1187,37 +1195,31 @@ mod tests {
         }
     }
 
+    /// A client that asks for another width of a screen that isn't drawing gets the newest frame
+    /// again at that size, at once: the new `hello` wakes the stream out of its wait for a frame
+    /// (which times out after a second), so the answer comes well before that.
+    #[test]
+    fn a_new_hello_width_on_a_static_screen_resends_the_newest_frame_at_that_size_without_waiting() {
+        let rig = Rig::new("rehello");
+        let (w, h) = (8u32, 4u32);
+        rig.store.posted(w, h);
+        let (mut client, mut frames_in) = rig.connect(false, 4096);
+        let (full, _) = read_frame(&mut frames_in).expect("frame");
+        assert_eq!((full.width, full.height), (w, h));
+        // The guest draws nothing more, and the stream is waiting for a frame that won't come.
+        std::thread::sleep(Duration::from_millis(100));
+        let asked = Instant::now();
+        client.send(&Input::Hello { max_width: 4 }).expect("hello");
+        let (half, rgba) = read_frame(&mut frames_in).expect("the same frame, resized");
+        let took = asked.elapsed();
+        assert_eq!((half.frame, half.width, half.height), (full.frame, 4, 2));
+        assert_eq!(rgba, downscale(w, h, &pixels(w, h, rig.store.frames()), 2).2);
+        assert!(took < Duration::from_millis(900), "took {took:?}: it waited out the frame timeout");
+    }
+
     /// `hello 0` pauses a stream (the desktop's switched-away screen). While the guest keeps
     /// drawing, the paused stream waits for the client, not for frames: it neither spins nor
     /// counts as a reader, so the store frees its buffers; `hello <w>` sends the newest at once.
-    #[test]
-    fn a_new_hello_width_on_a_static_screen_resends_the_newest_frame_at_that_size() {
-        let store = Arc::new(FrameStore::with_idle(Duration::from_millis(50)));
-        let (w, h) = (8u32, 4u32);
-        let wants = Arc::new(Wants::default());
-        wants.set_max_width(720);
-        let stop = Arc::new(AtomicBool::new(false));
-        let dir = scratch("rehello");
-        let (out, mut client) = UnixStream::pair().expect("pair");
-        client.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
-        let stream = {
-            let (store, wants, stop, dir) = (store.clone(), wants.clone(), stop.clone(), dir.join("simee"));
-            std::thread::spawn(move || frames(out, &store, &wants, &stop, &dir))
-        };
-        store.present(w, h, w * 4, sim_core::pixels::PixelFormat::RGBA_VIRTIO, &pixels(w, h, 1));
-        let (full, _) = read_frame(&mut client).expect("frame");
-        assert_eq!((full.width, full.height), (w, h));
-        // The guest draws nothing more; the client asks for half the width.
-        wants.set_max_width(4);
-        let (half, rgba) = read_frame(&mut client).expect("the same frame, resized");
-        assert_eq!((half.frame, half.width, half.height), (full.frame, 4, 2));
-        assert_eq!(rgba, downscale(w, h, &pixels(w, h, 1), 2).2);
-        wants.finish();
-        store.wake();
-        stream.join().expect("stream");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
     #[test]
     fn a_paused_stream_waits_for_the_client_and_resumes_with_the_newest_frame() {
         let store = Arc::new(FrameStore::with_idle(Duration::from_millis(50)));

@@ -2262,7 +2262,7 @@ mod linux_media {
     fn a_capped_stream_asks_emu_for_frames_at_its_size_and_a_full_size_stream_asks_for_full_frames() {
         let display = FakeDisplay::honouring(3, true);
         decoded_sizes(&display, Some(80));
-        assert_eq!(*display.hellos.lock().expect("hellos"), ["hello 48"], "factor 2 brings the 160-pixel side to 80");
+        assert_eq!(*display.hellos.lock().expect("hellos"), ["hello 48"], "factor 2 leaves the 160-pixel side at 80");
         let display = FakeDisplay::honouring(3, true);
         assert_eq!(decoded_sizes(&display, None), [SIZE; 3]);
         assert_eq!(*display.hellos.lock().expect("hellos"), [format!("hello {}", u32::MAX)]);

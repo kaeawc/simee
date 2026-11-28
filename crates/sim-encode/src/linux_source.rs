@@ -124,7 +124,7 @@ impl Source for AndroidSource {
                 if (width, height) != hold.expected && hold.left > 0 {
                     // Still the old shape's size: the encoder restarts once, at the new one.
                     hold.left -= 1;
-                    self.unreported += frame.unreported + 1;
+                    self.unreported += frame.unreported;
                     self.reader.recycle(frame.rgba);
                     return Ok(self.current.as_ref());
                 }
@@ -134,7 +134,7 @@ impl Source for AndroidSource {
                 // restart, so it goes out.
                 if self.current.is_some() {
                     self.hold = Some(Hold { expected, left: HOLD_FRAMES });
-                    self.unreported += frame.unreported + 1;
+                    self.unreported += frame.unreported;
                     self.reader.recycle(frame.rgba);
                     return Ok(self.current.as_ref());
                 }
@@ -287,7 +287,7 @@ mod tests {
     fn a_fitted_source_asks_emu_for_the_width_that_keeps_the_longest_side_at_or_over_max_size() {
         let emu = Emu::new(true, vec![(PHONE, PHONE)]);
         let _source = AndroidSource::connect_fitted(&emu.dir, 64, Some(PHONE)).expect("connect");
-        assert_eq!(emu.hellos_at_least(1), ["hello 32"], "factor 2 for a 128-pixel side under 64");
+        assert_eq!(emu.hellos_at_least(1), ["hello 32"], "factor 2 leaves the 128-pixel side at 64");
     }
 
     #[test]
@@ -349,17 +349,17 @@ mod tests {
     }
 
     #[test]
-    fn frames_held_back_after_a_rotation_are_counted_as_skipped() {
+    fn a_held_frame_is_counted_once() {
         let landscape = (128, 64);
         let emu = Emu::new(true, vec![(PHONE, PHONE), (landscape, landscape), (landscape, landscape)]);
         let mut source = AndroidSource::connect_fitted(&emu.dir, 64, Some(PHONE)).expect("connect");
         emu.next_picture(&mut source);
         assert_eq!(source.take_unreported(), 0);
         emu.next_picture(&mut source);
-        assert_eq!(source.take_unreported(), 1, "the held frame is counted as skipped");
+        assert_eq!(source.take_unreported(), 0, "`wait` reported the held frame, so it is not counted again");
         emu.hellos_at_least(2);
         emu.next_picture(&mut source);
-        assert_eq!(source.take_unreported(), 0, "and only once");
+        assert_eq!(source.take_unreported(), 0);
     }
 
     #[test]
