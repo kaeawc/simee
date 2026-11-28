@@ -21,7 +21,7 @@ pub mod metal;
 pub use channel::{ChannelRead, ChannelWrite, RenderChannel};
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{CString, OsString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -851,32 +851,74 @@ static VULKAN_FAILED: AtomicBool = AtomicBool::new(false);
 /// the executable's directory; set it to the parent of the renderer's `lib64` (the SDK's
 /// `emulator/`, or `<sdk>/simee/renderer/<revision>/`).
 ///
+/// The variables that pick the driver ([`driver_environment`]) are always set to `icd`'s; the
+/// rest only where unset. Returns what a user should hear: an `ANDROID_EMU_VK_ICD` (or loader manifest)
+/// of theirs honoured or overridden.
+///
 /// Call before spawning threads that might read the environment.
-pub fn configure_environment(emulator_dir: &Path, icd: Icd) {
-    for (k, v) in environment(emulator_dir, icd) {
-        if std::env::var_os(k).is_none() {
-            // SAFETY: documented precondition: called while the process is single-threaded
-            // with respect to environment access.
-            unsafe { std::env::set_var(k, v) };
-        }
+pub fn configure_environment(emulator_dir: &Path, icd: Icd) -> Vec<String> {
+    let (set, notices) = applied(emulator_dir, icd, |k| std::env::var_os(k));
+    for (k, v) in set {
+        // SAFETY: documented precondition: called while the process is single-threaded with
+        // respect to environment access.
+        unsafe { std::env::set_var(k, v) };
     }
+    notices
 }
 
-/// What [`configure_environment`] sets (each variable only where it isn't set already).
-fn environment(emulator_dir: &Path, icd: Icd) -> Vec<(&'static str, std::ffi::OsString)> {
+/// What [`configure_environment`] sets given the environment as it stands (`current`), and the
+/// notices it returns: the driver's variables ([`driver_environment`]) always, so gfxstream
+/// loads the driver the caller chose (a user's `ANDROID_EMU_VK_ICD` is honoured when it names
+/// that driver and overridden, with a notice, when it doesn't), and every other variable only
+/// where it isn't set (the user's MoltenVK or ANGLE settings win).
+fn applied(emulator_dir: &Path, icd: Icd, current: impl Fn(&str) -> Option<OsString>) -> (Vec<(&'static str, OsString)>, Vec<String>) {
+    let driver: Vec<&str> = driver_environment(emulator_dir, icd).into_iter().map(|(k, _)| k).collect();
+    let (mut set, mut notices) = (Vec::new(), Vec::new());
+    for (k, v) in environment(emulator_dir, icd) {
+        match current(k) {
+            None => set.push((k, v)),
+            Some(user) if driver.contains(&k) => {
+                if user != v {
+                    notices.push(format!(
+                        "emu: {k}={} overridden: gfxstream gets {}, the Vulkan driver emu chose ({})",
+                        user.to_string_lossy(),
+                        v.to_string_lossy(),
+                        icd.name()
+                    ));
+                } else if k == "ANDROID_EMU_VK_ICD" {
+                    notices.push(format!("emu: ANDROID_EMU_VK_ICD={} honoured", icd.name()));
+                }
+                set.push((k, v));
+            }
+            Some(_) => {}
+        }
+    }
+    (set, notices)
+}
+
+/// The variables that pick the Vulkan driver gfxstream loads, for `icd`: the loader's manifest
+/// (the loader otherwise searches only system ICD directories, found empty on macOS) and
+/// gfxstream's own `ANDROID_EMU_VK_ICD`.
+pub fn driver_environment(emulator_dir: &Path, icd: Icd) -> Vec<(&'static str, OsString)> {
+    let manifest = emulator_dir.join("lib64/vulkan").join(icd.manifest());
+    let mut vars = Vec::new();
+    if manifest.is_file() {
+        vars.push(("VK_DRIVER_FILES", manifest.clone().into_os_string()));
+        vars.push(("VK_ICD_FILENAMES", manifest.into_os_string()));
+    }
+    vars.push(("ANDROID_EMU_VK_ICD", icd.name().into()));
+    vars
+}
+
+/// Everything [`configure_environment`] sets for `icd`.
+fn environment(emulator_dir: &Path, icd: Icd) -> Vec<(&'static str, OsString)> {
     let vk = emulator_dir.join("lib64/vulkan");
     let loader = vk.join(if cfg!(target_os = "macos") { "libvulkan.dylib" } else { "libvulkan.so.1" });
     let mut vars = vec![("ANDROID_EMULATOR_LAUNCHER_DIR", emulator_dir.as_os_str().to_owned())];
     if loader.is_file() {
         vars.push(("ANDROID_EMU_VK_LOADER_PATH", loader.into_os_string()));
     }
-    // The loader otherwise searches only system ICD directories (found empty on macOS).
-    let manifest = vk.join(icd.manifest());
-    if manifest.is_file() {
-        vars.push(("VK_DRIVER_FILES", manifest.clone().into_os_string()));
-        vars.push(("VK_ICD_FILENAMES", manifest.into_os_string()));
-    }
-    vars.push(("ANDROID_EMU_VK_ICD", icd.name().into()));
+    vars.extend(driver_environment(emulator_dir, icd));
     // Host GLES through ANGLE (Metal) instead of the deprecated desktop GL, which lacks GLSL ES 3.
     vars.push(("ANDROID_EGL_ON_EGL", "1".into()));
     // ANGLE's default display on macOS is its CGL backend, whose context setup for a
@@ -1668,6 +1710,63 @@ mod tests {
             assert_eq!(get(Icd::MoltenVk, k), Some(v.into()), "{k}");
         }
         assert_eq!(get(Icd::MoltenVk, "VK_DRIVER_FILES"), Some(vk.join("MoltenVK_icd.json").into_os_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The environment gfxstream ends up with after [`configure_environment`] for `icd` over the
+    /// user's own `user`, and the notices it returned.
+    fn seen(dir: &Path, icd: Icd, user: &[(&str, &str)]) -> (HashMap<String, OsString>, Vec<String>) {
+        let current = |k: &str| user.iter().find(|(key, _)| *key == k).map(|(_, v)| OsString::from(v));
+        let (set, notices) = applied(dir, icd, current);
+        let mut env: HashMap<String, OsString> = user.iter().map(|(k, v)| (k.to_string(), OsString::from(v))).collect();
+        env.extend(set.into_iter().map(|(k, v)| (k.to_string(), v)));
+        (env, notices)
+    }
+
+    #[test]
+    fn gfxstream_loads_the_driver_emu_chose_whatever_the_environment_named() {
+        let dir = std::env::temp_dir().join(format!("emu-gfx-driver-{}", std::process::id()));
+        let vk = dir.join("lib64/vulkan");
+        std::fs::create_dir_all(&vk).expect("dir");
+        let all = [Icd::MoltenVk, Icd::KosmicKrisp, Icd::Lavapipe, Icd::SwiftShader];
+        for icd in all {
+            std::fs::write(vk.join(icd.manifest()), "{}").expect("manifest");
+        }
+        let kk = vk.join(Icd::KosmicKrisp.manifest()).to_string_lossy().into_owned();
+        let users: [&[(&str, &str)]; 4] = [
+            &[],
+            // scripts/bench/renderers.sh's KosmicKrisp arms.
+            &[("ANDROID_EMU_VK_ICD", "kosmickrisp"), ("VK_DRIVER_FILES", &kk), ("VK_ICD_FILENAMES", &kk)],
+            // A software driver's name under `-gpu host`, and a name that is no driver.
+            &[("ANDROID_EMU_VK_ICD", "lavapipe")],
+            &[("ANDROID_EMU_VK_ICD", "bogus")],
+        ];
+        for icd in all {
+            for user in users {
+                let (env, notices) = seen(&dir, icd, user);
+                let manifest = vk.join(icd.manifest()).into_os_string();
+                assert_eq!(env["ANDROID_EMU_VK_ICD"], icd.name(), "{icd:?} over {user:?}");
+                assert_eq!(env["VK_DRIVER_FILES"], manifest, "{icd:?} over {user:?}");
+                assert_eq!(env["VK_ICD_FILENAMES"], manifest, "{icd:?} over {user:?}");
+                // A user's ANDROID_EMU_VK_ICD is honoured (it named emu's choice) or overridden,
+                // and either way emu says so.
+                match user.iter().find(|(k, _)| *k == "ANDROID_EMU_VK_ICD").map(|(_, v)| *v) {
+                    None => assert!(notices.is_empty(), "{icd:?}: {notices:?}"),
+                    Some(v) if v == icd.name() => {
+                        assert!(notices.iter().any(|n| n.contains(&format!("ANDROID_EMU_VK_ICD={v} honoured"))), "{icd:?}: {notices:?}")
+                    }
+                    Some(v) => assert!(
+                        notices.iter().any(|n| n.contains(&format!("ANDROID_EMU_VK_ICD={v} overridden")) && n.contains(icd.name())),
+                        "{icd:?} over {v}: {notices:?}"
+                    ),
+                }
+            }
+        }
+        // Settings that don't pick the driver stay the user's.
+        let (env, notices) = seen(&dir, Icd::MoltenVk, &[("ANGLE_DEFAULT_PLATFORM", "swiftshader"), ("MVK_CONFIG_USE_MTLHEAP", "0")]);
+        assert_eq!(env["ANGLE_DEFAULT_PLATFORM"], "swiftshader");
+        assert_eq!(env["MVK_CONFIG_USE_MTLHEAP"], "0");
+        assert!(notices.is_empty(), "{notices:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

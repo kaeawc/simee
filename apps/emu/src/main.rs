@@ -142,7 +142,8 @@ fn real_main() -> Result<ExitCode> {
         };
         if let Some(run) = child {
             let ok = raw.get(2).is_some_and(|p| run(std::path::Path::new(p)));
-            return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+            // A clean "no" has a status of its own: a crash, a panic or a signal isn't a verdict.
+            return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::from(vkprobe::PROBE_FAILED) });
         }
     }
     let opts = args::parse(std::env::args().skip(1))?;

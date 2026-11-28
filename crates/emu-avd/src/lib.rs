@@ -642,7 +642,13 @@ impl Env {
             for f in CLONED_DISKS {
                 let from = src_disks.join(f);
                 if from.is_file() {
-                    clone::clone_file(&from, &disks.join(f))?;
+                    let to = disks.join(f);
+                    // The key is what a guest boots with: it lands whole or not at all (#431).
+                    if f == "encryptionkey.img" {
+                        clone::clone_file_atomic(&from, &to)?;
+                    } else {
+                        clone::clone_file(&from, &to)?;
+                    }
                 }
             }
             Ok(())
