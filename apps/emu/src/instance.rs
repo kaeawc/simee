@@ -364,6 +364,7 @@ impl Instance {
             battery: self.battery.clone(),
             telephony: self.telephony.clone(),
             network: self.network.clone(),
+            net_segment: opts.net_segment.clone(),
             car: self.car.clone(),
             sound: plan.sound.then_some(emu_vmm::audio::Options {
                 output: !opts.no_audio,
@@ -725,6 +726,8 @@ pub struct BootPlan {
     pub pipe_gles: bool,
     /// An x86_64 image: stock's x86 board under QEMU's TCG (software mode, #55).
     pub x86: bool,
+    /// `-net-segment`: the second NIC on a link subnet (#539).
+    pub net_segment: Option<sim_core::segment::SegmentSpec>,
 }
 
 impl BootPlan {
@@ -771,6 +774,7 @@ impl BootPlan {
             dual_mode_mouse: xr && avd.image_feature("VirtioDualModeMouse").unwrap_or(true),
             pipe_gles: pipe_gles(avd),
             x86: avd.is_x86_64(),
+            net_segment: opts.net_segment.clone(),
         };
         let bc = bootconfig(avd, opts, plan.renderer.is_some());
         if takes_bootconfig(avd) {
@@ -865,6 +869,9 @@ impl std::fmt::Display for BootPlan {
             None => writeln!(f, "graphics  none: no renderer (-gpu off, or none installed: emu -provision-renderer)")?,
         }
         writeln!(f, "devices   {}", self.devices().join(", "))?;
+        if let Some(seg) = &self.net_segment {
+            writeln!(f, "segment   eth1 at {} on the link in {}, member {}", seg.ip(), seg.dir.display(), seg.member)?;
+        }
         let sensors: Vec<&str> =
             emu_vmm::pipe::sensors::NAMES.iter().enumerate().filter(|(h, _)| self.sensor_mask & (1 << h) != 0).map(|(_, n)| *n).collect();
         writeln!(f, "sensors   {}", sensors.join(", "))?;
@@ -1896,6 +1903,19 @@ mod tests {
         ] {
             assert!(text.contains(line), "{line:?} missing from\n{text}");
         }
+    }
+
+    #[test]
+    fn the_plan_shows_the_segment_nic_only_when_asked_for() {
+        let s = sdk("segment");
+        let avd = s.env.load("phone").expect("load");
+        let plain = BootPlan::new(&avd, &Opts::default(), None);
+        assert!(plain.net_segment.is_none() && !plain.to_string().contains("segment   eth1"), "unlinked devices are unchanged");
+        let spec: sim_core::segment::SegmentSpec = "dir=/tmp/seg/pair,subnet=3,member=1".parse().expect("spec");
+        let linked = BootPlan::new(&avd, &Opts { net_segment: Some(spec), ..Opts::default() }, None);
+        assert!(linked.to_string().contains("segment   eth1 at 10.77.3.2 on the link in /tmp/seg/pair, member 1"), "{linked}");
+        // The NAT's NIC is still there, and it is still the first.
+        assert!(linked.devices().contains(&"virtio-net (link only)"));
     }
 
     /// x86_64 images get stock's x86 board (software mode, #55): the console on the first 8250

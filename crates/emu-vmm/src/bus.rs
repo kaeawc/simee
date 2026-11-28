@@ -281,6 +281,7 @@ pub fn region_name(base: u64) -> String {
             VSOCK => "vsock",
             RNG => "rng",
             NET => "net",
+            SEGMENT => "net-segment",
             VPORTS => "vports",
             SOUND => "snd",
             SYSTEM => "blk-system",

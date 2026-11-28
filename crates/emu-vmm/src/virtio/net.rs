@@ -84,7 +84,12 @@ type WorkerHandle = JoinHandle<Box<dyn Backend>>;
 
 impl Net {
     pub fn new(backend: Box<dyn Backend>) -> Net {
-        Net { mac: DEFAULT_MAC, backend: Some(backend), worker: None }
+        Net::with_mac(DEFAULT_MAC, backend)
+    }
+
+    /// A NIC with its own MAC: the segment NIC's, which differs from the NAT NIC's.
+    pub fn with_mac(mac: [u8; 6], backend: Box<dyn Backend>) -> Net {
+        Net { mac, backend: Some(backend), worker: None }
     }
 
     fn stop_worker(&mut self) {
@@ -410,6 +415,18 @@ mod tests {
         f.extend_from_slice(&[0x08, 0x06]); // ARP
         f.extend(std::iter::repeat_n(n, 46));
         f
+    }
+
+    #[test]
+    fn a_second_nic_reports_its_own_mac() {
+        let mem = Arc::new(GuestRam::new(RAM_BASE, 0x4000).expect("ram"));
+        let irq = Arc::new(Interrupt::new(Arc::new(TestLine::default())));
+        let mac = sim_core::segment::mac_for(3, 1);
+        let t = MmioTransport::new(Some(Box::new(Net::with_mac(mac, Box::new(LinkOnly)))), irq, mem);
+        let mut b = [0u8; 6];
+        t.read(0x100, &mut b);
+        assert_eq!(b, mac);
+        assert_ne!(b, DEFAULT_MAC, "two NICs never share a MAC");
     }
 
     #[test]
