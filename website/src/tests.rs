@@ -339,3 +339,29 @@ fn every_page_fits_a_phone() {
         assert!(wide.is_empty(), "{path} is wider than {width}: {:#?}", &wide[..wide.len().min(8)]);
     }
 }
+
+#[test]
+fn further_reading_citations_use_the_full_width() {
+    // The list and its rows shrank to their content, so each link (basis 0, grow 1) laid out at
+    // its min-content width: one word per line. At desktop width each citation is one line; on a
+    // phone it may wrap, but beside its `[n]` marker and within the column.
+    let rect = |rt: &Runtime<State>, suffix: &str| {
+        rt.elements().into_iter().find(|e| !e.exiting && e.path.ends_with(suffix)).unwrap_or_else(|| panic!("no {suffix}")).rect
+    };
+    for (width, one_line) in [(1084.0, true), (1400.0, true), (360.0, false)] {
+        let rt = page(Route::Home, width);
+        let list = rect(&rt, "/refs-list");
+        let single = rect(&rt, "/ref-5-a")[3];
+        for i in 0..6 {
+            let row = rect(&rt, &format!("/ref-{i}-row"));
+            let link = rect(&rt, &format!("/ref-{i}-a"));
+            assert!((row[2] - list[2]).abs() < 0.5, "ref {i} row at {width}: {row:?} in {list:?}");
+            assert!(link[0] + link[2] <= list[0] + list[2] + 0.5, "ref {i} at {width} overflows: {link:?}");
+            if one_line {
+                assert!(link[3] <= single + 0.5, "ref {i} wraps at {width}: {link:?}, one line is {single}");
+            } else {
+                assert!(link[3] <= single * 3.0 + 0.5, "ref {i} wraps word by word at {width}: {link:?}");
+            }
+        }
+    }
+}

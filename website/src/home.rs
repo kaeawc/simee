@@ -94,12 +94,13 @@ fn further(bp: Bp) -> El {
         ("Documentation", "/docs/"),
         ("Source code (MIT)", REPO),
     ];
-    let mut list = col().key("refs-list").role("list").gap(4.0);
+    let mut list = col().key("refs-list").role("list").w_full().gap(4.0);
     for (i, (label, href)) in refs.iter().enumerate() {
         list = list.child(
             el().key(format!("ref-{i}")).role("listitem").w_full().child(
                 row()
                     .key(format!("ref-{i}-row"))
+                    .w_full()
                     .gap(10.0)
                     .items_start()
                     .child(text(format!("[{}]", i + 1)).font(BODY).color(fg2()).w(30.0))
