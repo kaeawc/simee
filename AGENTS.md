@@ -150,7 +150,8 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   states, a seam-free rasterizer and every file in `assets/brand/`; `docs/design/brand.md`),
   `hostfs.rs` and `net.rs` (the unix-only std calls and Unix sockets, by one name on every host:
   std's on unix, stand-ins on Windows), `entropy.rs` (OS random bytes: tokens, ids, the guest's
-  rng; Windows has no `/dev/urandom`). No FFI.
+  rng; Windows has no `/dev/urandom`), `wear.rs` (Wear OS pairing: the `get-pairing-status` and
+  `[EMULATOR_PAIRING:*]` parsers, companion choice, Play services gates, preflight, pair state). No FFI.
 - `crates/sim-coresim` — the service boundary: `Context` (service + device set), `Device`
   (lifecycle, apps, settings, orientation, CarPlay), `Display` (framebuffer surface, capture; main
   or external), `Hid` (touch, buttons, keyboard, the Digital Crown, watch gestures, the Siri
@@ -185,7 +186,8 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   lints and tests the crate with `--features openh264`; `scripts/check.sh` doesn't.
 - `crates/sim-android` — the Android backend's client: AVDs as labelled devices, system images as
   runtimes, AVD creation shaped by form factor, starting `emu` and waiting for boot, the console
-  client (`console.rs`) and the display socket client (`display.rs`). No FFI.
+  client (`console.rs`) and the display socket client (`display.rs`), `forward.rs` (`adb forward`
+  and `reverse`), `wear.rs` (the Wear OS adb bridge, companion handshake and unbridge). No FFI.
 - `crates/emu-hvf` — `Vm` (GIC, RAM mapping, SPIs), `Vcpu` (run/regs/vtimer), `GuestRam`,
   `SharedMap` (a file mapped shared: the display server's frame ring). `GuestRam`, `SharedMap` and
   `host` (hole punching) build on any unix host; the hypervisor (`hv.rs`) is Apple silicon only.

@@ -228,12 +228,52 @@ pub fn wait_for(lines: &Mutex<Vec<String>>, n: usize) -> Vec<String> {
 /// an FCM receiver that a root `am broadcast` reaches (`noroot` beside the script: no `su`), and
 /// `am broadcast -a` succeeds except for the protected `BOOT_COMPLETED`. `forward` keeps the adb
 /// server's forwards (every device's) in `forwards` beside the script, host ports from 41001, and
-/// the TCP tables say 8080 listens.
+/// the TCP tables say 8080 listens. `reverse` keeps each device's reverses in `reverses`, and the
+/// Wear OS pairing's commands (`sim_android::wear`) answer from `wear.<what>.<serial>` files
+/// ([`FakeAdb::wear`]): a phone and a watch with Play services, `logcat -T 1` that prints the
+/// companion's states only after its activity starts.
 pub fn fake_adb(android: &Android) -> FakeAdb {
     let dir = android.env.sdk_root.as_ref().expect("sdk root").join("platform-tools");
     std::fs::create_dir_all(&dir).expect("platform-tools");
     write_script(&dir.join("adb"), FAKE_ADB);
     FakeAdb { log: dir.join("adb.log") }
+}
+
+/// A fake adb in a fresh SDK under `/tmp` (one per call), for tests of calls that go through adb
+/// alone. Dropping it removes the SDK.
+pub struct AdbRig {
+    pub root: std::path::PathBuf,
+    pub fake: FakeAdb,
+    pub android: Android,
+}
+
+impl AdbRig {
+    pub fn new(tag: &str) -> AdbRig {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::path::PathBuf::from("/tmp").join(format!("sa-rig-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let android = Android::new(emu_avd::Env { sdk_root: Some(root.join("sdk")), avd_home: root.join("avd") });
+        let fake = fake_adb(&android);
+        AdbRig { root, fake, android }
+    }
+
+    /// adb bound to the device `serial`.
+    pub fn adb(&self, serial: &str) -> crate::apps::Adb {
+        crate::apps::Adb {
+            adb: self.root.join("sdk/platform-tools/adb"),
+            serial: serial.into(),
+            bundletool: None,
+            pid_wait: Duration::ZERO,
+            deadlines: crate::apps::Deadlines::default(),
+        }
+    }
+}
+
+impl Drop for AdbRig {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
 }
 
 /// Writes `body` as an executable `/bin/sh` script at `path`, ready to run: written under a
@@ -295,6 +335,57 @@ impl FakeAdb {
     /// tcp:<device>`).
     pub fn forwards(&self) -> Vec<String> {
         std::fs::read_to_string(self.log.with_file_name("forwards")).unwrap_or_default().lines().map(str::to_owned).collect()
+    }
+
+    /// The reverses the devices hold now, `<serial> tcp:<device> tcp:<host>` per line (a reverse
+    /// belongs to one device; `adb reverse --list` shows a device its own).
+    pub fn reverses(&self) -> Vec<String> {
+        std::fs::read_to_string(self.log.with_file_name("reverses")).unwrap_or_default().lines().map(str::to_owned).collect()
+    }
+
+    /// Makes `adb reverse tcp:<a> tcp:<b>` fail from now on, as it does when the device's adbd
+    /// closes the stream.
+    pub fn reverse_fails(&self) {
+        std::fs::write(self.log.with_file_name("reverse.fail"), b"").expect("reverse flag");
+    }
+
+    /// What a Wear OS pairing reads from `serial` (`sim_android::wear`): `what` is `status` (the
+    /// text `get-pairing-status` prints after its `Broadcasting:` line), `setting` and `prop` (the
+    /// watch's companion choice), `abis`, `primer` (the line `logcat -T 1` prints first),
+    /// `logcat` (the lines the pairing logs once the companion's activity starts), `noactivity`
+    /// (the companion has no `EmulatorActivity`: any text), or `pkg.<package>` (what `dumpsys
+    /// package` greps: `versionCode=` and `versionName=` lines; a package without one isn't
+    /// installed, and Play services without one is version 240000000).
+    pub fn wear(&self, what: &str, serial: &str, text: &str) {
+        std::fs::write(self.log.with_file_name(format!("wear.{what}.{serial}")), text).expect("wear flag");
+    }
+
+    /// [`FakeAdb::wear`]`("status", ..)` as Play services prints it: the guest's own node (none
+    /// when `local` is `None`: Play services isn't ready) and its peers `(node, connected,
+    /// enabled)`.
+    pub fn wear_status(&self, serial: &str, local: Option<&str>, peers: &[(&str, bool, bool)]) {
+        let text = match local {
+            None => "Broadcast completed: result=0\n".to_owned(),
+            Some(local) => {
+                let mut data = format!("Local:[{local}]");
+                for (node, connected, enabled) in peers {
+                    data.push_str(&format!("\nPeer:[{node},{connected},{enabled}]"));
+                }
+                format!("Broadcast completed: result=1, data=\"{data}\"\n")
+            }
+        };
+        self.wear("status", serial, &text);
+    }
+
+    /// The companion's `[EMULATOR_PAIRING:<state>]` lines for each of `states`, in logcat's
+    /// `threadtime` format, for [`FakeAdb::wear`]`("logcat", ..)`.
+    pub fn wear_logcat(&self, serial: &str, states: &[&str]) {
+        let lines: String = states
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("08-17 11:35:0{}.797   439  2734 I EmulatorActivity:[EMULATOR_PAIRING:{s}]\n", i % 10))
+            .collect();
+        self.wear("logcat", serial, &lines);
     }
 
     /// Makes the guest's `package-restrictions.xml` never change after a profile's disables, so
@@ -481,6 +572,34 @@ forward)
       fi
       grep -v " $1 " "$f" > "$f.$$"; echo "$serial $1 $2" >> "$f.$$"; mv "$f.$$" "$f";;
   esac;;
+# `reverse <remote> <local>`, `reverse --remove <remote>`, `reverse --list` on a table of
+# `<serial> <remote> <local>` lines, `reverses` beside the script: a reverse belongs to one device,
+# and `--list` shows a device its own as `UsbFfs <remote> <local>`. While `reverse.fail` is beside
+# the script a new reverse fails as adb's does when the device closes the stream.
+reverse)
+  shift
+  f="$d/reverses"
+  touch "$f"
+  case "$1" in
+    --list) grep "^$serial " "$f" | while read -r _ a b; do echo "UsbFfs $a $b"; done;;
+    --remove)
+      grep -q "^$serial $2 " "$f" || { echo "adb: error: listener '$2' not found" >&2; exit 1; }
+      grep -v "^$serial $2 " "$f" > "$f.$$"; mv "$f.$$" "$f";;
+    *)
+      if [ -e "$d/reverse.fail" ]; then echo "adb: error: closed" >&2; exit 1; fi
+      grep -v "^$serial $1 " "$f" > "$f.$$"; echo "$serial $1 $2" >> "$f.$$"; mv "$f.$$" "$f";;
+  esac;;
+# sim_android::wear's `logcat -T 1`: prints a primer line at once (as `-T 1` prints the last
+# line), then, once the companion's activity has been started (`wear.logcat.go.<serial>`, which
+# only a start after this reader began creates: a start before it would have lost the lines), the
+# lines in `wear.logcat.<serial>`, then stays open.
+logcat)
+  touch "$d/wear.logcat.listening.$serial"
+  cat "$d/wear.primer.$serial" 2>/dev/null || echo "11-28 10:00:00.000     1     1 I primer: the last line"
+  i=0
+  while [ ! -e "$d/wear.logcat.go.$serial" ] && [ $i -lt 500 ]; do sleep 0.02; i=$((i + 1)); done
+  cat "$d/wear.logcat.$serial" 2>/dev/null
+  exec sleep 30;;
 install)
   case "$*" in
     *broken.apk*) echo "Performing Streamed Install" >&2; echo "adb: failed to install broken.apk: Failure [INSTALL_PARSE_FAILED_NOT_APK: Failed to parse /data/app/vmdl1.tmp/base.apk]" >&2; exit 1;;
@@ -489,6 +608,30 @@ install)
   echo "Success";;
 shell)
   case "$2" in
+    # sim_android::wear: Play services' pairing broadcasts, the watch's companion choice, the
+    # package versions and the companion's activity, answered per serial from `wear.<what>.<serial>`
+    # files beside the script (FakeAdb::wear). Text here is spelled out, not shared with the code.
+    "am broadcast -a com.google.android.gms.wearable.EMULATOR --es operation get-pairing-status")
+      echo "Broadcasting: Intent { act=com.google.android.gms.wearable.EMULATOR flg=0x400000 (has extras) }"
+      if [ -e "$d/wear.status.$serial" ]; then cat "$d/wear.status.$serial"
+      else echo "Broadcast completed: result=1, data=\"Local:[node-$serial]\""; fi;;
+    "am broadcast -a com.google.android.gms.wearable.EMULATOR --es operation refresh-emulator-connection")
+      printf 'Broadcasting: Intent { act=com.google.android.gms.wearable.EMULATOR flg=0x400000 (has extras) }\nBroadcast completed: result=0\n';;
+    "settings get secure cw.oem_companion_package") cat "$d/wear.setting.$serial" 2>/dev/null || echo null;;
+    "getprop ro.oem.companion_package") cat "$d/wear.prop.$serial" 2>/dev/null || echo;;
+    "getprop ro.product.cpu.abilist") cat "$d/wear.abis.$serial" 2>/dev/null || echo arm64-v8a;;
+    "dumpsys package "*" | grep -e versionCode -e versionName")
+      pkg=${2#dumpsys package }; pkg=${pkg%% *}
+      if [ -e "$d/wear.pkg.$pkg.$serial" ]; then cat "$d/wear.pkg.$pkg.$serial"
+      elif [ "$pkg" = com.google.android.gms ]; then printf '    versionCode=240000000 minSdk=26 targetSdk=34\n    versionName=24.00.00 (190400-1)\n'
+      else exit 1; fi;;
+    "pm clear "*) echo Success;;
+    "am start -n "*"/.EmulatorActivity --es emulator-name "*)
+      comp=${2#am start -n }; comp=${comp%%/*}
+      echo "Starting: Intent { cmp=$comp/.EmulatorActivity (has extras) }"
+      if [ -e "$d/wear.noactivity.$serial" ]; then
+        printf 'Error type 3\nError: Activity class {%s/%s.EmulatorActivity} does not exist.\n' "$comp" "$comp"
+      elif [ -e "$d/wear.logcat.listening.$serial" ]; then touch "$d/wear.logcat.go.$serial"; fi;;
     "pm uninstall com.missing.app") echo "Failure [DELETE_FAILED_INTERNAL_ERROR]";;
     "pm uninstall "*) echo "Success";;
     "pm list packages -3") printf 'package:com.example.app\npackage:com.example.zeta\n';;
