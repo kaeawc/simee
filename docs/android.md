@@ -882,8 +882,13 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   `dumpsys window displays` over adb before the turn (at most 1 s) and after it, for up to 3 s
   in all: it returns the
   rotation the guest turned to, or says why it stayed ("the guest stayed upright: the app in
-  front (`<package>`) doesn't rotate", auto-rotate off, or a turn upside down;
-  `sim_core::window`), which the desktop shows in its status line. The two tags add little log: on an API 36 phone (720x1280, 2026-11-26, this Mac at load 19 to 62), 4.3 KB in 17 lines from boot to boot complete, nothing in 2 minutes idle, and 11.4 KB in 50 lines over four rotations and five Settings launches (2 rotation lines each), against 1.9 MB in 10,385 lines that the guest logged under all tags in the same window (`adb logcat -d -s WindowManager:I ActivityTaskManager:I`; one run, not a benchmark). API 29 and 30 aren't followed: their filter
+  front (`<package>`) doesn't rotate", auto-rotate off, an app kept to landscape or portrait, or
+  a turn upside down; `sim_core::window`), which the desktop shows in its status line. It stops
+  after one read only when the guest can't turn: the app pins its orientation (portrait,
+  landscape, nosensor, their reverses, locked), or auto-rotate is off and the app doesn't ask for
+  the sensor over it (sensor, full sensor, sensor landscape and portrait do, as AOSP's
+  `DisplayRotation.rotationForOrientation` reads them); any other state is read until it turns
+  or the 3 s are over. The two tags add little log: on an API 36 phone (720x1280, 2026-11-26, this Mac at load 19 to 62), 4.3 KB in 17 lines from boot to boot complete, nothing in 2 minutes idle, and 11.4 KB in 50 lines over four rotations and five Settings launches (2 rotation lines each), against 1.9 MB in 10,385 lines that the guest logged under all tags in the same window (`adb logcat -d -s WindowManager:I ActivityTaskManager:I`; one run, not a benchmark). API 29 and 30 aren't followed: their filter
   goes through `qemu.cmdline`, at most 91 bytes, which the two tags would overflow, so emu
   leaves it as the user's and `rotation` says `unknown` there (frames and touches stay as the
   panel lies). Phones, tablets and foldables follow it; TVs, cars, watches and XR headsets and

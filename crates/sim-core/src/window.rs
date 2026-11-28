@@ -3,8 +3,9 @@
 //!
 //! The emulator's `rotate` turns only the virtual accelerometer; the guest decides whether to
 //! follow it. It stays put when the app in front fixes its orientation (the Pixel launcher is
-//! `nosensor`, `mLastOrientation=5`), when auto-rotate is off, or when the turn is upside down
-//! (180°), which phones refuse unless the app asks. [`stayed_note`] says which, so a rotate that
+//! `nosensor`, `mLastOrientation=5`), when auto-rotate is off (unless the app asks for the
+//! sensor), when the app keeps to landscape or portrait and the turn leaves that axis, or when the
+//! turn is upside down (180°), which phones refuse unless the app asks. [`stayed_note`] says which, so a rotate that
 //! changed nothing doesn't look broken.
 
 use crate::rotation::Rotation;
@@ -50,11 +51,37 @@ impl WindowState {
         s
     }
 
-    /// Whether the app in front fixes the display's orientation (or keeps it to one axis), so
-    /// the accelerometer doesn't turn it: anything but unspecified (-1), user (2), behind (3),
-    /// sensor (4), full sensor (10) and full user (13). Unknown (no `mLastOrientation`) is false.
+    /// Whether the app in front pins the display to one rotation whatever the accelerometer says:
+    /// landscape (0), portrait (1), nosensor (5), reverse landscape (8), reverse portrait (9) and
+    /// locked (14), the orientations AOSP's `DisplayRotation.rotationForOrientation` never gives
+    /// the sensor's rotation. Unknown (no `mLastOrientation`) is false.
     pub fn app_fixed(&self) -> bool {
-        self.orientation.is_some_and(|o| !matches!(o, -2 | -1 | 2 | 3 | 4 | 10 | 13))
+        self.orientation.is_some_and(|o| matches!(o, 0 | 1 | 5 | 8 | 9 | 14))
+    }
+
+    /// The axis the app in front keeps the display to, turning it only between that axis' two
+    /// sides: sensor or user landscape (6, 11) and portrait (7, 12).
+    pub fn app_axis(&self) -> Option<&'static str> {
+        match self.orientation? {
+            6 | 11 => Some("landscape"),
+            7 | 12 => Some("portrait"),
+            _ => None,
+        }
+    }
+
+    /// Whether the app in front follows the sensor even with auto-rotate off: sensor (4), sensor
+    /// landscape (6), sensor portrait (7) and full sensor (10), which `rotationForOrientation`
+    /// checks ahead of the user's rotation lock.
+    pub fn app_overrides_lock(&self) -> bool {
+        self.orientation.is_some_and(|o| matches!(o, 4 | 6 | 7 | 10))
+    }
+
+    /// Whether the guest can't follow any turn of the accelerometer: the app in front pins the
+    /// display ([`app_fixed`](Self::app_fixed)), or auto-rotate is off and the app doesn't
+    /// override it. Every other state may still turn, later on a busy guest; an unknown
+    /// orientation counts as one that may.
+    pub fn wont_turn(&self) -> bool {
+        self.app_fixed() || (self.user_locked && self.orientation.is_some() && !self.app_overrides_lock())
     }
 }
 
@@ -123,9 +150,10 @@ fn focused_package(text: &str, key: &str) -> Option<String> {
 }
 
 /// Why the guest stayed at `after.rotation` after a `rotate` it was given `waited` seconds to
-/// follow (None when it turned, or when its rotation couldn't be read either side): the app in
-/// front's orientation, the user's rotation lock, else the turn the guest won't make (upside
-/// down, which phones refuse by default) or, from upright, a guest too slow to turn in time.
+/// follow, from the turn (None when it turned, or when its rotation couldn't be read either side):
+/// the app in front pins its orientation, the user's rotation lock, an app kept to one axis, else
+/// the turn the guest won't make (upside down, which phones refuse by default) or, from upright,
+/// a guest too slow to turn in time.
 pub fn stayed_note(before: &WindowState, after: &WindowState, waited: f64) -> Option<String> {
     let (Some(was), Some(now)) = (before.rotation, after.rotation) else { return None };
     if was != now {
@@ -136,14 +164,16 @@ pub fn stayed_note(before: &WindowState, after: &WindowState, waited: f64) -> Op
         r => format!("at {}°", r.degrees()),
     };
     let app = || after.package.as_deref().map_or_else(|| "the app in front".to_owned(), |p| format!("the app in front (`{p}`)"));
+    let late = "a busy guest turns later; read `rotation` before rotating again";
+    let waited = (waited * 10.0).round() / 10.0;
     let why = if after.app_fixed() {
         format!("{} doesn't rotate", app())
-    } else if after.user_locked {
+    } else if after.user_locked && !after.app_overrides_lock() {
         "auto-rotate is off".to_owned()
+    } else if let Some(axis) = after.app_axis() {
+        format!("{} keeps to {axis}, which turns only between its two sides, or it didn't turn within {waited} s ({late})", app())
     } else if now == Rotation::Deg0 {
-        format!(
-            "it didn't turn within {waited} s (a busy guest turns later; read `rotation` before rotating again), or the turn is upside down, 180°, which phones refuse unless the app asks"
-        )
+        format!("it didn't turn within {waited} s ({late}), or the turn is upside down, 180°, which phones refuse unless the app asks")
     } else {
         "it doesn't follow this turn (phones don't turn upside down, 180°, unless the app asks); rotate again".to_owned()
     };
@@ -262,6 +292,24 @@ mod tests {
     }
 
     #[test]
+    fn only_orientations_that_cant_follow_the_sensor_refuse_a_turn() {
+        let state = |orientation, user_locked| WindowState { orientation, user_locked, ..WindowState::default() };
+        // AOSP DisplayRotation.rotationForOrientation: these never take the sensor's rotation.
+        for o in [0, 1, 5, 8, 9, 14] {
+            assert!(state(Some(o), false).app_fixed() && state(Some(o), false).wont_turn(), "{o}");
+        }
+        // These follow it with auto-rotate on, and sensor, sensor landscape and portrait and full
+        // sensor with it off too.
+        for o in [-2, -1, 2, 3, 4, 6, 7, 10, 11, 12, 13] {
+            assert!(!state(Some(o), false).app_fixed() && !state(Some(o), false).wont_turn(), "{o} unlocked");
+            assert_eq!(state(Some(o), true).wont_turn(), !matches!(o, 4 | 6 | 7 | 10), "{o} locked");
+        }
+        assert!(!state(None, false).wont_turn() && !state(None, true).wont_turn(), "unknown: it may turn");
+        assert_eq!((state(Some(6), false).app_axis(), state(Some(12), true).app_axis()), (Some("landscape"), Some("portrait")));
+        assert_eq!(state(Some(4), false).app_axis(), None);
+    }
+
+    #[test]
     fn a_rotate_the_guest_didnt_follow_says_why() {
         let launcher = WindowState::parse(LAUNCHER);
         assert_eq!(
@@ -280,6 +328,16 @@ mod tests {
         assert_eq!(stayed_note(&locked, &locked, 3.0).as_deref(), Some("the guest stayed upright: auto-rotate is off"));
         let anonymous = WindowState { package: None, ..launcher };
         assert_eq!(stayed_note(&anonymous, &anonymous, 3.0).as_deref(), Some("the guest stayed upright: the app in front doesn't rotate"));
+        let sensor_locked = WindowState { user_locked: true, orientation: Some(4), ..upright.clone() };
+        let note = stayed_note(&sensor_locked, &sensor_locked, 3.0).expect("note");
+        assert!(note.contains("didn't turn within 3 s"), "the app overrides the lock: {note}");
+        let landscape = WindowState { orientation: Some(6), rotation: Some(Rotation::Deg90), ..turned.clone() };
+        assert_eq!(
+            stayed_note(&landscape, &landscape, 2.74).as_deref(),
+            Some(
+                "the guest stayed at 90°: the app in front (`com.android.settings`) keeps to landscape, which turns only between its two sides, or it didn't turn within 2.7 s (a busy guest turns later; read `rotation` before rotating again)"
+            )
+        );
         assert_eq!(stayed_note(&WindowState::default(), &upright, 3.0), None, "unknown before: nothing to say");
         assert_eq!(
             stayed_note(&upright, &upright, 3.0).as_deref(),

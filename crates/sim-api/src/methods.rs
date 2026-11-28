@@ -663,7 +663,7 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     (
         "rotate",
         "device, orientation?(portrait|landscape-right|portrait-upside-down|landscape-left; iOS); iOS: set?",
-        "Rotate the device 90° clockwise, or to an orientation (iOS). iOS returns `{orientation}`; Android returns `{rotation, note?}` once the guest has turned or, at most 3 s after the turn, when it hasn't: `rotation` is the degrees the display is at (`null` without adb or when the guest's window manager doesn't answer in time) and `note` says why it stayed, or that it was only slow",
+        "Rotate the device 90° clockwise, or to an orientation (iOS)",
     ),
     (
         "fold",

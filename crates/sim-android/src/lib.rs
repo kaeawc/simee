@@ -766,7 +766,7 @@ const ROTATE_BEFORE: Duration = Duration::from_secs(1);
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Rotated {
     /// The guest's display rotation after it (as screenshots and touches follow it); None when
-    /// it couldn't be read (no adb).
+    /// it couldn't be read (no adb), or the guest's window manager didn't answer within the wait.
     pub rotation: Option<Rotation>,
     /// Why the guest didn't turn: "the guest stayed upright: the app in front (`<package>`)
     /// doesn't rotate". None when it turned or couldn't be read.
@@ -1292,9 +1292,11 @@ impl Device {
 
     /// Rotates the device 90° clockwise (the virtual accelerometer) and reports what the guest
     /// did: its display's rotation once it turned, or after [`ROTATE_SETTLE`] without turning,
-    /// with why it stayed (the app in front fixes its orientation, auto-rotate is off, or the
-    /// turn is upside down). Read with `dumpsys window displays` over adb: without adb, or when
-    /// the guest's window manager doesn't answer, the rotate is sent and nothing is reported.
+    /// with why it stayed (the app in front pins its orientation or keeps to one axis, auto-rotate
+    /// is off, or the turn is upside down). It returns after one read when the guest can't turn
+    /// ([`WindowState::wont_turn`](sim_core::window::WindowState::wont_turn)). Read with
+    /// `dumpsys window displays` over adb: without adb, or when the guest's window manager
+    /// doesn't answer, the rotate is sent and nothing is reported.
     pub fn rotate(&self, android: &Android) -> Result<Rotated, String> {
         self.rotate_within(android, ROTATE_SETTLE)
     }
@@ -1312,10 +1314,14 @@ impl Device {
         };
         let before = adb.as_ref().and_then(|adb| read(adb, ROTATE_BEFORE.min(settle / 3)));
         self.console(&["rotate".into()])?;
+        let turned = Instant::now();
         let (Some(adb), Some(before)) = (adb, before) else { return Ok(Rotated::default()) };
-        // The guest won't follow the turn when the app in front fixes its orientation or the
-        // user locked auto-rotate: its rotation is known now, one more read confirms it.
-        let refused = before.app_fixed() || before.user_locked;
+        // The guest can't follow the turn when the app in front pins its orientation, or when
+        // auto-rotate is off and the app doesn't ask for the sensor over it: its rotation is
+        // known now, one more read confirms it. Any other state may still turn, later on a busy
+        // guest (an app kept to landscape follows the sensor to its other side), so it is read
+        // until it turns or the wait is over.
+        let refused = before.wont_turn();
         let mut last = None;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -1337,7 +1343,8 @@ impl Device {
         }
         // No read after the turn answered in time: the guest's rotation is unknown.
         let Some(last) = last else { return Ok(Rotated::default()) };
-        let waited = settle.as_secs_f64();
+        // What the guest had to turn in: from the turn, not from the read before it.
+        let waited = deadline.saturating_duration_since(turned).as_secs_f64();
         Ok(Rotated { rotation: last.rotation, note: sim_core::window::stayed_note(&before, &last, waited) })
     }
 
@@ -2104,23 +2111,33 @@ mod tests {
     /// A fake `adb` whose `dumpsys window displays` answers `before` the first time and `after`
     /// from then on (each with the focused app and its orientation, as an API 35 guest dumps them).
     fn fake_dumpsys(f: &Fixture, before: (&str, &str, i32, u32), after: (&str, &str, i32, u32)) {
+        fake_dumpsys_reads(f, false, &[before, after]);
+    }
+
+    /// A fake `adb` whose `dumpsys window displays` answers `reads` in turn, the last from then
+    /// on, with auto-rotate off when `locked`.
+    fn fake_dumpsys_reads(f: &Fixture, locked: bool, reads: &[(&str, &str, i32, u32)]) {
         let dir = f.root.join("sdk/platform-tools");
         std::fs::create_dir_all(&dir).expect("platform-tools");
-        let dump = |(package, activity, orientation, rotation): (&str, &str, i32, u32)| {
-            format!(
-                "  mFocusedApp=ActivityRecord{{9a3b2c1 u0 {package}/{activity} t3}}\n  DisplayRotation\n    mLastOrientation={orientation}\n    mRotation={rotation} mDeferredRotationPauseCount=0\n    mUserRotationMode=USER_ROTATION_FREE mUserRotation=ROTATION_0\n"
-            )
-        };
-        std::fs::write(dir.join("before.txt"), dump(before)).expect("before");
-        std::fs::write(dir.join("after.txt"), dump(after)).expect("after");
-        let script = r#"d="$(dirname "$0")"
+        let mode = if locked { "USER_ROTATION_LOCKED" } else { "USER_ROTATION_FREE" };
+        for (n, (package, activity, orientation, rotation)) in reads.iter().enumerate() {
+            let dump = format!(
+                "  mFocusedApp=ActivityRecord{{9a3b2c1 u0 {package}/{activity} t3}}\n  DisplayRotation\n    mLastOrientation={orientation}\n    mRotation={rotation} mDeferredRotationPauseCount=0\n    mUserRotationMode={mode} mUserRotation=ROTATION_0\n"
+            );
+            std::fs::write(dir.join(format!("read-{}.txt", n + 1)), dump).expect("read");
+        }
+        let script = format!(
+            r#"d="$(dirname "$0")"
 case "$*" in
   *"shell dumpsys window displays")
-    if [ -e "$d/asked" ]; then cat "$d/after.txt"; else touch "$d/asked"; cat "$d/before.txt"; fi;;
+    n=$(( $(cat "$d/reads" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$d/reads"
+    if [ -e "$d/read-$n.txt" ]; then cat "$d/read-$n.txt"; else cat "$d/read-{}.txt"; fi;;
   *) echo 1;;
 esac
-"#;
-        crate::testing::write_script(&dir.join("adb"), script);
+"#,
+            reads.len()
+        );
+        crate::testing::write_script(&dir.join("adb"), &script);
     }
 
     #[test]
@@ -2131,7 +2148,9 @@ esac
         let fake = fake_emulator(&f.android, "phone");
         fake_dumpsys(&f, LAUNCHER, LAUNCHER);
         let d = f.android.device("phone").expect("phone");
-        let r = d.rotate_within(&f.android, Duration::from_millis(300)).expect("rotate");
+        // A wait long enough that the read before the turn (a third of it) answers on a loaded
+        // host; the launcher can't turn, so it returns after one more read anyway.
+        let r = d.rotate_within(&f.android, Duration::from_secs(3)).expect("rotate");
         assert_eq!(r.rotation, Some(Rotation::Deg0));
         assert_eq!(
             r.note.as_deref(),
@@ -2168,16 +2187,46 @@ esac
 
     #[test]
     fn rotate_returns_at_once_when_the_app_in_front_refuses_it() {
-        const LAUNCHER: (&str, &str, i32, u32) = ("com.google.android.apps.nexuslauncher", ".NexusLauncherActivity", 5, 0);
-        let f = fixture("rotearly");
-        f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("phone");
-        let _fake = fake_emulator(&f.android, "phone");
-        fake_dumpsys(&f, LAUNCHER, LAUNCHER);
-        let d = f.android.device("phone").expect("phone");
-        let started = Instant::now();
-        let r = d.rotate_within(&f.android, Duration::from_secs(30)).expect("rotate");
-        assert!(started.elapsed() < Duration::from_secs(5), "known from the first read, not after the wait");
-        assert!(r.note.expect("note").contains("doesn't rotate"));
+        // A portrait-only app, and auto-rotate off under an app that doesn't ask for the sensor.
+        let portrait = ("com.example.portrait", ".Main", 1, 0);
+        let settings = ("com.android.settings", ".Settings", -1, 0);
+        for (name, locked, app, why) in
+            [("rotearly", false, portrait, "doesn't rotate"), ("rotlocked", true, settings, "auto-rotate is off")]
+        {
+            let f = fixture(name);
+            f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("phone");
+            let _fake = fake_emulator(&f.android, "phone");
+            fake_dumpsys_reads(&f, locked, &[app]);
+            let d = f.android.device("phone").expect("phone");
+            let started = Instant::now();
+            let r = d.rotate_within(&f.android, Duration::from_secs(30)).expect("rotate");
+            assert!(started.elapsed() < Duration::from_secs(5), "{name}: known from the first read, not after the wait");
+            assert_eq!(r.rotation, Some(Rotation::Deg0), "{name}");
+            let note = r.note.expect("note");
+            assert!(note.contains(why), "{name}: {note}");
+        }
+    }
+
+    #[test]
+    fn rotate_waits_for_a_late_turn_the_app_or_the_sensor_still_makes() {
+        // A sensorLandscape app at 90° (ROTATION_270), and a sensor app with auto-rotate off:
+        // both follow the sensor, so a turn the second read hasn't seen yet is still caught.
+        let landscape = |rotation| ("com.example.game", ".Game", 6, rotation);
+        let sensor = |rotation| ("com.example.video", ".Player", 4, rotation);
+        for (name, locked, reads, turned) in [
+            ("rotsensorland", false, [landscape(3), landscape(3), landscape(1)], Rotation::Deg270),
+            ("rotsensorlock", true, [sensor(0), sensor(0), sensor(3)], Rotation::Deg90),
+        ] {
+            let f = fixture(name);
+            f.android.create("phone", "system-images;android-36;google_apis;arm64-v8a", None).expect("phone");
+            let _fake = fake_emulator(&f.android, "phone");
+            fake_dumpsys_reads(&f, locked, &reads);
+            let d = f.android.device("phone").expect("phone");
+            let started = Instant::now();
+            let r = d.rotate_within(&f.android, Duration::from_secs(10)).expect("rotate");
+            assert_eq!(r, Rotated { rotation: Some(turned), note: None }, "{name}");
+            assert!(started.elapsed() < Duration::from_secs(8), "{name}: returned at the turn, not after the wait");
+        }
     }
 
     #[test]
@@ -2188,8 +2237,15 @@ esac
         let settings = ("com.android.settings", ".Settings", -1, 0);
         fake_dumpsys(&f, settings, settings);
         let d = f.android.device("phone").expect("phone");
-        let note = d.rotate_within(&f.android, Duration::from_millis(600)).expect("rotate").note.expect("note");
-        assert!(note.contains("didn't turn within 0.6 s"), "{note}");
+        let note = d.rotate_within(&f.android, Duration::from_millis(1500)).expect("rotate").note.expect("note");
+        // The guest had the wait less the read before the turn and the turn itself.
+        let waited: f64 = note
+            .split("didn't turn within ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{note}"));
+        assert!(waited > 0.0 && waited <= 1.5, "{note}");
     }
 
     /// Adds an installed system image under the fixture's SDK.

@@ -1397,7 +1397,7 @@
         "readOnlyHint": false,
         "title": "rotate"
       },
-      "description": "Rotate the device 90° clockwise, or to an orientation (iOS). iOS returns `{orientation}`; Android returns `{rotation, note?}` once the guest has turned or, at most 3 s after the turn, when it hasn't: `rotation` is the degrees the display is at (`null` without adb or when the guest's window manager doesn't answer in time) and `note` says why it stayed, or that it was only slow. Acts on the device each time it is called.\n\nPlatforms: Android, iOS. Parameters: device, orientation?(portrait|landscape-right|portrait-upside-down|landscape-left; iOS); iOS: set?. Toolsets: core, input.",
+      "description": "Rotate the device 90° clockwise, or to an orientation (iOS). Acts on the device each time it is called.\n\nPlatforms: Android, iOS. Parameters: device, orientation?(portrait|landscape-right|portrait-upside-down|landscape-left; iOS); iOS: set?. Toolsets: core, input.",
       "inputSchema": {
         "properties": {
           "device": {
