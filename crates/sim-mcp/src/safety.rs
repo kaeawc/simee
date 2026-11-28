@@ -161,6 +161,11 @@ impl Safety {
         if policy.read_only && !tools::read_only(tool) {
             return Verdict::Refuse(read_only_refusal(tool));
         }
+        if tool == "console"
+            && let Some(refusal) = console_refusal(args)
+        {
+            return Verdict::Refuse(refusal);
+        }
         let mut changed: Option<Value> = None;
         if ADMITTED.contains(&tool)
             && let Err(refusal) = self.admit(&policy, tool, args, &mut changed)
@@ -498,6 +503,32 @@ fn what_it_does(tool: &str, args: &Value, targets: &[(String, Result<Resolved, S
         }
         other => format!("run `{other}` on {on}"),
     }
+}
+
+/// The longest console command, in bytes, that is certainly one line: the stock console starts a
+/// new line after 4095 bytes.
+const CONSOLE_LINE_LIMIT: usize = 4095;
+
+/// Why a `console` call is refused outright: a command with a control character, or one that is a
+/// whole line or longer. The stock console drops a CR instead of ending a line on it, ends a command
+/// at a NUL and starts a line after 4095 bytes, and `emu`'s ends one at an LF, so `ki\rll`,
+/// `kill\0x` and 4095 bytes before `kill` each run a `kill` that no reading of the text by the
+/// first word, or by a split at line breaks, finds. No model of either parser decides it: a command
+/// that could be read two ways isn't run.
+fn console_refusal(args: &Value) -> Option<String> {
+    let reason = console_commands(args).into_iter().find_map(|command| {
+        if command.chars().any(char::is_control) {
+            Some("has a control character (a line break, CR, NUL, tab: the console reads those differently from this check)".to_owned())
+        } else if command.len() >= CONSOLE_LINE_LIMIT {
+            Some(format!("is {} bytes, and the console starts a new line after {} bytes of one", command.len(), CONSOLE_LINE_LIMIT))
+        } else {
+            None
+        }
+    })?;
+    Some(format!(
+        "{REFUSED}a `console` command {reason}, so what it would do can't be told from here. Send one command per entry of `commands`, \
+         each a single short line of plain text (nothing was sent)"
+    ))
 }
 
 /// Why a call to a tool that only sometimes confirms does.

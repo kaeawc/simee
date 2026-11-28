@@ -46,9 +46,11 @@ impl std::ops::BitOr for Effects {
     }
 }
 
-/// The commands in `text`. The console runs each line as a command of its own, and a line ends
-/// at a CR or an LF (stock reads either; `emu` reads LF, and its words split at a CR), so a
-/// harmless word before a line break hides nothing after it.
+/// The commands in `text`, split at a CR or an LF. This is `emu`'s reading, near enough (it ends
+/// a line at an LF, and its words split at a CR); the stock console reads differently (a CR is
+/// dropped, a NUL ends a command, a line is 4095 bytes at most), so a front end that must not be
+/// fooled refuses a command with a control character instead of trusting this split (the MCP
+/// server does). It is a second line of defence.
 pub fn lines(text: &str) -> impl Iterator<Item = &str> {
     text.split(['\r', '\n']).map(str::trim).filter(|line| !line.is_empty())
 }

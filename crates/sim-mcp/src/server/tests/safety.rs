@@ -355,13 +355,8 @@ fn a_console_command_is_judged_line_by_line_and_by_every_name_the_console_knows(
         assert!(asked || !is_error(&result), "{args}: {result}");
         asked
     };
-    // The console runs each line as its own command: a harmless first word hides nothing.
-    for command in ["ping\r\nkill", "ping\nkill", "ping\rkill", "ping\r\n\r\n  kill  ", "\tkill"] {
-        assert!(asks(json!({"device": "ci-2", "command": command})), "{command:?}");
-    }
-    assert!(asks(json!({"device": "ci-2", "commands": ["ping", "help\nkill"]})));
     // A snapshot goes by `del` as well as `delete`, which is the stock console's and emu's own.
-    for command in ["avd snapshot del fresh", "avd snapshot delete fresh", "AVD SNAPSHOT DEL fresh", "ping\navd snapshot del x", "crash"] {
+    for command in ["avd snapshot del fresh", "avd snapshot delete fresh", "AVD SNAPSHOT DEL fresh", "crash"] {
         assert!(asks(json!({"device": "ci-2", "command": command})), "{command:?}");
     }
     // Several commands in one call: the first that is harmless, or a kill, doesn't excuse a snapshot's deletion.
@@ -375,11 +370,50 @@ fn a_console_command_is_judged_line_by_line_and_by_every_name_the_console_knows(
     // A client that booted the emulator may end it as it may with `shutdown`, but a snapshot's
     // deletion in the same call is still asked.
     assert!(!is_error(&call(&rig, "boot", json!({"device": "ci-1"}))));
-    assert!(!asks(json!({"device": "ci-1", "command": "ping\r\nkill"})));
+    assert!(!asks(json!({"device": "ci-1", "command": "kill"})));
     assert!(!is_error(&call(&rig, "boot", json!({"device": "ci-1"}))));
     assert!(asks(json!({"device": "ci-1", "commands": ["kill", "avd snapshot del x"]})));
     assert!(asks(json!({"device": "ci-1", "command": "avd snapshot del x"})));
-    assert!(rig.fake.called("console").iter().all(|p| p.get("confirm").is_none()));
+    // `confirm` is the server's, not the console's: a harmless command that carries it runs without it.
+    let before = rig.fake.called("console").len();
+    assert!(!is_error(&call(&rig, "console", json!({"device": "ci-2", "command": "ping", "confirm": true}))));
+    let reached = rig.fake.called("console");
+    assert_eq!(reached.len(), before + 1, "the command reached the device");
+    assert_eq!(reached.last(), Some(&json!({"device": "ci-2", "command": "ping"})));
+}
+
+/// Where the stock console and `emu`'s read a command differently (stock drops a CR and ends a
+/// command at a NUL, and starts a new line after 4095 bytes; emu ends a line at an LF), so no
+/// model of either decides what a command with a control character or a long line does.
+#[test]
+fn a_console_command_with_a_control_character_or_a_long_line_is_refused_whatever_it_says() {
+    let rig = rig(Policy::default());
+    let long_kill = format!("{}kill", " ".repeat(4095));
+    for command in [
+        "ki\rll",
+        "kill\u{0}x",
+        "ping\r\nkill",
+        "ping\nkill",
+        "ping\rkill",
+        "\tkill",
+        "ping\u{7}",
+        "ping\u{7f}",
+        "ping\u{85}",
+        long_kill.as_str(),
+        &"x".repeat(4095),
+    ] {
+        for args in [json!({"device": "ci-2", "command": command}), json!({"device": "ci-2", "commands": ["ping", command]})] {
+            let result = call(&rig, "console", args);
+            assert!(is_error(&result) && text(&result).starts_with("refused: "), "{:?}: {result}", &command[..command.len().min(12)]);
+            assert!(text(&result).contains("control character") || text(&result).contains("4095 bytes"), "says why: {result}");
+        }
+    }
+    // Even with the confirmation in hand: it isn't about asking.
+    let confirmed = call(&rig, "console", json!({"device": "ci-2", "command": "ki\rll", "confirm": true}));
+    assert!(is_error(&confirmed), "{confirmed}");
+    assert!(rig.fake.called("console").is_empty(), "nothing reached a console");
+    // A long command that is only long, one short of the line, is the console's to read.
+    assert!(!is_error(&call(&rig, "console", json!({"device": "ci-2", "command": "x".repeat(4094)}))));
 }
 
 #[test]
@@ -425,7 +459,8 @@ fn tools_that_only_sometimes_destroy_confirm_only_when_they_do() {
     assert!(is_error(&again) && text(&again).contains("needs the user's confirmation"), "{again}");
     // `confirm: true` doesn't reach the method either way.
     assert!(!is_error(&call(&rig, "console", json!({"device": "ci-1", "command": "kill", "confirm": true}))));
-    assert!(rig.fake.called("console").iter().all(|p| p.get("confirm").is_none()));
+    let sent = rig.fake.called("console");
+    assert!(!sent.is_empty() && sent.iter().all(|p| p.get("confirm").is_none()), "{sent:?}");
 }
 
 // ---- policy --------------------------------------------------------------------------------

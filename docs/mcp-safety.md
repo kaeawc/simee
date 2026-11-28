@@ -57,15 +57,14 @@ tool is an error when the policy is read: a misspelt tool would confirm nothing.
 
 ### What confirms, and what doesn't
 
-A `console` call is read the way the console runs it: every command of the call, and every line of
-each (the console takes a CR or an LF as the end of a command), so `ping\r\nkill` is a `kill` and
-a `kill` before a snapshot's deletion doesn't excuse it. The names are the stock console's, in
-`sim_core::console`, which `emu`'s own console parser matches through, so a name `emu` accepts for
-a deletion can't be one this layer doesn't know.
-
-Every tool the catalog marks as changing something was looked at. The rule: a call confirms when
-it removes something that nothing puts back (a device, files, an app and its data, a container, the
-keychain, a preference), signals a process, or stops a device the client didn't start.
+A `console` command with a control character (a CR, LF, NUL or tab, say), or one 4095 bytes long or
+longer, is refused outright, whatever it says. The stock console drops a CR instead of ending a line
+on it, ends a command at a NUL and starts a new line after 4095 bytes, while `emu`'s console ends a
+line at an LF, so `ki\rll`, `kill\0x` and 4095 bytes before `kill` are each a `kill` that no reading
+of the text finds: a command that could be read two ways isn't run. What is left is one short line of
+plain text per command (send several as `commands`), and every command of the call is read for what
+it does. The names are the stock console's, in `sim_core::console`, which `emu`'s own console parser
+matches through, so a name `emu` accepts for a deletion can't be one this layer doesn't know.
 
 | Confirms | Why |
 | --- | --- |
