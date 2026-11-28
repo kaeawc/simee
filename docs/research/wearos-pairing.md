@@ -56,6 +56,9 @@ From `DevicesConnectionStep.kt`, `WearPairingManager.createPairedDeviceBridge` a
 3. Check Google Play services is new enough on each side (version codes: reverse forwarding
    210915000 on the watch, multi-watch 213204000 on the phone, status 214412000, refresh
    213013000). An older one opens the Play Store page for GMS on that device and stops.
+   simee gates more strictly than Studio, which falls back to `dumpsys` and a restart of Play
+   services below status and refresh: it has neither fallback, so its preflight needs reverse
+   forwarding, refresh and status on the watch, and multi-watch and status on the phone.
 4. If the watch already has a peer that isn't this phone, it needs a **factory reset** (a Wear OS
    emulator pairs with one phone; a phone can pair several watches).
 5. Check the companion is installed on the phone; if not, open its Play Store page and wait for
@@ -155,7 +158,10 @@ adb per device with deadlines, `apps.rs`).
   stock emulator runs (as `install` and `launch` already do).
 - Cost: no process of its own and no per-device CPU beyond the forwarded stream.
 - Limits: the bridge must be rebuilt after an adb server restart or a device reboot (a
-  reconciler, below), and ports from 5602 up are claimed on the host.
+  reconciler, below), and a host port per pair is claimed. simee takes them from 49152 up, not from
+  stock's 5602: 5554 to 5682 is the emulators' own console and adb range, and a farm of 25 devices
+  or more reaches 5602 (the watch dials whichever host port its reverse names, so the number is
+  free to choose).
 
 ### Option 2: a virtual Bluetooth link between two emu instances
 

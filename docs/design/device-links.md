@@ -114,7 +114,7 @@ PR #447 (`docs/research/wearos-pairing.md`) arrived at the same file name, `link
 {"links": [{"id": "lnk-3f9a2c41", "kind": "watch-phone", "rev": 4, "mechanism": "adb-forward",
   "members": [{"platform": "android", "device": "pixel-9", "role": "phone"},
               {"platform": "android", "device": "wear-5", "role": "watch"}],
-  "params": {"phone_port": 5602}, "state": "active", "since": "2026-11-28T10:41:07Z"}]}
+  "params": {"phone_port": 49152}, "state": "active", "since": "2026-11-28T10:41:07Z"}]}
 ```
 
 Writing and reading:

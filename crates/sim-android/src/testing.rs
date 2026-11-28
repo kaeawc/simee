@@ -228,7 +228,8 @@ pub fn wait_for(lines: &Mutex<Vec<String>>, n: usize) -> Vec<String> {
 /// an FCM receiver that a root `am broadcast` reaches (`noroot` beside the script: no `su`), and
 /// `am broadcast -a` succeeds except for the protected `BOOT_COMPLETED`. `forward` keeps the adb
 /// server's forwards (every device's) in `forwards` beside the script, host ports from 41001, and
-/// the TCP tables say 8080 listens. `reverse` keeps each device's reverses in `reverses`, and the
+/// the TCP tables say 8080 listens (`ports_bound` makes adb unable to bind a host port range, as
+/// a farm's emulators do). `reverse` keeps each device's reverses in `reverses`, and the
 /// Wear OS pairing's commands (`sim_android::wear`) answer from `wear.<what>.<serial>` files
 /// ([`FakeAdb::wear`]): a phone and a watch with Play services, `logcat -T 1` that prints the
 /// companion's states only after its activity starts.
@@ -331,6 +332,15 @@ impl FakeAdb {
         std::fs::write(self.log.with_file_name("forward.busy"), n.to_string()).expect("busy flag");
     }
 
+    /// Makes adb unable to bind host ports `first` to `last`, as when emulators hold their console
+    /// and adb sockets there (a farm: 5554 to 5682). Adds to what was set before.
+    pub fn ports_bound(&self, first: u16, last: u16) {
+        use std::io::Write;
+        let mut f =
+            std::fs::OpenOptions::new().create(true).append(true).open(self.log.with_file_name("forward.bound")).expect("bound flag");
+        writeln!(f, "{first} {last}").expect("bound range");
+    }
+
     /// The forwards adb holds now, as `adb forward --list` prints them (`<serial> tcp:<host>
     /// tcp:<device>`).
     pub fn forwards(&self) -> Vec<String> {
@@ -351,7 +361,7 @@ impl FakeAdb {
 
     /// What a Wear OS pairing reads from `serial` (`sim_android::wear`): `what` is `status` (the
     /// text `get-pairing-status` prints after its `Broadcasting:` line), `setting` and `prop` (the
-    /// watch's companion choice), `abis`, `primer` (the line `logcat -T 1` prints first),
+    /// watch's companion choice), `abis`, `primer` (the line `logcat -T 1` prints first, after a buffer divider),
     /// `logcat` (the lines the pairing logs once the companion's activity starts), `logcat.exit` (the log
     /// ends after them instead of staying open), `noactivity`
     /// (the companion has no `EmulatorActivity`: any text), or `pkg.<package>` (what `dumpsys
@@ -566,6 +576,14 @@ forward)
       norebind=""
       [ "$1" = "--no-rebind" ] && norebind=1 && shift
       if [ -n "$norebind" ] && grep -q " $1 " "$f"; then echo "adb: error: cannot rebind existing socket" >&2; exit 1; fi
+      # `forward.bound`: `<first> <last>` host port ranges something else (an emulator's console and
+      # adb sockets) holds: adb can't bind them.
+      if [ -f "$d/forward.bound" ]; then
+        h=${1#tcp:}
+        while read -r lo hi; do
+          if [ "$h" -ge "$lo" ] && [ "$h" -le "$hi" ]; then echo "adb: error: cannot bind listener: Address already in use" >&2; exit 1; fi
+        done < "$d/forward.bound"
+      fi
       busy="$(cat "$d/forward.busy" 2>/dev/null || echo 0)"
       if [ "$busy" -gt 0 ]; then
         echo $((busy - 1)) > "$d/forward.busy"
@@ -590,12 +608,13 @@ reverse)
       if [ -e "$d/reverse.fail" ]; then echo "adb: error: closed" >&2; exit 1; fi
       grep -v "^$serial $1 " "$f" > "$f.$$"; echo "$serial $1 $2" >> "$f.$$"; mv "$f.$$" "$f";;
   esac;;
-# sim_android::wear's `logcat -T 1`: prints a primer line at once (as `-T 1` prints the last
-# line), then, once the companion's activity has been started (`wear.logcat.go.<serial>`, which
+# sim_android::wear's `logcat -T 1`: prints a buffer divider and a primer line at once (as `-T 1`
+# prints the last line), then, once the companion's activity has been started (`wear.logcat.go.<serial>`, which
 # only a start after this reader began creates: a start before it would have lost the lines), the
 # lines in `wear.logcat.<serial>`, then stays open (or ends, with `wear.logcat.exit.<serial>`).
 logcat)
   touch "$d/wear.logcat.listening.$serial"
+  echo "--------- beginning of main"
   cat "$d/wear.primer.$serial" 2>/dev/null || echo "11-28 10:00:00.000     1     1 I primer: the last line"
   i=0
   while [ ! -e "$d/wear.logcat.go.$serial" ] && [ $i -lt 500 ]; do sleep 0.02; i=$((i + 1)); done
@@ -619,7 +638,7 @@ shell)
       if [ -e "$d/wear.status.$serial" ]; then cat "$d/wear.status.$serial"
       else echo "Broadcast completed: result=1, data=\"Local:[node-$serial]\""; fi;;
     "am broadcast -a com.google.android.gms.wearable.EMULATOR --es operation refresh-emulator-connection")
-      printf 'Broadcasting: Intent { act=com.google.android.gms.wearable.EMULATOR flg=0x400000 (has extras) }\nBroadcast completed: result=0\n';;
+      printf 'Broadcasting: Intent { act=com.google.android.gms.wearable.EMULATOR flg=0x400000 (has extras) }\nBroadcast completed: result=1, data="Emulator connection refresh succeeded."\n';;
     "settings get secure cw.oem_companion_package") cat "$d/wear.setting.$serial" 2>/dev/null || echo null;;
     "getprop ro.oem.companion_package") cat "$d/wear.prop.$serial" 2>/dev/null || echo;;
     "getprop ro.product.cpu.abilist") cat "$d/wear.abis.$serial" 2>/dev/null || echo arm64-v8a;;

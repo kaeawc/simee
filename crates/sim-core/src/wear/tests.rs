@@ -1,13 +1,29 @@
 use super::*;
 
-// provisional: replace with the device capture from #442/#443. These are the texts Android
-// Studio's pairing assistant parses (its tests' fixtures), not output captured from an emulator.
+// Captured verbatim on real emu guests (the #442 device check, posted on #443): a phone with no
+// companion installed, and an unpaired Wear OS watch (API 37). The texts are exactly what adb
+// returned.
+const STATUS_PHONE_NO_COMPANION: &str = "Broadcasting: Intent { act=com.google.android.gms.wearable.EMULATOR flg=0x400000 (has extras) }\n\
+Broadcast completed: result=0\n";
+const STATUS_WATCH_UNPAIRED: &str = "Broadcasting: Intent { act=com.google.android.gms.wearable.EMULATOR flg=0x400000 (has extras) }\n\
+Broadcast completed: result=1, data=\"Local:[6973c660]\nPeer:[null,false,true]\n\"\n";
+const REFRESH_OUTPUT: &str = "Broadcasting: Intent { act=com.google.android.gms.wearable.EMULATOR flg=0x400000 (has extras) }\n\
+Broadcast completed: result=1, data=\"Emulator connection refresh succeeded.\"\n";
+/// The phone's `dumpsys package com.google.android.gms | grep versionCode`, and the watch's
+/// `dumpsys package com.google.android.wearable.app | grep -E 'versionName|versionCode'`.
+const GMS_PHONE: &str = "    versionCode=250834035 minSdk=35 targetSdk=35\n";
+const WEAR_APP_WATCH: &str = "    versionCode=790472107 minSdk=33 targetSdk=35\n    versionName=1.31.58.829364773\n";
+
+// provisional: a status with a real peer needs a phone with the companion installed and a Play
+// account, which no lane has; replace these with that capture. They are the texts Android
+// Studio's pairing assistant parses (its tests' fixtures).
 const STATUS_ONE_PEER: &str = "Broadcasting: Intent { act=com.google.android.gms.wearable.EMULATOR flg=0x400000 (has extras) }\n\
 Broadcast completed: result=1, data=\"Local:[LocalNodeId]\nPeer:[AnotherNode,false,false]\"";
-// provisional: replace with the device capture from #442/#443.
+// provisional: see above.
 const STATUS_TWO_PEERS: &str = "Broadcasting: Intent { act=com.google.android.gms.wearable.EMULATOR flg=0x400000 (has extras) }\n\
 Broadcast completed: result=1, data=\"Local:[TestNodeId]\nPeer:[TestNodeId,true,true]\nPeer:[AnotherNode,false,false]\"";
-// provisional: replace with the device capture from #442/#443.
+// provisional: no `[EMULATOR_PAIRING:*]` line has been captured (the companion needs a Play
+// account); this is the format Studio's tests use. Replace it with the device capture.
 const LOGCAT_FORMAT: &str = "08-17 11:35:01.797   439  2734 I EmulatorActivity:[EMULATOR_PAIRING:{}]";
 
 fn logcat(state: &str) -> String {
@@ -68,6 +84,46 @@ fn status_with_a_local_node_and_a_peer() {
     assert_eq!(s.local.as_deref(), Some("LocalNodeId"));
     assert_eq!(s.peers, [peer(Some("AnotherNode"), false, false)]);
     assert!(!s.is_connected("AnotherNode"));
+}
+
+#[test]
+fn a_phone_without_the_companion_has_no_status() {
+    // `result=0` and no `data=`: no node, no peers, and not an error.
+    assert_eq!(parse_pairing_status(STATUS_PHONE_NO_COMPANION), PairingStatus::default());
+}
+
+#[test]
+fn an_unpaired_watch_has_its_node_and_a_null_peer() {
+    let s = parse_pairing_status(STATUS_WATCH_UNPAIRED);
+    assert_eq!(s.local.as_deref(), Some("6973c660"));
+    // The slot with no node: enabled, not connected, nobody's.
+    assert_eq!(s.peers, [peer(None, false, true)]);
+    assert!(!s.is_connected("null") && s.peer("6973c660").is_none());
+    assert_eq!(watch_peer_conflict("watch", &s, "any-phone"), None, "an empty slot needs no factory reset");
+}
+
+#[test]
+fn the_refresh_broadcast_prints_no_status() {
+    assert_eq!(parse_pairing_status(REFRESH_OUTPUT), PairingStatus::default());
+}
+
+#[test]
+fn the_captured_watch_asks_for_the_pixel_companion_through_its_property() {
+    // `settings get secure cw.oem_companion_package` printed `null`; the property named the app.
+    let c = choose_companion("null\n", || Ok("com.google.android.apps.wear.companion\n".into())).expect("choice");
+    assert_eq!((c.package.as_str(), c.source), (PIXEL_COMPANION, CompanionSource::Property));
+}
+
+#[test]
+fn the_captured_package_versions_parse() {
+    let gms = parse_package_version(GMS_PHONE);
+    assert_eq!(gms, PackageVersion { code: Some(250_834_035), name: None });
+    assert!(Feature::ALL.iter().all(|f| f.in_version(gms.code.expect("code"))), "that Play services has every gate");
+    let app = parse_package_version(WEAR_APP_WATCH);
+    assert_eq!(app, PackageVersion { code: Some(790_472_107), name: Some("1.31.58.829364773".into()) });
+    assert!(companion_has_emulator_activity(LEGACY_COMPANION, app.code));
+    // The phone had neither companion: `dumpsys` printed nothing.
+    assert!(!parse_package_version("").installed());
 }
 
 #[test]
@@ -280,11 +336,11 @@ fn member<'a>(name: &'a str, form_factor: FormFactor, api: u32, play_store: bool
 }
 
 fn good_phone() -> Member<'static> {
-    member("phone", FormFactor::Phone, 36, true, Some(Feature::MultiWatch.min_version()))
+    member("phone", FormFactor::Phone, 36, true, Some(Feature::PairingStatus.min_version()))
 }
 
 fn good_watch() -> Member<'static> {
-    member("watch", FormFactor::Watch, 34, false, Some(Feature::ReverseForward.min_version()))
+    member("watch", FormFactor::Watch, 34, false, Some(Feature::PairingStatus.min_version()))
 }
 
 fn problems(phone: &Member<'_>, watch: &Member<'_>) -> Vec<String> {
@@ -349,23 +405,52 @@ fn a_wrong_form_factor_is_not_also_blamed_for_its_api() {
 }
 
 #[test]
-fn play_services_gates_sit_at_their_versions_on_each_side() {
-    let (multi, reverse) = (Feature::MultiWatch.min_version(), Feature::ReverseForward.min_version());
-    assert!(preflight(&Member { gms: Some(multi), ..good_phone() }, &good_watch()).is_empty());
-    let p = problems(&Member { gms: Some(multi - 1), ..good_phone() }, &good_watch());
-    assert_eq!(p.len(), 1);
-    assert!(p[0].contains(&format!("{}", multi - 1)) && p[0].contains(&multi.to_string()) && p[0].contains("several watches"), "{p:?}");
+fn the_phones_play_services_gates_sit_at_their_versions() {
+    // Multi-watch (213204000) and the status (214412000): the phone needs both.
+    let at = |v| preflight(&Member { gms: Some(v), ..good_phone() }, &good_watch());
+    let (multi, status) = (Feature::MultiWatch.min_version(), Feature::PairingStatus.min_version());
+    assert!(at(status).is_empty() && at(status + 1).is_empty());
+    let p: Vec<String> = at(status - 1).iter().map(Problem::to_string).collect();
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert!(p[0].contains(&(status - 1).to_string()) && p[0].contains(&status.to_string()) && p[0].contains("the pairing status"), "{p:?}");
     assert!(p[0].contains("update Google Play services on phone"), "{p:?}");
-    assert!(preflight(&good_phone(), &Member { gms: Some(reverse), ..good_watch() }).is_empty());
-    let p = problems(&good_phone(), &Member { gms: Some(reverse - 1), ..good_watch() });
-    assert_eq!(p.len(), 1);
-    assert!(p[0].contains("reverse port forwarding") && p[0].contains("update Google Play services on watch"), "{p:?}");
+    // Between the two it lacks only the status; below both, each is named with its version.
+    assert_eq!(at(multi).len(), 1);
+    let p: Vec<String> = at(multi - 1).iter().map(Problem::to_string).collect();
+    assert_eq!(p.len(), 2, "{p:?}");
+    assert!(p[0].contains(&multi.to_string()) && p[0].contains("several watches"), "{p:?}");
+    assert!(p[1].contains(&status.to_string()) && p[1].contains("the pairing status"), "{p:?}");
+}
+
+#[test]
+fn the_watchs_play_services_gates_sit_at_their_versions() {
+    // Reverse forwarding (210915000), refresh (213013000) and the status (214412000): the watch
+    // needs all three, so one between the first and the last fails the handshake later.
+    let at = |v| preflight(&good_phone(), &Member { gms: Some(v), ..good_watch() });
+    let (reverse, refresh, status) =
+        (Feature::ReverseForward.min_version(), Feature::RefreshConnection.min_version(), Feature::PairingStatus.min_version());
+    assert!(at(status).is_empty() && at(status + 1).is_empty());
+    let named = |v: u32| -> Vec<String> { at(v).iter().map(Problem::to_string).collect() };
+    let p = named(status - 1);
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert!(p[0].contains("the pairing status") && p[0].contains(&status.to_string()), "{p:?}");
+    let p = named(refresh);
+    assert_eq!(p.len(), 1, "at refresh it still lacks the status: {p:?}");
+    let p = named(refresh - 1);
+    assert_eq!(p.len(), 2, "{p:?}");
+    assert!(p[0].contains("refreshing the emulator connection") && p[0].contains(&refresh.to_string()), "{p:?}");
+    assert!(p[1].contains("the pairing status"), "{p:?}");
+    let p = named(reverse - 1);
+    assert_eq!(p.len(), 3, "{p:?}");
+    assert!(p[0].contains("reverse port forwarding") && p[0].contains(&reverse.to_string()), "{p:?}");
+    assert!(p.iter().all(|m| m.contains("update Google Play services on watch")), "{p:?}");
+    assert_eq!(named(reverse).len(), 2);
 }
 
 #[test]
 fn unreadable_play_services_asks_to_wait_or_update() {
     let p = problems(&Member { gms: None, ..good_phone() }, &Member { gms: None, ..good_watch() });
-    assert_eq!(p.len(), 2);
+    assert_eq!(p.len(), 2, "one for each side, not one for each feature");
     assert!(p.iter().all(|m| m.contains("isn't installed or couldn't be read")), "{p:?}");
 }
 
@@ -374,7 +459,8 @@ fn every_failure_is_listed_with_a_fix() {
     let bad_phone = member("p", FormFactor::Phone, 29, false, Some(1));
     let bad_watch = member("w", FormFactor::Watch, 27, false, Some(1));
     let all = preflight(&bad_phone, &bad_watch);
-    assert_eq!(all.len(), 5, "{all:?}");
+    // The phone: API, Play Store and two gates; the watch: API and three gates.
+    assert_eq!(all.len(), 4 + 4, "{all:?}");
     assert!(all.iter().all(|p| !p.problem.is_empty() && !p.fix.is_empty()));
 }
 

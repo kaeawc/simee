@@ -18,8 +18,11 @@ use crate::link::LinkState;
 
 /// The port the phone's companion app listens on, and the watch's Play services dials.
 pub const COMPANION_PORT: u16 = 5601;
-/// The first host port a bridge tries: the pair's own end of the forward and the reverse.
-pub const FIRST_BRIDGE_PORT: u16 = 5602;
+/// The first host port a bridge tries: the pair's own end of the forward and the reverse. Stock
+/// starts at 5602, but the watch dials whatever host port the reverse names, and 5554 to 5682 is
+/// the emulators' own console and adb range (a farm of 25 devices or more reaches 5602): the
+/// bridge scans from the start of the dynamic port range instead, clear of every emulator.
+pub const FIRST_BRIDGE_PORT: u16 = 49152;
 
 /// Google Play services.
 pub const GMS_PACKAGE: &str = "com.google.android.gms";
@@ -312,7 +315,8 @@ pub enum Feature {
     MultiWatch,
     /// `get-pairing-status` exists; older Play services say nothing.
     PairingStatus,
-    /// `refresh-emulator-connection` exists; older Play services need a restart instead.
+    /// `refresh-emulator-connection` exists. Older Play services would need a restart of Play
+    /// services instead, which simee doesn't do: the watch needs this too.
     RefreshConnection,
 }
 
@@ -393,8 +397,15 @@ fn update_play_services(name: &str) -> String {
     format!("update Google Play services on {name} (open its Play Store page for it) and run again")
 }
 
+/// What each side's Play services has to have: the watch dials the bridge (reverse forwarding),
+/// is told to reconnect (refresh) and reports its node (status); the phone lists several watches
+/// and reports its peers (status), which the handshake and [`pair_state`] read.
+const WATCH_FEATURES: [Feature; 3] = [Feature::ReverseForward, Feature::RefreshConnection, Feature::PairingStatus];
+const PHONE_FEATURES: [Feature; 2] = [Feature::MultiWatch, Feature::PairingStatus];
+
 /// Every reason `phone` and `watch` can't be paired, each with its fix; empty when they can.
-/// Checks the images and Play services (the companion app is [`companion_check`]).
+/// Checks the images and Play services against every feature the pairing uses ([`WATCH_FEATURES`]
+/// and [`PHONE_FEATURES`]; the companion app is [`companion_check`]).
 pub fn preflight(phone: &Member<'_>, watch: &Member<'_>) -> Vec<Problem> {
     let mut problems = Vec::new();
     if !matches!(phone.form_factor, FormFactor::Phone | FormFactor::Tablet | FormFactor::Foldable) {
@@ -409,7 +420,7 @@ pub fn preflight(phone: &Member<'_>, watch: &Member<'_>) -> Vec<Problem> {
         if !phone.play_store {
             problems.push(Problem::new(format!("{} has no Google Play Store, which the companion app comes from", phone.name), PLAY_IMAGE));
         }
-        problems.extend(gms_problem(phone.name, phone.gms, Feature::MultiWatch));
+        problems.extend(gms_problems(phone.name, phone.gms, &PHONE_FEATURES));
     }
     if watch.form_factor != FormFactor::Watch {
         problems.push(Problem::new(
@@ -423,25 +434,30 @@ pub fn preflight(phone: &Member<'_>, watch: &Member<'_>) -> Vec<Problem> {
                 "create the watch from an API 28 or newer Wear OS image",
             ));
         }
-        problems.extend(gms_problem(watch.name, watch.gms, Feature::ReverseForward));
+        problems.extend(gms_problems(watch.name, watch.gms, &WATCH_FEATURES));
     }
     problems
 }
 
-/// `name`'s Play services (`version`) against what `feature` needs.
-fn gms_problem(name: &str, version: Option<u32>, feature: Feature) -> Option<Problem> {
-    let min = feature.min_version();
-    match version {
-        None => Some(Problem::new(
+/// `name`'s Play services (`version`) against what `features` need: one problem for each feature
+/// it lacks, so each says which version has it.
+fn gms_problems(name: &str, version: Option<u32>, features: &[Feature]) -> Vec<Problem> {
+    let Some(v) = version else {
+        return vec![Problem::new(
             format!("Google Play services on {name} isn't installed or couldn't be read (wait for the device to finish booting)"),
             update_play_services(name),
-        )),
-        Some(v) if !feature.in_version(v) => Some(Problem::new(
-            format!("Google Play services {v} on {name} is older than {min}, the first with {}", feature.what()),
-            update_play_services(name),
-        )),
-        Some(_) => None,
-    }
+        )];
+    };
+    features
+        .iter()
+        .filter(|f| !f.in_version(v))
+        .map(|f| {
+            Problem::new(
+                format!("Google Play services {v} on {name} is older than {}, the first with {}", f.min_version(), f.what()),
+                update_play_services(name),
+            )
+        })
+        .collect()
 }
 
 /// Whether the phone can pair through `companion` (the watch's choice), from what it has:
