@@ -31,6 +31,12 @@ struct Cli {
     /// server fail instead of running here.
     #[arg(long, global = true)]
     verbose: bool,
+    /// The iOS device set to work in: a directory of simulators, as `simctl --set` takes (`create`
+    /// makes it). Its devices boot with no Simulator.app window. Default: `$SIMEE_IOS_DEVICE_SET`,
+    /// else the default set; `--set ''` is the default set. For `serve` and `mcp`, set
+    /// `SIMEE_IOS_DEVICE_SET` instead.
+    #[arg(long, global = true, value_name = "DIR")]
+    set: Option<String>,
     #[command(subcommand)]
     command: Cmd,
 }
@@ -446,7 +452,8 @@ enum Cmd {
     /// serve MCP's Streamable HTTP transport instead, at `http://ADDR/mcp`.
     Mcp {
         /// Serve Streamable HTTP on ADDR (default 127.0.0.1:8377). Every request needs a bearer
-        /// token (see `--token-file`); a non-loopback ADDR also needs `--insecure-remote`.
+        /// token (see `--token-file`); a non-loopback ADDR also needs TLS (`--tls-cert` and
+        /// `--tls-key`, or `--tls-self-signed`) or `--insecure-remote`.
         #[arg(long, value_name = "ADDR", num_args = 0..=1, default_missing_value = sim_mcp::http::DEFAULT_ADDR)]
         http: Option<String>,
         /// Bearer tokens, one per line, in a file of your own that only you can read, in a
@@ -459,12 +466,14 @@ enum Cmd {
         /// a reverse proxy on this host forwards, can then drive the devices.
         #[arg(long, requires = "http", conflicts_with = "token_file")]
         no_auth: bool,
-        /// Serve a non-loopback ADDR over plain HTTP (there is no TLS: the token crosses the network
-        /// in the clear; use a trusted network or a TLS proxy).
-        #[arg(long, requires = "http")]
+        /// Serve a non-loopback ADDR over plain HTTP: the token crosses the network in the clear,
+        /// so use a trusted network or a TLS proxy. Not needed with TLS.
+        #[arg(long, alias = "insecure", requires = "http")]
         insecure_remote: bool,
         #[command(flatten)]
         safety: mcp_safety::McpSafety,
+        #[command(flatten)]
+        tls: McpTls,
     },
     /// Read the audit log `simee mcp` keeps of every tool call: client, tool, arguments (secrets
     /// removed), how it ended and how long it took (docs/mcp-safety.md).
@@ -530,14 +539,36 @@ enum CameraCmd {
     },
 }
 
+/// `simee mcp --http`'s TLS flags. They need a build with the `tls` feature (`cargo build -p simee
+/// --features tls`); without it the server says so and doesn't start.
+#[derive(clap::Args, Clone, Debug, Default, PartialEq, Eq)]
+struct McpTls {
+    /// Serve HTTPS (TLS 1.3) with this PEM certificate chain, leaf first.
+    #[arg(long, value_name = "PATH", requires_all = ["tls_key", "http"], conflicts_with = "tls_self_signed")]
+    tls_cert: Option<std::path::PathBuf>,
+    /// The PEM private key of `--tls-cert`.
+    #[arg(long, value_name = "PATH", requires = "tls_cert")]
+    tls_key: Option<std::path::PathBuf>,
+    /// For development: serve HTTPS with a self-signed certificate, made on first use and kept in
+    /// simee's state directory (a file only you can read). The server prints the certificate's
+    /// SHA-256 fingerprint: pin that in the client.
+    #[arg(long, requires = "http")]
+    tls_self_signed: bool,
+    /// A host name or address the self-signed certificate must also name (repeatable), besides
+    /// `localhost`, the loopback addresses and the address bound.
+    #[arg(long, value_name = "NAME", requires = "tls_self_signed")]
+    tls_name: Vec<String>,
+}
+
 /// `simee mcp --http`'s settings: the address (`host:port`, a name resolved to its first address),
-/// the token file (or none, `--no-auth`), the toolsets `SIMEE_MCP_TOOLSETS` names and the screen
+/// the token file (or none, `--no-auth`), TLS, the toolsets `SIMEE_MCP_TOOLSETS` names and the screen
 /// subscription pace `SIMEE_MCP_SCREEN_FPS` sets.
 fn mcp_http_config(
     addr: &str,
     token_file: Option<std::path::PathBuf>,
     no_auth: bool,
     insecure_remote: bool,
+    tls: &McpTls,
 ) -> Result<sim_mcp::http::Config> {
     use std::net::ToSocketAddrs as _;
     let addr = addr
@@ -549,6 +580,11 @@ fn mcp_http_config(
     config.token_file = token_file;
     config.no_auth = no_auth;
     config.insecure_remote = insecure_remote;
+    config.tls = match (&tls.tls_cert, &tls.tls_key) {
+        (Some(cert), Some(key)) => Some(sim_mcp::http::Tls::Files { cert: cert.clone(), key: key.clone() }),
+        _ if tls.tls_self_signed => Some(sim_mcp::http::Tls::SelfSigned { dir: None, names: tls.tls_name.clone() }),
+        _ => None,
+    };
     config.toolsets = sim_mcp::Toolsets::from_env().map_err(anyhow::Error::msg)?;
     config.timing = sim_mcp::server::Timing::from_env().map_err(anyhow::Error::msg)?;
     Ok(config)
@@ -556,6 +592,10 @@ fn mcp_http_config(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let set = command_set(cli.set.as_deref(), std::env::var(sim_core::device::DEVICE_SET_ENV).ok().as_deref());
+    if cli.set.is_some() && matches!(cli.command, Cmd::Serve { .. } | Cmd::Mcp { .. }) {
+        anyhow::bail!("--set names the device set of one command; start a server on a set with SIMEE_IOS_DEVICE_SET=<dir>");
+    }
     match &cli.command {
         Cmd::Serve { socket } => {
             let path = socket.clone().unwrap_or_else(sim_api::default_socket);
@@ -578,9 +618,9 @@ fn main() -> Result<()> {
             served?;
             return Ok(());
         }
-        Cmd::Mcp { http: Some(addr), token_file, no_auth, insecure_remote, safety } => {
+        Cmd::Mcp { http: Some(addr), token_file, no_auth, insecure_remote, tls, safety } => {
             safety.install()?;
-            let config = mcp_http_config(addr, token_file.clone(), *no_auth, *insecure_remote)?;
+            let config = mcp_http_config(addr, token_file.clone(), *no_auth, *insecure_remote, tls)?;
             mcp_shutdown_on_signal()?;
             let served = sim_mcp::http::serve(std::sync::Arc::new(sim_mcp::ApiBackend::new()), config);
             sim_api::stop_streams();
@@ -590,7 +630,7 @@ fn main() -> Result<()> {
         Cmd::Call { method, params, socket } => {
             let path = socket.clone().unwrap_or_else(sim_api::default_socket);
             let params: Value = serde_json::from_str(params).context("params must be JSON")?;
-            let result = sim_api::call(&path, method, params).map_err(anyhow::Error::msg)?;
+            let result = sim_api::call(&path, method, with_set(params, set.as_deref())).map_err(anyhow::Error::msg)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             return Ok(());
         }
@@ -600,6 +640,7 @@ fn main() -> Result<()> {
     let mut transport = if in_process { Transport::local() } else { Transport::open(&sim_api::default_socket()) };
     transport.verbose = cli.verbose || flag("SIMEE_VERBOSE");
     transport.require = flag("SIMEE_REQUIRE_SERVER");
+    transport.set = set;
     let (stdout, stderr) = (std::io::stdout(), std::io::stderr());
     run(cli.command, &mut transport, &mut stdout.lock(), &mut stderr.lock())
 }
@@ -619,6 +660,32 @@ fn mcp_shutdown_on_signal() -> Result<()> {
         sim_api::shutdown::exit(sig);
     })
     .context("watching SIGINT and SIGTERM")
+}
+
+/// `--set`'s directory as it is sent: absolute (the process that runs the method may be a server
+/// elsewhere), or empty for the default set.
+fn set_arg(dir: &str) -> String {
+    match dir {
+        "" => String::new(),
+        dir => std::path::absolute(dir).map_or_else(|_| dir.to_owned(), |p| p.display().to_string()),
+    }
+}
+
+/// The iOS device set this command works in, sent with every call (#409): `--set`, else this
+/// process's `SIMEE_IOS_DEVICE_SET` (`env`), else `""`, the default set. It is always said, so a
+/// server never fills it in from its own environment.
+fn command_set(flag: Option<&str>, env: Option<&str>) -> Option<String> {
+    Some(set_arg(flag.or(env).unwrap_or("")))
+}
+
+/// `params` with the command's `set` added when they have none (#409).
+fn with_set(params: Value, set: Option<&str>) -> Value {
+    let Some(set) = set else { return params };
+    let mut params = if params.is_null() { json!({}) } else { params };
+    if let Some(p) = params.as_object_mut() {
+        p.entry("set").or_insert_with(|| json!(set));
+    }
+    params
 }
 
 /// Whether an on/off environment variable is on (set, not empty, not `0`).
@@ -648,6 +715,8 @@ struct Transport {
     local: Option<Box<sim_api::Session>>,
     verbose: bool,
     require: bool,
+    /// The command's iOS device set ([`command_set`]), sent with every method.
+    set: Option<String>,
 }
 
 impl Transport {
@@ -659,6 +728,7 @@ impl Transport {
             local: None,
             verbose: false,
             require: false,
+            set: None,
         }
     }
 
@@ -689,6 +759,7 @@ impl Transport {
     }
 
     fn route(&mut self, method: &str, params: Value, binary: bool) -> Result<(Value, Option<Vec<u8>>)> {
+        let params = with_set(params, self.set.as_deref());
         let forwards = sim_api::forwards(method);
         let forward = forwards && self.connected();
         if forwards && !forward {
@@ -1344,6 +1415,25 @@ fn xr_params(device: &str, words: &[String]) -> Result<Value> {
 mod tests {
     use super::*;
 
+    /// #409: `--set` goes with every method a command calls, as an absolute path, before or after
+    /// the subcommand; a `set` the params already have stays; with no set at all (a test's
+    /// transport) nothing is added.
+    #[test]
+    fn the_set_flag_goes_with_every_call_as_an_absolute_path() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).expect("arguments");
+        assert_eq!(parse(&["--set", "/farm/set", "list"]).set.as_deref(), Some("/farm/set"));
+        assert_eq!(parse(&["list", "--set", "/farm/set"]).set.as_deref(), Some("/farm/set"));
+        assert_eq!(parse(&["list"]).set, None);
+        let cwd = std::env::current_dir().expect("cwd");
+        assert_eq!(set_arg("sets/a"), cwd.join("sets/a").display().to_string());
+        assert_eq!(set_arg("/farm/set"), "/farm/set");
+        assert_eq!(set_arg(""), "", "the default set, over the environment's");
+        assert_eq!(with_set(json!({"device": "booted"}), Some("/s")), json!({"device": "booted", "set": "/s"}));
+        assert_eq!(with_set(json!({"set": "/mine"}), Some("/s")), json!({"set": "/mine"}));
+        assert_eq!(with_set(json!({"device": "booted"}), None), json!({"device": "booted"}));
+        assert_eq!(with_set(Value::Null, Some("/s")), json!({"set": "/s"}));
+    }
+
     #[test]
     fn camera_file_sources_are_sent_as_absolute_paths() {
         let cwd = std::env::current_dir().expect("cwd");
@@ -1653,7 +1743,14 @@ mod tests {
         let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
         assert!(matches!(parse(&["mcp"]), Ok(Cmd::Mcp { http: None, token_file: None, no_auth: false, insecure_remote: false, .. })));
         let mut transport = Transport::local();
-        let stdio = Cmd::Mcp { http: None, token_file: None, no_auth: false, insecure_remote: false, safety: Default::default() };
+        let stdio = Cmd::Mcp {
+            http: None,
+            token_file: None,
+            no_auth: false,
+            insecure_remote: false,
+            tls: McpTls::default(),
+            safety: Default::default(),
+        };
         let e = run(stdio, &mut transport, &mut Vec::new(), &mut Vec::new()).expect_err("served by main, not run");
         assert!(e.to_string().contains("`mcp` and `mcp-audit` don't run through a transport"));
     }
@@ -1678,11 +1775,36 @@ mod tests {
         assert!(parse(&["mcp", "--insecure-remote"]).is_err(), "so does the acknowledgement");
         assert!(parse(&["mcp", "--no-auth"]).is_err(), "and --no-auth");
         // With no flag, authentication is on (the state directory's token file).
-        let config = mcp_http_config("127.0.0.1:0", None, false, false).expect("config");
-        assert!(config.addr.ip().is_loopback() && config.token_file.is_none() && !config.no_auth);
-        assert!(mcp_http_config("127.0.0.1:0", None, true, false).expect("config").no_auth);
-        assert!(mcp_http_config("localhost:8377", None, false, false).expect("a name resolves").addr.ip().is_loopback());
-        assert!(mcp_http_config("nonsense", None, false, false).is_err());
+        let plain = McpTls::default();
+        let config = mcp_http_config("127.0.0.1:0", None, false, false, &plain).expect("config");
+        assert!(config.addr.ip().is_loopback() && config.token_file.is_none() && !config.no_auth && config.tls.is_none());
+        assert!(mcp_http_config("127.0.0.1:0", None, true, false, &plain).expect("config").no_auth);
+        assert!(mcp_http_config("localhost:8377", None, false, false, &plain).expect("a name resolves").addr.ip().is_loopback());
+        assert!(mcp_http_config("nonsense", None, false, false, &plain).is_err());
+        // The acknowledgement is also spelled `--insecure`.
+        assert!(matches!(parse(&["mcp", "--http", "0.0.0.0:9000", "--insecure"]), Ok(Cmd::Mcp { insecure_remote: true, .. })));
+    }
+
+    #[test]
+    fn mcp_http_takes_a_certificate_and_key_or_a_self_signed_one() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
+        let Ok(Cmd::Mcp { tls, .. }) = parse(&["mcp", "--http", "0.0.0.0:9000", "--tls-cert", "c.pem", "--tls-key", "k.pem"]) else {
+            panic!("a certificate and key")
+        };
+        let config = mcp_http_config("127.0.0.1:0", None, false, false, &tls).expect("config");
+        assert!(matches!(&config.tls, Some(sim_mcp::http::Tls::Files { cert, key }) if cert.ends_with("c.pem") && key.ends_with("k.pem")));
+        let Ok(Cmd::Mcp { tls, .. }) = parse(&["mcp", "--http", "--tls-self-signed", "--tls-name", "box.lan", "--tls-name", "10.0.0.5"])
+        else {
+            panic!("self-signed")
+        };
+        let config = mcp_http_config("127.0.0.1:0", None, false, false, &tls).expect("config");
+        assert!(matches!(&config.tls, Some(sim_mcp::http::Tls::SelfSigned { dir: None, names }) if names == &["box.lan", "10.0.0.5"]));
+        assert!(parse(&["mcp", "--http", "--tls-cert", "c.pem"]).is_err(), "a certificate needs its key");
+        assert!(parse(&["mcp", "--http", "--tls-key", "k.pem"]).is_err(), "and a key its certificate");
+        assert!(parse(&["mcp", "--http", "--tls-self-signed", "--tls-cert", "c.pem", "--tls-key", "k.pem"]).is_err(), "not both");
+        assert!(parse(&["mcp", "--http", "--tls-name", "box.lan"]).is_err(), "a name is for the self-signed certificate");
+        assert!(parse(&["mcp", "--tls-self-signed"]).is_err(), "TLS needs --http");
+        assert!(parse(&["mcp", "--tls-cert", "c.pem", "--tls-key", "k.pem"]).is_err(), "so does a certificate");
     }
 
     #[test]
@@ -1721,19 +1843,26 @@ mod tests {
     /// A server on `socket` that records each method it is sent and answers with `answer`; `None`
     /// never answers (a wedged server).
     fn fake_server(socket: &std::path::Path, answer: Option<Answer>) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        fake_server_params(socket, answer).0
+    }
+
+    /// [`fake_server`], recording each request's params too.
+    fn fake_server_params(socket: &std::path::Path, answer: Option<Answer>) -> (Seen<String>, Seen<Value>) {
         use std::io::BufRead;
         let listener = std::os::unix::net::UnixListener::bind(socket).expect("bind");
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let record = seen.clone();
+        let params = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (record, record_params) = (seen.clone(), params.clone());
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let record = record.clone();
+                let (record, record_params) = (record.clone(), record_params.clone());
                 std::thread::spawn(move || {
                     let mut writer = stream.try_clone().expect("clone");
                     for line in std::io::BufReader::new(stream).lines().map_while(Result::ok) {
                         let req: Value = serde_json::from_str(&line).expect("request");
                         let method = req["method"].as_str().unwrap_or("").to_owned();
                         record.lock().expect("lock").push(method.clone());
+                        record_params.lock().expect("lock").push(req["params"].clone());
                         match answer {
                             Some(answer) => {
                                 let reply = match answer(&method) {
@@ -1748,7 +1877,38 @@ mod tests {
                 });
             }
         });
-        seen
+        (seen, params)
+    }
+
+    /// What a fake server has been sent, as it arrives.
+    type Seen<T> = std::sync::Arc<std::sync::Mutex<Vec<T>>>;
+
+    /// #409: the device set is this command's, said on every call: `--set`, else this process's
+    /// `SIMEE_IOS_DEVICE_SET` (made absolute), else the default set (`""`). A server with another
+    /// set in its environment never picks the set (it would be the owner's default set).
+    #[test]
+    fn the_commands_own_device_set_reaches_a_server_on_every_call() {
+        let root = android_root("set-forward");
+        let cwd = std::env::current_dir().expect("cwd");
+        for (i, (flag, env, sent)) in [
+            (None, Some("/farm/sims"), "/farm/sims".to_owned()),
+            (None, Some("farm/sims"), cwd.join("farm/sims").display().to_string()),
+            (Some("/mine"), Some("/farm/sims"), "/mine".to_owned()),
+            (Some(""), Some("/farm/sims"), String::new()),
+            (None, None, String::new()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let socket = root.join(format!("{i}.sock"));
+            let (seen, params) =
+                fake_server_params(&socket, Some(|m| Ok(if m == "identity" { sim_api::identity().clone() } else { Value::Null })));
+            let mut transport = Transport { set: command_set(flag, env), ..Transport::open(&socket) };
+            assert_eq!(outputs(&mut transport, &["shutdown", "booted"]).2, None, "{flag:?} {env:?}");
+            assert_eq!(*seen.lock().expect("lock"), ["identity", "shutdown"], "{flag:?} {env:?}: forwarded");
+            assert_eq!(params.lock().expect("lock")[1], json!({"device": "booted", "set": sent}), "{flag:?} {env:?}");
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

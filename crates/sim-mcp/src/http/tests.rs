@@ -8,6 +8,9 @@ use super::*;
 use crate::backend::fake::Fake;
 use crate::rpc::{EXT_TASKS, META_CLIENT_CAPS, META_VERSION};
 
+#[cfg(feature = "tls")]
+mod https;
+
 const WAIT: Duration = Duration::from_secs(10);
 
 fn limits() -> Limits {
@@ -107,11 +110,79 @@ fn raw_exchange(addr: SocketAddr, bytes: &[u8], quiet: Duration) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// How a client reaches the server over TLS: its configuration and the name it expects (none:
+/// plain HTTP).
+#[cfg(feature = "tls")]
+type Trust = Option<(Arc<rustls::ClientConfig>, rustls::pki_types::ServerName<'static>)>;
+#[cfg(not(feature = "tls"))]
+type Trust = Option<std::convert::Infallible>;
+
+/// A client's end of a connection: the socket, or a TLS session over it.
+enum Wire {
+    Plain(TcpStream),
+    #[cfg(feature = "tls")]
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Wire {
+    fn open(addr: SocketAddr, trust: &Trust) -> Wire {
+        let tcp = TcpStream::connect(addr).expect("connect");
+        tcp.set_read_timeout(Some(WAIT)).expect("timeout");
+        tcp.set_nodelay(true).expect("nodelay");
+        #[cfg(feature = "tls")]
+        if let Some((config, name)) = trust {
+            let conn = rustls::ClientConnection::new(config.clone(), name.clone()).expect("a client session");
+            return Wire::Tls(Box::new(rustls::StreamOwned::new(conn, tcp)));
+        }
+        #[cfg(not(feature = "tls"))]
+        let _ = trust;
+        Wire::Plain(tcp)
+    }
+
+    /// The socket underneath (for TLS, the one the records travel on).
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Wire::Plain(tcp) => tcp,
+            #[cfg(feature = "tls")]
+            Wire::Tls(tls) => tls.get_ref(),
+        }
+    }
+}
+
+impl Read for Wire {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Wire::Plain(tcp) => tcp.read(buf),
+            #[cfg(feature = "tls")]
+            Wire::Tls(tls) => tls.read(buf),
+        }
+    }
+}
+
+impl Write for Wire {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Wire::Plain(tcp) => tcp.write(buf),
+            #[cfg(feature = "tls")]
+            Wire::Tls(tls) => tls.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Wire::Plain(tcp) => tcp.flush(),
+            #[cfg(feature = "tls")]
+            Wire::Tls(tls) => tls.flush(),
+        }
+    }
+}
+
 /// A client on one kept-alive connection, with the headers it sends on every request. A response
 /// that closes the connection makes the next request open a new one.
 struct Client {
     addr: SocketAddr,
-    reader: BufReader<TcpStream>,
+    trust: Trust,
+    reader: BufReader<Wire>,
     session: Option<String>,
     token: Option<String>,
     headers: Vec<(String, String)>,
@@ -121,16 +192,16 @@ struct Client {
 
 impl Client {
     fn connect(addr: SocketAddr) -> Client {
-        let stream = TcpStream::connect(addr).expect("connect");
-        stream.set_read_timeout(Some(WAIT)).expect("timeout");
-        stream.set_nodelay(true).expect("nodelay");
-        Client { addr, reader: BufReader::new(stream), session: None, token: None, headers: Vec::new(), next: 1, closed: false }
+        Client::connect_with(addr, None)
+    }
+
+    fn connect_with(addr: SocketAddr, trust: Trust) -> Client {
+        let reader = BufReader::new(Wire::open(addr, &trust));
+        Client { addr, trust, reader, session: None, token: None, headers: Vec::new(), next: 1, closed: false }
     }
 
     fn reconnect(&mut self) {
-        let stream = TcpStream::connect(self.addr).expect("connect");
-        stream.set_read_timeout(Some(WAIT)).expect("timeout");
-        self.reader = BufReader::new(stream);
+        self.reader = BufReader::new(Wire::open(self.addr, &self.trust));
         self.closed = false;
     }
 
@@ -526,6 +597,37 @@ fn every_bind_requires_a_token_unless_no_auth_on_loopback() {
     assert!(prepare_auth(&config, from_state_dir).is_err());
 }
 
+#[test]
+fn a_non_loopback_bind_needs_tls_or_the_acknowledgement_and_still_a_token() {
+    let scratch = Scratch::new("remote-tls");
+    let token_file = scratch.0.join("state/mcp-token");
+    let mut config = Config::new("192.0.2.1:0".parse().expect("addr"));
+    let e = prepare_auth(&config, || unreachable!("no default token file here")).err().expect("plain HTTP off loopback");
+    let message = e.to_string();
+    assert!(message.contains("--tls-cert") && message.contains("--tls-self-signed") && message.contains("--insecure-remote"), "{message}");
+    // TLS is what makes it safe to bind there: the token is still required, and --no-auth still isn't allowed.
+    config.tls = Some(Tls::SelfSigned { dir: None, names: Vec::new() });
+    config.token_file = Some(token_file);
+    assert!(prepare_auth(&config, || unreachable!()).expect("TLS configured").is_some(), "a token is required over TLS too");
+    config.token_file = None;
+    config.no_auth = true;
+    let e = prepare_auth(&config, || unreachable!()).err().expect("--no-auth off loopback");
+    assert!(e.to_string().contains("loopback"), "{e}");
+}
+
+#[cfg(not(feature = "tls"))]
+#[test]
+fn without_the_tls_feature_asking_for_tls_is_an_error_that_says_how_to_build_it() {
+    let scratch = Scratch::new("no-tls-feature");
+    let mut config = Config::new("127.0.0.1:0".parse().expect("addr"));
+    config.no_auth = true;
+    config.tls = Some(Tls::SelfSigned { dir: Some(scratch.0.clone()), names: Vec::new() });
+    let e = start(Arc::new(Fake::with_devices()), config).err().expect("no TLS in this build");
+    assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
+    assert!(e.to_string().contains("--features tls"), "{e}");
+    assert_eq!(std::fs::read_dir(&scratch.0).expect("dir").count(), 0, "and nothing was written");
+}
+
 /// A rig that requires a token, and the token.
 fn authed_rig(scratch: &Scratch) -> (Rig, String) {
     let path = scratch.0.join("state/mcp-token");
@@ -727,7 +829,7 @@ fn oversized_and_malformed_requests_are_refused() {
     assert_eq!((reply.status, reply.header("connection")), (413, Some("close")), "{reply:?}");
     // Chunked past the limit.
     let mut client = rig.client();
-    let mut stream = client.reader.get_ref().try_clone().expect("clone");
+    let mut stream = client.reader.get_ref().tcp().try_clone().expect("clone");
     let head = format!(
         "POST {ENDPOINT} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
         rig.running.addr()
@@ -749,7 +851,7 @@ fn oversized_and_malformed_requests_are_refused() {
     let mut client = rig.client();
     let body = json!({"jsonrpc": "2.0", "id": 9, "method": "server/discover", "params": {}}).to_string();
     let (a, b) = body.split_at(10);
-    let mut stream = client.reader.get_ref().try_clone().expect("clone");
+    let mut stream = client.reader.get_ref().tcp().try_clone().expect("clone");
     stream.write_all(head.as_bytes()).expect("head");
     stream.write_all(format!("{:x}\r\n{a}\r\n{:x}\r\n{b}\r\n0\r\n\r\n", a.len(), b.len()).as_bytes()).expect("chunks");
     assert_eq!(client.read_reply().json()["id"], 9);
@@ -854,7 +956,7 @@ fn concurrent_sessions_are_isolated() {
     };
     assert_eq!(updated["params"]["uri"], "simee://devices/phone");
     // B's stream has had only pings meanwhile.
-    b_stream.reader.get_ref().set_read_timeout(Some(Duration::from_millis(400))).expect("timeout");
+    b_stream.reader.get_ref().tcp().set_read_timeout(Some(Duration::from_millis(400))).expect("timeout");
     let mut seen = String::new();
     while let Ok(Some(chunk)) = b_stream.try_chunk() {
         seen.push_str(&chunk);
@@ -866,7 +968,7 @@ fn concurrent_sessions_are_isolated() {
     // Ending A leaves B working, and ends A's stream.
     a.write_request("DELETE", &[], b"");
     assert_eq!(a.read_reply().status, 204);
-    a_stream.reader.get_ref().set_read_timeout(Some(WAIT)).expect("timeout");
+    a_stream.reader.get_ref().tcp().set_read_timeout(Some(WAIT)).expect("timeout");
     while a_stream.chunk().is_some() {}
     assert_eq!(b.call("ping", json!({}))["result"], json!({}));
     assert_eq!(rig.running.sessions(), 1);
@@ -924,23 +1026,26 @@ fn a_full_session_table_closes_the_idlest_session_first() {
 #[test]
 fn the_router_puts_the_clients_ids_back() {
     let router = Router::default();
-    let (tx, rx) = channel();
-    router.insert("h7".into(), Route { id: json!({"weird": 1}).get("weird").cloned().expect("id"), token: Some(json!("tok")), tx });
+    let (tx, rx) = note_queue(NOTE_QUEUE);
+    router.insert(
+        "h7".into(),
+        Route { id: json!({"weird": 1}).get("weird").cloned().expect("id"), token: Some(json!("tok")), tx: Arc::new(tx) },
+    );
     router.deliver(r#"{"id":"h7","jsonrpc":"2.0","result":{"x":"{\"id\":\"h7\"}"}}"#.into(), None);
-    let Ok(Out::Response(line)) = rx.try_recv() else { panic!("a response") };
+    let Ok(Out::Response(line)) = rx.recv_timeout(Duration::ZERO) else { panic!("a response") };
     assert_eq!(serde_json::from_str::<Value>(&line).expect("json"), json!({"id": 1, "jsonrpc": "2.0", "result": {"x": "{\"id\":\"h7\"}"}}));
     assert!(lock(&router.routes).is_empty(), "a response ends its route");
     // Insertion order (`jsonrpc` first) and an error (`error` first) are found too.
     for line in [r#"{"jsonrpc":"2.0","id":"h8","result":{}}"#, r#"{"error":{"code":1,"message":"m"},"id":"h8","jsonrpc":"2.0"}"#] {
-        let (tx, rx) = channel();
-        router.insert("h8".into(), Route { id: json!("mine"), token: None, tx });
+        let (tx, rx) = note_queue(NOTE_QUEUE);
+        router.insert("h8".into(), Route { id: json!("mine"), token: None, tx: Arc::new(tx) });
         router.deliver(line.into(), None);
-        let Ok(Out::Response(out)) = rx.try_recv() else { panic!("a response for {line}") };
+        let Ok(Out::Response(out)) = rx.recv_timeout(Duration::ZERO) else { panic!("a response for {line}") };
         assert_eq!(serde_json::from_str::<Value>(&out).expect("json")["id"], "mine");
     }
     // Progress for no request, and messages with no route, go nowhere; the rest go to the session.
     let standalone: Standalone = Mutex::new(None);
-    let (tx, rx) = note_queue(STANDALONE_QUEUE);
+    let (tx, rx) = note_queue(NOTE_QUEUE);
     *lock(&standalone) = Some((0, tx));
     router.deliver(
         r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"h99","progress":1}}"#.into(),
@@ -965,17 +1070,17 @@ fn queued(rx: &NoteRx) -> Vec<String> {
 fn a_get_stream_nobody_reads_queues_a_bounded_number_and_never_blocks_the_sender() {
     let router = Router::default();
     let standalone: Standalone = Mutex::new(None);
-    let (tx, rx) = note_queue(STANDALONE_QUEUE);
+    let (tx, rx) = note_queue(NOTE_QUEUE);
     *lock(&standalone) = Some((0, tx));
     // Three times the queue's worth of different resources for a client that stopped reading:
     // every `deliver` returns at once.
-    for n in 0..STANDALONE_QUEUE * 3 {
+    for n in 0..NOTE_QUEUE * 3 {
         router.deliver(updated(&format!("u{n}")), Some(&standalone));
     }
     let got = queued(&rx);
-    assert_eq!(got.len(), STANDALONE_QUEUE);
-    assert!(got[0].contains(&format!("\"u{}\"", STANDALONE_QUEUE * 2)), "the oldest are dropped, not the newest");
-    assert!(got[STANDALONE_QUEUE - 1].contains(&format!("\"u{}\"", STANDALONE_QUEUE * 3 - 1)));
+    assert_eq!(got.len(), NOTE_QUEUE);
+    assert!(got[0].contains(&format!("\"u{}\"", NOTE_QUEUE * 2)), "the oldest are dropped, not the newest");
+    assert!(got[NOTE_QUEUE - 1].contains(&format!("\"u{}\"", NOTE_QUEUE * 3 - 1)));
     // Once read, it takes more.
     router.deliver(updated("later"), Some(&standalone));
     assert!(rx.try_recv().is_some_and(|n| n.contains("later")));
@@ -985,7 +1090,7 @@ fn a_get_stream_nobody_reads_queues_a_bounded_number_and_never_blocks_the_sender
 fn a_stalled_get_stream_keeps_the_latest_update_of_each_resource_behind_a_busy_screen() {
     let router = Router::default();
     let standalone: Standalone = Mutex::new(None);
-    let (tx, rx) = note_queue(STANDALONE_QUEUE);
+    let (tx, rx) = note_queue(NOTE_QUEUE);
     *lock(&standalone) = Some((0, tx));
     router.deliver(updated("simee://devices/p/logs"), Some(&standalone));
     router.deliver(updated("simee://devices/p/prefs/app"), Some(&standalone));
@@ -1003,12 +1108,124 @@ fn a_stalled_get_stream_keeps_the_latest_update_of_each_resource_behind_a_busy_s
     assert_eq!(uris, [r#""simee://devices/p/prefs/app""#, r#""simee://devices/p/screen""#, "null", r#""simee://devices/p/logs""#]);
 }
 
+/// A route for a request the client sent as `id`, listening under the internal id `h1`.
+fn listen_route(router: &Router, id: Value) -> NoteRx {
+    let (tx, rx) = note_queue(NOTE_QUEUE);
+    router.insert("h1".into(), Route { id, token: Some(json!("tok")), tx: Arc::new(tx) });
+    rx
+}
+
+fn listened(method: &str, params: Value) -> String {
+    let mut params = params;
+    params["_meta"] = json!({META_SUBSCRIPTION: "h1"});
+    json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string()
+}
+
+fn listened_update(uri: &str) -> String {
+    listened("notifications/resources/updated", json!({"uri": uri}))
+}
+
+fn drained(rx: &NoteRx) -> Vec<Value> {
+    std::iter::from_fn(|| rx.try_recv()).map(|n| serde_json::from_str(&n).expect("json")).collect()
+}
+
+#[test]
+fn a_stalled_listen_queues_a_bounded_number_and_never_blocks_the_sender() {
+    let router = Router::default();
+    let rx = listen_route(&router, json!(7));
+    router.deliver(listened("notifications/subscriptions/acknowledged", json!({})), None);
+    // Three times the queue's worth of different resources for a client that stopped reading:
+    // every `deliver` returns at once.
+    for n in 0..NOTE_QUEUE * 3 {
+        router.deliver(listened_update(&format!("u{n}")), None);
+    }
+    let got = drained(&rx);
+    assert_eq!(got.len(), NOTE_QUEUE, "the acknowledgement and the newest updates");
+    assert_eq!(got[0]["method"], "notifications/subscriptions/acknowledged", "the acknowledgement is never the one dropped");
+    assert_eq!(got[0]["params"]["_meta"][META_SUBSCRIPTION], 7, "with the client's own id put back");
+    assert_eq!(got[1]["params"]["uri"], format!("u{}", NOTE_QUEUE * 3 - (NOTE_QUEUE - 1)), "the oldest updates are dropped");
+    assert_eq!(got[NOTE_QUEUE - 1]["params"]["uri"], format!("u{}", NOTE_QUEUE * 3 - 1));
+    // Once read, it takes more.
+    router.deliver(listened_update("later"), None);
+    assert_eq!(drained(&rx)[0]["params"]["uri"], "later");
+}
+
+#[test]
+fn a_stalled_listen_keeps_the_latest_update_of_each_resource_behind_a_busy_screen() {
+    let router = Router::default();
+    let rx = listen_route(&router, json!("L"));
+    router.deliver(listened_update("simee://devices/p/logs"), None);
+    router.deliver(listened_update("simee://devices/p/prefs/app"), None);
+    // A screen announced 30 times a second for ten seconds, and the list changing as often.
+    let list = listened("notifications/resources/list_changed", json!({}));
+    for _ in 0..300 {
+        router.deliver(listened_update("simee://devices/p/screen"), None);
+        router.deliver(list.clone(), None);
+    }
+    router.deliver(listened_update("simee://devices/p/logs"), None);
+    let got = drained(&rx);
+    assert_eq!(got.len(), 4, "one message for each of the screen, the list, the prefs and the logs: {got:?}");
+    // The logs' latest is the one kept, in the order the updates last happened.
+    let uris: Vec<&Value> = got.iter().map(|n| &n["params"]["uri"]).collect();
+    assert_eq!(
+        uris,
+        [&json!("simee://devices/p/prefs/app"), &json!("simee://devices/p/screen"), &Value::Null, &json!("simee://devices/p/logs")]
+    );
+}
+
+#[test]
+fn a_stalled_listens_response_follows_its_notifications_and_is_never_dropped() {
+    let router = Router::default();
+    let rx = listen_route(&router, json!(3));
+    // Progress for the request: the latest is the one that counts.
+    for progress in 1..=1000 {
+        let line = json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": {"progressToken": "h1", "progress": progress}});
+        router.deliver(line.to_string(), None);
+    }
+    // A full queue of other things, then the response.
+    for n in 0..NOTE_QUEUE * 2 {
+        router.deliver(listened_update(&format!("u{n}")), None);
+    }
+    router.deliver(r#"{"jsonrpc":"2.0","id":"h1","result":{"done":true}}"#.into(), None);
+    let mut got = Vec::new();
+    while let Ok(out) = rx.recv_timeout(Duration::ZERO) {
+        got.push(out);
+    }
+    let Some(Out::Response(last)) = got.pop() else { panic!("the response comes last: {got:?}") };
+    assert_eq!(serde_json::from_str::<Value>(&last).expect("json"), json!({"jsonrpc": "2.0", "id": 3, "result": {"done": true}}));
+    assert_eq!(got.len(), NOTE_QUEUE, "the notifications are bounded, the response is not among them");
+    let progress: Vec<&Out> = got.iter().filter(|o| matches!(o, Out::Note(n) if n.contains("notifications/progress"))).collect();
+    assert!(progress.len() <= 1, "progress is coalesced to its latest: {progress:?}");
+    assert!(lock(&router.routes).is_empty(), "a response ends its route");
+    assert_eq!(rx.recv_timeout(Duration::ZERO), Err(RecvTimeoutError::Disconnected), "and its stream");
+}
+
+#[test]
+fn progress_and_task_updates_keep_only_the_latest_of_each() {
+    let router = Router::default();
+    let rx = listen_route(&router, json!(1));
+    for step in 1..=50 {
+        let progress = json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": {"progressToken": "h1", "progress": step}});
+        router.deliver(progress.to_string(), None);
+        router.deliver(listened("notifications/tasks", json!({"taskId": "a", "status": format!("s{step}")})), None);
+        router.deliver(listened("notifications/tasks", json!({"taskId": "b", "status": format!("s{step}")})), None);
+    }
+    let got = drained(&rx);
+    assert_eq!(got.len(), 3, "progress and each task once: {got:?}");
+    let progress = got.iter().find(|n| n["method"] == "notifications/progress").expect("progress");
+    assert_eq!((progress["params"]["progress"].as_i64(), progress["params"]["progressToken"].as_str()), (Some(50), Some("tok")));
+    for task in ["a", "b"] {
+        let note = got.iter().find(|n| n["params"]["taskId"] == task).expect("the task's update");
+        assert_eq!(note["params"]["status"], "s50");
+    }
+}
+
 #[test]
 fn a_get_streams_queue_ends_when_its_sender_goes_but_hands_over_what_it_holds_first() {
     let (tx, rx) = note_queue(4);
     tx.push(None, "one".into());
     drop(tx);
-    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).as_deref(), Ok("one"));
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok(Out::Note("one".into())));
     assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Err(RecvTimeoutError::Disconnected));
     let (_tx, rx) = note_queue(4);
     assert_eq!(rx.recv_timeout(Duration::from_millis(10)), Err(RecvTimeoutError::Timeout));
@@ -1217,7 +1434,7 @@ fn a_client_that_half_closes_still_gets_its_response() {
         let mut client = Client::connect(addr);
         client.write_request("POST", &[("Accept", accept)], body.as_bytes());
         // Done sending (`nc -N`, HTTP/1.0-style clients); still reading.
-        client.reader.get_ref().shutdown(Shutdown::Write).expect("half-close");
+        client.reader.get_ref().tcp().shutdown(Shutdown::Write).expect("half-close");
         std::thread::sleep(limits().ping * 5);
         gate.release();
         let reply = client.read_reply();
