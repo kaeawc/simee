@@ -70,6 +70,11 @@ argue with measured numbers against the stock tools, so keep the numbers current
   it doesn't have.
 - A change that moves a published number updates its row in the same PR. A performance PR with
   no row to update adds one, or says in its description why the win isn't user-visible.
+- Publish only a result the quiet-host protocol calls publishable: every `scripts/bench/` script
+  waits for a quiet host (`scripts/bench/quiet.sh`) and writes a host record beside its results;
+  `python3 -I scripts/bench/summarize.py check <result.json>` says whether a run may enter a table
+  (gate passed, 3 or more rounds, no measure over its noise budget). `--no-quiet-gate` is for
+  smoke runs. See `docs/research/bench-protocol.md`.
 - Compare like with like: the same AVD or device type, host and day, both tools cold or both
   warm, median of at least 3 runs. Say what was run (`scripts/android-bench.sh`, `hyperfine`, a
   `--ignored` bench). A number measured on a different machine (a Linux VM bench) is labelled so.
