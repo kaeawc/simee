@@ -199,15 +199,15 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "screen",
-        "device, display?(main|outer|inner|carplay); iOS: set?",
+        "device, display?(main|outer|inner|carplay|car); iOS: set?",
         "Screen size in pixels, the space tap, swipe and touch take (a folded Android foldable: the size its guest lays out for, a Pixel Fold's 1080x2092, as uiautomator's bounds). \
-         display (iOS): main is the screen in use (an unfolded iPhone Duo's inner one), outer and inner an iPhone Duo's two, carplay an iPhone's CarPlay screen",
+         display (iOS): main is the screen in use (an unfolded iPhone Duo's inner one), outer and inner an iPhone Duo's two, carplay an iPhone's CarPlay screen; car: Android Auto's head unit (car_start)",
     ),
     (
         "screenshot",
-        "device, path?, display?(main|outer|inner|carplay); iOS: set?",
+        "device, path?, display?(main|outer|inner|carplay|car); iOS: set?",
         "PNG to path, else base64 in `png` (a folded Android foldable: its outer screen as the scanout shows it, a Pixel Fold's 949x1840; \
-         an iPhone Duo's inner screen as its framebuffer holds it, 2007x2853)",
+         an iPhone Duo's inner screen as its framebuffer holds it, 2007x2853; display car: Android Auto's head unit, see car_start)",
     ),
     (
         "wait_idle",
@@ -248,13 +248,13 @@ pub const METHODS: &[(&str, &str, &str)] = &[
     ),
     (
         "tap",
-        "device, x, y, hold_ms?, display?(main|outer|inner|carplay); iOS: set?",
+        "device, x, y, hold_ms?, display?(main|outer|inner|carplay|car); iOS: set?",
         "Tap at pixels, held hold_ms (default: iOS 10, Android 60) (display, iOS only: an iPhone Duo's outer or inner screen, an \
-         iPhone's CarPlay screen)",
+         iPhone's CarPlay screen; car: Android Auto's head unit, see car_start)",
     ),
     (
         "swipe",
-        "device, x1, y1, x2, y2, duration_ms?, settle?, display?(main|outer|inner|carplay), edge?(top|bottom|left|right; iOS); iOS: set?",
+        "device, x1, y1, x2, y2, duration_ms?, settle?, display?(main|outer|inner|carplay|car), edge?(top|bottom|left|right; iOS); iOS: set?",
         "Swipe between pixels over duration_ms (default 300; iOS sends its samples on schedule, so a busy host doesn't stretch \
          it); with edge (iOS) the touch comes in from that screen edge, as a drag from Simulator.app's bezel: \
          home and the app switcher from the bottom, Notification Center and Control Center from the top (Android's edge \
@@ -632,6 +632,21 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          (UITouch type .pencil): tap, down, move, up or a stroke; hover, pressure, button and eraser are refused (the \
          simulator's touch screen has none)",
     ),
+    // Android Auto (#437). Before `rotary` and `vehicle` so the schema probe, which switches fake devices for those two, visits `fold` once.
+    (
+        "car_start",
+        "device, input?(touch|rotary|hybrid), resolution?(800x480|1280x720|1920x1080), dpi?(160), headless?(false)",
+        "Android Auto projection: run Google's Desktop Head Unit (installed by `emu -provision-dhu`) against a booted phone and supervise it \
+         (its PID is kept in the AVD's simee directory). Needs Android Auto on the phone (6.0 or newer) with its head unit server running \
+         (developer mode, then \"Start head unit server\"); each phone gets its own adb forward to port 5277 and its own head unit. Then \
+         tap/swipe/screenshot with display=car, and `vehicle` sets speed, gear, night and parking-brake. Returns pid, serial, \
+         forward_port, resolution, dpi, input and headless",
+    ),
+    (
+        "car_stop",
+        "device",
+        "Stop the phone's Desktop Head Unit and remove its adb forward; a head unit that already exited just has its record cleared",
+    ),
     (
         "rotary",
         "device, ticks | delta (Digital Crown units; iOS); iOS: set?",
@@ -786,7 +801,7 @@ const ALL_PLATFORMS: &[&str] = &[
     "link_status",
 ];
 /// Methods only Android devices have.
-const ANDROID_ONLY: &[&str] = &["console", "xr", "vehicle", "touchpad", "export", "import"];
+const ANDROID_ONLY: &[&str] = &["console", "xr", "vehicle", "touchpad", "export", "import", "car_start", "car_stop"];
 
 /// The platforms whose devices `method` works on.
 pub fn platforms(method: &str) -> &'static [Platform] {
@@ -1894,8 +1909,8 @@ pub(crate) mod tests {
         assert_eq!(call(&mut s, "rotate", &json!({"device": "fold"})).expect_err("stopped"), "fold isn't running; boot it first");
         let err = call(&mut s, "rotate", &json!({"device": "fold", "orientation": "portrait"})).expect_err("iOS-only orientation");
         assert!(err.contains("`orientation` is iOS-only"), "{err}");
-        let err = call(&mut s, "tap", &json!({"device": "fold", "x": 1, "y": 1, "display": "carplay"})).expect_err("no CarPlay");
-        assert!(err.starts_with("display=carplay is an iPhone's CarPlay screen"), "{err}");
+        let err = call(&mut s, "tap", &json!({"device": "fold", "x": 1, "y": 1, "display": "carplay"})).expect_err("no head unit");
+        assert_eq!(err, "no head unit is running for this device: start one with `car_start`");
         let err = call(&mut s, "carplay", &json!({"device": "fold", "on": true})).expect_err("iOS-only");
         assert_eq!(err, "`carplay` isn't available on Android devices (it works on iOS)");
         // `platform` keeps the lookup off the simulator service, whose first start on a fresh
@@ -3225,6 +3240,11 @@ pub(crate) mod tests {
         ("clone", "creates a device from a golden that has booted"),
         ("ls", "without a path it lists the device's `/`, in no app's container; android_files.rs runs it on the files fake"),
         ("du", "without a path it sizes the device's `/`, in no app's container; android_files.rs runs it on the files fake"),
+        (
+            "car_start",
+            "every parameter is optional (read by `start_options`), and the call needs the DHU, Android Auto and its server: android_car.rs runs it on a fake DHU",
+        ),
+        ("car_stop", "it takes only `device` and needs a head unit: android_car.rs runs it on a fake DHU"),
         ("kill", "the probe's pid is 1, init, which kill refuses without force (its own tests read its parameters)"),
         ("link", "takes `devices`, not `device`, and a headset-phone pair: links.rs runs it on its fakes"),
         ("link_status", "refuses a device in no link before it reads more: links.rs runs it on its fakes"),

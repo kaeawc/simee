@@ -267,6 +267,36 @@ pub struct FakeAdb {
 }
 
 impl FakeAdb {
+    /// Android Auto on the phone at `version` (`None`: not installed), as `dumpsys package` says.
+    pub fn android_auto(&self, version: Option<&str>) {
+        let flag = self.log.with_file_name("gearhead");
+        match version {
+            Some(v) => std::fs::write(flag, v).expect("gearhead flag"),
+            None => drop(std::fs::remove_file(flag)),
+        }
+    }
+
+    /// Whether the head unit server listens on the phone's port 5277.
+    pub fn head_unit_server(&self, listening: bool) {
+        let flag = self.log.with_file_name("gearhead.server");
+        if listening {
+            std::fs::write(flag, b"").expect("server flag");
+        } else {
+            let _ = std::fs::remove_file(flag);
+        }
+    }
+
+    /// Makes the next `n` forwards fail as adb does for a host port another program took.
+    pub fn ports_taken(&self, n: u32) {
+        std::fs::write(self.log.with_file_name("forward.busy"), n.to_string()).expect("busy flag");
+    }
+
+    /// The forwards adb holds now, as `adb forward --list` prints them (`<serial> tcp:<host>
+    /// tcp:<device>`).
+    pub fn forwards(&self) -> Vec<String> {
+        std::fs::read_to_string(self.log.with_file_name("forwards")).unwrap_or_default().lines().map(str::to_owned).collect()
+    }
+
     /// Each invocation's arguments, in order, without the leading `-s <serial>`.
     pub fn calls(&self) -> Vec<String> {
         let text = std::fs::read_to_string(&self.log).unwrap_or_default();
@@ -282,7 +312,7 @@ impl FakeAdb {
 }
 
 const FAKE_ADB: &str = r#"echo "$*" >> "$(dirname "$0")/adb.log"
-serial=
+serial=""
 [ "$1" = "-s" ] && serial="$2" && shift 2
 # What an API 36 guest's toybox `ps -A -o PID,PPID,%CPU,RSS,ETIME,NAME,CMDLINE` prints (trimmed).
 ps_rows() {
@@ -415,17 +445,35 @@ stat() { echo "$1 ($2) S $3 1 1 0 -1 4194560 100 0 0 0 $4 $5 0 0 20 0 1 0 100 0 
 d="$(dirname "$0")"
 installed() { printf 'package:android\npackage:com.android.systemui\npackage:com.google.android.apps.turbo\npackage:com.google.android.apps.wellbeing\npackage:com.google.android.partnersetup\n'; }
 case "$1" in
-# The adb server's forwards, every device's, in `forwards` beside the script; host ports from 41001.
+# `forward [--no-rebind] tcp:<host> tcp:<device>`, `forward --remove tcp:<host>` and `forward --list`
+# (sim_android::dhu) on one table for every serial, `forwards` beside the script, as adb's server
+# keeps it: `--no-rebind` refuses a host port already forwarded, and while `forward.busy` holds a
+# count above 0 that many more forwards are refused as taken by another program. `forward tcp:0
+# tcp:<device>` (net-forward links) allocates the next host port from 41001 (`forward.next`) and
+# prints it, as adb does.
 forward)
+  shift
   f="$d/forwards"
-  case "$2" in
-    --list) cat "$f" 2>/dev/null || true;;
-    --remove) grep -v " $3 " "$f" > "$f.new" 2>/dev/null; mv "$f.new" "$f";;
+  touch "$f"
+  case "$1" in
+    --list) cat "$f";;
+    --remove)
+      grep -q " $2 " "$f" || { echo "adb: error: listener '$2' not found" >&2; exit 1; }
+      grep -v " $2 " "$f" > "$f.$$"; mv "$f.$$" "$f";;
     tcp:0)
       n=$(( $(cat "$d/forward.next" 2>/dev/null || echo 41001) ))
       echo $(( n + 1 )) > "$d/forward.next"
-      echo "$serial tcp:$n $3" >> "$f"; echo "$n";;
-    *) echo "fake adb: unhandled: $*" >&2; exit 2;;
+      echo "$serial tcp:$n $2" >> "$f"; echo "$n";;
+    *)
+      norebind=""
+      [ "$1" = "--no-rebind" ] && norebind=1 && shift
+      if [ -n "$norebind" ] && grep -q " $1 " "$f"; then echo "adb: error: cannot rebind existing socket" >&2; exit 1; fi
+      busy="$(cat "$d/forward.busy" 2>/dev/null || echo 0)"
+      if [ "$busy" -gt 0 ]; then
+        echo $((busy - 1)) > "$d/forward.busy"
+        echo "adb: error: cannot bind listener: Address already in use" >&2; exit 1
+      fi
+      grep -v " $1 " "$f" > "$f.$$"; echo "$serial $1 $2" >> "$f.$$"; mv "$f.$$" "$f";;
   esac;;
 install)
   case "$*" in
@@ -512,6 +560,19 @@ shell)
       if [ "$verb" = adj-mute ]; then touch "$here/music.muted"; else rm -f "$here/music.muted"; fi;;
     # Every other signal succeeds, and is only logged: the fake never signals a host process.
     "kill -"*) ;;
+    # sim_android::dhu: Android Auto's version is the text in `gearhead` beside the script (not
+    # installed without it); `gearhead.server` makes the head unit server listen on 5277.
+    "dumpsys package com.google.android.projection.gearhead")
+      if [ -e "$d/gearhead" ]; then
+        printf 'Packages:\n  Package [com.google.android.projection.gearhead] (1a2b3c):\n    versionCode=1 minSdk=26\n    versionName=%s\n' "$(cat "$d/gearhead")"
+      else
+        echo "Unable to find package: com.google.android.projection.gearhead"
+      fi;;
+    "cat /proc/net/tcp /proc/net/tcp6")
+      echo '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode'
+      echo '   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1 1 0'
+      [ -e "$d/gearhead.server" ] && echo '   1: 00000000:149D 00000000:0000 0A 00000000:00000000 00:00000000 00000000 10170        0 2 1 0'
+      true;;
     "settings get global airplane_mode_on") cat "$(dirname "$0")/airplane" 2>/dev/null || echo 0;;
     "settings put global airplane_mode_on "*) echo "${2##* }" > "$(dirname "$0")/airplane";;
     # After the airplane-mode arm above: case takes the first match.
