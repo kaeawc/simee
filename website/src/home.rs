@@ -54,7 +54,11 @@ fn body(mc: &MdCx, bp: Bp) -> El {
         .child(abstract_(bp))
         .child(
             section("performance", "1", "Performance", bp)
-                .child(caption("t1-cap", "Table 1", "simee against the stock tools: Android against the SDK emulator, iOS against simctl."))
+                .child(caption(
+                    "t1-cap",
+                    "Table 1",
+                    "simee against the stock tools, a measure a row: Android against the SDK emulator (QEMU), iOS against Simulator.app.",
+                ))
                 .child(markdown("t1-md", &performance, mc)),
         )
         .child(section("quick-start", "2", "Quick start", bp).child(markdown("qs-md", &quick, mc)))

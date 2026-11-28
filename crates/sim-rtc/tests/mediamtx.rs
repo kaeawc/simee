@@ -44,7 +44,12 @@ fn publishes_and_is_ready(fixture: &[u8], profile: ProfileLevelId, name: &str, m
         publisher.send(&au, Duration::from_millis(100 * frame)).expect("send");
         frame += 1;
         std::thread::sleep(Duration::from_millis(100));
-        if let Some(body) = mtx.ready_path(name) {
+        // Ready can come before MediaMTX has parsed the track's profile: keep publishing until
+        // the body has both, or the deadline passes (the asserts below then name what is missing).
+        if let Some(body) = mtx.ready_path(name)
+            && body.contains("\"tracks\":[\"H264\"]")
+            && body.contains("\"profile\":")
+        {
             break body;
         }
         assert!(
@@ -92,11 +97,12 @@ fn json_number_reads_a_field_wherever_it_is() {
 }
 
 /// MediaMTX v1.19.2 doesn't carry the `simee-input` channel (#271): it refuses an offer with an
-/// `m=application` section outright (406, `unsupported media 'application'`), so a stream whose
-/// endpoint is MediaMTX must be started without input. When a MediaMTX release accepts the offer
-/// this fails: update docs/streaming.md ("Input over a data channel") with what it relays.
+/// `m=application` section outright (406, `unsupported media 'application'`). Asking for input
+/// anyway (#381) retries the POST without the channel: the stream is live, and says why it has no
+/// input. When a MediaMTX release accepts the first offer `note` is `None` and this fails: update
+/// docs/streaming.md ("Input over a data channel") with what it relays.
 #[test]
-fn mediamtx_refuses_the_input_channel_offer() {
+fn mediamtx_takes_the_stream_without_the_input_channel() {
     if !simee_rtc::crypto_available() {
         common::skip("no DTLS backend in this build (Linux needs --features rust-crypto)");
         return;
@@ -106,10 +112,33 @@ fn mediamtx_refuses_the_input_channel_offer() {
     let config = PublisherConfig::new(mtx.whip_url("simee-input"));
     let sink = |_: &simee_rtc::InputEvent| -> Result<(), String> { Ok(()) };
     let input = InputSession::new(sink, InputConfig::default());
-    match Publisher::connect_with_input(config, input, |_| {}) {
+    // The strict call still fails the way it did.
+    match Publisher::connect_with_input(
+        config.clone(),
+        InputSession::new(|_: &simee_rtc::InputEvent| Ok(()), InputConfig::default()),
+        |_| {},
+    ) {
         Err(Error::Status { status: 406, body, .. }) => assert!(body.contains("application"), "406 for another reason: {body}"),
         Err(e) => panic!("expected a 406 for the data channel, got {e}"),
         Ok(_) => panic!("MediaMTX accepted the input channel offer: update docs/streaming.md"),
     }
     assert!(mtx.ready_path("simee-input").is_none());
+
+    let (mut publisher, note) = Publisher::connect_with_input_or_without(config, input, |_| {}).expect("falls back to no input");
+    let note = note.expect("the channel was refused");
+    assert!(note.contains("refused the input data channel") && note.contains("application"), "{note}");
+    let units = h264::access_units(BASELINE);
+    let end = std::time::Instant::now() + Duration::from_secs(20);
+    let mut frame = 0u64;
+    loop {
+        let au: Vec<u8> = units[(frame % units.len() as u64) as usize].iter().flat_map(|n| [&[0, 0, 0, 1][..], n].concat()).collect();
+        publisher.send(&au, Duration::from_millis(100 * frame)).expect("send");
+        frame += 1;
+        std::thread::sleep(Duration::from_millis(100));
+        if mtx.ready_path("simee-input").is_some() {
+            break;
+        }
+        assert!(std::time::Instant::now() < end, "path simee-input never became ready");
+    }
+    publisher.close().expect("close");
 }

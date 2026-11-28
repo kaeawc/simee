@@ -190,6 +190,14 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   `examples/soft_devices.rs`
   serves the whole software-mode device set. Everything but `machine.rs`, `vcpu.rs` and
   `virtio/gpu.rs` builds and tests on Linux: put device logic there, not behind the hypervisor.
+- `crates/emu-container` — the container backend's host side, safe Rust (Android's userspace in a
+  container on the host's kernel, #210): `probe.rs` (binderfs, memfd, cgroups v2, user namespaces,
+  overlayfs, each missing piece with its fix, over an injectable `/proc` and `/sys` view),
+  `select.rs` (KVM, then container, then TCG; `-backend` overrides; `choose` is the one call
+  `apps/emu` makes), `image.rs` (the official Redroid image pinned by SHA-256; a download only on
+  request), `launch.rs` (the namespaces, id maps, mounts and `/init` arguments as data, run
+  through `unshare(1)`), `helper.rs` (`pivot_root` and parent-death, via rustix's safe wrappers).
+  Tests use fake trees; `SIMEE_E2E_CONTAINER=1` runs the launcher against the host's kernel.
 - `crates/emu-avd` — `Env` (SDK/AVD paths), `Avd` (config, `profile()`), `NewAvd`
   (`for_profile`), running-instance advertisements (`Running`), `BootConfig`, ini parsing.
 - `crates/emu-sdk` — Java-free provisioning: repository manifests, verified downloads, the

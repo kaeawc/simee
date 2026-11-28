@@ -12,6 +12,35 @@ code. Every claim carries one tag:
 - **[inferred]**: reasoned from the above and from reading the code, not run. These are the
   spike's questions (section 7).
 
+## Status after the research (2026-11-28)
+
+Owner decisions of 2026-11-27 settle what the recommendation below left open. The container backend
+is pursued, and automatic selection is **KVM first, then the container (only on a host without
+KVM that has binder), then TCG**, with `-backend kvm|container|tcg` to override; that replaces the
+"behind an explicit opt-in" in section 8 and the caution about silent swaps in section 7. The host
+side is built in `crates/emu-container` (probe, selection, pinned image, launcher; see
+[android.md](../android.md#container-backend-linux-with-binder-and-no-kvm)). Facts it settled, from
+reading the sources on 2026-11-28:
+
+- **What Redroid's init expects from a runtime** ([vendor_redroid `redroid.common.rc`](https://github.com/remote-android/vendor_redroid/blob/master/redroid.common.rc)):
+  `/dev/null`, `zero`, `full`, `random`, `urandom`, `tty`, `ptmx` and `pts/ptmx` already exist (it
+  only `chmod`s them), and so may `/dev/ashmem`, `/dev/ion` and `/dev/dma_heap/system`; it mounts
+  debugfs and binds over `/proc/vmallocinfo` and `/sys/power/state` itself. The launcher builds
+  that `/dev`.
+- **What the image runs**: the pinned image's config says `Entrypoint: ["/init", "qemu=1",
+  "androidboot.hardware=redroid"]`, and arguments after the image name are `/init`'s, which
+  [redroid-doc](https://github.com/remote-android/redroid-doc) turns into properties
+  (`androidboot.redroid_width|height|dpi|fps|gpu_mode`, `androidboot.use_memfd`, `ro.xxx` overrides).
+- **The pinned image**: one layer per architecture, 730 MB (amd64) and 694 MB (arm64) compressed;
+  the manifest and layer digests are in `crates/emu-container/src/image.rs`.
+- **Rootless works as far as a host without binder allows**: on this VM, as an unprivileged user
+  with `newuidmap` and a 65,536-id range, a user namespace mounts the overlay, a `/dev` tmpfs,
+  devpts, `/proc` and the host's `/sys` (read-only) and pivots into the result; as root, with the
+  container mapped to a range of its own, likewise. Only binderfs fails, as section 1 predicts. Whether Redroid's `/init` then boots, and in
+  how long, is still the spike.
+- **Open**: the adb port (no network namespace yet, so the container's adbd takes the host's 5555),
+  display, input and console, cgroup limits, and the numbers for `docs/benchmarks.md`.
+
 ## Summary
 
 1. **This Hive VM can't run Redroid, and can't be made to without a different kernel.** The kernel

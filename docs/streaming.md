@@ -183,10 +183,14 @@ short: it runs where the media is sent. `stream_start {input: true}` wires one t
 
 The channel only reaches a viewer whose peer connection ends at the publisher. MediaMTX doesn't
 relay it, and doesn't ignore it either: v1.19.2 refuses an offer with an `m=application` section
-(`406`, `{"status":"error","error":"unsupported media 'application'"}`, run by
-`mediamtx_refuses_the_input_channel_offer`). So `connect_with_input`, and `stream_start {input:
-true}`, fail against a MediaMTX endpoint; start the stream without input there. Input for a
-MediaMTX viewer needs a direct peer connection or a relay of its own, which isn't built.
+(`406`, `{"status":"error","error":"unsupported media 'application'"}`). So `connect_with_input`
+fails against a MediaMTX endpoint, and `Publisher::connect_with_input_or_without` (what
+`stream_start {input: true}` uses) answers that refusal, and only that one (a 406 to the POST whose
+body names `application`), by offering the stream again without the channel, once; it returns why
+the channel was dropped. Any other error, including the retry's own, is returned as it is
+(`mediamtx_takes_the_stream_without_the_input_channel` runs this against MediaMTX; the
+`input_fallback` tests pin the retry rules). Input for a MediaMTX viewer needs a direct peer
+connection or a relay of its own, which isn't built: the stream there runs with `input: false`.
 
 **Messages** are one compact JSON object per text frame. Every message has `"v":1` (the version)
 and a `kind`; `seq` (an integer) and `t` (the viewer's time in milliseconds, any clock, e.g.
@@ -593,7 +597,8 @@ and on x86_64 with `OPENH264_NO_ASM=1`.
 (docs/api.md, "Streams"), which the MCP server serves as the `stream` toolset:
 
 - `stream_start` (`device, whip_url, token?, fps?(30), max_size?(1280), bitrate?(2500000),
-  audio?(false), input?(false)`) → `{stream_id, whip_resource, lease_ttl_s, device}`.
+  audio?(false), input?(false)`) → `{stream_id, whip_resource, lease_ttl_s, device}`, plus `input`
+  (boolean) and, when the server refused the channel, `input_note`, when `input` was asked for.
 - `stream_status` (`stream_id`): the state, the stage timeline and the stats; renews the lease.
 - `stream_stop` (`stream_id`): ends the stream and sends the WHIP DELETE.
 - `streams` (`device?`): every stream of the process, without renewing anything.
@@ -626,7 +631,11 @@ stream that ended on its own stays listed as `ended`, with its `reason`, until i
 and a new stream to the same destination replaces it. There is one stream per device and WHIP
 URL; a second `stream_start` for the pair is refused with the running one's id.
 
-**Input.** With `input: true` the publisher is opened with `connect_with_input`, and the
+**Input.** With `input: true` the publisher is opened with `connect_with_input_or_without`: a
+server that refuses the data channel (MediaMTX: `406 unsupported media 'application'`) is offered
+the stream again without it, and the stream runs with `input: false` and an `input_note` (in the
+`stream_start` result and in `stream_status`, whose `input` is the live state), instead of failing.
+Where the channel is carried, the
 session's sink maps each event through a `DisplayMap` of the device's `screen` size (the space
 `touch` and `swipe` take) and queues one device call to a thread of the stream's own, which runs
 it through the method table (so the publisher's thread never waits on a device):

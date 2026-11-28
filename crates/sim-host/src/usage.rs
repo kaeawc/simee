@@ -976,10 +976,25 @@ mod tests {
         assert_eq!(d.energy_w.and_then(|e| e.s1), Some(1.5));
     }
 
-    /// The live host: whatever is running is listed (nothing booted or touched).
-    /// `cargo test -p simee-host live_devices -- --nocapture`
+    /// A fake device listing, two observations 1 s apart: the device is listed with its rates.
+    #[test]
+    fn fake_devices_are_listed() {
+        let mut t = Tracker::new(4);
+        t.update(obs(0, vec![sim(&[1, 2])], &[(1, c(1, 0)), (2, c(2, 0))]));
+        t.update(obs(1, vec![sim(&[1, 2])], &[(1, c(1, S1 / 2)), (2, c(2, S1 / 4))]));
+        let r = t.report();
+        assert_eq!((r.samples, r.devices.len(), r.host.devices), (2, 1, 1), "{r:?}");
+        let d = &r.devices[0];
+        assert_eq!((d.kind, d.id.as_str(), d.pid, d.pids), (Some(Kind::Simulator), UDID, Some(1), 2), "{d:?}");
+        assert_eq!((d.cpu_pct.s1, d.footprint_bytes), (Some(75.0), 40), "{d:?}");
+    }
+
+    /// The live host: whatever is running is listed (nothing booted or touched). Load-sensitive,
+    /// so it only runs on request.
+    /// `cargo test -p simee-host live_devices -- --ignored --nocapture`
     #[test]
     #[cfg(target_os = "macos")]
+    #[ignore = "reads the live host; run with --ignored"]
     fn live_devices_are_listed() {
         let mut reader = Reader::default();
         let mut t = Tracker::new(std::thread::available_parallelism().map_or(1, |n| n.get()));

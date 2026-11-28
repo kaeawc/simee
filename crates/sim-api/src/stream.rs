@@ -117,14 +117,29 @@ pub(crate) trait Publication: Send {
     fn close(self: Box<Self>) -> sim_rtc::Result<()>;
 }
 
-/// Opens WHIP sessions.
+/// A connected WHIP session, and why it has no input channel when one was asked for.
+pub(crate) struct Connected {
+    pub publication: Box<dyn Publication>,
+    /// Set when the server refused the input data channel and the session runs without it.
+    pub input_note: Option<String>,
+}
+
+#[cfg(test)]
+impl Connected {
+    pub fn new(publication: Box<dyn Publication>) -> Connected {
+        Connected { publication, input_note: None }
+    }
+}
+
+/// Opens WHIP sessions. With `input`, a server that refuses the data channel is offered the
+/// session without it (`Connected::input_note` says so).
 pub(crate) trait Whip: Send + Sync {
     fn connect(
         &self,
         config: PublisherConfig,
         input: Option<InputSession>,
         on_event: Box<dyn FnMut(PublisherEvent) + Send>,
-    ) -> sim_rtc::Result<Box<dyn Publication>>;
+    ) -> sim_rtc::Result<Connected>;
 }
 
 /// A device's input methods, called on the stream's input thread (where it is made).
@@ -165,12 +180,12 @@ impl Whip for RtcWhip {
         config: PublisherConfig,
         input: Option<InputSession>,
         on_event: Box<dyn FnMut(PublisherEvent) + Send>,
-    ) -> sim_rtc::Result<Box<dyn Publication>> {
-        let publisher = match input {
-            Some(input) => sim_rtc::Publisher::connect_with_input(config, input, on_event)?,
-            None => sim_rtc::Publisher::connect(config, on_event)?,
+    ) -> sim_rtc::Result<Connected> {
+        let (publisher, input_note) = match input {
+            Some(input) => sim_rtc::Publisher::connect_with_input_or_without(config, input, on_event)?,
+            None => (sim_rtc::Publisher::connect(config, on_event)?, None),
         };
-        Ok(Box::new(publisher))
+        Ok(Connected { publication: Box::new(publisher), input_note })
     }
 }
 
@@ -420,6 +435,8 @@ struct Progress {
     input_events: u64,
     input_errors: u64,
     last_input_error: Option<String>,
+    /// Why the stream runs without the input it asked for (the server refused the channel).
+    input_note: Option<String>,
     resource: Option<String>,
     /// Why it is ending or ended: the first reason given wins.
     reason: Option<String>,
@@ -655,12 +672,20 @@ impl Streams {
                 if let Some(e) = self.entries().get_mut(&id) {
                     e.lease_until = self.clock.now() + self.ttl;
                 }
-                Ok(json!({
-                "stream_id": id,
-                "whip_resource": resource,
-                "lease_ttl_s": self.ttl.as_secs(),
-                "device": target.udid,
-                }))
+                let mut started = json!({
+                    "stream_id": id,
+                    "whip_resource": resource,
+                    "lease_ttl_s": self.ttl.as_secs(),
+                    "device": target.udid,
+                });
+                if options.settings.input {
+                    let note = shared.lock().input_note.clone();
+                    started["input"] = json!(note.is_none());
+                    if let Some(note) = note {
+                        started["input_note"] = json!(note);
+                    }
+                }
+                Ok(started)
             }
             Err(e) => {
                 shared.stop(e.clone());
@@ -781,7 +806,7 @@ impl Streams {
             "whip_url": e.whip_url,
             "whip_resource": p.resource,
             "state": state,
-            "input": e.input,
+            "input": e.input && p.input_note.is_none(),
             "lease_ttl_s": self.ttl.as_secs(),
             "lease_expires_in_s": (e.lease_until.saturating_duration_since(now).as_secs_f64() * 10.0).round() / 10.0,
             "stages": stages,
@@ -802,6 +827,9 @@ impl Streams {
         });
         if let Some(reason) = &p.reason {
             v["reason"] = json!(reason);
+        }
+        if let Some(note) = &p.input_note {
+            v["input_note"] = json!(note);
         }
         if let Some(e) = &p.last_input_error {
             v["stats"]["last_input_error"] = json!(e);
@@ -848,15 +876,19 @@ impl Worker {
         let result = self.media.run(&self.target, &config, Pacing::new(config.fps, Some(HEARTBEAT)), &shared.controls, &mut |unit| {
             shared.encoded(&unit);
             if publication.is_none() {
-                let p = match connect(&self.whip, &self.options, &config, &unit, input.take(), &shared) {
-                    Ok(p) => p,
+                let (p, input_note) = match connect(&self.whip, &self.options, &config, &unit, input.take(), &shared) {
+                    Ok(c) => (c.publication, c.input_note),
                     Err(e) => {
                         shared.lock().reason.get_or_insert(e.clone());
                         send_ready(&mut ready, Err(e.clone()));
                         return Err(sim_encode::Error::Encoder(e));
                     }
                 };
-                shared.lock().resource = Some(p.resource());
+                {
+                    let mut progress = shared.lock();
+                    progress.resource = Some(p.resource());
+                    progress.input_note = input_note;
+                }
                 shared.stage("whip_connected");
                 send_ready(&mut ready, Ok(p.resource()));
                 publication = Some(p);
@@ -912,7 +944,7 @@ fn connect(
     first: &AccessUnit,
     input: Option<InputSession>,
     shared: &Arc<Shared>,
-) -> Result<Box<dyn Publication>, String> {
+) -> Result<Connected, String> {
     let profile = sim_rtc::h264::nal_units(&first.data)
         .into_iter()
         .find_map(ProfileLevelId::from_sps)
@@ -1327,6 +1359,8 @@ pub(crate) mod tests {
     #[derive(Default)]
     struct FakeWhip {
         refuse: Option<u16>,
+        /// Models a server that refuses the input data channel: the session runs without it.
+        refuse_input: bool,
         clock: Option<Arc<FakeClock>>,
         log: Arc<Mutex<Vec<String>>>,
         sessions: Mutex<Vec<FakeSession>>,
@@ -1348,8 +1382,10 @@ pub(crate) mod tests {
             config: PublisherConfig,
             input: Option<InputSession>,
             on_event: Box<dyn FnMut(PublisherEvent) + Send>,
-        ) -> sim_rtc::Result<Box<dyn Publication>> {
+        ) -> sim_rtc::Result<Connected> {
             self.log.lock().expect("log").push(format!("POST {}", config.endpoint));
+            let input_offered = input.is_some();
+            let input = if self.refuse_input { None } else { input };
             if let Some(status) = self.refuse {
                 return Err(sim_rtc::Error::Status { status, method: "POST", body: "unauthorized".into() });
             }
@@ -1366,7 +1402,9 @@ pub(crate) mod tests {
                 events: Arc::new(Mutex::new(Some(on_event))),
             };
             sessions.push(session.clone());
-            Ok(Box::new(FakePublication { resource, log: self.log.clone(), session }))
+            let input_note =
+                (self.refuse_input && input_offered).then(|| "the WHIP server refused the input data channel (406 fake)".to_owned());
+            Ok(Connected { publication: Box::new(FakePublication { resource, log: self.log.clone(), session }), input_note })
         }
     }
 
@@ -1500,9 +1538,9 @@ pub(crate) mod tests {
             config: PublisherConfig,
             _: Option<InputSession>,
             _: Box<dyn FnMut(PublisherEvent) + Send>,
-        ) -> sim_rtc::Result<Box<dyn Publication>> {
+        ) -> sim_rtc::Result<Connected> {
             let resource = format!("{}/session-0", config.endpoint);
-            Ok(Box::new(FilePublication { resource, log: self.log.clone(), wedged: self.wedged }))
+            Ok(Connected::new(Box::new(FilePublication { resource, log: self.log.clone(), wedged: self.wedged })))
         }
     }
 
@@ -1716,6 +1754,30 @@ pub(crate) mod tests {
         // The same destination can be streamed to again; the ended stream is replaced.
         assert_eq!(f.start(json!({"whip_url": URL})).expect("again")["stream_id"], "stream-2");
         assert_eq!(f.call("streams", json!({})).expect("streams").as_array().map(Vec::len), Some(1));
+        f.call("stream_stop", json!({"stream_id": "stream-2"})).expect("stop");
+    }
+
+    #[test]
+    fn a_server_that_refuses_the_input_channel_streams_without_input_and_says_why() {
+        let f = fixture_with(FakeWhip { refuse_input: true, ..FakeWhip::default() }, FakeMedia::default());
+        let started = f.start(json!({"whip_url": URL, "input": true})).expect("start");
+        assert_eq!(started["input"], false, "{started}");
+        let note = started["input_note"].as_str().expect("input_note");
+        assert!(note.contains("refused the input data channel"), "{note}");
+        let status = f.status("stream-1");
+        assert_eq!((&status["input"], &status["input_note"]), (&json!(false), &json!(note)), "{status}");
+        f.call("stream_stop", json!({"stream_id": "stream-1"})).expect("stop");
+    }
+
+    #[test]
+    fn start_reports_input_only_when_it_was_asked_for() {
+        let f = fixture();
+        let plain = f.start(json!({"whip_url": URL})).expect("start");
+        assert!(plain.get("input").is_none() && plain.get("input_note").is_none(), "{plain}");
+        f.call("stream_stop", json!({"stream_id": "stream-1"})).expect("stop");
+        let with = f.start(json!({"whip_url": URL, "input": true})).expect("start");
+        assert_eq!(with["input"], true, "{with}");
+        assert!(with.get("input_note").is_none(), "{with}");
         f.call("stream_stop", json!({"stream_id": "stream-2"})).expect("stop");
     }
 

@@ -175,7 +175,11 @@ fn resolve_line(line: &str, dir: &str) -> String {
         if ticks % 2 == 1 {
             out.push_str(target);
         } else {
-            out.push_str(&site_url(target, dir));
+            // A title (`[↗](docs/benchmarks.md#x "M3 Max, 2026-11-24")`) stays as it is.
+            let target = target.trim_start();
+            let (dest, title) = target.split_at(target.find(char::is_whitespace).unwrap_or(target.len()));
+            out.push_str(&site_url(dest, dir));
+            out.push_str(title);
         }
         rest = &after[close..];
     }
@@ -216,6 +220,17 @@ fn link_code_paths(line: &str, dir: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// The links in `md` that have a title, as (destination, title): the tooltip each one shows,
+/// as GitHub shows it. Table 1's source icons name their host and date this way.
+pub fn link_titles(md: &str) -> Vec<(String, String)> {
+    Parser::new_ext(md, options())
+        .filter_map(|event| match event {
+            Event::Start(Tag::Link { dest_url, title, .. }) if !title.is_empty() => Some((dest_url.into_string(), title.into_string())),
+            _ => None,
+        })
+        .collect()
 }
 
 /// `md` without its tables: a section quoted somewhere a table would repeat another page.

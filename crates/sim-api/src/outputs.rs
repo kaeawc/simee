@@ -73,7 +73,7 @@ const DEFS: &[(&str, &str)] = &[
     (
         "stream",
         r#"stream_id: string, device: string, name: string, platform: string, whip_url: string, whip_resource: string|null,
-            state: "starting"|"running"|"ended", reason?: string, input: boolean, lease_ttl_s: number, lease_expires_in_s: number,
+            state: "starting"|"running"|"ended", reason?: string, input: boolean, input_note?: string, lease_ttl_s: number, lease_expires_in_s: number,
             stages: [{stage: string, ms: number}], stats: {encoded: number, sent: number, heartbeats: number, keyframes: number,
             bytes: number, fps: number|null, bitrate_bps: number|null, bitrate_estimate_bps: number|null, pli: number, fir: number,
             input_events: number, input_errors: number, last_input_error?: string}"#,
@@ -147,7 +147,10 @@ pub const OUTPUTS: &[(&str, &str)] = &[
     ("erase", "null"),
     ("screen", "{width: number, height: number}"),
     ("screenshot", "{width: number, height: number, png?: string, path?: string}"),
-    ("stream_start", "{stream_id: string, whip_resource: string, lease_ttl_s: number, device: string}"),
+    (
+        "stream_start",
+        "{stream_id: string, whip_resource: string, lease_ttl_s: number, device: string, input?: boolean, input_note?: string}",
+    ),
     ("stream_status", "{...@stream}"),
     ("stream_stop", "{...@stream, deleted: boolean, delete_error?: string}"),
     ("streams", "[{...@stream}]"),

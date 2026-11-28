@@ -1984,6 +1984,7 @@ dependencies = [
  "simee-core",
  "simee-coresim",
  "simee-emu-avd",
+ "simee-host",
 ]
 
 [[package]]
@@ -2101,6 +2102,17 @@ dependencies = [
  "rustix",
  "simee-bundle",
  "simee-core",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "simee-emu-container"
+version = "0.2.0"
+dependencies = [
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
  "thiserror 2.0.21",
 ]
 

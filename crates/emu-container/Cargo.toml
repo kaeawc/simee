@@ -1,0 +1,26 @@
+[package]
+name = "simee-emu-container"
+description = "Android's userspace in a container on the host kernel: the host probe, backend selection (KVM, container, TCG) and a Redroid-style launcher. Safe Rust; no unsafe."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["android", "emulator", "container", "binder", "linux"]
+categories = ["emulators", "development-tools::testing"]
+include = ["/Cargo.toml", "/LICENSE", "/src", "/tests"]
+
+[lib]
+doctest = false
+
+[dependencies]
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -69,6 +69,7 @@ ignored for now.
 | `crates/emu-sdk` | Java-free SDK provisioning: repository manifests, verified downloads, unpacking, the on-demand renderer (`emu -provision`, `-provision-renderer`) |
 | `crates/emu-ext4` | Native ext4 formatter for first-boot userdata: writes only metadata, so a fresh 10 GiB image takes under 1 MB on disk |
 | `crates/emu-fdt` | Flattened device tree writer |
+| `crates/emu-container` | Host probe, backend selection (KVM, container, TCG) and the Redroid-style container launcher for Linux hosts with binder ([below](#container-backend-linux-with-binder-and-no-kvm)) |
 | `apps/emu` | The `emu` CLI: SDK-emulator-compatible flags, per-AVD instance state, console server, display server |
 | `crates/sim-android` | The client front ends use: AVDs as devices, starting `emu`, the console and display-socket clients |
 | `desktop/` | simee's Rune window (both platforms), its own workspace |
@@ -103,7 +104,9 @@ qemu's command line and ports by (PID, start time), so a PID the kernel hands to
 is asked about again; an emulator is never listed from memory alone, as every call reads the locks
 and checks the PID is alive. The parsed pointer and `config.ini` of each AVD are remembered by
 (path, mtime, ctime, size, inode) in `emu-avd` (the change time catches a same-size file put back with its old mtime), except files changed in the last 2 s, so resolving a
-device reads no AVD file that hasn't changed.
+device reads no AVD file that hasn't changed. The listing of the AVD home is remembered too, by the
+directory's own stamp, which an entry that comes, goes or is renamed over changes; a listing
+with a link among the pointers or a failed read is not remembered.
 `simee info` shows `running.emulator` (`stock` or `simee`), the serial, ports and PID. What needs
 simee's `emu` (touch, keys, wheel and frames over `display.sock`, the touchpad) says so and names
 the fix instead of failing on a missing socket. `shutdown` interrupts the qemu process
@@ -380,8 +383,58 @@ emu -avd phone -accel off   # TCG even where /dev/kvm is usable (-accel on: KVM 
 
 When the host has KVM, software mode runs the guest on it (above); TCG is the fallback.
 
-A third route for hosts with binder and no KVM, Android's userspace in a container on the host's kernel,
-is researched in [research/container-backend.md](research/container-backend.md) (#210).
+## Container backend (Linux with binder and no KVM)
+
+In progress ([#210](https://github.com/kaeawc/simee/issues/210)): Android's userspace in a
+container on the host's kernel, as Redroid does, for hosts that have binder and no usable KVM. The
+research, environment matrix and the cited Redroid numbers are in
+[research/container-backend.md](research/container-backend.md). What `crates/emu-container` has
+so far, and what it doesn't:
+
+- **Selection.** Owner decision 2026-11-27: with no `-backend`, KVM first; the container only on
+  a host without usable KVM that has what it needs; then TCG software mode. `-backend
+  kvm|container|tcg` forces one, and a forced backend that can't run is an error naming why, never a
+  fallback. The container is considered only for a guest of the host's own architecture.
+- **Host probe.** Required: Linux, binder (binderfs in `/proc/filesystems` that, test-mounted in a
+  throwaway user namespace, holds `binder`, `hwbinder` and `vndbinder`: a plain `modprobe
+  binder_linux` gives an empty one), memfd, the unified cgroup hierarchy, user namespaces (also for
+  root: the container's process runs unprivileged), and, for an unprivileged user, `newuidmap` and
+  `newgidmap` with a 65,536-id range in `/etc/subuid` and `/etc/subgid`; overlayfs on Linux 5.11
+  or newer (`userxattr`). Reported but not blocking: cgroup memory/cpu/pids controllers, DMA-BUF
+  heaps. Each missing piece prints its fix.
+- **Image.** One pinned image: `redroid/redroid:15.0.0_64only-250627`, by per-architecture
+  manifest digest and layer digest (`image.rs`). It is downloaded only when asked (`skopeo copy` of
+  the manifest by digest) and every blob is hashed against the pin before it is unpacked.
+- **Launcher.** `unshare` into new user, mount, pid, uts, ipc and cgroup namespaces (not network).
+  Container root is never host root: an unprivileged user is their own container root with their
+  `/etc/subuid` range above it (`newuidmap`); run as host root, the container's process drops to a
+  range of its own (root's `/etc/subuid` range, else 2,000,000,000 + 65,536) before it creates the
+  namespace, and the state directory is handed to that range. The script mounts an overlay of the
+  unpacked image over a per-device writable layer, a `/dev` tmpfs with the nodes Redroid's init
+  expects, binderfs (checked for the three devices, linked at `/dev/*`), `/proc` with runc's masked
+  and read-only paths (`kcore`, `/proc/sys`, `sysrq-trigger`...), and the host's `/sys` with every
+  mount in it read-only. A helper then `pivot_root`s into the overlay and detaches the old root
+  (no `chroot`: root inside one can walk out), and execs `/init` with Redroid's arguments
+  (`androidboot.redroid_width|height|dpi|gpu_mode`, `androidboot.use_memfd=true`). The helper is
+  `emu` itself under a hidden subcommand (`helper::main`) or the crate's `simee-container-helper`
+  binary, and it also sets `PR_SET_PDEATHSIG` so a crashed `emu` takes the container down with it
+  (start containers from a thread that outlives them: the kernel ties the signal to the thread);
+  dropping a `Container` kills it. Removing a rootfs the container made runs `rm` inside the
+  namespace.
+- **Verified:** the plan, the script, the probe and the selection against fake hosts; and on a Linux
+  VM without binder, as root and as an unprivileged user, a real user namespace with the id maps,
+  the overlay, `/dev`, devpts, `/proc` and its masks, `/sys` read-only throughout, and the pivot:
+  the container's mount table has the overlay as its only root, no host device, no path to the
+  host's files, and uid 0 maps to a non-zero host id; setup stops at binderfs with its message
+  there. Also that a helper's child dies when its parent is killed, and that a tree owned by
+  subordinate ids is removed from inside the namespace.
+- **Not verified:** a boot. No binder host has run this launcher, so whether Redroid's `/init`
+  starts unprivileged in this namespace set, and how long it takes, are open. It is not wired into
+  `emu` yet, so nothing boots through it; there is no display, input or console for it, no
+  network namespace (adbd listens on the host's port 5555, so one container per host), no cgroup
+  limits, and no `docs/benchmarks.md` row (nothing measured). `SIMEE_E2E_CONTAINER=1 cargo
+  nextest run -p simee-emu-container` runs the namespace tests against the host's kernel;
+  `cargo run -p simee-emu-container --example probe` prints what a host offers.
 
 ## Automotive
 
@@ -638,6 +691,12 @@ What has mattered so far, measured with `sample` and the `-verbose` exit counter
   are on another APFS volume (`EXDEV`; a 6 GiB userdata holding 1 GiB of data), `std::fs::copy`'s
   `fcopyfile` filled the holes, 2.97 s and 6.1 GiB per clone; the extent copy takes 0.57 s and
   1.0 GiB (median of 5, same host and day).
+  The key is the one disk written at boot, so `emu_avd::clone::clone_file_atomic` copies
+  `encryptionkey.img` under `.encryptionkey.img.partial` and renames it into place: a kill mid-copy
+  leaves no half-written key at the final name. A symlink at that path, dangling or not, is
+  refused with an error naming it (the old `std::fs::copy` wrote through it). The tests run the
+  real `FICLONE` where the file system has it; `SIMEE_REFLINK_DIR=<dir on Btrfs or XFS>` points
+  them at one (a loop-mounted `mkfs.xfs -m reflink=1` image works).
 - **Screenshots: fast PNG, no re-encode, no needless copies.** Automation takes a screenshot
   after nearly every step. On a 2480×1740 screen (`cargo run --release -p simee-core --example
   frame_bench`), PNG encoding at the `png` crate's default level took 74 ms and BGRA→RGBA

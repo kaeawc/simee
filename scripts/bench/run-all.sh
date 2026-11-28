@@ -30,6 +30,7 @@ android-gles-first|android|android-idle.sh --arms "emu emu:ANGLE_DEFAULT_PLATFOR
 android-gles-warm|android|android-idle.sh --warm --arms "emu emu:ANGLE_DEFAULT_PLATFORM=swiftshader" --launcher --window 0|API 29 (GLES over the goldfish pipe), warm boots by host GLES
 android-frames-phone|android|android-frames.sh --device phone|Frame pacing
 android-frames-tablet|android|android-frames.sh --device tablet|Frame pacing
+android-renderers|android|renderers.sh|Android renderers (docs/research/renderers.md)
 android-net|android|android-net.sh|Idle host CPU (the NAT) and NAT throughput
 android-reset|android|android-reset.sh|Emulator internals: guest resets
 android-steps|android|api-steps.sh --android|Software mode through emu -avd (tap, screenshot)

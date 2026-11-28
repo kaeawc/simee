@@ -77,6 +77,41 @@ fn links_resolve_to_site_pages_images_and_github() {
 }
 
 #[test]
+fn link_titles_survive_resolving() {
+    // Table 1's source icons carry their host and date as a link title; the site resolved the
+    // destination with the title still in it, which made the anchor junk.
+    let md = "[\u{2197}](docs/benchmarks.md#frame-pacing \"Android: M3 Max, 2026-11-25\")";
+    let out = resolve_links(md, "");
+    assert_eq!(out, "[\u{2197}](/docs/benchmarks/#frame-pacing \"Android: M3 Max, 2026-11-25\")");
+    assert_eq!(content::link_titles(&out), [("/docs/benchmarks/#frame-pacing".to_owned(), "Android: M3 Max, 2026-11-25".to_owned())]);
+}
+
+#[test]
+fn table_1_has_measures_as_rows_and_a_source_icon_per_platform() {
+    let perf = content::readme_section("Performance");
+    let header = perf.lines().find(|l| l.starts_with('|')).expect("README ## Performance has a table");
+    let cells: Vec<&str> = header.trim_matches('|').split('|').map(str::trim).collect();
+    assert_eq!(cells, ["Measure", "simee, Android / iOS", "Android emulator (QEMU)", "Simulator.app", "Source"]);
+    // Each source is an icon whose tooltip names the platform, host and date, not file names in
+    // the cell.
+    let rt = page(Route::Home, 1400.0);
+    let in_table = |e: &rune::ElementInfo| !e.exiting && e.path.contains("t1-md");
+    let sources: Vec<_> = rt.elements().into_iter().filter(|e| in_table(e) && e.role == "link").collect();
+    assert!(sources.len() >= 2, "Table 1 has no source links");
+    for e in &sources {
+        let help = e.help.as_deref().unwrap_or_else(|| panic!("{:?} has no tooltip", e.key));
+        assert!(help.contains("2026-") && (help.starts_with("Android") || help.starts_with("iOS")), "{help}");
+    }
+    assert!(sources.iter().any(|e| e.help.as_deref().is_some_and(|h| h.starts_with("iOS"))), "no iOS source");
+    let table: String = perf.lines().filter(|l| l.starts_with('|')).map(|l| format!("{l}\n")).collect();
+    for event in Parser::new_ext(&table, Options::ENABLE_TABLES) {
+        if let Event::Text(t) | Event::Code(t) = event {
+            assert!(!t.contains("scripts/") && !t.contains(".md"), "a file name shows in Table 1: {t}");
+        }
+    }
+}
+
+#[test]
 fn links_in_code_are_left_alone() {
     let md = "See [cli](cli.md) and `[x](cli.md)`.\n```\n[y](cli.md)\n```\n";
     assert_eq!(resolve_links(md, "docs"), "See [cli](/docs/cli/) and `[x](cli.md)`.\n```\n[y](cli.md)\n```\n");

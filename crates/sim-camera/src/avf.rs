@@ -1406,12 +1406,72 @@ mod tests {
     }
 
     /// A 10 s, 30 fps H.264 clip with one keyframe, at its start: frame `i` is grey level
-    /// `i * 255 / 299`, so a picture says roughly which frame it is.
+    /// `i * 255 / 299`, so a picture says roughly which frame it is. The key interval is only a
+    /// maximum, and the encoder cuts a keyframe of its own now and then when the host is busy
+    /// (seen with other encodes running), so a clip is written again until it has just the one.
     fn long_gop_clip(path: &std::path::Path) {
-        write_movie(path, 64, 48, 30, IDENTITY, Some(300), 300, |i, _| {
-            let g = (i * 255 / 299) as u8;
-            [g, g, g, 255]
-        });
+        // One at a time: the encoder cuts the most keyframes when several encodes run at once.
+        static ENCODING: Mutex<()> = Mutex::new(());
+        let _one = ENCODING.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..8 {
+            write_movie(path, 64, 48, 30, IDENTITY, Some(3000), 300, |i, _| {
+                let g = (i * 255 / 299) as u8;
+                [g, g, g, 255]
+            });
+            let reader = ok(autoreleasepool(|_| VideoReader::open("video:long-gop", path)));
+            if samples_and_keyframes(&reader.track) == (300, 1) {
+                return;
+            }
+        }
+        panic!("the encoder would not write a clip with a single keyframe");
+    }
+
+    /// `AVSampleCursorSyncInfo`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct SyncInfo {
+        full: Bool,
+        partial: Bool,
+        droppable: Bool,
+    }
+
+    // SAFETY: the three BOOL fields of `AVSampleCursorSyncInfo`, in order.
+    unsafe impl Encode for SyncInfo {
+        const ENCODING: Encoding = Encoding::Struct("?", &[Bool::ENCODING; 3]);
+    }
+
+    /// The samples of `track` and how many of them are keyframes (full sync samples), walking an
+    /// `AVSampleCursor` through the file's samples in decode order.
+    fn samples_and_keyframes(track: &AnyObject) -> (usize, usize) {
+        // SAFETY: `makeSampleCursorAtFirstSampleInDecodeOrder` returns a cursor or nil;
+        // `currentSampleSyncInfo` returns the sync struct and `stepInDecodeOrderByCount:`
+        // the number of samples stepped (0 at the last), on that cursor.
+        unsafe {
+            let cursor: Option<Obj> = msg_send![track, makeSampleCursorAtFirstSampleInDecodeOrder];
+            let cursor = cursor.expect("an AVSampleCursor for the track");
+            let (mut samples, mut keyframes) = (0, 0);
+            loop {
+                let info: SyncInfo = msg_send![&*cursor, currentSampleSyncInfo];
+                samples += 1;
+                keyframes += usize::from(info.full.as_bool());
+                let stepped: i64 = msg_send![&*cursor, stepInDecodeOrderByCount: 1i64];
+                if stepped == 0 {
+                    return (samples, keyframes);
+                }
+            }
+        }
+    }
+
+    /// The long-GOP clip really is one: 300 samples, a single keyframe (so a seek into it lands
+    /// in a GOP that starts at the clip's first frame, not in one the encoder cut short).
+    /// `long_gop_clip` retries until it is, so this pins the helper and the keyframe count.
+    #[test]
+    fn the_long_gop_clip_has_a_single_keyframe() {
+        let path = temp_clip("long-gop-keyframes.mov");
+        long_gop_clip(&path);
+        let reader = ok(autoreleasepool(|_| VideoReader::open("video:long-gop", &path)));
+        assert_eq!(samples_and_keyframes(&reader.track), (300, 1));
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A reader started mid-GOP gives frames from the time it starts at, not from the keyframe

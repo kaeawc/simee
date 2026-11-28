@@ -149,8 +149,8 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "Stream the screen as H.264 over WebRTC to a WHIP endpoint (plaintext http to a loopback host only, e.g. MediaMTX's \
          `http://127.0.0.1:8889/<path>/whip`), with token as its bearer token; max_size caps the longest side (0: full size), \
          bitrate is in bit/s; input offers the `simee-input` data channel, whose touches, keys, text, buttons, rotations, folds \
-         and scrolls reach the device. One stream per device and URL, living in this process (`simee serve`) on a 30 s lease \
-         that stream_status renews: a stream nobody renews is stopped. Returns stream_id, whip_resource and lease_ttl_s. \
+         and scrolls reach the device (a server that refuses the data channel, as MediaMTX does, gets the stream without it: the result's input is false and input_note says why). One stream per device and URL, living in this process (`simee serve`) on a 30 s lease \
+         that stream_status renews: a stream nobody renews is stopped. Returns stream_id, whip_resource and lease_ttl_s (and, with input, whether it is on). \
          Encoded on macOS by VideoToolbox (iOS and Android devices) and on Linux by OpenH264 in a build with `--features openh264` (Android devices only); audio isn't streamed yet",
     ),
     (

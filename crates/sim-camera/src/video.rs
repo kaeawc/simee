@@ -82,9 +82,12 @@ pub(crate) struct Player<D: Decode> {
     base: Duration,
     /// The time between the last two frames decoded: how long the last frame of a pass shows.
     gap: Option<Duration>,
-    /// How long one pass lasts, once one has been decoded to its end (or a stall in the first
-    /// pass has gone past the end the container gives).
+    /// How long one pass lasts: measured once a pass has been decoded to its end; until then the
+    /// container's end stands in, when a stall in the first pass has gone past it (or a jump has
+    /// found no frame before it).
     length: Option<Duration>,
+    /// `length` is the measured one: the last frame's time plus the gap, replacing the container's.
+    measured: bool,
     /// The file time the decoder last restarted at, until playback reaches it: no jump before
     /// then, so a decoder that starts a jump at the keyframe before its time catches up instead
     /// of jumping again every tick.
@@ -116,6 +119,7 @@ impl<D: Decode> Player<D> {
             base: Duration::ZERO,
             gap: None,
             length: None,
+            measured: false,
             target: None,
             failures: 0,
             retry_at: None,
@@ -155,7 +159,12 @@ impl<D: Decode> Player<D> {
             {
                 if self.before_end(at) {
                     if self.target.is_none() {
+                        let before = self.length;
                         self.reposition(at)?;
+                        if self.length != before {
+                            // No frame at `at`: the gap is the end, and playback has wrapped.
+                            continue;
+                        }
                     }
                 } else if self.length.is_none()
                     && let Some(end) = self.decoder.end().filter(|&end| end > self.first)
@@ -184,7 +193,12 @@ impl<D: Decode> Player<D> {
             // The end of the pass: it lasts until the last frame's time plus the gap before it.
             let last = self.gap.filter(|g| !g.is_zero()).unwrap_or_else(|| self.decoder.interval());
             let measured = (self.now.saturating_sub(self.first) + last).max(Duration::from_millis(1));
-            let length = *self.length.get_or_insert(measured);
+            if !self.measured {
+                // The first full pass replaces the container's length, so the loop does not
+                // depend on whether the host stalled.
+                (self.length, self.measured) = (Some(measured), true);
+            }
+            let length = self.length.unwrap_or(measured);
             if pts.saturating_sub(self.base) < length {
                 return Ok(());
             }
@@ -203,6 +217,11 @@ impl<D: Decode> Player<D> {
         self.target = Some(at);
         let mut sample = self.decoder.next()?;
         if sample.is_none() && at > self.first {
+            // No frame at `at`, in the gap between the last frame and the container's end: treat
+            // the gap as the end of the pass, and start over.
+            if !self.measured {
+                self.length = Some(at - self.first);
+            }
             self.decoder.seek(Duration::ZERO)?;
             self.target = None;
             sample = self.decoder.next()?;
@@ -301,6 +320,9 @@ pub(crate) mod tests {
         /// Frames between keyframes, when a seek starts at the keyframe before its time (a
         /// decoder that delivers a jump from its sync sample).
         keyframes: Option<usize>,
+        /// A seek further past the last frame than one interval finds no frame (a container whose
+        /// track runs past its last sample).
+        empty_past_last: bool,
         pub(crate) restarts: Arc<Mutex<usize>>,
         decoded: Arc<Mutex<usize>>,
         copies: Arc<Mutex<usize>>,
@@ -317,6 +339,7 @@ pub(crate) mod tests {
                 broken_from: None,
                 end: None,
                 keyframes: None,
+                empty_past_last: false,
                 restarts: Arc::default(),
                 decoded: Arc::default(),
                 copies: Arc::default(),
@@ -341,6 +364,11 @@ pub(crate) mod tests {
 
         fn keyframe_every(mut self, frames: usize) -> Fake {
             self.keyframes = Some(frames);
+            self
+        }
+
+        fn empty_past_last_frame(mut self) -> Fake {
+            self.empty_past_last = true;
             self
         }
 
@@ -394,6 +422,9 @@ pub(crate) mod tests {
         fn seek(&mut self, to: Duration) -> Result<()> {
             let at = self.frames.iter().rposition(|&(ms, _)| Duration::from_millis(ms) <= to).unwrap_or(0);
             self.at = self.keyframes.map_or(at, |k| at / k.max(1) * k.max(1));
+            if self.empty_past_last && self.frames.last().is_some_and(|&(ms, _)| to > Duration::from_millis(ms) + self.interval) {
+                self.at = self.frames.len();
+            }
             *self.restarts.lock().unwrap_or_else(|p| p.into_inner()) += 1;
             Ok(())
         }
@@ -586,6 +617,34 @@ pub(crate) mod tests {
         assert!(decodes <= DECODES_PER_TICK + 2, "{decodes} frames decoded in one tick");
         assert_eq!(count(&restarts), 1, "one restart, at the wrap");
         assert_eq!(value(&mut p, 12_510), 0, "and it plays on from there (frame 251)");
+    }
+
+    #[test]
+    fn a_measured_pass_replaces_the_length_the_container_gave() {
+        // 10 s at 100 fps; the track runs to 12 s, 2 s past the last frame's end. A stall in the
+        // first pass wraps on the container's 12 s; once a pass has played to its last frame, the
+        // loop is that frame's time plus the gap (10 s), stall or no stall.
+        let fake = Fake::steady(1000, 10).ending_at(12_000);
+        let mut p = Player::new("video:long-track".into(), fake).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(value(&mut p, 0), 0);
+        assert_eq!(value(&mut p, 12_500), 50, "0.5 s into the second pass, wrapped on the container's length");
+        for ms in (12_550..22_000).step_by(50) {
+            value(&mut p, ms);
+        }
+        assert_eq!(value(&mut p, 22_000), 0, "the pass that started at 12 s lasts its measured 10 s");
+        assert_eq!(value(&mut p, 22_050), 5);
+    }
+
+    #[test]
+    fn a_jump_into_the_gap_after_the_last_frame_wraps_without_replaying_the_start() {
+        // 10 s at 100 fps in a track that runs to 12 s: a stall lands 11 s in, where no frame is.
+        let fake = Fake::steady(1000, 10).ending_at(12_000).empty_past_last_frame();
+        let restarts = fake.restarts.clone();
+        let mut p = Player::new("video:gap".into(), fake).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(value(&mut p, 0), 0);
+        let shown: Vec<u8> = (0..10u64).map(|tick| value(&mut p, 11_000 + tick * 10)).collect();
+        assert_eq!(shown, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], "starts over and plays on, no replay of the first frames");
+        assert!(count(&restarts) <= 3, "{} restarts", count(&restarts));
     }
 
     #[test]

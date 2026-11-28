@@ -14,6 +14,7 @@
 //! at once and a stopped or dead one never is.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use emu_avd::{Env, Probe, Running};
@@ -60,19 +61,20 @@ impl StockCache {
         self.by_pid.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The stock emulators running among the AVDs `names` (left out: those `skip` names), asking
-    /// the host only about a PID not seen at its current start time. Forgets emulators no lock
-    /// names any more.
-    pub fn instances(&self, env: &Env, names: &[String], skip: &[Running]) -> Vec<Running> {
-        self.scan(env, names, skip, true)
+    /// The stock emulators running among `avds` (name and directory, as [`Env::content_dir`]
+    /// resolves them; left out: those `skip` names), asking the host only about a PID not seen at
+    /// its current start time. Forgets emulators no lock names any more.
+    pub fn instances<'a>(&self, avds: impl IntoIterator<Item = (&'a str, &'a Path)>, skip: &[Running]) -> Vec<Running> {
+        self.scan(avds, skip, true)
     }
 
     /// [`StockCache::instances`] for the one AVD `name`: its lock only.
     pub fn instance(&self, env: &Env, name: &str, skip: &[Running]) -> Option<Running> {
-        self.scan(env, &[name.to_owned()], skip, false).pop()
+        let dir = env.content_dir(name).ok()?;
+        self.scan([(name, dir.as_path())], skip, false).pop()
     }
 
-    fn scan(&self, env: &Env, names: &[String], skip: &[Running], forget: bool) -> Vec<Running> {
+    fn scan<'a>(&self, avds: impl IntoIterator<Item = (&'a str, &'a Path)>, skip: &[Running], forget: bool) -> Vec<Running> {
         let mut seen = self.lock();
         let touched = std::cell::RefCell::new(HashSet::new());
         let table = std::cell::RefCell::new(std::mem::take(&mut *seen));
@@ -109,7 +111,7 @@ impl StockCache {
             }
             ports
         };
-        let found = env.stock_instances_among_with(names, skip, &Probe { args: &args, listening: &listening });
+        let found = Env::stock_instances_in_with(avds, skip, &Probe { args: &args, listening: &listening });
         *seen = table.into_inner();
         if forget {
             let touched = touched.into_inner();
@@ -123,7 +125,7 @@ impl StockCache {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     /// What a fake process looks like to the host.
@@ -235,7 +237,11 @@ mod tests {
     }
 
     fn all(stock: &StockCache, env: &Env, skip: &[Running]) -> Vec<Running> {
-        stock.instances(env, &env.list_avds(), skip)
+        stock.instances(avds(env).iter().map(|(n, d)| (n.as_str(), d.as_path())), skip)
+    }
+
+    fn avds(env: &Env) -> Vec<(String, PathBuf)> {
+        env.list_avds().into_iter().filter_map(|n| Some((n.clone(), env.content_dir(&n).ok()?))).collect()
     }
 
     #[test]
