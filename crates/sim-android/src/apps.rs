@@ -69,7 +69,14 @@ impl Device {
     pub fn adb(&self, android: &Android) -> Result<Adb, String> {
         let serial = self.running()?.serial();
         let adb = android.adb().ok_or("adb not found: install the SDK's platform-tools (`emu -provision`) or put adb on the PATH")?;
-        Ok(Adb { adb, serial, bundletool: on_path("bundletool"), pid_wait: PID_WAIT, deadlines: Deadlines::default() })
+        Ok(Adb::bound(adb, serial))
+    }
+}
+
+impl Adb {
+    /// adb at `adb` bound to the device `serial`, with the default waits and deadlines.
+    pub(crate) fn bound(adb: PathBuf, serial: String) -> Adb {
+        Adb { adb, serial, bundletool: on_path("bundletool"), pid_wait: PID_WAIT, deadlines: Deadlines::default() }
     }
 }
 

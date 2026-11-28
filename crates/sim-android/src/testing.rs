@@ -284,6 +284,17 @@ impl FakeAdb {
         }
     }
 
+    /// Makes the next `n` forwards fail as adb does for a host port another program took.
+    pub fn ports_taken(&self, n: u32) {
+        std::fs::write(self.log.with_file_name("forward.busy"), n.to_string()).expect("busy flag");
+    }
+
+    /// The forwards adb holds now, as `adb forward --list` prints them (`<serial> tcp:<host>
+    /// tcp:<device>`).
+    pub fn forwards(&self) -> Vec<String> {
+        std::fs::read_to_string(self.log.with_file_name("forwards")).unwrap_or_default().lines().map(str::to_owned).collect()
+    }
+
     /// Each invocation's arguments, in order, without the leading `-s <serial>`.
     pub fn calls(&self) -> Vec<String> {
         let text = std::fs::read_to_string(&self.log).unwrap_or_default();
@@ -299,7 +310,8 @@ impl FakeAdb {
 }
 
 const FAKE_ADB: &str = r#"echo "$*" >> "$(dirname "$0")/adb.log"
-[ "$1" = "-s" ] && shift 2
+serial=""
+[ "$1" = "-s" ] && serial="$2" && shift 2
 # What an API 36 guest's toybox `ps -A -o PID,PPID,%CPU,RSS,ETIME,NAME,CMDLINE` prints (trimmed).
 ps_rows() {
   printf '%s\n' \
@@ -431,8 +443,30 @@ stat() { echo "$1 ($2) S $3 1 1 0 -1 4194560 100 0 0 0 $4 $5 0 0 20 0 1 0 100 0 
 d="$(dirname "$0")"
 installed() { printf 'package:android\npackage:com.android.systemui\npackage:com.google.android.apps.turbo\npackage:com.google.android.apps.wellbeing\npackage:com.google.android.partnersetup\n'; }
 case "$1" in
-# `forward tcp:<host> tcp:<device>` and `forward --remove tcp:<host>` (sim_android::dhu): logged only.
-forward) ;;
+# `forward [--no-rebind] tcp:<host> tcp:<device>`, `forward --remove tcp:<host>` and `forward --list`
+# (sim_android::dhu) on one table for every serial, `forwards` beside the script, as adb's server
+# keeps it: `--no-rebind` refuses a host port already forwarded, and while `forward.busy` holds a
+# count above 0 that many more forwards are refused as taken by another program.
+forward)
+  shift
+  f="$d/forwards"
+  touch "$f"
+  case "$1" in
+    --list) cat "$f";;
+    --remove)
+      grep -q " $2 " "$f" || { echo "adb: error: listener '$2' not found" >&2; exit 1; }
+      grep -v " $2 " "$f" > "$f.$$"; mv "$f.$$" "$f";;
+    *)
+      norebind=""
+      [ "$1" = "--no-rebind" ] && norebind=1 && shift
+      if [ -n "$norebind" ] && grep -q " $1 " "$f"; then echo "adb: error: cannot rebind existing socket" >&2; exit 1; fi
+      busy="$(cat "$d/forward.busy" 2>/dev/null || echo 0)"
+      if [ "$busy" -gt 0 ]; then
+        echo $((busy - 1)) > "$d/forward.busy"
+        echo "adb: error: cannot bind listener: Address already in use" >&2; exit 1
+      fi
+      grep -v " $1 " "$f" > "$f.$$"; echo "$serial $1 $2" >> "$f.$$"; mv "$f.$$" "$f";;
+  esac;;
 install)
   case "$*" in
     *broken.apk*) echo "Performing Streamed Install" >&2; echo "adb: failed to install broken.apk: Failure [INSTALL_PARSE_FAILED_NOT_APK: Failed to parse /data/app/vmdl1.tmp/base.apk]" >&2; exit 1;;

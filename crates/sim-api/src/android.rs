@@ -473,7 +473,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
                 "dropped": m.dropped,
             }))
         }
-        "shutdown" => null(d.shutdown()),
+        "shutdown" => null(android.shutdown(&d)),
         m if crate::android_state::is_method(m) => crate::android_state::call(&android, &d, m, p),
         // The guest's layout, which tap, swipe and touch take (a folded foldable's outer screen).
         "screen" => d.layout_size().map(|(w, h)| json!({"width": w, "height": h})),

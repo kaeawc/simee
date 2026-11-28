@@ -14,8 +14,13 @@
 //!   open for writing, so it never sees end of input and a later call, from another process, can
 //!   still write a command line to it; stdout and stderr go to `dhu.log` beside it;
 //! - its PID and what it was started with are recorded in `<avd>/simee/dhu.state` (as `emu`'s
-//!   PID is), so [`Device::car_stop`] from any process finds it; a PID is signalled only while its
-//!   command line still names the DHU, never a reused one;
+//!   PID is), with the process's start time, so [`Device::car_stop`] from any process finds it; a
+//!   record counts only while its PID still has that start time and a command line naming the
+//!   DHU, so a reused PID is a stale record (cleared by the next start or stop), never signalled;
+//! - a start or stop holds `<avd>/simee/dhu.lock` (an `flock`), so two starts of one phone make
+//!   one head unit; the forward takes `--no-rebind`, so two phones never share a host port;
+//! - `shutdown` and `delete` ([`crate::Android::shutdown`], [`crate::Android::delete`]) stop the
+//!   device's head unit and its forward first;
 //! - `--headless` still renders for `screenshot`: unverified, a device check (#438).
 //!
 //! The DHU's files are never bundled or fetched here (`emu -provision-dhu` installs them into the
@@ -47,6 +52,8 @@ pub const EXECUTABLE: &str = "extras/google/auto/desktop-head-unit";
 pub const DEFAULT_DPI: u32 = 160;
 /// What a `screenshot` waits for the DHU to write its PNG.
 pub const SHOT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The refusal on Windows, before anything else is checked.
+const WINDOWS: &str = "Android Auto projection isn't supported on Windows yet: the DHU console needs a FIFO (unix)";
 
 /// The resolutions the DHU takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -546,6 +553,10 @@ pub struct Projection {
     pub forward_port: u16,
     pub config: Config,
     pub headless: bool,
+    /// When the DHU's process started, as the host reports it ([`crate::host::Native`]): with the
+    /// PID it names one process, so a reused PID isn't taken for the DHU. `None` where the host
+    /// can't say (then the command line alone is checked).
+    pub started: Option<u64>,
 }
 
 impl Projection {
@@ -553,7 +564,7 @@ impl Projection {
     pub fn render(&self) -> String {
         let sensors: Vec<&str> = self.config.sensors.iter().map(|s| s.key()).collect();
         format!(
-            "pid={}\nserial={}\nforward_port={}\nresolution={}\ndpi={}\ninput={}\nheadless={}\nsensors={}\n",
+            "pid={}\nserial={}\nforward_port={}\nresolution={}\ndpi={}\ninput={}\nheadless={}\nsensors={}\n{}",
             self.pid,
             self.serial,
             self.forward_port,
@@ -561,7 +572,8 @@ impl Projection {
             self.config.dpi,
             self.config.input.as_str(),
             self.headless,
-            sensors.join(",")
+            sensors.join(","),
+            self.started.map(|t| format!("started={t}\n")).unwrap_or_default()
         )
     }
 
@@ -578,6 +590,7 @@ impl Projection {
                 sensors: kv.get("sensors")?.split(',').filter_map(Sensor::from_key).collect(),
             },
             headless: *kv.get("headless")? == "true",
+            started: kv.get("started").and_then(|t| t.parse().ok()),
         })
     }
 }
@@ -601,25 +614,48 @@ fn children<R>(f: impl FnOnce(&mut HashMap<u32, Child>) -> R) -> R {
     f(guard.get_or_insert_with(HashMap::new))
 }
 
-/// Whether process `pid` is still running.
-fn pid_alive(pid: u32) -> bool {
+/// Whether this process's child `pid` still runs (`None`: not a child of ours). A child that
+/// exited is reaped and forgotten. Its PID can't be reused before that, so the answer is exact.
+fn child_alive(pid: u32) -> Option<bool> {
     let ours = children(|c| c.get_mut(&pid).map(|child| child.try_wait().map(|s| s.is_none()).unwrap_or(false)));
-    if let Some(alive) = ours {
-        if !alive {
-            children(|c| c.remove(&pid));
-        }
-        return alive;
+    if ours == Some(false) {
+        children(|c| c.remove(&pid));
     }
-    Process::new("kill").args(["-0", &pid.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    ours
 }
 
-/// Whether `pid`'s command line names the DHU: the check before signalling a recorded PID.
-fn is_head_unit(pid: u32) -> bool {
-    Process::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .stderr(Stdio::null())
-        .output()
-        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("desktop-head-unit"))
+/// Whether process `pid` is still running.
+fn pid_alive(pid: u32) -> bool {
+    child_alive(pid).unwrap_or_else(|| {
+        Process::new("kill").args(["-0", &pid.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    })
+}
+
+/// Whether `p`'s DHU still runs: a child of this process that hasn't exited, or a live process
+/// with the recorded PID, the recorded start time (where the host reports one) and a command line
+/// that names the DHU. A PID reused by another program, or by a later DHU, is not it.
+fn alive(p: &Projection) -> bool {
+    use crate::listing::Host;
+    if let Some(alive) = child_alive(p.pid) {
+        return alive;
+    }
+    if !pid_alive(p.pid) {
+        return false;
+    }
+    let host = crate::host::Native;
+    let pid = p.pid as i32;
+    if let (Some(recorded), Some(now)) = (p.started, host.start(pid))
+        && recorded != now
+    {
+        return false;
+    }
+    host.args(pid).is_some_and(|a| a.contains("desktop-head-unit"))
+}
+
+/// When `pid` started, as the host reports it.
+fn start_time(pid: u32) -> Option<u64> {
+    use crate::listing::Host;
+    crate::host::Native.start(pid as i32)
 }
 
 fn signal(name: &str, pid: u32) {
@@ -652,35 +688,116 @@ fn log_tail(dir: &Path) -> String {
     if lines.is_empty() { "it printed nothing".to_owned() } else { lines[from..].join(" | ") }
 }
 
-/// The recorded projection in `dir` (`<avd>/simee`) when its DHU still runs; a stale record is
-/// `None` (and is left for [`stop`] to clear).
+/// What a start or stop waits for another one on the same device to finish.
+const LOCK_WAIT: Duration = Duration::from_secs(30);
+/// How many host ports a start tries when adb refuses one as taken.
+const FORWARD_TRIES: usize = 5;
+
+/// Holds `<avd>/simee/dhu.lock` (an advisory `flock`) until dropped, so a start's check, spawn
+/// and record, or a stop, runs alone on one device across threads and processes. The kernel lets
+/// go of a dead holder's lock, so there is never a stale one to clear.
+struct DeviceLock {
+    _file: std::fs::File,
+}
+
+fn lock(dir: &Path) -> Result<DeviceLock, String> {
+    let path = dir.join("dhu.lock");
+    let file = OpenOptions::new().create(true).truncate(false).write(true).open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(DeviceLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => sleep(Duration::from_millis(25)),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(format!("another car_start or car_stop of this device still holds {} after {LOCK_WAIT:?}", path.display()));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
+}
+
+/// The projection `dir`'s `dhu.state` records, running or not.
+fn recorded(dir: &Path) -> Option<Projection> {
+    Projection::parse(&std::fs::read_to_string(state_path(dir)).ok()?)
+}
+
+/// The recorded projection in `dir` (`<avd>/simee`) when its DHU still runs ([`alive`]); a stale
+/// record is `None`, and the next [`start`] or [`stop`] clears it.
 pub fn running(dir: &Path) -> Option<Projection> {
-    let p = Projection::parse(&std::fs::read_to_string(state_path(dir)).ok()?)?;
-    pid_alive(p.pid).then_some(p)
+    recorded(dir).filter(alive)
 }
 
+/// Removes `port`'s forward when adb lists it as this phone's forward to the head unit server:
+/// once the phone went away, the port may be another phone's forward now, which stays.
 fn forward_remove(adb: &Adb, port: u16) -> bool {
-    adb.run(&["forward", "--remove", &format!("tcp:{port}")], adb.deadlines.query).is_ok_and(|(ok, _)| ok)
+    let (host, device) = (format!("tcp:{port}"), format!("tcp:{SERVER_PORT}"));
+    let ours = adb.run(&["forward", "--list"], adb.deadlines.query).is_ok_and(|(ok, text)| {
+        ok && text.lines().any(|l| l.split_whitespace().collect::<Vec<_>>() == [adb.serial.as_str(), host.as_str(), device.as_str()])
+    });
+    ours && adb.run(&["forward", "--remove", &host], adb.deadlines.query).is_ok_and(|(ok, _)| ok)
 }
 
-/// Starts the DHU `program` against the phone `adb` is bound to, with state in `dir`.
+/// Forgets `p`: its forward (through `adb`, on the serial `p` recorded) and its files. Whether
+/// the forward was removed.
+fn clear(dir: &Path, p: &Projection, adb: Option<&Adb>) -> bool {
+    let removed = adb.is_some_and(|a| forward_remove(&Adb { serial: p.serial.clone(), ..a.clone() }, p.forward_port));
+    for f in [state_path(dir), fifo_path(dir)] {
+        let _ = std::fs::remove_file(f);
+    }
+    removed
+}
+
+/// Forwards a free host port to the phone's head unit server with `--no-rebind`, so a port that
+/// another phone's forward holds is refused instead of taken over; a port adb can't bind (taken
+/// since [`free_port`] let it go) is retried with another, up to [`FORWARD_TRIES`] ports.
+fn forward(adb: &Adb) -> Result<u16, String> {
+    let mut tried = Vec::new();
+    let mut last = String::new();
+    // Bounded: the OS may hand out the same free port again.
+    for _ in 0..FORWARD_TRIES * 4 {
+        let port = free_port()?;
+        if tried.contains(&port) {
+            continue;
+        }
+        tried.push(port);
+        let (ok, text) =
+            adb.run(&["forward", "--no-rebind", &format!("tcp:{port}"), &format!("tcp:{SERVER_PORT}")], adb.deadlines.query)?;
+        if ok {
+            return Ok(port);
+        }
+        // adb's refusals of a port: `cannot rebind existing socket`, `cannot bind listener: ...`.
+        if !text.contains("bind") {
+            return Err(crate::apps::failure("adb forward", &text));
+        }
+        last = text;
+        if tried.len() == FORWARD_TRIES {
+            break;
+        }
+    }
+    let ports: Vec<String> = tried.iter().map(u16::to_string).collect();
+    Err(format!("adb refused every host port tried for the forward ({}): {}", ports.join(", "), last.trim()))
+}
+
+/// Starts the DHU `program` against the phone `adb` is bound to, with state in `dir`. One start
+/// or stop runs at a time per device ([`DeviceLock`]); a stale record is cleared first.
 pub fn start(program: &Path, adb: &Adb, dir: &Path, options: &Options) -> Result<Projection, String> {
     if cfg!(windows) {
-        return Err("Android Auto projection isn't supported on Windows yet: the DHU console needs a FIFO (unix)".into());
+        return Err(WINDOWS.into());
     }
     options.config.validate()?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    if let Some(p) = running(dir) {
-        return Err(format!(
-            "a head unit is already running for this device (PID {}, port {}): `car_stop` it first",
-            p.pid, p.forward_port
-        ));
+    let _lock = lock(dir)?;
+    if let Some(p) = recorded(dir) {
+        if alive(&p) {
+            return Err(format!(
+                "a head unit is already running for this device (PID {}, port {}): `car_stop` it first",
+                p.pid, p.forward_port
+            ));
+        }
+        // The DHU died, or its PID names another process now: forget it.
+        clear(dir, &p, Some(adb));
     }
-    let port = free_port()?;
-    let (ok, text) = adb.run(&["forward", &format!("tcp:{port}"), &format!("tcp:{SERVER_PORT}")], adb.deadlines.query)?;
-    if !ok {
-        return Err(crate::apps::failure("adb forward", &text));
-    }
+    let port = forward(adb)?;
     let started = spawn(program, dir, port, options).and_then(|child| {
         let pid = child.id();
         children(|c| c.insert(pid, child));
@@ -697,19 +814,31 @@ pub fn start(program: &Path, adb: &Adb, dir: &Path, options: &Options) -> Result
             }
             sleep(Duration::from_millis(25));
         }
-        Ok(Projection { pid, serial: adb.serial.clone(), forward_port: port, config: options.config.clone(), headless: options.headless })
+        Ok(Projection {
+            pid,
+            serial: adb.serial.clone(),
+            forward_port: port,
+            config: options.config.clone(),
+            headless: options.headless,
+            started: start_time(pid),
+        })
     });
-    match started {
-        Ok(p) => {
-            std::fs::write(state_path(dir), p.render()).map_err(|e| format!("{}: {e}", state_path(dir).display()))?;
-            Ok(p)
-        }
+    let recorded = started.and_then(|p| match std::fs::write(state_path(dir), p.render()) {
+        Ok(()) => Ok(p),
         Err(e) => {
-            forward_remove(adb, port);
-            let _ = std::fs::remove_file(fifo_path(dir));
-            Err(e)
+            // No record, so nothing could stop it later: stop it now.
+            if let Some(mut child) = children(|c| c.remove(&p.pid)) {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Err(format!("{}: {e}", state_path(dir).display()))
         }
+    });
+    if recorded.is_err() {
+        forward_remove(adb, port);
+        let _ = std::fs::remove_file(fifo_path(dir));
     }
+    recorded
 }
 
 fn spawn(program: &Path, dir: &Path, port: u16, options: &Options) -> Result<Child, String> {
@@ -742,43 +871,37 @@ fn spawn(program: &Path, dir: &Path, port: u16, options: &Options) -> Result<Chi
         .map_err(|e| format!("couldn't run {}: {e}", program.display()))
 }
 
-/// Stops the recorded DHU in `dir` and removes its forward and its files. A DHU already gone
-/// still clears its record; a PID that no longer names the DHU is never signalled.
+/// Stops the recorded DHU in `dir` and removes its forward and its files. A record whose DHU is
+/// gone, or whose PID names another process now, is cleared without signalling anything.
 pub fn stop(dir: &Path, adb: Option<&Adb>, grace: Duration) -> Result<Stopped, String> {
-    let text =
-        std::fs::read_to_string(state_path(dir)).map_err(|_| "no head unit is running for this device (nothing to stop)".to_owned())?;
-    let p = Projection::parse(&text).ok_or_else(|| format!("{} is unreadable; delete it", state_path(dir).display()))?;
-    let was_running = pid_alive(p.pid);
-    let ours = children(|c| c.contains_key(&p.pid));
-    if was_running && !ours && !is_head_unit(p.pid) {
-        return Err(format!(
-            "PID {} is running but isn't a Desktop Head Unit any more (its command line changed); not signalling it. Remove {} to forget it",
-            p.pid,
-            state_path(dir).display()
-        ));
+    let nothing = || "no head unit is running for this device (nothing to stop)".to_owned();
+    if !state_path(dir).exists() {
+        return Err(nothing());
     }
+    let _lock = lock(dir)?;
+    let text = std::fs::read_to_string(state_path(dir)).map_err(|_| nothing())?;
+    let p = Projection::parse(&text).ok_or_else(|| format!("{} is unreadable; delete it", state_path(dir).display()))?;
+    let was_running = alive(&p);
     if was_running {
         signal("-TERM", p.pid);
         let deadline = Instant::now() + grace;
-        while pid_alive(p.pid) && Instant::now() < deadline {
+        while alive(&p) && Instant::now() < deadline {
             sleep(Duration::from_millis(25));
         }
-        if pid_alive(p.pid) {
+        if alive(&p) {
             signal("-KILL", p.pid);
             let deadline = Instant::now() + Duration::from_secs(2);
-            while pid_alive(p.pid) && Instant::now() < deadline {
+            while alive(&p) && Instant::now() < deadline {
                 sleep(Duration::from_millis(25));
             }
         }
+        // `alive` reaps a child of ours once it exits; one that survived SIGKILL stays in the
+        // map (never waited on under its lock), and so does its record.
+        if alive(&p) {
+            return Err(format!("the Desktop Head Unit (PID {}) is still running after SIGKILL", p.pid));
+        }
     }
-    children(|c| c.remove(&p.pid).map(|mut child| child.wait()));
-    if pid_alive(p.pid) {
-        return Err(format!("the Desktop Head Unit (PID {}) is still running after SIGKILL", p.pid));
-    }
-    let forward_removed = adb.is_some_and(|a| forward_remove(a, p.forward_port));
-    for f in [state_path(dir), fifo_path(dir)] {
-        let _ = std::fs::remove_file(f);
-    }
+    let forward_removed = clear(dir, &p, adb);
     Ok(Stopped { pid: p.pid, was_running, forward_removed })
 }
 
@@ -851,6 +974,9 @@ impl Device {
     /// the phone (each missing piece answers with what to do), a port is forwarded and the DHU
     /// spawned and supervised.
     pub fn car_start(&self, android: &Android, options: &Options) -> Result<Projection, String> {
+        if cfg!(windows) {
+            return Err(WINDOWS.into());
+        }
         let sdk = android.env.sdk_root.as_ref().ok_or("no Android SDK found: the Desktop Head Unit lives in it")?;
         let program = sdk.join(EXECUTABLE);
         if !program.is_file() {
@@ -891,6 +1017,21 @@ impl Device {
         stop(&self.simee_dir()?, adb.as_ref(), Options::default().grace)
     }
 
+    /// Stops this device's head unit, if one is recorded, for a shutdown or a delete: the adb
+    /// forward goes through the serial the record names, so the phone needn't run any more.
+    /// `Ok(None)` when there was none to stop (or only a record that couldn't be read, which goes
+    /// with the device); an error only while the DHU still runs.
+    pub fn stop_head_unit(&self, android: &Android) -> Result<Option<Stopped>, String> {
+        let Ok(dir) = self.simee_dir() else { return Ok(None) };
+        let Some(p) = recorded(&dir) else { return Ok(None) };
+        let adb = android.adb().map(|a| Adb::bound(a, p.serial.clone()));
+        match stop(&dir, adb.as_ref(), Options::default().grace) {
+            Ok(s) => Ok(Some(s)),
+            Err(_) if running(&dir).is_none() => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Sends a console command to this device's head unit.
     pub fn car_command(&self, command: &Command) -> Result<(), String> {
         send(&self.simee_dir()?, command)
@@ -899,7 +1040,10 @@ impl Device {
     /// The car display as the DHU's PNG: its size and bytes.
     pub fn car_screenshot(&self) -> Result<(u32, u32, Vec<u8>), String> {
         let dir = self.simee_dir()?;
-        let tmp = dir.join(format!("car-shot-{}.png", std::process::id()));
+        // Unique per call: two callers can take car screenshots of one device at once.
+        static SHOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SHOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!("car-shot-{}-{n}.png", std::process::id()));
         let result =
             screenshot_to(&dir, &tmp, SHOT_TIMEOUT).and_then(|(w, h)| std::fs::read(&tmp).map(|b| (w, h, b)).map_err(|e| e.to_string()));
         let _ = std::fs::remove_file(&tmp);
@@ -1056,8 +1200,12 @@ mod tests {
                 sensors: vec![Sensor::Speed, Sensor::Night],
             },
             headless: true,
+            started: Some(987_654_321),
         };
-        assert_eq!(Projection::parse(&p.render()), Some(p));
+        assert_eq!(Projection::parse(&p.render()), Some(p.clone()));
+        // A record from before start times were kept still reads, with none.
+        let old = p.render().replace("started=987654321\n", "");
+        assert_eq!(Projection::parse(&old), Some(Projection { started: None, ..p }));
         assert_eq!(Projection::parse("pid=1\n"), None);
     }
 
@@ -1072,16 +1220,15 @@ mod tests {
     #[cfg(unix)]
     mod supervised {
         use super::*;
-        use crate::testing::{fake_adb, write_script};
+        use crate::testing::{FakeAdb, fake_adb, write_script};
 
         /// An SDK with a fake adb and a fake DHU; the DHU records its arguments (`dhu.argv`) and
         /// each console line (`dhu.lines`), and writes `shot.png` for `screenshot <path>`.
-        fn fixture(tag: &str, dhu_body: &str) -> (PathBuf, Adb, PathBuf, PathBuf) {
+        fn fixture(tag: &str, dhu_body: &str) -> (PathBuf, Adb, PathBuf, PathBuf, FakeAdb) {
             let root = PathBuf::from("/tmp").join(format!("sa-dhu-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             let android = Android::new(emu_avd::Env { sdk_root: Some(root.join("sdk")), avd_home: root.join("avd") });
-            let adb_log = fake_adb(&android);
-            let _ = adb_log;
+            let fake = fake_adb(&android);
             let auto = root.join("sdk/extras/google/auto");
             std::fs::create_dir_all(&auto).expect("auto dir");
             let png = sim_core::frame::encode_png(&sim_core::frame::Frame { width: 1280, height: 720, rgba: vec![7; 1280 * 720 * 4] })
@@ -1096,7 +1243,7 @@ mod tests {
                 deadlines: crate::apps::Deadlines::default(),
             };
             let dir = root.join("avd/phone.avd/simee");
-            (root, adb, auto.join("desktop-head-unit"), dir)
+            (root, adb, auto.join("desktop-head-unit"), dir, fake)
         }
 
         pub(super) const FAKE_DHU: &str = r#"d="$(dirname "$0")"
@@ -1127,7 +1274,7 @@ done
 
         #[test]
         fn start_forwards_a_free_port_and_the_dhu_dials_it() {
-            let (root, adb, program, dir) = fixture("start", FAKE_DHU);
+            let (root, adb, program, dir, _) = fixture("start", FAKE_DHU);
             let options = Options { headless: true, config: Config { input: InputMode::Hybrid, dpi: 213, ..Config::default() }, ..quick() };
             let p = start(&program, &adb, &dir, &options).expect("start");
             assert!(p.forward_port > 0 && pid_alive(p.pid));
@@ -1137,7 +1284,7 @@ done
             let ini = std::fs::read_to_string(dir.join("dhu.ini")).expect("ini");
             assert!(ini.contains("resolution=1280x720") && ini.contains("dpi=213"), "{ini}");
             let calls = std::fs::read_to_string(root.join("sdk/platform-tools/adb.log")).expect("adb log");
-            assert!(calls.contains(&format!("forward tcp:{} tcp:5277", p.forward_port)), "{calls}");
+            assert!(calls.contains(&format!("forward --no-rebind tcp:{} tcp:5277", p.forward_port)), "{calls}");
             // A second start is refused while the first runs.
             assert!(start(&program, &adb, &dir, &quick()).expect_err("running").contains("already running"));
             let stopped = stop(&dir, Some(&adb), Duration::from_secs(2)).expect("stop");
@@ -1153,7 +1300,7 @@ done
 
         #[test]
         fn two_phones_get_two_ports() {
-            let (root, adb, program, dir) = fixture("two", FAKE_DHU);
+            let (root, adb, program, dir, _) = fixture("two", FAKE_DHU);
             let other = root.join("avd/other.avd/simee");
             let a = start(&program, &adb, &dir, &quick()).expect("first");
             let b = start(&program, &Adb { serial: "emulator-5558".into(), ..adb.clone() }, &other, &quick()).expect("second");
@@ -1167,7 +1314,7 @@ done
 
         #[test]
         fn commands_reach_the_console_across_calls() {
-            let (root, adb, program, dir) = fixture("send", FAKE_DHU);
+            let (root, adb, program, dir, _) = fixture("send", FAKE_DHU);
             start(&program, &adb, &dir, &quick()).expect("start");
             send(&dir, &Command::Tap { x: 100, y: 200 }).expect("tap");
             send(&dir, &Command::Speed(9.5)).expect("speed");
@@ -1181,7 +1328,7 @@ done
 
         #[test]
         fn a_screenshot_is_the_pngs_the_dhu_writes() {
-            let (root, adb, program, dir) = fixture("shot", FAKE_DHU);
+            let (root, adb, program, dir, _) = fixture("shot", FAKE_DHU);
             start(&program, &adb, &dir, &quick()).expect("start");
             let target = root.join("car.png");
             assert_eq!(screenshot_to(&dir, &target, Duration::from_secs(5)), Ok((1280, 720)));
@@ -1192,7 +1339,7 @@ done
 
         #[test]
         fn a_screenshot_that_never_comes_times_out_with_the_log() {
-            let (root, adb, program, dir) = fixture("noshot", "echo 'rendering disabled' >&2\ncat > /dev/null\n");
+            let (root, adb, program, dir, _) = fixture("noshot", "echo 'rendering disabled' >&2\ncat > /dev/null\n");
             start(&program, &adb, &dir, &quick()).expect("start");
             let err = screenshot_to(&dir, &root.join("x.png"), Duration::from_millis(200)).expect_err("none");
             assert!(err.contains("wrote no screenshot") && err.contains("dhu.log"), "{err}");
@@ -1202,7 +1349,7 @@ done
 
         #[test]
         fn a_dhu_that_exits_right_away_is_reported_with_its_output() {
-            let (root, adb, program, dir) = fixture("exit", "echo 'Connection refused: no head unit server' >&2\nexit 3\n");
+            let (root, adb, program, dir, _) = fixture("exit", "echo 'Connection refused: no head unit server' >&2\nexit 3\n");
             let err = start(&program, &adb, &dir, &quick()).expect_err("exits");
             assert!(err.contains("exited") && err.contains("Connection refused") && err.contains("head unit server"), "{err}");
             assert_eq!(running(&dir), None);
@@ -1214,28 +1361,112 @@ done
 
         #[test]
         fn a_stale_record_is_cleared_and_a_reused_pid_is_never_signalled() {
-            let (root, adb, _program, dir) = fixture("stale", FAKE_DHU);
+            let (root, adb, program, dir, fake) = fixture("stale", FAKE_DHU);
             std::fs::create_dir_all(&dir).expect("dir");
-            let mut p = Projection {
-                pid: 999_999,
+            let stale = |pid: u32, started: Option<u64>| Projection {
+                pid,
                 serial: "emulator-5556".into(),
                 forward_port: 40001,
                 config: Config::default(),
                 headless: false,
+                started,
             };
-            std::fs::write(dir.join("dhu.state"), p.render()).expect("state");
+            // The dead DHU's forward is still in adb's table.
+            adb.run(&["forward", "tcp:40001", "tcp:5277"], adb.deadlines.query).expect("forward");
+            std::fs::write(dir.join("dhu.state"), stale(999_999, None).render()).expect("state");
             assert_eq!(running(&dir), None, "a dead PID isn't a running head unit");
             let stopped = stop(&dir, Some(&adb), Duration::from_secs(1)).expect("clears");
-            assert!(!stopped.was_running && !dir.join("dhu.state").exists());
-            // A live process that isn't the DHU (a sleep this test started) is left alone.
+            assert!(!stopped.was_running && stopped.forward_removed && !dir.join("dhu.state").exists());
+            assert!(fake.forwards().is_empty(), "{:?}", fake.forwards());
+
+            // The PID reused by a process that isn't the DHU (a sleep this test started): not
+            // running, never signalled, and both car_stop and car_start recover from it.
             let mut other = Process::new("sleep").arg("30").spawn().expect("sleep");
-            p.pid = other.id();
-            std::fs::write(dir.join("dhu.state"), p.render()).expect("state");
-            let err = stop(&dir, Some(&adb), Duration::from_secs(1)).expect_err("not the DHU");
-            assert!(err.contains("isn't a Desktop Head Unit any more"), "{err}");
+            adb.run(&["forward", "tcp:40001", "tcp:5277"], adb.deadlines.query).expect("forward");
+            std::fs::write(dir.join("dhu.state"), stale(other.id(), None).render()).expect("state");
+            assert_eq!(running(&dir), None, "a reused PID isn't a running head unit");
+            assert!(send(&dir, &Command::Day).expect_err("none").contains("no head unit is running"), "nothing written to a dead FIFO");
+            let stopped = stop(&dir, Some(&adb), Duration::from_secs(1)).expect("clears the reused PID's record");
+            assert_eq!((stopped.was_running, stopped.forward_removed), (false, true));
+            assert!(!dir.join("dhu.state").exists());
+            std::fs::write(dir.join("dhu.state"), stale(other.id(), None).render()).expect("state");
+            adb.run(&["forward", "tcp:40001", "tcp:5277"], adb.deadlines.query).expect("forward");
+            let p = start(&program, &adb, &dir, &quick()).expect("start over a stale record");
+            assert_eq!(fake.forwards(), [format!("emulator-5556 tcp:{} tcp:5277", p.forward_port)], "the stale forward went");
+            stop(&dir, Some(&adb), Duration::from_secs(2)).expect("stop");
             assert!(other.try_wait().expect("wait").is_none(), "the unrelated process still runs");
             let _ = other.kill();
             let _ = other.wait();
+
+            // A DHU with the PID but another start time is a later process, not the recorded one.
+            let mut later = Process::new(&program).stdin(Stdio::piped()).spawn().expect("a DHU");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !crate::listing::Host::args(&crate::host::Native, later.id() as i32).is_some_and(|a| a.contains("desktop-head-unit"))
+                && Instant::now() < deadline
+            {
+                sleep(Duration::from_millis(10));
+            }
+            if let Some(t) = start_time(later.id()) {
+                assert!(alive(&stale(later.id(), Some(t))), "the same PID and start time is it");
+                std::fs::write(dir.join("dhu.state"), stale(later.id(), Some(t + 1)).render()).expect("state");
+                assert_eq!(running(&dir), None);
+                assert!(!stop(&dir, Some(&adb), Duration::from_secs(1)).expect("clears").was_running);
+                assert!(later.try_wait().expect("wait").is_none(), "the later DHU wasn't signalled");
+            }
+            let _ = later.kill();
+            let _ = later.wait();
+            std::fs::remove_dir_all(root).ok();
+        }
+
+        #[test]
+        fn concurrent_starts_of_one_phone_make_one_head_unit() {
+            let (root, adb, program, dir, fake) = fixture("race", FAKE_DHU);
+            let gate = std::sync::Barrier::new(2);
+            let results: Vec<Result<Projection, String>> = std::thread::scope(|s| {
+                let racers: Vec<_> = (0..2)
+                    .map(|_| {
+                        s.spawn(|| {
+                            gate.wait();
+                            start(&program, &adb, &dir, &quick())
+                        })
+                    })
+                    .collect();
+                racers.into_iter().map(|r| r.join().expect("thread")).collect()
+            });
+            let won: Vec<&Projection> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+            assert_eq!(won.len(), 1, "{results:?}");
+            let lost = results.iter().find_map(|r| r.as_ref().err()).expect("one refused");
+            assert!(lost.contains("already running"), "{lost}");
+            assert_eq!(running(&dir).as_ref(), Some(won[0]), "the record names the one that runs");
+            let forwards = fake.calls().iter().filter(|c| c.starts_with("forward --no-rebind")).count();
+            assert_eq!(forwards, 1, "the refused start forwarded nothing: {:?}", fake.calls());
+            assert_eq!(fake.forwards().len(), 1);
+            stop(&dir, Some(&adb), Duration::from_secs(2)).expect("stop");
+            assert!(fake.forwards().is_empty());
+            std::fs::remove_dir_all(root).ok();
+        }
+
+        #[test]
+        fn a_taken_port_is_retried_with_another_and_never_rebound() {
+            let (root, adb, program, dir, fake) = fixture("taken", FAKE_DHU);
+            fake.ports_taken(2);
+            let p = start(&program, &adb, &dir, &quick()).expect("start");
+            let tried: Vec<String> = fake.calls().into_iter().filter(|c| c.starts_with("forward --no-rebind")).collect();
+            assert_eq!(tried.len(), 3, "{tried:?}");
+            assert_eq!(tried[2], format!("forward --no-rebind tcp:{} tcp:5277", p.forward_port));
+            assert!(tried[0] != tried[1] && tried[1] != tried[2], "each try is another port: {tried:?}");
+            // Another phone can't take this one's port: adb refuses `--no-rebind` on it.
+            let b = Adb { serial: "emulator-5558".into(), ..adb.clone() };
+            let (ok, text) =
+                b.run(&["forward", "--no-rebind", &format!("tcp:{}", p.forward_port), "tcp:5277"], b.deadlines.query).expect("adb");
+            assert!(!ok && text.contains("cannot rebind"), "{text}");
+            assert_eq!(fake.forwards(), [format!("emulator-5556 tcp:{} tcp:5277", p.forward_port)]);
+            stop(&dir, Some(&adb), Duration::from_secs(2)).expect("stop");
+            // Every port refused: an error naming them, and nothing started or left behind.
+            fake.ports_taken(100);
+            let err = start(&program, &adb, &dir, &quick()).expect_err("no port");
+            assert!(err.contains("refused every host port") && err.contains("Address already in use"), "{err}");
+            assert!(!dir.join("dhu.state").exists() && fake.forwards().is_empty());
             std::fs::remove_dir_all(root).ok();
         }
     }

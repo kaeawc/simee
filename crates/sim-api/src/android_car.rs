@@ -252,7 +252,7 @@ done
             (Some("800x480"), Some(200), Some("hybrid"), Some(true))
         );
         assert!(started["pid"].as_u64().is_some() && started["serial"].as_str().is_some_and(|s| s.starts_with("emulator-")), "{started}");
-        assert!(f.adb.calls().iter().any(|c| *c == format!("forward tcp:{port} tcp:5277")), "{:?}", f.adb.calls());
+        assert!(f.adb.calls().iter().any(|c| *c == format!("forward --no-rebind tcp:{port} tcp:5277")), "{:?}", f.adb.calls());
         let auto = f.root.join("sdk/extras/google/auto");
         assert!(lines(&auto.join("dhu.argv"), 1)[0].starts_with(&format!("--adb={port} -i hybrid -c ")));
         assert!(run(&mut f, "car_start", json!({})).expect_err("twice").contains("already running"));

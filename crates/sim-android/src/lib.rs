@@ -546,13 +546,23 @@ impl Android {
         Ok(results.into_inner().unwrap_or_else(|e| e.into_inner()).into_iter().flatten().collect())
     }
 
-    /// Deletes a stopped AVD (its directory and pointer file).
+    /// Deletes a stopped AVD (its directory and pointer file). A head unit still running for it
+    /// (`car_start`) is stopped first: its record goes with the directory, and nothing could find
+    /// it afterwards.
     pub fn delete(&self, device: &Device) -> Result<(), String> {
         if device.running.is_some() {
             return Err(format!("{} is running; shut it down first", device.info.name));
         }
+        device.stop_head_unit(self).map_err(|e| format!("{}'s head unit: {e}; not deleting it", device.info.name))?;
         // Also refuses one a stock emulator holds that hasn't advertised itself (its lock files).
         self.env.delete_avd_in(&device.info.udid, self.running_dir.as_deref()).map_err(|e| e.to_string())
+    }
+
+    /// Shuts `device` down ([`Device::shutdown`]), stopping its head unit (`car_start`) and that
+    /// forward first, best effort: one that can't be stopped doesn't keep the device up.
+    pub fn shutdown(&self, device: &Device) -> Result<(), String> {
+        let _ = device.stop_head_unit(self);
+        device.shutdown()
     }
 
     /// `adb`, from the SDK's platform-tools or the PATH.
@@ -1820,6 +1830,35 @@ mod tests {
         let _ = other.wait();
         assert!(alive, "the unrelated process was not signalled");
         assert!(err.contains("no longer looks like the stock emulator") && err.contains("not signalling"), "{err}");
+    }
+
+    #[test]
+    fn shutdown_and_delete_stop_the_head_unit_and_its_forward() {
+        let f = fixture("dhugone");
+        let fake = crate::testing::fake_adb(&f.android);
+        let program = f.root.join("sdk").join(dhu::EXECUTABLE);
+        std::fs::create_dir_all(program.parent().expect("auto dir")).expect("auto dir");
+        crate::testing::write_script(&program, "cat > /dev/null\n");
+        let adb = apps::Adb::bound(f.android.adb().expect("adb"), "emulator-5556".into());
+        let options = dhu::Options { startup: Duration::from_millis(200), ..dhu::Options::default() };
+        let gone = |pid: u32| !Command::new("kill").args(["-0", &pid.to_string()]).status().expect("kill").success();
+        for (name, deleted) in [("down", false), ("gone", true)] {
+            f.android.create(name, "system-images;android-36;google_apis;arm64-v8a", None).expect("avd");
+            let d = f.android.device(name).expect("device");
+            let p = dhu::start(&program, &adb, &d.avd.as_ref().expect("avd").dir.join("simee"), &options).expect("head unit");
+            assert_eq!(fake.forwards().len(), 1);
+            if deleted {
+                f.android.delete(&d).expect("delete");
+                assert!(f.android.device(name).is_err(), "the AVD is gone");
+            } else {
+                // The emulator was already down: its part refuses, and the head unit still goes.
+                assert!(f.android.shutdown(&d).expect_err("not running").contains("isn't running"));
+                assert_eq!(d.head_unit(), Ok(None));
+            }
+            assert!(gone(p.pid), "{name}: the DHU (PID {}) was stopped", p.pid);
+            assert!(fake.forwards().is_empty(), "{name}: its forward was removed: {:?}", fake.forwards());
+        }
+        std::fs::remove_dir_all(&f.root).ok();
     }
 
     #[test]
