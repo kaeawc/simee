@@ -248,6 +248,7 @@ impl Env {
             compression: String::new(),
             disks: Vec::new(),
             files: Vec::new(),
+            tree: Vec::new(),
         };
         let (manifest, summary) = sim_bundle::export(header, &contents, to, opts)?;
         drop(lock);
@@ -280,7 +281,9 @@ impl Env {
         if m.platform != Platform::Android {
             return Err(Error::Config(format!("the bundle is an {} device's; this imports Android AVDs", m.platform.label())));
         }
-        let Identity::Android(image) = &m.identity;
+        let Identity::Android(image) = &m.identity else {
+            return Err(Error::Config("the bundle's manifest names no Android system image".into()));
+        };
         if let Some(p) = m.disks.iter().map(|d| &d.path).chain(m.files.iter().map(|f| &f.path)).find(|p| !allowed_path(p)) {
             return Err(Error::Config(format!("the bundle holds `{p}`, which isn't part of an AVD (config.ini, boot.prop, simee/<disk>)")));
         }
@@ -415,7 +418,7 @@ mod tests {
             let ex = env.export_avd("golden", &bundle, &Options::default()).expect("export");
             assert_no_host_path(&tmp, &bundle);
             let m = &ex.manifest;
-            let Identity::Android(img) = &m.identity;
+            let Identity::Android(img) = &m.identity else { panic!("an Android identity") };
             assert_eq!(
                 (img.api.as_str(), img.tag.as_str(), img.abi.as_str(), img.revision.as_str()),
                 ("36", "google_apis", "arm64-v8a", "7")

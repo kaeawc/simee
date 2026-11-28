@@ -142,12 +142,13 @@ pub const OUTPUTS: &[(&str, &str)] = &[
     (
         "export",
         "{device: string, to: string, summary: object, identity: object, captures: {disks: boolean, ram: boolean}, resume: string,
-            secrets: [object], guest_identity: object, dropped: [string]}",
+            secrets: [object], guest_identity: object, dropped: [string], left_out?: [string]}",
     ),
     (
         "import",
-        "{device: @device, system_image: string, mismatch: string|null, dropped: [string], extracted: object, exported_as: string,
-            guest_identity?: object, note?: string, resume?: string}",
+        "{device: @device, system_image?: string, mismatch?: string|null, runtime?: {identifier: string, name: string,
+            version: string, build: string}, dropped: [string], extracted: object, exported_as: string, guest_identity?: object,
+            note?: string, resume?: string}",
     ),
     ("shutdown", "null"),
     ("erase", "null"),
