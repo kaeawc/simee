@@ -8,6 +8,7 @@
 //! output is the same either way.
 
 mod doctor;
+mod mcp_install;
 mod stream_cli;
 
 use std::io::Write;
@@ -443,7 +444,11 @@ enum Cmd {
     /// a tool, devices as resources, long operations as tasks, a device view as an app. Configure
     /// it in the agent's MCP settings as the command `simee mcp` (see docs/mcp.md). With `--http`,
     /// serve MCP's Streamable HTTP transport instead, at `http://ADDR/mcp`.
+    #[command(args_conflicts_with_subcommands = true)]
     Mcp {
+        /// `install` writes a client's MCP config; `config` prints it (docs/mcp-clients.md).
+        #[command(subcommand)]
+        action: Option<mcp_install::McpAction>,
         /// Serve Streamable HTTP on ADDR (default 127.0.0.1:8377). Every request needs a bearer
         /// token (see `--token-file`); a non-loopback ADDR also needs `--insecure-remote`.
         #[arg(long, value_name = "ADDR", num_args = 0..=1, default_missing_value = sim_mcp::http::DEFAULT_ADDR)]
@@ -558,6 +563,10 @@ fn main() -> Result<()> {
             let code = sim_api::serve(&path)?;
             std::process::exit(code);
         }
+        Cmd::Mcp { action: Some(action), .. } => {
+            let stdout = std::io::stdout();
+            return mcp_install::run(action, &mcp_install::Host::current()?, &mut stdout.lock());
+        }
         Cmd::Mcp { http: None, .. } => {
             mcp_shutdown_on_signal()?;
             // Methods run in this process, on the server's own threads: nothing but protocol
@@ -567,7 +576,7 @@ fn main() -> Result<()> {
             served?;
             return Ok(());
         }
-        Cmd::Mcp { http: Some(addr), token_file, no_auth, insecure_remote } => {
+        Cmd::Mcp { http: Some(addr), token_file, no_auth, insecure_remote, .. } => {
             let config = mcp_http_config(addr, token_file.clone(), *no_auth, *insecure_remote)?;
             mcp_shutdown_on_signal()?;
             let served = sim_mcp::http::serve(std::sync::Arc::new(sim_mcp::ApiBackend::new()), config);
@@ -1632,21 +1641,35 @@ mod tests {
     #[test]
     fn mcp_is_a_subcommand_that_runs_no_device_command() {
         let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
-        assert!(matches!(parse(&["mcp"]), Ok(Cmd::Mcp { http: None, token_file: None, no_auth: false, insecure_remote: false })));
+        assert!(matches!(
+            parse(&["mcp"]),
+            Ok(Cmd::Mcp { action: None, http: None, token_file: None, no_auth: false, insecure_remote: false })
+        ));
         let mut transport = Transport::local();
-        let stdio = Cmd::Mcp { http: None, token_file: None, no_auth: false, insecure_remote: false };
+        let stdio = Cmd::Mcp { action: None, http: None, token_file: None, no_auth: false, insecure_remote: false };
         let e = run(stdio, &mut transport, &mut Vec::new(), &mut Vec::new()).expect_err("served by main, not run");
         assert!(e.to_string().contains("`mcp` don't run through a transport"));
     }
 
     #[test]
+    fn mcp_install_and_config_are_subcommands_that_do_not_mix_with_serving_flags() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
+        assert!(matches!(parse(&["mcp", "install", "cursor", "--dry-run"]), Ok(Cmd::Mcp { action: Some(_), http: None, .. })));
+        assert!(matches!(parse(&["mcp", "config", "claude-desktop"]), Ok(Cmd::Mcp { action: Some(_), .. })));
+        assert!(parse(&["mcp", "--http", "install", "cursor"]).is_err());
+        assert!(parse(&["mcp", "install", "nonsense"]).is_err());
+    }
+
+    #[test]
     fn mcp_http_takes_an_address_a_token_file_and_an_acknowledgement() {
         let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).map(|c| c.command);
-        let Ok(Cmd::Mcp { http: Some(addr), token_file: None, no_auth: false, insecure_remote: false }) = parse(&["mcp", "--http"]) else {
+        let Ok(Cmd::Mcp { action: None, http: Some(addr), token_file: None, no_auth: false, insecure_remote: false }) =
+            parse(&["mcp", "--http"])
+        else {
             panic!("--http alone")
         };
         assert_eq!(addr, sim_mcp::http::DEFAULT_ADDR);
-        let Ok(Cmd::Mcp { http: Some(addr), token_file: Some(path), no_auth: false, insecure_remote: true }) =
+        let Ok(Cmd::Mcp { action: None, http: Some(addr), token_file: Some(path), no_auth: false, insecure_remote: true }) =
             parse(&["mcp", "--http", "0.0.0.0:9000", "--token-file", "/tmp/t", "--insecure-remote"])
         else {
             panic!("every flag")
