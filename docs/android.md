@@ -564,6 +564,26 @@ card's thread for longer than a period, only one overdue buffer completes at onc
 follow at the stream's rate: returning every queued period in one burst left the guest's
 driver queueing nothing more, and every HAL write then timed out (EIO).
 
+**Capturing playback.** The console copies what the guest plays, with or without `-no-audio`
+(`crates/emu-vmm/src/audio/tap.rs`; a second reader on the playback path, ahead of the host ring):
+
+```
+audio capture start <path|unix:/socket> [wav|raw]   # a file is a WAV by default, a socket raw
+audio capture status                                # running or stopped, format, frames captured, frames dropped
+audio capture stop                                  # finishes the file, then the same report
+```
+
+The bytes are the guest's own, in the guest's format (rate, channels and sample format are in
+the WAV header, and in `status` once the guest has played something; 24-bit samples are a
+`WAVE_FORMAT_EXTENSIBLE` WAV, left-justified in a 32-bit word as that format says, so the WAV's samples are the guest's shifted up a byte; a raw capture keeps the guest's words as written). With no capture running a buffer costs
+one atomic load. With one running it is copied into a 1 MiB queue that a writer thread drains;
+the guest never waits for it, and frames the queue can't take (a slow socket) are dropped and
+counted. A capture holds what the guest plays, not wall-clock time: silence the guest doesn't
+queue isn't in it. A stream that changes format mid-capture has its new frames dropped and
+counted. A socket reader that pauses (a write that times out after 2 s) costs the frames it didn't take, counted as dropped; the capture ends when the peer closes, or when it stays paused for more than about 6 s in the middle of a frame. `stop` and emu's exit wait at most about 2 s for a stalled reader, then drop and count what is still queued. A file's WAV sizes are filled in on `stop`, when emu exits (power-off, `kill`, SIGINT/SIGTERM) and once a second while capturing, so a file from an emu that was killed hard opens with at most about a second of audio missing, plus whatever was still queued; a socket's say "unknown". Software mode
+(QEMU) has no tap. Not yet: the `audio_capture_start`/`audio_capture_stop` API methods for
+Android (#265).
+
 Checked on API 36 `google_apis` (phone, `android.hardware.audio@7.1-impl.ranchu`): the card
 is `/proc/asound` card 0 (`pcmC0D0p`, `pcmC0D0c`); AudioFlinger's primary output (48 kHz,
 stereo S16, 1088-frame HAL buffer) plays through it, the HAL setting 544-frame periods in a

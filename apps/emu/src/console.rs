@@ -31,6 +31,8 @@ pub struct ConsoleInfo {
     /// What `network speed|delay` asked for (seeded by `-netspeed`/`-netdelay`). Reported by
     /// `network status` and shared with the guest's NAT, which shapes its traffic by it.
     pub network: Arc<std::sync::Mutex<sim_core::network::Conditions>>,
+    /// The tap on the sound card's playback (`audio capture`).
+    pub audio: Arc<emu_vmm::audio::tap::Tap>,
     /// A foldable's hinge (`fold`, `unfold`, `posture`).
     pub fold: Option<Arc<crate::fold::Foldable>>,
     /// The guest may turn its display without emu knowing (`crate::instance::rotation_unknown`):
@@ -487,6 +489,70 @@ fn xr(info: &ConsoleInfo, words: &[&str]) -> String {
     }
 }
 
+/// `audio capture start <path|unix:socket> [wav|raw]`, `audio capture stop`, `audio capture status`
+/// (simee): copies what the guest plays, as the guest wrote it, to a file (a WAV by default) or a
+/// Unix socket (raw by default). Works under `-no-audio`. The format is in the WAV header, and in
+/// every status reply once the guest has played something.
+fn audio(info: &ConsoleInfo, words: &[&str]) -> String {
+    use emu_vmm::audio::tap::{Container, Sink, Status};
+    const USAGE: &str = "KO: usage: audio capture start <path|unix:socket> [wav|raw] | audio capture stop | audio capture status";
+    fn report(s: &Status) -> String {
+        let format = s.format.map_or_else(|| "unknown (the guest hasn't played yet)".to_string(), |f| f.to_string());
+        let mut out = format!(
+            "capture: {}\r\nformat: {format}\r\nframes captured: {}\r\nframes dropped: {}\r\n",
+            if s.capturing { "running" } else { "stopped" },
+            s.captured_frames,
+            s.dropped_frames
+        );
+        if let Some(e) = &s.error {
+            out.push_str(&format!("error: {e}\r\n"));
+        }
+        out.push_str("OK");
+        out
+    }
+    let tap = &info.audio;
+    match words {
+        ["capture", "start", target, rest @ ..] if rest.len() <= 1 => {
+            if !tap.status().card {
+                return "KO: this device has no sound card to capture".into();
+            }
+            let (socket, path) = match target.strip_prefix("unix:") {
+                Some(p) => (true, p),
+                None => (false, *target),
+            };
+            let container = match (rest.first().copied(), socket) {
+                (Some("wav"), _) | (None, false) => Container::Wav,
+                (Some("raw"), _) | (None, true) => Container::Raw,
+                _ => return USAGE.into(),
+            };
+            // Opened only once the tap knows no capture is running: a refused start leaves the
+            // running capture's file alone.
+            let open = || {
+                let sink = if socket {
+                    sim_core::net::UnixStream::connect(path).map(|s| {
+                        // A reader that stops reading drops frames (counted); `stop` waits for it at most a couple of seconds.
+                        let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+                        Sink::Stream(Box::new(s))
+                    })
+                } else {
+                    std::fs::File::create(path).map(|f| Sink::Seekable(Box::new(f)))
+                };
+                sink.map_err(|e| format!("cannot open {path}: {e}"))
+            };
+            match tap.start_with(open, container) {
+                Ok(()) => "OK".into(),
+                Err(e) => format!("KO: {e}"),
+            }
+        }
+        ["capture", "stop"] => match tap.stop() {
+            Some(s) => report(&s),
+            None => "KO: no capture is running".into(),
+        },
+        ["capture", "status"] => report(&tap.status()),
+        _ => USAGE.into(),
+    }
+}
+
 const NO_TOUCH: &str = "KO: this device has no touch screen (hw.screen=no-touch)";
 
 /// Commands this console implements (stock names first, then simee extensions).
@@ -506,6 +572,7 @@ const HELP: &[(&str, &str)] = &[
     ("sms", "SMS related commands"),
     ("gsm", "GSM related commands"),
     ("network", "manage network settings"),
+    ("audio", "capture what the guest plays: capture start|stop|status (simee)"),
     ("ping", "check if the emulator is alive"),
     ("sensor", "manage emulator sensors"),
     ("screenshot", "take a screenshot of the display"),
@@ -669,6 +736,7 @@ fn command(info: &ConsoleInfo, words: &[&str]) -> String {
         "xr" => xr(info, &words[1..]),
         "car" => car(info, &words[1..]),
         "network" => network(info, &words[1..]),
+        "audio" => audio(info, &words[1..]),
         "fold" if words.get(1) == Some(&"status") => crate::fold::status(info.fold.as_deref()),
         "fold" | "unfold" | "posture" => crate::fold::console(info.fold.as_deref(), words),
         // Stock: rotate the device 90° clockwise. Gravity in device coordinates turns the
@@ -870,6 +938,7 @@ mod tests {
             xr: (form_factor == FormFactor::Vision).then(Arc::default),
             car: (form_factor == FormFactor::Auto).then(Arc::default),
             network: Arc::default(),
+            audio: Arc::default(),
             fold,
             rotation_unknown: false,
         }
@@ -976,6 +1045,51 @@ mod tests {
                 start.elapsed().as_secs_f64() * 1000.0 / f64::from(n)
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audio_capture_starts_stops_and_reports_the_format() {
+        let info = console(FormFactor::Phone);
+        let usage = "KO: usage: audio capture start <path|unix:socket> [wav|raw] | audio capture stop | audio capture status";
+        let path = std::env::temp_dir().join(format!("emu-audio-capture-{}.wav", std::process::id()));
+        let start = format!("audio capture start {}", path.display());
+        assert_eq!(run(&info, &start), "KO: this device has no sound card to capture");
+        info.audio.set_card(true);
+        assert_eq!(run(&info, "audio capture stop"), "KO: no capture is running");
+        assert!(run(&info, "audio capture status").starts_with("capture: stopped\r\nformat: unknown"));
+        for round in 0..2 {
+            assert_eq!(run(&info, &start), "OK", "round {round}");
+            assert!(run(&info, &start).starts_with("KO: already capturing"));
+            assert!(run(&info, "audio capture status").starts_with("capture: running\r\n"));
+            let pcm = emu_vmm::audio::tap::PcmFormat { rate: 44_100, channels: 1, format: emu_vmm::audio::Format::S16 };
+            info.audio.offer(pcm, &[1, 0, 2, 0]);
+            let stopped = run(&info, "audio capture stop");
+            assert_eq!(
+                stopped, "capture: stopped\r\nformat: 44100 Hz 1 ch s16\r\nframes captured: 2\r\nframes dropped: 0\r\nOK",
+                "round {round}"
+            );
+            let wav = std::fs::read(&path).expect("capture file");
+            assert_eq!(wav, [emu_vmm::audio::tap::wav_header(pcm, 4), vec![1, 0, 2, 0]].concat());
+        }
+        let _ = std::fs::remove_file(&path);
+        // A refused second start leaves the running capture's file alone.
+        {
+            assert_eq!(run(&info, &start), "OK");
+            info.audio
+                .offer(emu_vmm::audio::tap::PcmFormat { rate: 8_000, channels: 1, format: emu_vmm::audio::Format::S16 }, &[1, 0, 2, 0]);
+            while info.audio.status().captured_frames < 2 {
+                std::thread::yield_now();
+            }
+            assert_eq!(run(&info, &start), "KO: already capturing; stop it first");
+            run(&info, "audio capture stop");
+            let wav = std::fs::read(&path).expect("capture file");
+            assert_eq!(wav.len(), 44 + 4, "the first capture's samples survived the refused start");
+            let _ = std::fs::remove_file(&path);
+        }
+        assert!(run(&info, "audio capture start /nonexistent-dir/x.wav").starts_with("KO: cannot open /nonexistent-dir/x.wav: "));
+        assert_eq!(run(&info, "audio capture start x.wav mp3"), usage);
+        assert_eq!(run(&info, "audio"), usage);
     }
 
     #[test]

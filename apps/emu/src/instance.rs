@@ -119,6 +119,8 @@ pub struct Instance {
     /// What `network speed|delay` (and `-netspeed`/`-netdelay`) ask for: the console writes it,
     /// the guest's NAT shapes by it, and it survives a guest reset.
     pub network: std::sync::Arc<std::sync::Mutex<sim_core::network::Conditions>>,
+    /// The tap on the sound card's playback, started and stopped by the console's `audio capture`.
+    pub audio_tap: std::sync::Arc<emu_vmm::audio::tap::Tap>,
     /// Android XR images: the guest's XR service link.
     pub xr: Option<std::sync::Arc<emu_vmm::pipe::xr::Xr>>,
     /// The vehicle HAL channel, for Automotive images only (as stock).
@@ -284,6 +286,7 @@ impl Instance {
             battery: Default::default(),
             telephony: Default::default(),
             network: std::sync::Arc::new(std::sync::Mutex::new(opts.network)),
+            audio_tap: Default::default(),
             xr: is_xr(avd).then(Default::default),
             car: avd.is_car().then(Default::default),
             adb: std::sync::Arc::new(adb),
@@ -367,6 +370,7 @@ impl Instance {
                 input: opts.allow_host_audio && !opts.no_audio,
                 verbose: opts.verbose,
             }),
+            sound_tap: self.audio_tap.clone(),
             on_guest_event: {
                 let started = std::time::Instant::now();
                 let verbose = opts.verbose;

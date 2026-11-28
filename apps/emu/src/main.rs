@@ -406,6 +406,7 @@ fn boot(
             xr: inst.xr.clone(),
             car: inst.car.clone(),
             network: inst.network.clone(),
+            audio: inst.audio_tap.clone(),
             fold: fold.clone(),
             rotation_unknown: instance::rotation_unknown(&avd),
         },
@@ -426,6 +427,10 @@ fn boot(
     }
     loop {
         let out = emu_vmm::run(cfg, stop.clone())?;
+        if !matches!(out.reason, emu_vmm::StopReason::Reset) || stop.load(Ordering::SeqCst) {
+            // Power-off, a signal, `kill` or a fault: write out what is queued and finish a WAV's sizes.
+            inst.audio_tap.stop();
+        }
         if opts.verbose {
             eprintln!("emu: stopped after {:.1}s: {:?}", out.uptime.as_secs_f64(), out.reason);
             for line in exit_lines(&out.exits) {
