@@ -4,6 +4,10 @@
 //! (external/qemu `android/emu/cmdline/{include,src}/android/network/constants.{h,c}` and
 //! `do_network_*` in `android/android-emu/android/console.cpp`, emu-master-dev). The VMM's
 //! network engine applies them; this module only says what was asked for.
+//!
+//! Packet loss is simee's own: stock's console has no command for it. `network loss
+//! <percent>|<up>:<down>|none` sets it, and `network status` adds a line for each direction
+//! while any is set (with none, the report is stock's byte for byte).
 
 /// A `network speed` preset: its name, stock's display name, and upload/download in bits/s.
 /// `0` means no limit.
@@ -105,14 +109,30 @@ fn parse_pair(arg: &str, scale: f64) -> Option<(f64, f64)> {
     Some((a * scale, b * scale))
 }
 
-/// What the guest's network is shaped to: bits/s each way (`0` = unlimited) and the latency
-/// range in ms. The default is stock's: `full` and `none`.
+/// What the guest's network is shaped to: bits/s each way (`0` = unlimited), the latency
+/// range in ms, and the percent of packets lost each way (simee's `network loss`). The default
+/// is stock's: `full`, `none` and no loss.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Conditions {
     pub upload_bps: f64,
     pub download_bps: f64,
     pub min_latency_ms: i32,
     pub max_latency_ms: i32,
+    /// Percent (0 to 100) of the guest's packets lost on the way out and on the way in.
+    pub upload_loss_pct: f64,
+    pub download_loss_pct: f64,
+}
+
+/// One `network loss` percentage: a number from 0 to 100, with or without a `%`.
+fn loss_pct(text: &str) -> Result<f64, String> {
+    let text = text.trim();
+    let t = text.strip_suffix('%').unwrap_or(text).trim_end();
+    match t.parse::<f64>() {
+        // `+ 0.0` makes -0 read as 0.
+        Ok(v) if (0.0..=100.0).contains(&v) => Ok(v + 0.0),
+        Ok(v) if v.is_finite() => Err(format!("`{text}` is out of range, each loss is 0 to 100 percent")),
+        _ => Err(format!("`{text}` isn't a percentage")),
+    }
 }
 
 impl Conditions {
@@ -144,36 +164,72 @@ impl Conditions {
         true
     }
 
+    /// simee's `network loss <loss>`: `<percent>` both ways or `<up>:<down>`, each 0 to 100
+    /// with an optional `%`; `none` (or nothing) for no loss. Nothing changes on an error, which
+    /// names the part it couldn't read.
+    pub fn set_loss(&mut self, loss: &str) -> Result<(), String> {
+        let loss = loss.trim();
+        let (up, down) = match loss {
+            "" | "none" => (0.0, 0.0),
+            _ => match loss.split_once(':') {
+                Some((up, down)) => (loss_pct(up)?, loss_pct(down)?),
+                None => {
+                    let both = loss_pct(loss)?;
+                    (both, both)
+                }
+            },
+        };
+        (self.upload_loss_pct, self.download_loss_pct) = (up, down);
+        Ok(())
+    }
+
+    /// Whether any packets are lost.
+    pub fn is_lossy(&self) -> bool {
+        self.upload_loss_pct > 0.0 || self.download_loss_pct > 0.0
+    }
+
     /// Whether traffic is shaped at all.
     pub fn is_shaped(&self) -> bool {
         *self != Conditions::default()
     }
 
-    /// `network status`'s report, stock's lines without the final `OK`, CRLF-separated.
+    /// `network status`'s report, stock's lines without the final `OK`, CRLF-separated; while
+    /// packets are lost, then a line for each direction's loss.
     pub fn status(&self) -> String {
         let speed = |bps: f64| format!("{:>8} bits/s ({:.1} KB/s)", bps as i64, bps / 8192.0);
-        format!(
+        let mut s = format!(
             "Current network status:\r\n  download speed:   {}\r\n  upload speed:     {}\r\n  minimum latency:  {} ms\r\n  maximum latency:  {} ms",
             speed(self.download_bps),
             speed(self.upload_bps),
             self.min_latency_ms,
             self.max_latency_ms
-        )
+        );
+        if self.is_lossy() {
+            s.push_str(&format!("\r\n  download loss:    {} %\r\n  upload loss:      {} %", self.download_loss_pct, self.upload_loss_pct));
+        }
+        s
     }
 
     /// The conditions a `network status` report (as [`status`](Self::status) prints it, from
     /// simee's emulator or the stock one) says are set; `None` when a line is missing or isn't
-    /// a number. Lines may end in CRLF or LF, and a trailing `OK` is ignored.
+    /// a number. Lines may end in CRLF or LF, and a trailing `OK` is ignored. A report without
+    /// loss lines (stock's, or simee's with no loss) reads as no loss.
     pub fn from_status(report: &str) -> Option<Conditions> {
-        let value = |label: &str| -> Option<i64> {
-            let line = report.lines().map(str::trim).find_map(|l| l.strip_prefix(label))?;
-            line.split_whitespace().next()?.parse().ok()
+        let line = |label: &str| report.lines().map(str::trim).find_map(|l| l.strip_prefix(label));
+        let value = |label: &str| -> Option<i64> { line(label)?.split_whitespace().next()?.parse().ok() };
+        let loss = |label: &str| -> Option<f64> {
+            match line(label) {
+                None => Some(0.0),
+                Some(l) => loss_pct(l.split_whitespace().next()?).ok(),
+            }
         };
         Some(Conditions {
             download_bps: value("download speed:")? as f64,
             upload_bps: value("upload speed:")? as f64,
             min_latency_ms: i32::try_from(value("minimum latency:")?).ok()?,
             max_latency_ms: i32::try_from(value("maximum latency:")?).ok()?,
+            upload_loss_pct: loss("upload loss:")?,
+            download_loss_pct: loss("download loss:")?,
         })
     }
 }
@@ -271,6 +327,58 @@ mod tests {
         );
         assert!(c.set_speed("lte"));
         assert!(c.status().contains("download speed:   173000000 bits/s (21118.2 KB/s)"), "wider than 8 digits isn't cut");
+    }
+
+    fn loss(arg: &str) -> Result<(f64, f64), String> {
+        let mut c = Conditions::default();
+        c.set_loss(arg).map(|()| (c.upload_loss_pct, c.download_loss_pct))
+    }
+
+    /// simee's `network loss`: one percent for both ways or `<up>:<down>`, each 0 to 100, an
+    /// optional `%`, and `none` (or nothing) for no loss. Errors name the bad part.
+    #[test]
+    fn loss_parses_percentages_and_explains_what_it_refuses() {
+        assert_eq!(loss("10"), Ok((10.0, 10.0)));
+        assert_eq!(loss("5:20"), Ok((5.0, 20.0)));
+        assert_eq!(loss("5%:20%"), Ok((5.0, 20.0)));
+        assert_eq!(loss(" 12.5 "), Ok((12.5, 12.5)));
+        assert_eq!(loss("0:100"), Ok((0.0, 100.0)));
+        assert_eq!(loss("none"), Ok((0.0, 0.0)));
+        assert_eq!(loss(""), Ok((0.0, 0.0)));
+        assert_eq!(loss("-0"), Ok((0.0, 0.0)));
+        let err = loss("lots").expect_err("a word");
+        assert!(err.contains("`lots` isn't a percentage"), "{err}");
+        let err = loss("10:101").expect_err("over 100");
+        assert!(err.contains("`101`") && err.contains("0 to 100"), "{err}");
+        let err = loss("-5").expect_err("negative");
+        assert!(err.contains("0 to 100"), "{err}");
+        assert!(loss("1:2:3").is_err(), "two values at most");
+        assert!(loss("10:").is_err(), "a ':' needs a second value");
+        assert!(loss("inf").is_err() && loss("nan").is_err());
+        // A refused argument changes nothing.
+        let mut c = Conditions::default();
+        assert_eq!(c.set_loss("10:20"), Ok(()));
+        assert!(c.is_shaped(), "loss alone is shaping");
+        assert!(c.set_loss("abc").is_err());
+        assert_eq!((c.upload_loss_pct, c.download_loss_pct), (10.0, 20.0));
+    }
+
+    /// No loss reads exactly as stock (the lines above); loss adds its two lines, which read
+    /// back. Stock's report, with none, reads as no loss.
+    #[test]
+    fn loss_shows_in_status_and_reads_back() {
+        let mut c = Conditions::default();
+        assert!(!c.status().contains("loss"));
+        assert_eq!(c.set_loss("2.5:30"), Ok(()));
+        assert_eq!(
+            c.status(),
+            "Current network status:\r\n  download speed:          0 bits/s (0.0 KB/s)\r\n  upload speed:            0 bits/s (0.0 KB/s)\r\n  minimum latency:  0 ms\r\n  maximum latency:  0 ms\r\n  download loss:    30 %\r\n  upload loss:      2.5 %"
+        );
+        assert_eq!(Conditions::from_status(&c.status()), Some(c));
+        assert_eq!(Conditions::from_status(&format!("{}\r\nOK", c.status()).replace("\r\n", "\n")), Some(c));
+        assert_eq!(c.set_loss("none"), Ok(()));
+        assert_eq!(Conditions::from_status(&c.status()), Some(Conditions::default()));
+        assert_eq!(Conditions::from_status(&format!("{}\r\n  upload loss:      x %", c.status())), None, "a bad loss line");
     }
 
     /// What a client reads back from `network status` is what was set, from either line ending

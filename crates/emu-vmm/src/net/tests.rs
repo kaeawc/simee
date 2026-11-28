@@ -620,7 +620,7 @@ fn shaped(c: sim_core::network::Conditions) -> (Arc<std::sync::Mutex<sim_core::n
 }
 
 fn cond(up: f64, down: f64, min: i32, max: i32) -> sim_core::network::Conditions {
-    sim_core::network::Conditions { upload_bps: up, download_bps: down, min_latency_ms: min, max_latency_ms: max }
+    sim_core::network::Conditions { upload_bps: up, download_bps: down, min_latency_ms: min, max_latency_ms: max, ..Default::default() }
 }
 
 /// A host server that answers its first datagram with `count` datagrams of `size` bytes.
@@ -947,4 +947,93 @@ fn control_frames_past_a_full_queue_hold_a_bounded_reserve_and_bulk_is_still_ref
     assert!(arp < 2000, "the reserve is bounded: {arp} replies");
     assert!(bulk <= 40, "bulk stays within the queue: {bulk}");
     drop(server);
+}
+
+// Loss: the console's `network loss`, applied at the NAT to the guest's TCP, UDP and ICMP.
+
+/// A NAT losing `up`% and `down`% of packets, its loss drawn from `seed`.
+fn lossy(up: f64, down: f64, seed: u64) -> (Arc<std::sync::Mutex<sim_core::network::Conditions>>, Nat) {
+    let c = sim_core::network::Conditions { upload_loss_pct: up, download_loss_pct: down, ..Default::default() };
+    let shared = Arc::new(std::sync::Mutex::new(c));
+    (shared.clone(), nat(Config { network: shared, loss_seed: Some(seed), ..Config::default() }))
+}
+
+fn is_echo_reply(f: &[u8]) -> bool {
+    f.len() > 34 && f[23] == packet::PROTO_ICMP && f[34] == packet::ICMP_ECHO_REPLY
+}
+
+/// The payloads a host UDP server reads until it has been quiet for `quiet`.
+fn received(server: &UdpSocket, quiet: Duration) -> Vec<Vec<u8>> {
+    server.set_read_timeout(Some(quiet)).expect("timeout");
+    let mut got = Vec::new();
+    let mut b = [0u8; 64];
+    while let Ok((n, _)) = server.recv_from(&mut b) {
+        got.push(b[..n].to_vec());
+    }
+    got
+}
+
+#[test]
+fn full_upload_loss_drops_the_guests_datagrams_and_pings_but_never_arp() {
+    let server = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let dst = SocketAddrV4::new(GW, server.local_addr().expect("addr").port());
+    let src = SocketAddrV4::new(GUEST, 40100);
+    let (shared, mut n) = lossy(100.0, 0.0, 1);
+    n.transmit(&arp_request(GW));
+    assert!(next_frame(&mut n, Duration::from_secs(5), is_arp_reply).is_some(), "ARP is link control, never lost");
+    for i in 0..5u8 {
+        n.transmit(&udp_frame(src, dst, &[i]));
+    }
+    n.transmit(&ping_frame(GW, 0x99, 1, b"lost"));
+    assert!(received(&server, Duration::from_millis(300)).is_empty(), "every datagram was lost");
+    assert!(next_frame(&mut n, Duration::from_millis(200), is_echo_reply).is_none(), "the echo request was lost");
+    // `network loss none`: the next look at the conditions lets traffic through again.
+    assert_eq!(shared.lock().expect("network").set_loss("none"), Ok(()));
+    std::thread::sleep(Duration::from_millis(120));
+    n.transmit(&udp_frame(src, dst, b"back"));
+    assert_eq!(received(&server, Duration::from_secs(2)), [b"back".to_vec()]);
+    n.transmit(&ping_frame(GW, 0x99, 2, b"back"));
+    assert!(next_frame(&mut n, Duration::from_secs(5), is_echo_reply).is_some());
+}
+
+#[test]
+fn full_download_loss_drops_what_the_host_sends_back_but_the_host_still_hears_the_guest() {
+    let server = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let dst = SocketAddrV4::new(GW, server.local_addr().expect("addr").port());
+    let echo = std::thread::spawn(move || {
+        let mut b = [0u8; 64];
+        let (len, from) = server.recv_from(&mut b).expect("recv");
+        server.send_to(&b[..len], from).expect("send");
+        b[..len].to_vec()
+    });
+    let (_, mut n) = lossy(0.0, 100.0, 1);
+    n.transmit(&arp_request(GW));
+    assert!(next_frame(&mut n, Duration::from_secs(5), is_arp_reply).is_some(), "ARP is link control, never lost");
+    n.transmit(&udp_frame(SocketAddrV4::new(GUEST, 40101), dst, b"hello"));
+    assert_eq!(echo.join().expect("echo"), b"hello", "the upload is lossless");
+    assert!(
+        next_frame(&mut n, Duration::from_millis(300), |f| matches!(packet::parse(f), Frame::Udp { .. })).is_none(),
+        "the reply was lost"
+    );
+    n.transmit(&ping_frame(GW, 0x98, 1, b"lost"));
+    assert!(next_frame(&mut n, Duration::from_millis(200), is_echo_reply).is_none(), "the echo reply was lost");
+}
+
+/// The NAT draws its loss from the seed it was given: half the guest's datagrams are lost,
+/// exactly the ones that seed's pattern picks.
+#[test]
+fn a_seeded_half_loss_drops_exactly_the_seeds_pattern() {
+    let server = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let dst = SocketAddrV4::new(GW, server.local_addr().expect("addr").port());
+    let src = SocketAddrV4::new(GUEST, 40102);
+    let frames: Vec<Vec<u8>> = (0..40u8).map(|i| udp_frame(src, dst, &[i])).collect();
+    let mut expect = super::shape::Loss::new(99);
+    expect.set(50.0, 0.0);
+    let kept: Vec<Vec<u8>> = (0..40u8).zip(&frames).filter(|(_, f)| !expect.drop_up(f)).map(|(i, _)| vec![i]).collect();
+    assert!((10..=30).contains(&kept.len()), "{}", kept.len());
+    let (_, mut n) = lossy(50.0, 0.0, 99);
+    for f in &frames {
+        n.transmit(f);
+    }
+    assert_eq!(received(&server, Duration::from_millis(500)), kept);
 }

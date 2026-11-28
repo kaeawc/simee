@@ -83,8 +83,11 @@ pub struct Config {
     pub dns: Dns,
     /// How many flows (each a host socket) the guest may hold open.
     pub limits: Limits,
-    /// The console's `network speed|delay`: read live, so a change applies to the next frame.
+    /// The console's `network speed|delay|loss`: read live, so a change applies to the next frame.
     pub network: Arc<Mutex<sim_core::network::Conditions>>,
+    /// What `network loss` draws its drops from; `None` (the default) seeds from the clock, once
+    /// per boot. Tests fix it, so the packets lost are always the same ones.
+    pub loss_seed: Option<u64>,
 }
 
 /// Caps on the guest's flows. The guest is untrusted and every flow is a host file descriptor
@@ -140,6 +143,7 @@ impl Default for Config {
             dns: Dns::System,
             limits: Limits::from_rlimit(),
             network: Arc::default(),
+            loss_seed: None,
         }
     }
 }

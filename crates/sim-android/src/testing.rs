@@ -35,7 +35,7 @@ pub fn fake_emulator(android: &Android, avd: &str) -> FakeEmulator {
 }
 
 /// [`fake_emulator`] as the stock emulator: advertised without `emulator=simee`, and simee's own
-/// console commands (`fold status`) get stock's refusal.
+/// console commands (`fold status`, `network loss`) get stock's refusal.
 pub fn fake_stock_emulator(android: &Android, avd: &str) -> FakeEmulator {
     fake(android, avd, true)
 }
@@ -131,6 +131,12 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
                         ["network", "delay", delay] => match network.lock().expect("network").set_latency(delay) {
                             true => "OK".to_owned(),
                             false => "KO: invalid <delay> argument, see 'help network delay' for valid values".to_owned(),
+                        },
+                        // simee's own: stock's console has no such sub-command.
+                        ["network", "loss", ..] if stock => "KO:  bad sub-command".to_owned(),
+                        ["network", "loss", loss @ ..] => match network.lock().expect("network").set_loss(&loss.join(" ")) {
+                            Ok(()) => "OK".to_owned(),
+                            Err(why) => format!("KO: invalid <loss> argument: {why}; use <percent> or <up>:<down>"),
                         },
                         ["screenshot", path] => {
                             let frame = Frame { width: 2, height: 1, rgba: vec![9, 9, 9, 255, 8, 8, 8, 255] };

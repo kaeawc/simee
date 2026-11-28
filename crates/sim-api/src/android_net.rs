@@ -2,9 +2,10 @@
 //!
 //! - `network_shape`, `network_state`, `network_clear`: the emulator's NAT through its console
 //!   (`network speed <up>:<down>`, `network delay <ms>`, `network status`: simee's emulator and
-//!   the stock one answer alike), and offline as airplane mode over adb. Loss, per-host rules,
-//!   source-port ranges, the proxy and injection are iOS's shaper's: refused, before anything
-//!   runs, with the reason.
+//!   the stock one answer alike), loss as simee's `network loss <pct>` (that percent of packets
+//!   dropped each way; the stock console has none, so there it is refused with the reason), and
+//!   offline as airplane mode over adb. Per-host rules, source-port ranges, the proxy and
+//!   injection are iOS's shaper's: refused, before anything runs, with the reason.
 //! - `connections`: the guest kernel's socket tables matched to processes by socket inode
 //!   (`sim_android::net`), as iOS's rows plus each socket's `uid`; `pid` is null for a socket no
 //!   process could be matched to.
@@ -33,9 +34,6 @@ const IOS_SHAPE_PARAMS: &[(&str, &str)] = &[
     ("inject", "the shaper is injected into a simulator's processes"),
 ];
 
-/// Why loss is iOS's.
-const NO_LOSS: &str = "the emulator's console shapes speed and latency, not loss";
-
 /// Dispatches the Android network methods.
 pub(crate) fn call(android: &Android, d: &Device, method: &str, p: &Value) -> Result<Value, String> {
     match method {
@@ -45,7 +43,9 @@ pub(crate) fn call(android: &Android, d: &Device, method: &str, p: &Value) -> Re
             Ok(json!({"profile": profile, "proxy_port": null, "injected": false, "boot_injected": false, "network_status": lines}))
         }
         "network_clear" => {
-            d.set_network(Some("full"), Some("none"))?;
+            // Loss only where there is any: the stock console has no `network loss`.
+            let loss = d.check_network_loss().is_ok().then_some("none");
+            d.set_network(Some("full"), Some("none"), loss)?;
             // Only when it is on: API 29 has no `cmd connectivity airplane-mode`, and an online
             // device has nothing to undo.
             let adb = d.adb(android)?;
@@ -73,14 +73,12 @@ fn shape(android: &Android, d: &Device, p: &Value) -> Result<Value, String> {
             return Err(format!("`network_shape` takes `{key}` for iOS devices only ({why})"));
         }
     }
-    // Checked before the device is read: what a preset or loss_pct asks for doesn't depend on it.
+    // Checked before the device is read: what a preset or loss_pct asks for doesn't depend on it,
+    // and whether the device can lose packets is in its advertisement.
     if shape_profile(p, Profile::default())?.loss_pct > 0 {
-        return Err(match p.get("loss_pct").and_then(Value::as_u64) {
-            Some(n) if n > 0 => format!("`network_shape` takes `loss_pct` for iOS devices only ({NO_LOSS})"),
-            _ => {
-                format!("preset `{}` drops connections, which only iOS devices shape ({NO_LOSS})", p["preset"].as_str().unwrap_or_default())
-            }
-        });
+        d.check_network_loss().map_err(|why| {
+            format!("`network_shape` takes `loss_pct` (and so the lossy and very-bad presets) on simee's emu only: {why}")
+        })?;
     }
     let (base, _) = current(android, d)?;
     let want = shape_profile(p, base.clone())?;
@@ -92,7 +90,11 @@ fn shape(android: &Android, d: &Device, p: &Value) -> Result<Value, String> {
         0 => "none".to_owned(),
         ms => ms.to_string(),
     });
-    let mut commands = d.set_network(speed.as_deref(), delay.as_deref())?;
+    let loss = (want.loss_pct != base.loss_pct).then(|| match want.loss_pct {
+        0 => "none".to_owned(),
+        pct => pct.to_string(),
+    });
+    let mut commands = d.set_network(speed.as_deref(), delay.as_deref(), loss.as_deref())?;
     if want.offline != base.offline {
         commands.extend(d.adb(android)?.set_airplane_mode(want.offline)?);
     }
@@ -111,8 +113,9 @@ fn asks(v: Option<&Value>) -> bool {
     }
 }
 
-/// The device's shaping as a profile: the console's conditions (a latency range reads as its
-/// mean) and airplane mode as offline; with the console's report.
+/// The device's shaping as a profile: the console's conditions (a latency range, and a loss
+/// that differs each way, read as their mean) and airplane mode as offline; with the console's
+/// report.
 fn current(android: &Android, d: &Device) -> Result<(Profile, Vec<String>), String> {
     let (c, lines) = d.network_conditions()?;
     let offline = d.adb(android)?.airplane_mode()?;
@@ -127,6 +130,7 @@ fn profile_of(c: &Conditions, offline: bool) -> Profile {
         latency_ms: u32::try_from(latency).unwrap_or(u32::MAX),
         down_kbps: kbps(c.download_bps),
         up_kbps: kbps(c.upload_bps),
+        loss_pct: ((c.upload_loss_pct + c.download_loss_pct) / 2.0).round().clamp(0.0, 100.0) as u32,
         ..Profile::default()
     }
 }
@@ -149,7 +153,7 @@ fn connection(s: &sim_android::net::Socket) -> Value {
 #[cfg(all(test, unix))]
 mod tests {
     use serde_json::{Value, json};
-    use sim_android::testing::{FakeAdb, FakeEmulator, fake_adb, fake_emulator};
+    use sim_android::testing::{FakeAdb, FakeEmulator, fake_adb, fake_emulator, fake_stock_emulator};
 
     use crate::methods::{Session, call};
 
@@ -158,6 +162,11 @@ mod tests {
     const IOS_ONLY: &[&str] = &["network_flows", "network_env"];
 
     fn session(tag: &str) -> (Session, std::path::PathBuf, FakeAdb, FakeEmulator) {
+        session_as(tag, false)
+    }
+
+    /// A session whose device runs under simee's emu, or under the stock emulator (`stock`).
+    fn session_as(tag: &str, stock: bool) -> (Session, std::path::PathBuf, FakeAdb, FakeEmulator) {
         let root = std::path::PathBuf::from("/tmp").join(format!("sa-net-{tag}-{}", std::process::id()));
         let image = root.join("sdk/system-images/android-36/google_apis/x86_64");
         std::fs::create_dir_all(&image).expect("image dir");
@@ -167,7 +176,7 @@ mod tests {
         android.running_dir = Some(root.join("running"));
         android.create("phone", "system-images;android-36;google_apis;x86_64", None).expect("create");
         let adb = fake_adb(&android);
-        let emulator = fake_emulator(&android, "phone");
+        let emulator = if stock { fake_stock_emulator(&android, "phone") } else { fake_emulator(&android, "phone") };
         (Session::with_android(android), root, adb, emulator)
     }
 
@@ -291,7 +300,7 @@ mod tests {
         let (mut s, root, adb, emulator) = session("clear");
         run(&mut s, "network_shape", json!({"preset": "lte", "offline": true})).expect("shape");
         assert_eq!(run(&mut s, "network_clear", json!({})), Ok(Value::Null));
-        assert_eq!(&shaping(&emulator)[2..], ["network speed full", "network delay none"]);
+        assert_eq!(&shaping(&emulator)[2..], ["network speed full", "network delay none", "network loss none"]);
         assert_eq!(adb.calls().last().map(String::as_str), Some("shell cmd connectivity airplane-mode disable"));
         let state = run(&mut s, "network_state", json!({})).expect("state");
         assert_eq!(state["profile"], profile("none"));
@@ -302,9 +311,6 @@ mod tests {
     fn network_shape_refuses_what_only_ios_shapes_before_anything_runs() {
         let (mut s, root, adb, emulator) = session("refuse");
         for (p, says) in [
-            (json!({"loss_pct": 10}), "`loss_pct`"),
-            (json!({"preset": "lossy"}), "preset `lossy`"),
-            (json!({"preset": "very-bad"}), "preset `very-bad`"),
             (json!({"rules": [{"pattern": "*", "offline": true}]}), "`rules`"),
             (json!({"port_base": 40000}), "`port_base`"),
             (json!({"port_count": 10}), "`port_count`"),
@@ -317,6 +323,51 @@ mod tests {
         assert_eq!(run(&mut s, "network_shape", json!({"preset": "warp"})), Err("unknown preset `warp`".into()));
         assert!(adb.calls().is_empty(), "{:?}", adb.calls());
         assert!(emulator.console.lock().expect("console").is_empty());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// iOS's loss presets (lossy: 100 ms, 2000/1000 kbit/s, 10%; very-bad: 500 ms, 1000/1000
+    /// kbit/s, 10%) become simee's `network loss`, read back by `network_state`.
+    #[test]
+    fn loss_presets_and_loss_pct_map_to_simees_network_loss() {
+        let (mut s, root, _adb, emulator) = session("loss");
+        let out = run(&mut s, "network_shape", json!({"preset": "lossy"})).expect("lossy");
+        assert_eq!(out["profile"], profile("lossy"));
+        assert_eq!(out["commands"], json!(["network speed 1000:2000", "network delay 100", "network loss 10"]));
+        assert_eq!(run(&mut s, "network_state", json!({})).expect("state")["profile"], profile("lossy"));
+        let out = run(&mut s, "network_shape", json!({"preset": "very-bad"})).expect("very-bad");
+        assert_eq!(out["profile"], profile("very-bad"));
+        assert_eq!(out["commands"], json!(["network speed 1000:1000", "network delay 500"]), "the loss is already 10%");
+        // loss_pct alone changes only the loss; over 100 is capped as on iOS.
+        let out = run(&mut s, "network_shape", json!({"loss_pct": 30})).expect("loss_pct");
+        assert_eq!(out["commands"], json!(["network loss 30"]));
+        assert_eq!(run(&mut s, "network_state", json!({})).expect("state")["profile"]["loss_pct"], 30);
+        assert_eq!(run(&mut s, "network_shape", json!({"loss_pct": 400})).expect("capped")["commands"], json!(["network loss 100"]));
+        // A preset without loss clears it; so does network_clear.
+        assert_eq!(run(&mut s, "network_shape", json!({"preset": "3g"})).expect("3g")["commands"][2], "network loss none");
+        run(&mut s, "network_shape", json!({"loss_pct": 5})).expect("loss again");
+        assert_eq!(run(&mut s, "network_clear", json!({})), Ok(Value::Null));
+        assert_eq!(shaping(&emulator).last().map(String::as_str), Some("network loss none"));
+        assert_eq!(run(&mut s, "network_state", json!({})).expect("state")["profile"], profile("none"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The stock emulator's console has no packet loss: loss is refused there before anything
+    /// runs, saying why, while the rest still shapes and clear sends no loss command.
+    #[test]
+    fn the_stock_emulator_refuses_loss_and_says_why() {
+        let (mut s, root, adb, emulator) = session_as("stockloss", true);
+        for p in [json!({"loss_pct": 10}), json!({"preset": "lossy"}), json!({"preset": "very-bad"})] {
+            let err = run(&mut s, "network_shape", p.clone()).expect_err("refused");
+            assert!(err.contains("`loss_pct`") && err.contains("stock emulator") && err.contains("no `network loss`"), "{p}: {err}");
+        }
+        assert!(adb.calls().is_empty(), "{:?}", adb.calls());
+        assert!(emulator.console.lock().expect("console").is_empty());
+        // No loss asked for: shaped as before, and loss 0 is no request.
+        let out = run(&mut s, "network_shape", json!({"preset": "3g", "loss_pct": 0})).expect("3g");
+        assert_eq!(out["commands"], json!(["network speed 330:780", "network delay 200"]));
+        assert_eq!(run(&mut s, "network_clear", json!({})), Ok(Value::Null));
+        assert!(!shaping(&emulator).iter().any(|c| c.starts_with("network loss")), "{:?}", shaping(&emulator));
         std::fs::remove_dir_all(root).ok();
     }
 
