@@ -29,6 +29,9 @@ mod host;
 // Pure frame and shaping logic: built everywhere (and tested), used by the unix-only engine.
 #[cfg_attr(not(unix), allow(dead_code))]
 mod packet;
+/// `net-segment`: the second NIC's frames between linked emu processes (#539).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub mod segment;
 #[cfg_attr(not(unix), allow(dead_code))]
 mod shape;
 #[cfg(all(test, unix))]

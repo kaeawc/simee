@@ -257,7 +257,10 @@ Mechanisms, in order of work:
    per-link directory: one L2 segment with multicast, so mDNS and Nearby work between Android
    guests. Stock has the same idea for Wi-Fi (`-android-wifi-server-port` and
    `-android-wifi-client-port` in the stock emulator's help, 37.x). It lives in emu, so a server
-   restart doesn't touch it.
+   restart doesn't touch it. The host side is built (`emu -net-segment`, `sim_core::segment`,
+   `emu_vmm::net::segment`; [net-segment.md](net-segment.md), #539): what is left is this
+   model's adapter, which plans a segment, starts the members with the flag and runs the guest's
+   address commands, and a boot of two guests to check mDNS.
 3. Discovery between iOS and Android members would need an mDNS reflector between the host and
    the segment. Not designed here (open question 8).
 
