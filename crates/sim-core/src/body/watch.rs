@@ -160,7 +160,9 @@ pub(super) fn generic(g: &Spec) -> Option<Body> {
     })
 }
 
-#[cfg(test)]
+// Its one test pins raw f32 mesh fingerprints, which differ by platform: macOS only. Tests that
+// hold on every platform go outside this gate.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::super::tests::fingerprint;
     use super::*;

@@ -3,6 +3,7 @@
 
 pub mod body;
 pub mod carplay;
+pub mod console;
 pub mod contrast;
 pub mod debug;
 pub mod device;
@@ -19,8 +20,10 @@ pub mod gesture;
 pub mod goldfish;
 pub mod hid;
 pub mod hostfs;
+pub mod idle;
 pub mod indigo;
 pub mod launchd;
+pub mod launchd_profiles;
 pub mod logcat;
 pub mod mark;
 pub mod net;
@@ -32,6 +35,7 @@ pub mod plist;
 pub mod pointer;
 pub mod reuse;
 pub mod rotation;
+pub mod shot;
 pub mod stream;
 pub mod stylus;
 pub mod support;

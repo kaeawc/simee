@@ -10,6 +10,13 @@ use serde_json::Value;
 /// One API method call: the method's result, or its error text.
 pub trait Backend: Send + Sync + 'static {
     fn call(&self, method: &str, params: &Value) -> Result<Value, String>;
+
+    /// Whether the call `method` with `params` would be allowed now, without making it: what a
+    /// policy's backend asks again before it shows more of a result it already read (the next page
+    /// of a list). Everything is, unless a policy says otherwise.
+    fn permits(&self, _method: &str, _params: &Value) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 thread_local! {
@@ -115,6 +122,26 @@ pub mod fake {
     use serde_json::{Value, json};
 
     use super::Backend;
+
+    /// A scratch directory of its own, removed on drop.
+    pub struct Scratch(pub std::path::PathBuf);
+
+    impl Scratch {
+        pub fn new(tag: &str) -> Scratch {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("simee-mcp-{tag}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch");
+            Scratch(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     /// A latch: calls to a method named in `block` wait until it is released.
     #[derive(Default)]

@@ -11,6 +11,9 @@
 //! - **Prompts**: common workflows (boot and install, reproduce a bug, audit contrast, find
 //!   slowness, test across form factors) naming the tools to call and their toolsets ([`prompts`]).
 //! - **App**: a live, clickable view of a device, as an MCP App ([`app`]).
+//! - **Safety**: destructive tools need the user's confirmation ([`safety`]), a policy says which
+//!   devices and toolsets a client may use and whether it may change anything ([`policy`]), boots go
+//!   through the host's admission, and every call is audited ([`audit`]): docs/mcp-safety.md.
 //!
 //! It speaks the current revision (2026-07-28: stateless, `server/discover`, per-request `_meta`)
 //! and answers `initialize` for clients of the revisions before it ([`rpc`], [`server`]). The
@@ -18,11 +21,15 @@
 //! the same [`Server`].
 
 pub mod app;
+pub mod audit;
 pub mod backend;
+pub mod drain;
 pub mod http;
+pub mod policy;
 pub mod prompts;
 pub mod resources;
 pub mod rpc;
+pub mod safety;
 pub mod server;
 pub mod tasks;
 pub mod tools;
@@ -30,9 +37,11 @@ pub mod watch;
 
 use std::io::{BufRead, Write};
 use std::sync::Arc;
-use std::time::Duration;
 
 pub use backend::{ApiBackend, Backend};
+pub use drain::Drain;
+pub use policy::Policy;
+pub use safety::Safety;
 pub use server::Server;
 pub use tools::Toolsets;
 
@@ -44,9 +53,6 @@ pub fn stdout_sink() -> tasks::Sink {
         let _ = out.write_all(line.as_bytes()).and_then(|()| out.write_all(b"\n")).and_then(|()| out.flush());
     })
 }
-
-/// How long to wait for requests in flight once the client closes its end.
-const DRAIN: Duration = Duration::from_secs(10);
 
 /// Serves one client on stdin and stdout until stdin closes, with the toolsets
 /// `SIMEE_MCP_TOOLSETS` names (default `core`) and the subscription pace `SIMEE_MCP_SCREEN_FPS`
@@ -72,6 +78,8 @@ pub fn serve_with(
     timing: server::Timing,
 ) -> std::io::Result<()> {
     let server = Server::with_timing(backend, sink, timing, toolsets);
+    // The client's responses to a question arrive on this same stream.
+    server.ask_clients_to_confirm(server::ELICIT_TIMEOUT);
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -83,6 +91,6 @@ pub fn serve_with(
             server.handle_line(text.trim_end());
         }
     }
-    server.drain(DRAIN);
+    server.drain(drain::DRAIN);
     Ok(())
 }

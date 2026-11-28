@@ -34,6 +34,16 @@ impl Rig {
 
     /// A server of every tool whose backend is `wrap` of the fake.
     fn over(toolsets: Toolsets, wrap: impl FnOnce(Arc<Fake>) -> Arc<dyn Backend>) -> Rig {
+        Rig::guarded(toolsets, wrap, Arc::new(Safety::default()))
+    }
+
+    /// [`Rig::over`], with these safety settings.
+    fn guarded(toolsets: Toolsets, wrap: impl FnOnce(Arc<Fake>) -> Arc<dyn Backend>, safety: Arc<Safety>) -> Rig {
+        Rig::draining(toolsets, wrap, safety, Drain::shared())
+    }
+
+    /// [`Rig::guarded`], whose server counts its calls with `drain`.
+    fn draining(toolsets: Toolsets, wrap: impl FnOnce(Arc<Fake>) -> Arc<dyn Backend>, safety: Arc<Safety>, drain: Arc<Drain>) -> Rig {
         let fake = Arc::new(Fake::with_devices());
         let backend = wrap(fake.clone());
         let timing = Timing { watch: Pace::uniform(Duration::from_millis(20)), heartbeat: Duration::from_millis(40) };
@@ -50,7 +60,13 @@ impl Rig {
             });
             vrx
         };
-        Rig { server: Server::with_timing(backend, sink, timing, toolsets), fake, rx, notes: RefCell::default(), next: Cell::new(1) }
+        Rig {
+            server: Server::with_drain(backend, sink, timing, toolsets, safety, drain),
+            fake,
+            rx,
+            notes: RefCell::default(),
+            next: Cell::new(1),
+        }
     }
 
     fn meta(tasks: bool) -> Value {
@@ -178,7 +194,7 @@ fn tools_list_has_a_tool_for_every_method() {
     assert_eq!(tools.len(), METHODS.len() + 1);
     assert!(tools.iter().all(|t| t["inputSchema"]["type"] == "object" && t["description"].is_string()));
     assert_eq!(response["result"]["resultType"], "complete");
-    assert_eq!(response["result"]["cacheScope"], "public");
+    assert_eq!(response["result"]["cacheScope"], "private");
     let again = rig.modern("tools/list", json!({}));
     assert_eq!(again["result"]["tools"], response["result"]["tools"], "a deterministic order");
 }
@@ -306,7 +322,8 @@ fn a_long_method_is_a_task_for_a_client_that_declares_the_extension() {
         std::thread::sleep(Duration::from_millis(10));
     };
     assert_eq!(done["result"]["result"]["structuredContent"], json!({"boot_s": 12.0}));
-    assert_eq!(rig.fake.called("boot"), [json!({"device": "phone"})]);
+    // The server applies the host's admission to a boot the agent didn't say anything about.
+    assert_eq!(rig.fake.called("boot"), [json!({"device": "phone", "admission": "refuse"})]);
     // A method that isn't long is answered inline even for such a client.
     let tap = rig.with_tasks("tools/call", json!({"name": "tap", "arguments": {"device": "phone", "x": 1, "y": 1}}));
     assert_eq!(tap["result"]["resultType"], "complete");
@@ -1142,8 +1159,21 @@ fn tool_call_overhead() {
     let tx = Mutex::new(tx);
     let sink: Sink = Arc::new(move |line| drop(tx.lock().expect("tx").send(line)));
     let server = Server::new(backend.clone(), sink, Toolsets::all());
+    // The same server with the audit log on: one more append a call.
+    let scratch = crate::backend::fake::Scratch::new("overhead");
+    let log = crate::audit::AuditLog::open(crate::audit::Config::new(scratch.0.join("audit.log"))).expect("audit log");
+    let (audited_tx, audited_rx) = channel::<String>();
+    let audited_tx = Mutex::new(audited_tx);
+    let audited_sink: Sink = Arc::new(move |line| drop(audited_tx.lock().expect("tx").send(line)));
+    let audited = Server::with_safety(
+        backend.clone(),
+        audited_sink,
+        Timing::default(),
+        Toolsets::all(),
+        Arc::new(Safety::new(crate::policy::Policy::default(), Some(log))),
+    );
     let meta = Rig::meta(false);
-    println!("{:<13} {:>8} {:>8} {:>8} {:>8} {:>8}  µs per call", "tool", "parse", "method", "result", "write", "server");
+    println!("{:<13} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}  µs per call", "tool", "parse", "method", "result", "write", "server", "audited");
     for tool in ["identity", "help", "form_factors"] {
         let line = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": {}, "_meta": meta}})
             .to_string();
@@ -1157,6 +1187,13 @@ fn tool_call_overhead() {
             server.handle_line(&line);
             drop(rx.recv_timeout(WAIT).expect("reply"));
         });
-        println!("{tool:<13} {parse:>8.2} {method:>8.2} {result:>8.2} {write:>8.2} {whole:>8.2}");
+        let with_log = per_call_us(|| {
+            audited.handle_line(&line);
+            drop(audited_rx.recv_timeout(WAIT).expect("reply"));
+        });
+        println!("{tool:<13} {parse:>8.2} {method:>8.2} {result:>8.2} {write:>8.2} {whole:>8.2} {with_log:>8.2}");
     }
 }
+
+mod drain;
+mod safety;
