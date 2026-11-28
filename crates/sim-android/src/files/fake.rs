@@ -3,16 +3,20 @@
 //! runs each command the way the guest would: `run-as <package>` only for a debuggable package,
 //! `su 0` and `adb root` only when the image allows them, the shell's own uid kept out of the apps'
 //! data dirs, and the rest run by the host's `sh` with the device's paths mapped into that
-//! directory. `stat` (toybox's `-c` and `-L`), `chown`, `restorecon`, `chmod`, `cat`, `mv` and
-//! `realpath` are stand-ins too: `stat` answers every file's owner and mode from
-//! [`FakeFiles::set_owner`] (a symlink's own mode is 777, as Linux has it); `mv` is toybox's,
+//! directory. `stat` (toybox's `-c` and `-L`), `chown`, `restorecon`, `chmod`, `cat`, `mv`,
+//! `mkdir`, `id` and `realpath` are stand-ins too: `stat` answers every file's owner and mode from
+//! [`FakeFiles::set_owner`] (a symlink's own mode is 777, as Linux has it), except a temp dir's
+//! (`.simee-write-*`), which is the uid's that made it (`id -u`: 0 as root, the app's through
+//! `run-as`) with the mode the umask gave; `mv` is toybox's,
 //! with `-T` unless [`FakeFiles::old_toybox`] (API 29's has none); the rest pass through to the
 //! host's tools, and are where the hostile app's moves ([`FakeFiles::late_swap_temp_files`] and
 //! the like) happen. As a real device's `adb exec-in`, the fake's carries back no exit status.
 //!
 //! The hostile app owns its data dir, so it can rename, remove and plant any entry in it, but
 //! not touch what is inside a directory root made there with mode 0700: the fake leaves alone
-//! whatever is inside a `.simee-write-*` dir.
+//! whatever is inside a `.simee-write-*` dir root made, never one the app made in its place
+//! ([`FakeFiles::swap_in_own_temp_dir`]). The host's shell runs every script as one uid, so its
+//! `[ -O ]` is always true; `stat` is what tells whose a temp dir is.
 //!
 //! The device has two third-party apps: `com.example.app`, debuggable, with `files/notes.txt`
 //! (`hello`), `shared_prefs/a.xml`, `cache/c.bin`, a `lib` dir (as the system leaves one) and
@@ -95,6 +99,8 @@ pub fn fake_files_adb(android: &Android, root: Root) -> FakeFiles {
         "attack",
         "attack-late",
         "attack-mv",
+        "attack-dir",
+        "made",
         "attack-target",
         "swap-after-guard",
         "old-toybox",
@@ -113,6 +119,8 @@ pub fn fake_files_adb(android: &Android, root: Root) -> FakeFiles {
     write_script(&bin.join("cat"), FAKE_CAT);
     write_script(&bin.join("mv"), FAKE_MV);
     write_script(&bin.join("realpath"), FAKE_REALPATH);
+    write_script(&bin.join("mkdir"), FAKE_MKDIR);
+    write_script(&bin.join("id"), FAKE_ID);
     write_script(&tools.join("adb"), FAKE_ADB);
     FakeFiles { tools, device, outside }
 }
@@ -164,6 +172,13 @@ impl FakeFiles {
         std::fs::write(self.tools.join("attack-late"), "swap").expect("attack-late");
     }
 
+    /// From now on, as soon as a write's upload makes its temp dir, a hostile app moves it aside
+    /// (to `<name>.moved`) and makes a dir of its own, mode 0700, under the same name: a real
+    /// dir, not a symlink, so only its owner tells it from root's.
+    pub fn swap_in_own_temp_dir(&self) {
+        std::fs::write(self.tools.join("attack-dir"), "swap").expect("attack-dir");
+    }
+
     /// The next time `mv` moves a temp file over its target, a hostile app first replaces the
     /// target with a symlink to the `outside` dir.
     pub fn swap_target_in_mv(&self) {
@@ -210,12 +225,14 @@ const FAKE_STAT: &str = r#"L=; [ "$1" = -L ] && { L=1; shift; }
 fmt=$2; shift 2; rc=0
 IFS=: read -r ou og om < "$(dirname "$0")/../owner"
 for f in "$@"; do
-  m=$om
+  u=$ou g=$og m=$om
   if [ -L "$f" ] && [ -z "$L" ]; then t="symbolic link"; s=$(readlink "$f" | tr -d '\n' | wc -c | tr -d ' '); m=777
   elif [ -d "$f" ]; then t=directory; s=4096
+    made=$(awk -F'|' -v p="$(cd "$f" && pwd -P)" '$1 == p { v = $2 } END { print v }' "$(dirname "$0")/../made" 2>/dev/null)
+    [ -n "$made" ] && { u=${made%%:*}; m=${made##*:}; g=${made#*:}; g=${g%%:*}; }
   elif [ -e "$f" ]; then t="regular file"; s=$(wc -c < "$f" | tr -d ' ')
   else echo "stat: '$f': No such file or directory" >&2; rc=1; continue; fi
-  printf '%s\n' "$fmt" | sed -e "s|%F|$t|g" -e "s|%s|$s|g" -e "s|%u|$ou|g" -e "s|%g|$og|g" -e "s|%a|$m|g" -e "s|%n|$f|g"
+  printf '%s\n' "$fmt" | sed -e "s|%F|$t|g" -e "s|%s|$s|g" -e "s|%u|$u|g" -e "s|%g|$g|g" -e "s|%a|$m|g" -e "s|%n|$f|g"
 done
 exit $rc
 "#;
@@ -226,11 +243,34 @@ if [ -e "$here/attack-late" ]; then
   for f in "$@"; do
     case "$(basename "$f")" in .simee-write-*) ;; *) continue;; esac
     d=$(cd "$(dirname "$f")" && pwd -P)
-    case "$(basename "$d")" in .simee-write-*) continue;; esac
+    case "$(awk -F'|' -v p="$d" '$1 == p { v = $2 } END { print v }' "$here/made" 2>/dev/null)" in ""|10123:*) ;; *) continue;; esac
     rm -f "$f"; ln -s "$here/outside/victim" "$f"
   done
 fi
 PATH=${PATH#*fakebin:} exec chmod "$@"
+"#;
+
+/// The host's `mkdir`, keeping whose each temp dir is (`made`: `<path>|<uid>:<gid>:<mode>`, the
+/// last line for a path wins), and the hostile app's swap of one ([`FakeFiles::swap_in_own_temp_dir`]).
+const FAKE_MKDIR: &str = r#"here=$(cd "$(dirname "$0")/.." && pwd)
+PATH=${PATH#*fakebin:} command mkdir "$@" || exit $?
+mode=$(printf '%o' $((0777 & ~0$(umask))))
+for d in "$@"; do
+  case "$(basename "$d")" in .simee-write-*) ;; *) continue;; esac
+  p=$(cd "$d" && pwd -P)
+  echo "$p|$SIMEE_FAKE_UID:$SIMEE_FAKE_UID:$mode" >> "$here/made"
+  if [ "$SIMEE_FAKE_VERB" = exec-in ] && [ -e "$here/attack-dir" ]; then
+    PATH=${PATH#*fakebin:} command mv "$p" "$p.moved"
+    echo "$p.moved|$SIMEE_FAKE_UID:$SIMEE_FAKE_UID:$mode" >> "$here/made"
+    PATH=${PATH#*fakebin:} command mkdir -m 700 "$p"
+    echo "$p|10123:10123:700" >> "$here/made"
+  fi
+done
+"#;
+
+/// `id -u`: the uid the device runs the script as.
+const FAKE_ID: &str = r#"[ "$*" = -u ] && { echo "$SIMEE_FAKE_UID"; exit 0; }
+PATH=${PATH#*fakebin:} exec id "$@"
 "#;
 
 /// The host's `cat`, failing to write in what `exec-in` runs after [`FakeFiles::fail_upload`].
@@ -307,6 +347,7 @@ printf '%s\n' "$*" >> "$here/adb.log"
 dev="$here/device"
 mode=$(cat "$here/root")
 rooted() { [ "$mode" = adbd ] || [ -e "$here/rooted" ]; }
+if rooted; then uid=0; else uid=2000; fi
 case "$1" in
 root)
   if rooted; then echo "adbd is already running as root"; exit 0; fi
@@ -341,11 +382,13 @@ case "$cmd" in
   rest=${cmd#run-as }; pkg=${rest%% *}; cmd=${rest#"$pkg" }
   [ -d "$dev/data/user/0/$pkg" ] || { echo "run-as: unknown package: $pkg" >&2; exit 1; }
   grep -qx "$pkg" "$here/debuggable" || { echo "run-as: package not debuggable: $pkg" >&2; exit 1; }
-  [ "$cmd" = "id -u" ] && { echo 10123; exit 0; };;
+  [ "$cmd" = "id -u" ] && { echo 10123; exit 0; }
+  uid=10123;;
 "su 0 "*)
   [ "$mode" = su ] || { echo "/system/bin/sh: su: inaccessible or not found" >&2; exit 127; }
   cmd=${cmd#su 0 }
-  [ "$cmd" = "id -u" ] && { echo 0; exit 0; };;
+  [ "$cmd" = "id -u" ] && { echo 0; exit 0; }
+  uid=0;;
 *)
   if ! rooted; then
     case "$cmd" in *"/data/user/"*|*"/data/data/"*) echo "/system/bin/sh: Permission denied" >&2; exit 1;; esac
@@ -354,7 +397,7 @@ esac
 # Every device path the client sends is quoted: map those (and only those, not the `/data/` in
 # `/sdcard/Android/data/`) into the device's directory.
 cmd=$(printf '%s' "$cmd" | sed -e "s#'/data/#'$dev/data/#g" -e "s#'/sdcard/#'$dev/sdcard/#g" -e "s#'/storage/emulated/0/#'$dev/sdcard/#g")
-export SIMEE_FAKE_VERB="$verb"
+export SIMEE_FAKE_VERB="$verb" SIMEE_FAKE_UID="$uid"
 if [ "$verb" = exec-in ]; then
   # adb exec-in carries back neither the command's output nor its exit status.
   PATH="$here/fakebin:$PATH" sh -c "$cmd" > /dev/null 2>&1

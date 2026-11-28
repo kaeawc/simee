@@ -289,7 +289,9 @@ fn name_and_path(words: &[&str]) -> Option<(String, String)> {
     Some((first.to_owned(), words.get(1).unwrap_or(&first).to_string()))
 }
 
-#[cfg(test)]
+// Unix only: the tests drive a fake emulator and adb (`crate::testing`: a Unix socket per device and
+// `/bin/sh` scripts) and use `process_group`.
+#[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::path::{Path, PathBuf};

@@ -16,7 +16,8 @@ pub mod files;
 pub mod host;
 pub mod listing;
 pub mod procs;
-#[cfg(any(test, feature = "testing"))]
+/// A fake emulator and adb for tests (a Unix socket per device and `/bin/sh` scripts): unix only.
+#[cfg(all(unix, any(test, feature = "testing")))]
 pub mod testing;
 
 use std::path::{Path, PathBuf};
@@ -395,7 +396,7 @@ impl Android {
         self.boot_window(avds, concurrency, timeout, first_port, free, |d, port| d.launch_command(Some(port), false), hook)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn boot_many_with(
         &self,
         avds: &[String],
@@ -849,7 +850,7 @@ impl Device {
     }
 
     /// [`boot_launching`](Self::boot_launching) asking nothing.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn boot_with(&self, android: &Android, timeout: Duration, cmd: Command) -> Result<(), String> {
         self.boot_launching(android, timeout, || cmd, &|| Ok(()))
     }
@@ -1606,7 +1607,9 @@ fn decode_png(bytes: &[u8]) -> Result<Frame, String> {
     Ok(Frame { width: info.width, height: info.height, rgba })
 }
 
-#[cfg(test)]
+/// These run against `testing`'s fake emulator (a Unix socket per device, `/bin/sh` scripts for
+/// adb), which Windows can't host until it has a transport.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::testing::{fake_emulator, fake_stock_emulator, wait_for};

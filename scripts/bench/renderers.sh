@@ -65,7 +65,7 @@
 # BENCH_PROTECTED_DEVICES), whether or not that device is up. Before every boot the ports are
 # checked free again; emu is told to quit on the console only while it is the process this run
 # started and the one listening on the port, and is signalled only while its PID still has the
-# start time it had at launch.
+# start time and command (when it was seen) it had at launch.
 # Results: one JSON per API (renderers-api<N>-*.json) and one for the inits (renderers-init-*).
 # Reproduces docs/research/renderers.md.
 set -uo pipefail
@@ -158,36 +158,33 @@ shots=${shots:-$BENCH_OUT/renderers-shots}
 
 # --- Processes this run started ----------------------------------------------------------------
 
-# A PID alone is not an identity: hours into a run macOS can hand a finished process's PID to an
-# unrelated one. A process this script started is its PID and its start time (ps lstart, which an
-# exec doesn't change), and nothing is signalled unless both still match.
-pid_start() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'; }
-proc_is() { # PID START: PID is still the process that started at START
-  [ -n "$1" ] && [ -n "$2" ] && [ "$(pid_start "$1")" = "$2" ]
-}
+# A process this script started is identified as lib.sh's bench_track identifies it: its PID, its
+# start time and, where it is known, its command, recorded at launch. Nothing is signalled unless
+# they all still match (hours into a run macOS can hand a finished process's PID to another).
 owns_port() { # PID PORT: PID is the process listening on the console port
   case " $(lsof -nP -iTCP:"$2" -sTCP:LISTEN -t 2>/dev/null | tr '\n' ' ') " in
     *" $1 "*) return 0 ;;
     *) return 1 ;;
   esac
 }
-# Stops the emu a boot started (PID, its START, the console PORT). The console's quit goes out
-# only when PID is that process and the one on the port: the port alone could be another run's
-# emulator. Then SIGINT/SIGTERM, again only while PID is still that process. Always untracked.
+# Stops the emu a boot started (PID, its IDENT from android_boot's BOOT_IDENT, the console PORT).
+# The console's quit goes out only when PID is still that process and the one on the port: the
+# port alone could be another run's emulator. Then SIGINT/SIGTERM, again only while PID is still
+# that process. Always untracked.
 emu_stop() {
-  local pid=$1 started=$2 port=$3 i
+  local pid=$1 ident=$2 port=$3 i
   [ -n "$pid" ] || return 0
-  if proc_is "$pid" "$started"; then
+  if bench_pid_is "$pid" "$ident"; then
     if owns_port "$pid" "$port"; then
       "$BENCH_ADB" -s "emulator-$port" emu kill >/dev/null 2>&1
     fi
     for i in $(seq 1 $((${EMU_QUIT_WAIT:-15} * 10))); do
-      proc_is "$pid" "$started" || break
+      bench_pid_is "$pid" "$ident" || break
       sleep 0.1
     done
-    ! proc_is "$pid" "$started" || bench_stop_pid "$pid" "${EMU_STOP_GRACE:-30}"
-  elif [ -z "$started" ]; then
-    bench_log "emu $pid: no start time recorded; not signalling it"
+    ! bench_pid_is "$pid" "$ident" || bench_stop_pid "$pid" "${EMU_STOP_GRACE:-30}" "$ident"
+  elif [ -z "$ident" ]; then
+    bench_log "emu $pid: no identity recorded; not signalling it"
   fi
   bench_untrack "$pid"
   return 0
@@ -196,12 +193,12 @@ emu_stop() {
 # The boot gate: SCRIPT -- (touch go; wait for done) in the background. Each boot has its own
 # pair of files, so a previous boot's waiter can't miss its done; the waiter also stops once the
 # work directory is gone (the run's exit), as nothing else stops it. The waiters are kept as
-# "PID|START" entries here, not in bench_track's list, whose cleanup signals a bare PID.
+# "PID|START" entries here, not in bench_track's list, whose cleanup signals at once, with no grace.
 GATE_N=0
 GATE_DONE=""
 GATE_GRACE=${GATE_GRACE:-10}
 GATE_SLOTS=()
-gate_live() { proc_is "${1%%|*}" "${1#*|}"; }
+gate_live() { bench_pid_is "${1%%|*}" "${1#*|}|"; }
 gate_reap() { # forget the waiters that have finished
   local keep=() e
   for e in ${GATE_SLOTS[@]+"${GATE_SLOTS[@]}"}; do gate_live "$e" && keep+=("$e"); done
@@ -219,7 +216,7 @@ gate_acquire() {
   "$gate" --label "renderers $1" -- sh -c 'touch "$1"; until [ -e "$2" ] || [ ! -d "${2%/*}" ]; do sleep 1; done' \
     gate "$go" "$GATE_DONE" >>"$BENCH_WORK/gate.log" 2>&1 &
   GATE_PID=$!
-  entry="$GATE_PID|$(pid_start "$GATE_PID")"
+  entry="$GATE_PID|$(bench_pid_start "$GATE_PID")"
   GATE_SLOTS+=("$entry")
   until [ -e "$go" ]; do
     gate_live "$entry" || {
@@ -247,7 +244,7 @@ gate_cleanup() {
       gate_live "$e" || break
       sleep 0.1
     done
-    ! gate_live "$e" || bench_stop_pid "${e%%|*}" "$GATE_GRACE"
+    ! gate_live "$e" || bench_stop_pid "${e%%|*}" "$GATE_GRACE" "${e#*|}|"
   done
   GATE_SLOTS=()
 }
@@ -284,15 +281,49 @@ failure_note() {
   else echo "Failed runs: none."; fi
 }
 
-# RENDERERS_SOURCE_ONLY=1: only the functions above (scripts/bench/test-renderers.sh).
-[ "${RENDERERS_SOURCE_ONLY:-0}" = 1 ] && return 0
+# --- Boots (functions) -------------------------------------------------------------------------
 
-image_for() {
-  case $1 in
-    30 | 33 | 34 | 36) echo "system-images/android-$1/google_apis/arm64-v8a" ;;
-    *) echo "" ;;
-  esac
+# The console and adb ports are free before a boot: a stopped emu may take a moment to let go,
+# but whatever still holds them after that isn't this run's, and isn't touched.
+port_clear() {
+  local i
+  for i in $(seq 1 30); do
+    port_free "$port" && return 0
+    sleep 1
+  done
+  bench_die "port $port or $((port + 1)) is in use before a boot, and not by this run's emulator; not touching what owns it"
 }
+# One boot of the arm: sets BOOT_PID, BOOT_IDENT (its identity, recorded at launch), BOOT_* and
+# INIT_MS; returns 1 when it didn't boot and 2 without a boot slot. The slot wait can be long, so
+# the ports are checked after it, right before the launch.
+boot_arm() {
+  local a=$1 log=$2 envs
+  shift 2
+  envs=$(arm_env "$a")
+  BOOT_PID=""
+  BOOT_IDENT=""
+  if ! gate_acquire "$a"; then
+    bench_log "$a: no boot slot (see $BENCH_WORK/gate.log)"
+    BOOT_S=no-slot
+    return 2
+  fi
+  port_clear
+  LAUNCH_LOAD=$(load1)
+  BOOT_T0=$(now)
+  android_boot "emu${envs:+:$envs}" "$AVD" "$port" "$log" -gpu "$(arm_gpu "$a")" "$@"
+  local rc=$?
+  gate_release
+  INIT_MS=$(sed -n 's/.*renderer initialized in \([0-9]*\) ms.*/\1/p' "$log" | head -1)
+  return "$rc"
+}
+boot_alive() { bench_pid_is "${BOOT_PID:-}" "${BOOT_IDENT:-}"; }
+stop_boot() {
+  emu_stop "${BOOT_PID:-}" "${BOOT_IDENT:-}" "$port"
+  BOOT_PID=""
+  BOOT_IDENT=""
+}
+# --- The arms (functions; $lib64 is set by the caller) ---------------------------------------
+
 label() {
   case $1 in
     mvk-metal) echo "MoltenVK + ANGLE-Metal" ;;
@@ -304,7 +335,10 @@ label() {
     *) echo "$1" ;;
   esac
 }
-# The arm's environment, comma-separated K=V (android_boot's emu:K=V form).
+# The arm's environment, comma-separated K=V (android_boot's emu:K=V form). Every Vulkan arm names
+# its ICD, MoltenVK's included: emu's default driver depends on the API level (KosmicKrisp where
+# MoltenVK can't compile a guest's pipelines), so an unset one would mean different drivers on
+# different APIs.
 arm_env() {
   local kk="$lib64/vulkan/libkosmickrisp_icd.json"
   case $1 in
@@ -341,6 +375,15 @@ arm_icd() {
   esac
 }
 
+# RENDERERS_SOURCE_ONLY=1: only the functions above (scripts/bench/test-renderers.sh).
+[ "${RENDERERS_SOURCE_ONLY:-0}" = 1 ] && return 0
+
+image_for() {
+  case $1 in
+    30 | 33 | 34 | 36) echo "system-images/android-$1/google_apis/arm64-v8a" ;;
+    *) echo "" ;;
+  esac
+}
 # The SDK and renderer, without failing (the dry run works on a host with neither).
 if [ -z "${ANDROID_HOME:-}" ]; then
   if [ "$(uname -s)" = Darwin ]; then ANDROID_HOME=$HOME/Library/Android/sdk; else ANDROID_HOME=$HOME/Android/Sdk; fi
@@ -457,45 +500,6 @@ cold_inits() {
 
 # --- Boots -------------------------------------------------------------------------------------
 
-# The console and adb ports are free before a boot: a stopped emu may take a moment to let go,
-# but whatever still holds them after that isn't this run's, and isn't touched.
-port_clear() {
-  local i
-  for i in $(seq 1 30); do
-    port_free "$port" && return 0
-    sleep 1
-  done
-  bench_die "port $port or $((port + 1)) is in use before a boot, and not by this run's emulator; not touching what owns it"
-}
-# One boot of the arm: sets BOOT_PID, BOOT_START (its start time), BOOT_* and INIT_MS; returns 1
-# when it didn't boot and 2 without a boot slot.
-boot_arm() {
-  local a=$1 log=$2 envs
-  shift 2
-  envs=$(arm_env "$a")
-  BOOT_PID=""
-  BOOT_START=""
-  port_clear
-  if ! gate_acquire "$a"; then
-    bench_log "$a: no boot slot (see $BENCH_WORK/gate.log)"
-    BOOT_S=no-slot
-    return 2
-  fi
-  LAUNCH_LOAD=$(load1)
-  BOOT_T0=$(now)
-  android_boot "emu${envs:+:$envs}" "$AVD" "$port" "$log" -gpu "$(arm_gpu "$a")" "$@"
-  local rc=$?
-  BOOT_START=$(pid_start "$BOOT_PID")
-  gate_release
-  INIT_MS=$(sed -n 's/.*renderer initialized in \([0-9]*\) ms.*/\1/p' "$log" | head -1)
-  return "$rc"
-}
-boot_alive() { proc_is "${BOOT_PID:-}" "${BOOT_START:-}"; }
-stop_boot() {
-  emu_stop "${BOOT_PID:-}" "${BOOT_START:-}" "$port"
-  BOOT_PID=""
-  BOOT_START=""
-}
 # score TOP RAW [REF] -> "colors=N flat=F diff=D" over the rows from the fraction TOP down, every
 # 4th pixel: colours at 5 bits a channel, the dominant colour's share (1 = one flat colour, a
 # blank buffer), and the share of pixels more than 32 off REF's in any channel. RAW is

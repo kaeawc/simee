@@ -55,6 +55,8 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         // boot, boot_many, create and clone's admission, and admission_check (#275)
         "admission" => Str,
         "admission_timeout_s" | "count" => Int,
+        // every iOS method's device set (#409)
+        "set" => Str,
         // Android's kill and exec (#414)
         "force" => Bool,
         "max_bytes" => Int,
@@ -429,8 +431,9 @@ mod tests {
         assert!(write["properties"]["text"].is_object() && write["properties"]["base64"].is_object());
         assert_eq!(schema("console")["required"], json!(["device"]));
         assert!(schema("console")["properties"]["commands"].is_object());
-        // `audio_route`'s `uid | "default"` is the uid alone, and required: the quoted word is a value, not a name.
-        assert_eq!(schema("audio_route")["properties"].as_object().map(|p| p.len()), Some(3));
+        // `audio_route`'s `uid | "default"` is the uid alone, and required: the quoted word is a value, not a name
+        // (beside `device`, `scope` and the device set).
+        assert_eq!(schema("audio_route")["properties"].as_object().map(|p| p.len()), Some(4));
         assert_eq!(schema("audio_route")["required"], json!(["device", "scope", "uid"]));
         let rotary = schema("rotary");
         assert_eq!(rotary["required"], json!(["device"]));

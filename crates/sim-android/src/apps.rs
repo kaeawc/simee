@@ -423,7 +423,8 @@ fn on_path(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(name)).find(|p| p.is_file())
 }
 
-#[cfg(test)]
+/// Run against `testing`'s fake adb and emulator, which are unix only.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::testing::{fake_adb, fake_emulator};

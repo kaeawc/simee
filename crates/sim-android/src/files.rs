@@ -25,19 +25,24 @@
 //!   0700, so as root nothing the app runs can change what is in it, and the file in it with
 //!   `O_EXCL` (`set -C`) under the mode of the file the target is or points at (`umask`). adb
 //!   carries back no exit status from `exec-in`, so the upload leaves a mark and its errors in
-//!   the dir. The finish step enters the dir and checks it is the one made there, that the upload
-//!   finished, and that the temp file is the regular file it made and of the right size; as
-//!   root, a data-dir file gets the owner the file had (or the container's, new) and its context,
-//!   on the temp file, with the execute and special bits `chmod` sets. Then one rename within
+//!   the dir. Each step that enters the dir checks it is the one made there: at the same path and,
+//!   as root, root's own with mode 0700, since the app may move root's dir aside and make one of
+//!   its own under the same name. The finish step also checks that the upload finished, and that
+//!   the temp file is the regular file it made and of the right size; as root, a data-dir file
+//!   gets the owner the file had (or the container's, new) and its context, on the temp file,
+//!   with the execute and special bits `chmod` sets. Then one rename within
 //!   the target's dir puts it there: `mv -T` (rename(2), which replaces a symlink at the target
 //!   rather than following it into a directory); API 29's toybox `mv` has no `-T`, so there a
 //!   directory or a symlink to one at the target is refused just before the move, which narrows
 //!   that window but can't close it. Any failure removes the temp dir and leaves the target as it
-//!   was. Through `run-as` the app's uid wrote it, so owner and context are the app's already,
-//!   and on external storage they are its FUSE daemon's.
+//!   was, except a temp dir the app moved aside, which can't be found. Through `run-as` the app's
+//!   uid wrote it, so owner and context are the app's already, and on external storage they are
+//!   its FUSE daemon's.
 //! - Every command works from the dir it acts in, entered with `cd -P` after the guard and
 //!   checked to be in the container, and names paths relative to it, so a parent swapped for a
-//!   symlink after the guard can't move what it reads, lists, sizes or changes.
+//!   symlink after the guard can't move what it reads, lists, sizes or changes. The last name
+//!   itself is looked up again when it is used: a read follows a symlink the app swaps in there
+//!   after the guard (the bytes go only to the caller, and must match the size read first).
 //! - **Clearing** a container empties it in place; `pm clear --user <n>` runs instead only with
 //!   [`Allow::pm_clear`], as it also stops the app, wipes its external dir and resets its
 //!   runtime permissions.
@@ -535,12 +540,32 @@ impl Adb {
         let sub = format!(".simee-write-{}", random_hex());
         let tmp = format!("./{sub}");
         let here = format!("{}; {}; h=$(pwd -P)", guard(&loc, loc.parent()), enter(&dir));
+        // As root, whether a dir is the one root made: root's own and 0700 (2700 in a setgid dir
+        // such as `cache`). The app can move root's dir aside and make one of its own, 0700 too,
+        // under the same name, so the path alone doesn't tell them apart. Through run-as the app's
+        // own uid made it, and there is nothing to keep the app out of.
+        let mine = |d: &str| {
+            format!(
+                "[ -d {d} ] && [ ! -L {d} ] && [ -O {d} ] && u=$(id -u) && \
+                 case \"$(stat -c %u:%a {d})\" in \"$u:700\" | \"$u:2700\") ;; *) false ;; esac"
+            )
+        };
+        let (owned, lost) = if access.is_root() {
+            // A failure before the trap removes root's dir if it is still at its name (one the app
+            // moved aside can't be found); the app can't remove it, nor read what is in it.
+            (
+                format!(" && {}", mine(".")),
+                format!("cd -P \"$h\" 2>/dev/null && [ \"$(pwd -P)\" = \"$h\" ] && {} && rm -rf {tmp}; ", mine(&tmp)),
+            )
+        } else {
+            (String::new(), String::new())
+        };
         // Into the temp dir, refusing one that isn't the dir made there (moved aside, a symlink or
-        // another dir in its place); from inside, `..` is the target's dir, since a dir can't be
-        // moved to another parent by anyone who can't write to it.
+        // another dir in its place, the app's own as root); from inside, `..` is the target's dir,
+        // since a dir can't be moved to another parent by anyone who can't write to it.
         let inside = format!(
-            "{{ cd -P {tmp} 2>/dev/null && [ \"$(pwd -P)\" = \"$h/{sub}\" ]; }} || \
-             {{ echo 'the temp dir simee made is gone or was replaced (or the upload failed before it was made)' >&2; exit 1; }}"
+            "{{ cd -P {tmp} 2>/dev/null && [ \"$(pwd -P)\" = \"$h/{sub}\" ]{owned}; }} || \
+             {{ {lost}echo 'the temp dir simee made is gone or was replaced (or the upload failed before it was made)' >&2; exit 1; }}"
         );
         let clean = format!("rm -f {tmp} ./.done ./.err ./.probe ./.probed; rmdir ../{sub}");
         // The dir 0700, the file in it made with O_EXCL (`set -C`); `.done` marks an upload that
@@ -1218,6 +1243,36 @@ mod tests {
         let made = calls.iter().find(|c| c.starts_with("exec-in ")).expect("exec-in");
         assert!(made.contains("umask 077; mkdir ./.simee-write-"), "a temp dir of root's own: {made}");
         assert_eq!(names(target.parent().expect("dir")), ["r.txt"], "the temp dir is gone");
+    }
+
+    // Review of #470 (third pass), finding 1: the app moves root's temp dir aside and makes a
+    // real dir of its own under the same name, so every path check passes. A root write refuses
+    // it (not root's, or not 0700), so the app never gets to swap the temp file before `chmod`.
+    #[test]
+    fn a_root_write_refuses_a_temp_dir_the_app_swapped_for_its_own() {
+        let f = fixture("owndir", Root::Adbd);
+        let victim = f.fake.outside.join("victim");
+        std::fs::write(&victim, b"victim!").expect("victim");
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).expect("mode");
+        // A mode umask can't give, so chmod runs.
+        f.fake.set_owner("10123:10123:770");
+        f.fake.swap_in_own_temp_dir();
+        f.fake.late_swap_temp_files();
+        let err = f.adb.write_file(RELEASE, b"hostile", NONE).expect_err("refused");
+        assert!(err.contains("the temp dir simee made is gone or was replaced"), "{err}");
+        assert_eq!(std::fs::symlink_metadata(&victim).expect("victim").permissions().mode() & 0o7777, 0o644, "not chmodded");
+        assert_eq!(std::fs::read(&victim).expect("victim"), b"victim!");
+        assert_eq!(std::fs::read(f.fake.on_device(RELEASE)).expect("file"), b"release", "the file is as it was");
+        // The caller's bytes never went into the app's dir.
+        let dir = f.fake.on_device("data/data/com.example.release/files");
+        let left = names(&dir);
+        assert_eq!(left.len(), 3, "{left:?}");
+        assert!(left[0].starts_with(".simee-write-") && left[1] == format!("{}.moved", left[0]), "{left:?}");
+        assert_eq!(names(&dir.join(&left[0])), Vec::<String>::new(), "nothing was written into the app's dir");
+        // A pin: through run-as the app's own uid made the dir, and the write goes through.
+        let f = fixture("owndirrunas", Root::None);
+        f.adb.write_file(NOTES, b"mine", NONE).expect("write");
+        assert_eq!(std::fs::read(f.fake.on_device(NOTES)).expect("file"), b"mine");
     }
 
     // Finding 1: a write to a symlink takes the mode of what it points at, never the link's 777.
