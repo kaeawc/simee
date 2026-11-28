@@ -194,7 +194,7 @@ fn tools_list_has_a_tool_for_every_method() {
     assert_eq!(tools.len(), METHODS.len() + 1);
     assert!(tools.iter().all(|t| t["inputSchema"]["type"] == "object" && t["description"].is_string()));
     assert_eq!(response["result"]["resultType"], "complete");
-    assert_eq!(response["result"]["cacheScope"], "public");
+    assert_eq!(response["result"]["cacheScope"], "private");
     let again = rig.modern("tools/list", json!({}));
     assert_eq!(again["result"]["tools"], response["result"]["tools"], "a deterministic order");
 }

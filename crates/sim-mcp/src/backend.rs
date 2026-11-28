@@ -10,6 +10,13 @@ use serde_json::Value;
 /// One API method call: the method's result, or its error text.
 pub trait Backend: Send + Sync + 'static {
     fn call(&self, method: &str, params: &Value) -> Result<Value, String>;
+
+    /// Whether the call `method` with `params` would be allowed now, without making it: what a
+    /// policy's backend asks again before it shows more of a result it already read (the next page
+    /// of a list). Everything is, unless a policy says otherwise.
+    fn permits(&self, _method: &str, _params: &Value) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 thread_local! {

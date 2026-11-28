@@ -792,11 +792,15 @@
         "readOnlyHint": false,
         "title": "uninstall"
       },
-      "description": "Uninstall an app (Android: the package name; `pm uninstall`). Destructive: deletes, stops or overwrites something; deleted or overwritten data is not recovered, and a stopped device or app can be started again.\n\nPlatforms: Android, iOS. Parameters: device, bundle_id. Toolsets: core, apps.",
+      "description": "Uninstall an app (Android: the package name; `pm uninstall`). Destructive: deletes, stops or overwrites something; deleted or overwritten data is not recovered, and a stopped device or app can be started again. Needs the user's confirmation every time: a client that supports elicitation asks the user; any other must pass `confirm: true`, which only a person's agreement allows.\n\nPlatforms: Android, iOS. Parameters: device, bundle_id. Toolsets: core, apps.",
       "inputSchema": {
         "properties": {
           "bundle_id": {
             "type": "string"
+          },
+          "confirm": {
+            "description": "Only after the user has agreed, for a client that can't be asked itself: true confirms this call. A client that can be asked is asked, and this is ignored",
+            "type": "boolean"
           },
           "device": {
             "description": "A device's UDID, name or `booted`",

@@ -359,6 +359,15 @@ fn console_safe(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The device a camera `source` shows the screen of (`device:<udid or name>[:x,y,w,h]`), as written:
+/// the device that call names besides its own `device`, which a policy must judge too.
+pub fn source_device(source: &str) -> Option<String> {
+    match SourceSpec::parse(source.trim()) {
+        Ok(SourceSpec::Device(spec)) => Some(spec.device),
+        _ => None,
+    }
+}
+
 /// Resolves `source` to what `camera_link` saves: a host camera found by id, name, index or part
 /// of its name (and the permission to capture it checked), a synthetic source checked, another
 /// device's screen (never the `target` device's own, which goes by those names, `booted`

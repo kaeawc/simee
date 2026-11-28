@@ -147,6 +147,18 @@ fn a_destructive_call_without_confirmation_is_refused_and_says_how_to_confirm() 
         ("kill", json!({"device": "ci-2", "pid": 123})),
         ("clear_container", json!({"device": "ci-2", "path": "Data/Application/x"})),
         ("reset_keychain", json!({"device": "ci-2"})),
+        // Data nothing replaces.
+        ("rm", json!({"device": "ci-2", "path": "Data/x"})),
+        ("uninstall", json!({"device": "ci-2", "bundle_id": "com.example"})),
+        ("prefs_delete", json!({"device": "ci-2", "bundle_id": "com.example", "store": "visible", "key": "k"})),
+        (
+            "prefs_batch",
+            json!({"device": "ci-2", "bundle_id": "com.example", "store": "visible", "ops": [{"key": "a", "type": "string", "value": "1"}, {"key": "b", "delete": true}]}),
+        ),
+        // The console's own ways to stop an emulator and delete a snapshot.
+        ("console", json!({"device": "ci-2", "command": "kill"})),
+        ("console", json!({"device": "ci-2", "commands": ["help", "avd stop"]})),
+        ("console", json!({"device": "ci-2", "command": "AVD  Snapshot delete fresh"})),
         // A device this client didn't boot.
         ("shutdown", json!({"device": "ci-2"})),
     ] {
@@ -334,6 +346,30 @@ fn shutting_down_what_this_client_booted_needs_no_confirmation_and_anything_else
     assert_eq!(rig.fake.called("shutdown").len(), 1, "only the first ran");
 }
 
+#[test]
+fn tools_that_only_sometimes_destroy_confirm_only_when_they_do() {
+    let (rig, _) = rig_world(Policy::default(), None);
+    // Setting and keeping a preference, and a console command that stops nothing, are not asked about.
+    for (tool, args) in [
+        ("prefs_batch", json!({"device": "ci-2", "bundle_id": "b", "store": "visible", "ops": [{"key": "a", "type": "string", "value": "1"}]})),
+        ("prefs_batch", json!({"device": "ci-2", "bundle_id": "b", "store": "visible", "ops": [{"key": "a", "delete": false}]})),
+        ("console", json!({"device": "ci-2", "command": "avd snapshot list"})),
+        ("console", json!({"device": "ci-2", "command": "network status"})),
+    ] {
+        let result = call(&rig, tool, args);
+        assert!(!is_error(&result), "{tool}: {result}");
+    }
+    // A client that booted the emulator ends it through the console as it would with `shutdown`.
+    assert!(!is_error(&call(&rig, "boot", json!({"device": "ci-1"}))));
+    assert!(!is_error(&call(&rig, "console", json!({"device": "ci-1", "command": "kill"}))));
+    // And that put it back: ci-1 is nobody's again, so the same command asks.
+    let again = call(&rig, "console", json!({"device": "ci-1", "command": "kill"}));
+    assert!(is_error(&again) && text(&again).contains("needs the user's confirmation"), "{again}");
+    // `confirm: true` doesn't reach the method either way.
+    assert!(!is_error(&call(&rig, "console", json!({"device": "ci-1", "command": "kill", "confirm": true}))));
+    assert!(rig.fake.called("console").iter().all(|p| p.get("confirm").is_none()));
+}
+
 // ---- policy --------------------------------------------------------------------------------
 
 #[test]
@@ -375,6 +411,63 @@ fn a_client_cannot_erase_a_device_it_was_not_allowed_to_touch() {
     let listed = call(&rig, "devices", json!({}));
     let names: Vec<&str> = listed["structuredContent"].as_array().expect("devices").iter().filter_map(|d| d["name"].as_str()).collect();
     assert_eq!(names, ["ci-1", "ci-2"]);
+}
+
+#[test]
+fn a_camera_cannot_show_a_screen_the_client_may_not_touch() {
+    let rig = rig(devices_only(&["ci-*"]));
+    let link = |source: &str| call(&rig, "camera_link", json!({"device": "ci-1", "facing": "both", "source": source}));
+    // Another device's screen, named any way the source id allows: by name, by UDID, with a crop, in
+    // another case, with space around it.
+    for source in ["device:prod-1", &format!("device:{PROD}"), "device:prod-1:0,0,100,100", "DEVICE:prod-1", "  device:prod-1 "] {
+        let refused = link(source);
+        assert!(is_error(&refused) && text(&refused).contains("may not touch") && text(&refused).contains("prod-1"), "{source}: {refused}");
+    }
+    assert!(rig.fake.called("camera_link").is_empty(), "no link was made");
+    // A screen it may touch, and sources that show no device's, are fine.
+    for source in ["device:ci-2", "pattern:testcard", "qr:device:prod-1"] {
+        assert!(!is_error(&link(source)), "{source}");
+    }
+    // A boot's cameras are the same thing under other names.
+    for key in ["camera_back", "camera_front"] {
+        let refused = call(&rig, "boot", json!({"device": "ci-1", key: "device:prod-1"}));
+        assert!(is_error(&refused) && text(&refused).contains("may not touch"), "{key}: {refused}");
+    }
+    assert!(rig.fake.called("boot").is_empty());
+    assert!(!is_error(&call(&rig, "boot", json!({"device": "ci-1", "camera_back": "device:ci-2"}))));
+}
+
+#[test]
+fn a_stream_is_judged_by_the_device_it_shows() {
+    let rig = rig(devices_only(&["ci-*"]));
+    rig.fake.answer("streams", Ok(json!([{"stream_id": "stream-1", "device": PROD}, {"stream_id": "stream-2", "device": CI_2}])));
+    for tool in ["stream_status", "stream_stop"] {
+        let refused = call(&rig, tool, json!({"stream_id": "stream-1"}));
+        assert!(is_error(&refused) && text(&refused).contains("may not touch"), "{tool}: {refused}");
+        assert!(!is_error(&call(&rig, tool, json!({"stream_id": "stream-2"}))), "{tool}");
+        // One that isn't there is the method's to say.
+        assert!(!is_error(&call(&rig, tool, json!({"stream_id": "stream-9"}))));
+    }
+    assert_eq!(rig.fake.called("stream_stop"), [json!({"stream_id": "stream-2"}), json!({"stream_id": "stream-9"})]);
+}
+
+#[test]
+fn a_cursor_is_the_clients_own_and_its_next_page_is_judged_again() {
+    let (rig, world) = rig_world(devices_only(&[crate::policy::CREATED]), None);
+    rig.fake.answer("processes", Ok(json!([1, 2, 3, 4, 5])));
+    let made = call(&rig, "create", json!({"name": "mine", "device_type": "t", "runtime": "r"}));
+    assert!(!is_error(&made), "{made}");
+    let first = call(&rig, "processes", json!({"device": "mine", "limit": 2}));
+    let cursor = first["structuredContent"]["next_cursor"].clone();
+    assert!(cursor.is_string(), "{first}");
+    // Another client on the same server can't turn a page of a list it was never given.
+    let stolen = call_as(&rig, "another-agent", json!({}), "processes", json!({"cursor": cursor}));
+    assert!(is_error(&stolen) && text(&stolen).contains("`cursor` has expired"), "{stolen}");
+    assert!(!is_error(&call(&rig, "processes", json!({"cursor": cursor}))));
+    // The device stops being this client's (deleted): the rest of its list isn't either.
+    world.devices.lock().expect("devices").retain(|d| d["name"] != "mine");
+    let gone = call(&rig, "processes", json!({"cursor": cursor}));
+    assert!(is_error(&gone), "{gone}");
 }
 
 #[test]

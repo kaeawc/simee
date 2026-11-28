@@ -504,30 +504,10 @@ So HTTP adds about 25 µs per call on a kept-alive connection (checking a token 
 and about 85 µs with a connection per call: small next to a device method (a `tap` or `screenshot`
 takes milliseconds). Reproduce: `cargo test --release -p simee-mcp http_call_overhead -- --ignored --nocapture`.
 
-## Stopping the server
-
-On SIGINT or SIGTERM, `simee mcp` (stdio or `--http`) shuts down in order, the way `simee serve`
-does ([api.md](api.md), "Stopping a server"):
-
-1. It stops taking tool calls. Every `tools/call` from then on, on a connection already open or one
-   made during the shutdown, isn't run: it is answered with a tool error saying
-   `cancelled: server shutting down`, and filed in the audit log as refused. Other requests
-   (`tools/list`, resource reads) are still answered until the process exits.
-2. The calls in flight, tasks included, stop at their next safe point and get up to 10 s
-   (`sim_api::DRAIN`, the bound `simee serve` uses). A call that ends in an error meanwhile says the
-   shutdown cancelled it (`cancelled: server shutting down (<its error>)`). A question waiting for the
-   user's answer to a confirmation is dropped the same way, so the call is refused.
-3. Each reply is sent before the wait for its call ends, so a client reads the answer before it sees
-   the process exit. Calls still running after 10 s are abandoned, with a line on stderr.
-4. The streams stop with their WHIP DELETE, and the process exits 130 (SIGINT) or 143 (SIGTERM). A
-   second signal exits at once.
-
-Closing stdin is a different goodbye: the server waits up to 10 s for its requests and exits 0.
-
 ## Limits and what is not here
 
-- Completions, logging, sampling and elicitation are not offered; the specification deprecates
-  three of them.
+- Completions, logging and sampling are not offered; the specification deprecates three of them.
+  Elicitation is used, and only to confirm a destructive call ([mcp-safety.md](mcp-safety.md)).
 - Cancelling stops `boot`, `boot_many`, `create`, `clone` and `import` at their next safe point
   and undoes what they half did; it doesn't stop an install, erase, settle or memory tool already
   running (above).

@@ -606,14 +606,14 @@ fn main() -> Result<()> {
 
 /// `simee mcp` on SIGINT or SIGTERM: the servers stop taking tool calls (each is answered
 /// `cancelled: server shutting down`), the calls in flight stop at their next safe point and get up
-/// to `sim_api::DRAIN`, the streams stop with their WHIP DELETE, and the process exits with 130 or
+/// to `sim_mcp::drain::DRAIN`, the streams stop with their WHIP DELETE, and the process exits with 130 or
 /// 143 (a second signal exits at once). The transports answer until then, so every reply reaches
 /// the client first.
 fn mcp_shutdown_on_signal() -> Result<()> {
     sim_api::shutdown::watch(|sig| {
-        if !sim_mcp::Drain::shared().finish(sim_api::DRAIN) {
+        if !sim_mcp::Drain::shared().finish(sim_mcp::drain::DRAIN) {
             use std::io::Write as _;
-            let _ = writeln!(std::io::stderr(), "simee: calls still running after {} s: stopping anyway", sim_api::DRAIN.as_secs());
+            let _ = writeln!(std::io::stderr(), "simee: calls still running after {} s: stopping anyway", sim_mcp::drain::DRAIN.as_secs());
         }
         sim_api::stop_streams();
         sim_api::shutdown::exit(sig);

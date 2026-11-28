@@ -14,6 +14,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+/// How long a shutdown gives the calls in flight to finish, or to stop at a safe point, before it
+/// stops the streams and exits anyway: the bound `simee serve` uses (`sim-api`'s `DRAIN`).
+pub const DRAIN: Duration = Duration::from_secs(10);
+
 /// What a call that the shutdown cancelled, or never ran, answers.
 pub use sim_api::shutdown::SHUTTING_DOWN;
 

@@ -94,6 +94,8 @@ fn a_policy_that_does_not_parse_says_where_instead_of_loosening() {
         (r#"{"default": {"toolsets": ["nope"]}}"#, "unknown toolset `nope`"),
         (r#"{"default": {"admission": "wait"}}"#, "unknown admission `wait`"),
         (r#"{"default": 3}"#, "`default` is an object"),
+        (r#"{"default": {"confirm": ["tapp"]}}"#, "`default.confirm`: `tapp` is not a tool"),
+        (r#"{"clients": {"ci": {"confirm": ["tap", "unistall"]}}}"#, "`clients.ci.confirm`: `unistall` is not a tool"),
     ] {
         let error = Policy::parse(text).expect_err(text);
         assert!(error.contains(says), "{text}: {error}");

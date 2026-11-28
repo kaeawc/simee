@@ -109,7 +109,7 @@ did:
   during the drain is deleted, and a `boot` waiting for admission boots nothing.
 
 `simee mcp` shuts down the same way, over stdio and over HTTP: see "Stopping the server" in
-[mcp.md](mcp.md). A watched `boot` that launched its device for a call in flight may shut that
+[mcp-safety.md](mcp-safety.md). A watched `boot` that launched its device for a call in flight may shut that
 device down as it is cancelled. `emu` stops its guest as the console's `kill` does and exits 130
 or 143 too.
 

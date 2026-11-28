@@ -177,7 +177,8 @@ pub fn iso8601(t: SystemTime) -> String {
 }
 
 /// An unguessable task id: 128 random bits as hex.
-fn new_id() -> String {
+/// A random 128-bit id as 32 hex digits: a task's, a page snapshot's. Nobody can guess another's.
+pub(crate) fn new_id() -> String {
     use std::io::Read;
     let mut bytes = [0u8; 16];
     if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).is_err() {

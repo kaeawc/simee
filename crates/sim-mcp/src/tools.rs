@@ -226,7 +226,7 @@ fn describe(method: &str, params: &str, doc: &str, schema: &Value) -> String {
     if LONG_RUNNING.contains(&method) {
         text.push_str(" Can take a while (seconds to minutes): a client with the tasks extension gets a task to poll.");
     }
-    if crate::safety::CONFIRM.contains(&method) {
+    if crate::safety::may_confirm(method) {
         text.push_str(&format!(" {}", crate::safety::confirm_sentence(method)));
     }
     if paged(method).is_some() {
@@ -255,7 +255,7 @@ fn input(method: &str) -> Value {
     if let (Some(name), Some(properties)) = (withheld(method), schema["properties"].as_object_mut()) {
         properties.remove(name);
     }
-    if crate::safety::CONFIRM.contains(&method) {
+    if crate::safety::may_confirm(method) {
         schema["properties"]["confirm"] = json!({"type": "boolean",
             "description": "Only after the user has agreed, for a client that can't be asked itself: true confirms this call. \
                 A client that can be asked is asked, and this is ignored"});
@@ -398,6 +398,11 @@ pub fn list(toolsets: &Toolsets, ctx: &Ctx) -> Vec<Value> {
     tools
 }
 
+/// Whether `name` is a tool this server has: a method in `sim-api`'s table, or the device view.
+pub fn is_tool(name: &str) -> bool {
+    name == VIEW_TOOL || METHODS.iter().any(|(method, ..)| *method == name)
+}
+
 /// The tool's arguments as the method's params: a missing or null `arguments` is none, anything
 /// but an object is refused.
 pub fn arguments(params: &Value) -> Result<Value, RpcError> {
@@ -410,17 +415,24 @@ pub fn arguments(params: &Value) -> Result<Value, RpcError> {
 
 /// Snapshots of long lists a client is paging through: the first page's call is the list's
 /// snapshot, and each cursor names one, so the pages after it are the same list (a process list or
-/// a log window doesn't shift under the client). Kept [`Pages::TTL`]; at most [`Pages::KEPT`] of them
-/// and [`Pages::MAX_BYTES`] of JSON in all (the oldest go first), and none for a first page that
-/// holds the whole list.
+/// a log window doesn't shift under the client). A snapshot belongs to the client that made it
+/// (one HTTP server's stateless sessions share these) and its id is a random 128-bit number, so a
+/// cursor works for nobody else; serving a page asks the client's backend again whether the call
+/// that made the snapshot is still allowed ([`Backend::permits`]). Kept [`Pages::TTL`]; at most
+/// [`Pages::KEPT`] of them and [`Pages::MAX_BYTES`] of JSON in all (the oldest go first), and none
+/// for a first page that holds the whole list.
 #[derive(Default)]
 pub struct Pages {
-    kept: Mutex<(u64, VecDeque<Snapshot>)>,
+    kept: Mutex<VecDeque<Snapshot>>,
 }
 
 struct Snapshot {
-    id: u64,
+    id: String,
+    /// The client it was made for.
+    owner: String,
     tool: String,
+    /// The call that made it, as the method took it (without paging).
+    args: Value,
     at: Instant,
     /// The whole result.
     value: Value,
@@ -433,35 +445,44 @@ impl Pages {
     pub const KEPT: usize = 4;
     pub const MAX_BYTES: usize = 32 << 20;
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, (u64, VecDeque<Snapshot>)> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<Snapshot>> {
         self.kept.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn keep(&self, tool: &str, value: &Value) -> u64 {
-        self.keep_within(tool, value, Pages::KEPT, Pages::MAX_BYTES)
+    fn keep(&self, owner: &str, tool: &str, args: &Value, value: &Value) -> String {
+        self.keep_within(owner, tool, args, value, Pages::KEPT, Pages::MAX_BYTES)
     }
 
-    fn keep_within(&self, tool: &str, value: &Value, entries: usize, max_bytes: usize) -> u64 {
+    fn keep_within(&self, owner: &str, tool: &str, args: &Value, value: &Value, entries: usize, max_bytes: usize) -> String {
         let bytes = value.to_string().len();
         let mut kept = self.lock();
-        kept.0 += 1;
-        let id = kept.0;
-        kept.1.retain(|s| s.at.elapsed() < Pages::TTL);
+        let id = crate::tasks::new_id();
+        kept.retain(|s| s.at.elapsed() < Pages::TTL);
         // Make room: the oldest go until this one fits both caps (it is kept even when alone over).
-        while !kept.1.is_empty() && (kept.1.len() >= entries || kept.1.iter().map(|s| s.bytes).sum::<usize>() + bytes > max_bytes) {
-            kept.1.pop_front();
+        while !kept.is_empty() && (kept.len() >= entries || kept.iter().map(|s| s.bytes).sum::<usize>() + bytes > max_bytes) {
+            kept.pop_front();
         }
-        kept.1.push_back(Snapshot { id, tool: tool.to_owned(), at: Instant::now(), value: value.clone(), bytes });
+        kept.push_back(Snapshot {
+            id: id.clone(),
+            owner: owner.to_owned(),
+            tool: tool.to_owned(),
+            args: args.clone(),
+            at: Instant::now(),
+            value: value.clone(),
+            bytes,
+        });
         id
     }
 
-    fn find(&self, tool: &str, id: u64) -> Option<Value> {
+    /// The snapshot `id` that `owner` made for `tool`: its list, and the call that made it.
+    fn find(&self, owner: &str, tool: &str, id: &str) -> Option<(Value, Value)> {
         let kept = self.lock();
-        kept.1.iter().find(|s| s.id == id && s.tool == tool && s.at.elapsed() < Pages::TTL).map(|s| s.value.clone())
+        let found = kept.iter().find(|s| s.id == id && s.owner == owner && s.tool == tool && s.at.elapsed() < Pages::TTL);
+        found.map(|s| (s.value.clone(), s.args.clone()))
     }
 
     /// One page of `tool`'s list: from a new call, or from the snapshot `cursor` names.
-    fn page(&self, backend: &dyn Backend, tool: &str, field: Option<&str>, args: &Value) -> Result<Value, String> {
+    fn page(&self, backend: &dyn Backend, owner: &str, tool: &str, field: Option<&str>, args: &Value) -> Result<Value, String> {
         let limit = match args.get("limit") {
             None | Some(Value::Null) => None,
             Some(v) => Some(
@@ -472,24 +493,27 @@ impl Pages {
         };
         let expired =
             || format!("`cursor` has expired (pages are kept 10 minutes) or isn't one of this server's: call `{tool}` again without it");
-        let (value, offset, limit) = match args.get("cursor") {
-            None | Some(Value::Null) => {
-                let mut call = args.clone();
-                if let Some(o) = call.as_object_mut() {
-                    o.remove("limit");
-                    o.remove("cursor");
-                }
-                (backend.call(tool, &call)?, 0, limit.unwrap_or(MAX_LIMIT))
-            }
+        let mut made = args.clone();
+        if let Some(o) = made.as_object_mut() {
+            o.remove("limit");
+            o.remove("cursor");
+        }
+        let (value, offset, limit, id) = match args.get("cursor") {
+            None | Some(Value::Null) => (backend.call(tool, &made)?, 0, limit.unwrap_or(MAX_LIMIT), None),
             Some(Value::String(cursor)) => {
-                let mut parts = cursor.split('.').map(str::parse::<u64>);
-                let (Some(Ok(id)), Some(Ok(offset)), Some(Ok(was)), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+                let mut parts = cursor.split('.');
+                let (Some(id), Some(Ok(offset)), Some(Ok(was)), None) =
+                    (parts.next(), parts.next().map(str::parse::<u64>), parts.next().map(str::parse::<u64>), parts.next())
+                else {
                     return Err(expired());
                 };
                 if !(1..=MAX_LIMIT).contains(&was) {
                     return Err(expired());
                 }
-                (self.find(tool, id).ok_or_else(expired)?, offset, limit.unwrap_or(was))
+                let (value, original) = self.find(owner, tool, id).ok_or_else(expired)?;
+                // The list was read when the call was allowed: ask again before showing more of it.
+                backend.permits(tool, &original)?;
+                (value, offset, limit.unwrap_or(was), Some(id.to_owned()))
             }
             Some(other) => return Err(format!("`cursor` is a previous page's `next_cursor`, not {other}")),
         };
@@ -505,10 +529,7 @@ impl Pages {
         let end = offset.saturating_add(limit).min(total);
         let page: Vec<Value> = items.iter().skip(offset as usize).take((end.saturating_sub(offset)) as usize).cloned().collect();
         let next = if end < total {
-            let id = match args.get("cursor").and_then(Value::as_str) {
-                Some(cursor) => cursor.split('.').next().and_then(|i| i.parse().ok()).unwrap_or_default(),
-                None => self.keep(tool, &value),
-            };
+            let id = id.unwrap_or_else(|| self.keep(owner, tool, &made, &value));
             json!(format!("{id}.{end}.{limit}"))
         } else {
             Value::Null
@@ -527,7 +548,8 @@ impl Pages {
 }
 
 /// Runs one tool: the method's outcome (a failure is a tool error, not a protocol error).
-pub fn run(backend: &dyn Backend, pages: &Pages, name: &str, args: &Value) -> Result<Value, String> {
+/// `owner` is the client the call is for, whose snapshots its pages are.
+pub fn run(backend: &dyn Backend, pages: &Pages, owner: &str, name: &str, args: &Value) -> Result<Value, String> {
     if let Some(param) = withheld(name).filter(|p| args.get(*p).is_some_and(|v| !v.is_null())) {
         return Err(format!("`{param}` isn't available through MCP: `{name}` returns the image in its result"));
     }
@@ -539,7 +561,7 @@ pub fn run(backend: &dyn Backend, pages: &Pages, name: &str, args: &Value) -> Re
     if let Some(field) = paged(name)
         && ["limit", "cursor"].iter().any(|k| args.get(*k).is_some_and(|v| !v.is_null()))
     {
-        return pages.page(backend, name, field, args);
+        return pages.page(backend, owner, name, field, args);
     }
     backend.call(name, args)
 }

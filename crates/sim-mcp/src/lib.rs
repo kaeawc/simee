@@ -37,7 +37,6 @@ pub mod watch;
 
 use std::io::{BufRead, Write};
 use std::sync::Arc;
-use std::time::Duration;
 
 pub use backend::{ApiBackend, Backend};
 pub use drain::Drain;
@@ -54,9 +53,6 @@ pub fn stdout_sink() -> tasks::Sink {
         let _ = out.write_all(line.as_bytes()).and_then(|()| out.write_all(b"\n")).and_then(|()| out.flush());
     })
 }
-
-/// How long to wait for requests in flight once the client closes its end.
-const DRAIN: Duration = Duration::from_secs(10);
 
 /// Serves one client on stdin and stdout until stdin closes, with the toolsets
 /// `SIMEE_MCP_TOOLSETS` names (default `core`) and the subscription pace `SIMEE_MCP_SCREEN_FPS`
@@ -95,6 +91,6 @@ pub fn serve_with(
             server.handle_line(text.trim_end());
         }
     }
-    server.drain(DRAIN);
+    server.drain(drain::DRAIN);
     Ok(())
 }

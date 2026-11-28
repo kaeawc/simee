@@ -432,9 +432,9 @@ impl Call {
         era: Era,
     ) -> Value {
         let guarded = safety.guard(backend, &self.client);
-        let ran = drain.outcome(tools::run(&*guarded, pages, &self.name, prepared.args(&self.args)));
+        let ran = drain.outcome(tools::run(&*guarded, pages, &self.client, &self.name, prepared.args(&self.args)));
         if let Ok(value) = &ran {
-            safety.done(&self.client, &self.name, prepared, value);
+            safety.done(&self.client, &self.name, prepared, prepared.args(&self.args), value);
         }
         if safety.audits() {
             let (status, detail, admission) = safety::outcome(&ran);
@@ -551,9 +551,10 @@ impl Inner {
         let backend = self.safety.guard(self.backend.clone(), &client);
         match method {
             "server/discover" => reply(Ok(self.discover())),
-            "tools/list" => reply(Ok(cacheable(json!({"tools": self.listed_tools(&client, &toolsets, &ctx)}), STATIC_TTL_MS, "public"))),
+            // What a client is listed depends on its policy (toolsets, read-only), so no shared cache may keep it.
+            "tools/list" => reply(Ok(cacheable(json!({"tools": self.listed_tools(&client, &toolsets, &ctx)}), STATIC_TTL_MS, "private"))),
             "resources/templates/list" => {
-                reply(Ok(cacheable(json!({"resourceTemplates": resources::templates(&toolsets)}), STATIC_TTL_MS, "public")));
+                reply(Ok(cacheable(json!({"resourceTemplates": resources::templates(&toolsets)}), STATIC_TTL_MS, "private")));
             }
             "prompts/list" => reply(prompts::list(&params, &ctx).map(|page| cacheable(page, STATIC_TTL_MS, "public"))),
             "prompts/get" => reply(prompts::get(&params, &toolsets)),

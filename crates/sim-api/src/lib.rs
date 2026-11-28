@@ -56,6 +56,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use forward::{HANDSHAKE_TIMEOUT, IN_CALLER, forwards, identity};
+pub use camera::source_device;
 pub use ios::{flush_input, track_input};
 pub use methods::{METHODS, Session, call as call_method, platforms};
 pub use outputs::output_schema;
@@ -283,8 +284,8 @@ pub fn stop_streams() {
 }
 
 /// How long a shutdown gives the calls in flight to finish, or to stop at a safe point, before it
-/// stops the streams and exits anyway (`simee mcp` gives its calls the same).
-pub const DRAIN: Duration = Duration::from_secs(10);
+/// stops the streams and exits anyway.
+const DRAIN: Duration = Duration::from_secs(10);
 
 /// Listens on `path` (replacing a stale socket) and serves connections until SIGINT or SIGTERM
 /// (#388). Then it shuts down in order: calls in flight get up to 10 s (each stops at its next

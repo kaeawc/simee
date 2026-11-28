@@ -192,7 +192,14 @@ fn partial(value: &Value, at: &str) -> Result<Partial, String> {
                 p.toolsets = Some(Toolsets::parse(&names.join(",")).map_err(|e| format!("`{here}`: {e}"))?);
             }
             "devices" => p.devices = Some(strings(value, &here)?),
-            "confirm" => p.confirm_also = Some(strings(value, &here)?.into_iter().collect()),
+            "confirm" => {
+                let tools = strings(value, &here)?;
+                // A misspelt tool would confirm nothing, and the operator would think it did.
+                if let Some(unknown) = tools.iter().find(|t| !crate::tools::is_tool(t)) {
+                    return Err(format!("`{here}`: `{unknown}` is not a tool (`tools/list` and docs/api.md name them)"));
+                }
+                p.confirm_also = Some(tools.into_iter().collect());
+            }
             "admission" => {
                 let text = value.as_str().ok_or_else(|| format!("`{here}` is ignore or refuse"))?;
                 p.admission = Some(AdmissionMode::parse(text).map_err(|e| format!("`{here}`: {e}"))?);

@@ -29,9 +29,19 @@ use crate::backend::Backend;
 use crate::policy::{AdmissionMode, ClientPolicy, Policy};
 use crate::tools::{self, VIEW_TOOL};
 
-/// The tools every client confirms: they delete a device or its data, kill a process, or (for
-/// `shutdown`) stop a device this client didn't boot. A policy may add tools (`confirm`).
-pub const CONFIRM: &[&str] = &["delete", "erase", "kill", "clear_container", "reset_keychain", "shutdown"];
+/// The tools every client confirms: they delete a device or data that nothing replaces (a file, an
+/// app and its data, a container, the keychain, a preference), kill a process, or (for `shutdown`)
+/// stop a device this client didn't boot. A policy may add tools (`confirm`).
+pub const CONFIRM: &[&str] = &["delete", "erase", "kill", "clear_container", "reset_keychain", "rm", "uninstall", "prefs_delete", "shutdown"];
+
+/// The tools that confirm only for some arguments: `prefs_batch` when an op deletes a key, and
+/// `console` for a command that stops the emulator or deletes a snapshot.
+pub const CONFIRM_SOMETIMES: &[&str] = &["prefs_batch", "console"];
+
+/// Whether `tool` ever asks for a confirmation of its own accord (so its input has `confirm`).
+pub fn may_confirm(tool: &str) -> bool {
+    CONFIRM.contains(&tool) || CONFIRM_SOMETIMES.contains(&tool)
+}
 
 /// The boots and creations that go through the host's admission (#275).
 const ADMITTED: &[&str] = &["boot", "boot_many", "create", "clone"];
@@ -41,7 +51,12 @@ pub const REFUSED: &str = "refused: ";
 
 /// The sentence a confirming tool's description carries.
 pub fn confirm_sentence(tool: &str) -> String {
-    let when = if tool == "shutdown" { "for a device this client didn't boot" } else { "every time" };
+    let when = match tool {
+        "shutdown" => "for a device this client didn't boot",
+        "prefs_batch" => "when an op deletes a key",
+        "console" => "for a command that stops the emulator (`kill`, `avd stop`) or deletes a snapshot, unless this client booted it",
+        _ => "every time",
+    };
     format!(
         "Needs the user's confirmation {when}: a client that supports elicitation asks the user; any other must pass `confirm: true`, \
          which only a person's agreement allows."
@@ -148,8 +163,9 @@ impl Safety {
         {
             return Verdict::Refuse(refusal);
         }
-        let asks = CONFIRM.contains(&tool) || policy.confirm_also.contains(tool);
-        if asks && args.get("confirm").is_some() {
+        let sometimes = destructive_args(tool, args);
+        let asks = CONFIRM.contains(&tool) || policy.confirm_also.contains(tool) || sometimes.is_some();
+        if (asks || may_confirm(tool)) && args.get("confirm").is_some() {
             let mut stripped = changed.take().unwrap_or_else(|| args.clone());
             if let Some(fields) = stripped.as_object_mut() {
                 fields.remove("confirm");
@@ -179,7 +195,8 @@ impl Safety {
             return Verdict::Go(prepared);
         }
         // A shutdown of what this client started is its own to end; anything else it asks about.
-        if tool == "shutdown" && !policy.confirm_also.contains(tool) {
+        let own_to_end = tool == "shutdown" || sometimes == Some(Destructive::Stops);
+        if own_to_end && !policy.confirm_also.contains(tool) {
             let clients = self.clients();
             let booted = clients.get(client).map(|c| &c.booted);
             let all_ours =
@@ -188,7 +205,7 @@ impl Safety {
                 return Verdict::Go(prepared);
             }
         }
-        let what = what_it_does(tool, args, &resolved);
+        let what = what_it_does(tool, args, &resolved, sometimes);
         let sent = prepared.args.as_ref().unwrap_or(args);
         let state = self.seal_state(client, tool, sent);
         Verdict::Confirm(Confirmation { tool: tool.to_owned(), message: format!("An agent asks to {what}."), state, what }, prepared)
@@ -222,7 +239,7 @@ impl Safety {
     }
 
     /// What a call that succeeded has changed about the client's devices.
-    pub fn done(&self, client: &str, tool: &str, prepared: &Prepared, result: &Value) {
+    pub fn done(&self, client: &str, tool: &str, prepared: &Prepared, args: &Value, result: &Value) {
         let mut clients = self.clients();
         let state = clients.entry(client.to_owned()).or_default();
         match tool {
@@ -242,6 +259,11 @@ impl Safety {
                 }
             }
             "shutdown" => {
+                for d in &prepared.resolved {
+                    state.booted.remove(&d.udid);
+                }
+            }
+            "console" if destructive_args(tool, args) == Some(Destructive::Stops) => {
                 for d in &prepared.resolved {
                     state.booted.remove(&d.udid);
                 }
@@ -404,8 +426,27 @@ fn device_queries(tool: &str, args: &Value) -> Vec<String> {
     }
 }
 
+/// Every device a call names for the policy to judge: its `device`s, and the devices whose screens
+/// it asks to show on a camera (`camera_link`'s `source`, `boot`'s `camera_back` and
+/// `camera_front`, as `device:<name>`). Linking a forbidden device's screen to an allowed device's
+/// camera hands the allowed device the forbidden one's screen.
+fn named_devices(tool: &str, args: &Value) -> Vec<String> {
+    let mut named = device_queries(tool, args);
+    let sources: &[&str] = match tool {
+        "camera_link" => &["source"],
+        "boot" | "boot_many" => &["camera_back", "camera_front"],
+        _ => &[],
+    };
+    for key in sources {
+        if let Some(device) = args.get(*key).and_then(Value::as_str).and_then(sim_api::source_device) {
+            named.push(device);
+        }
+    }
+    named
+}
+
 /// `tool`'s effect on its devices, as a clause the user reads: `erase iPhone 17 (UDID)`.
-fn what_it_does(tool: &str, args: &Value, targets: &[(String, Result<Resolved, String>)]) -> String {
+fn what_it_does(tool: &str, args: &Value, targets: &[(String, Result<Resolved, String>)], sometimes: Option<Destructive>) -> String {
     let label = |q: &str, r: &Result<Resolved, String>| match r {
         Ok(d) if d.name != d.udid => format!("`{}` ({})", d.name, d.udid),
         Ok(d) => format!("`{}`", d.udid),
@@ -425,7 +466,59 @@ fn what_it_does(tool: &str, args: &Value, targets: &[(String, Result<Resolved, S
         "clear_container" => format!("empty `{}` on {on}: an app's data is deleted", text("path")),
         "reset_keychain" => format!("delete every keychain item on {on}"),
         "shutdown" => format!("shut down {on}, which this client didn't boot"),
+        "rm" => format!("remove `{}` from the data of {on}: files are deleted", text("path")),
+        "uninstall" => format!("uninstall `{}` from {on}, with its data", text("bundle_id")),
+        "prefs_delete" => format!("delete the preference `{}` in `{}` of `{}` on {on}", text("key"), text("store"), text("bundle_id")),
+        "prefs_batch" => format!("delete preference keys of `{}` in `{}` on {on}", text("bundle_id"), text("store")),
+        "console" => {
+            let commands = console_commands(args).join("; ");
+            match sometimes {
+                Some(Destructive::Snapshot) => format!("send `{commands}` to the emulator console of {on}: a snapshot is deleted"),
+                _ => format!("send `{commands}` to the emulator console of {on}: the emulator stops"),
+            }
+        }
         other => format!("run `{other}` on {on}"),
+    }
+}
+
+/// Why a call to a tool that only sometimes confirms does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Destructive {
+    /// A console command that stops the emulator.
+    Stops,
+    /// A console command that deletes a snapshot, or a batch of preferences with a delete in it.
+    Snapshot,
+    Deletes,
+}
+
+/// The commands a `console` call sends.
+fn console_commands(args: &Value) -> Vec<&str> {
+    match (args.get("command").and_then(Value::as_str), args.get("commands").and_then(Value::as_array)) {
+        (Some(c), _) => vec![c],
+        (None, Some(list)) => list.iter().filter_map(Value::as_str).collect(),
+        (None, None) => Vec::new(),
+    }
+}
+
+/// Whether this call to `tool` destroys something though the tool doesn't always: `console`'s
+/// `kill`, `avd stop` and `avd snapshot delete` do what `shutdown` and a delete do, behind another
+/// tool's name, and a `prefs_batch` with a delete op is a `prefs_delete`.
+fn destructive_args(tool: &str, args: &Value) -> Option<Destructive> {
+    match tool {
+        "console" => console_commands(args).iter().find_map(|command| {
+            let words: Vec<String> = command.split_whitespace().map(str::to_ascii_lowercase).collect();
+            match words.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+                ["kill", ..] | ["avd", "stop", ..] => Some(Destructive::Stops),
+                ["avd", "snapshot", "delete", ..] => Some(Destructive::Snapshot),
+                _ => None,
+            }
+        }),
+        "prefs_batch" => {
+            let ops = args.get("ops").and_then(Value::as_array)?;
+            // An op that isn't an object is the method's to refuse; one that says `delete` at all is asked about.
+            ops.iter().any(|op| op.get("delete").is_some_and(|d| d != &json!(false))).then_some(Destructive::Deletes)
+        }
+        _ => None,
     }
 }
 
@@ -466,37 +559,61 @@ impl Guard {
     }
 }
 
-impl Backend for Guard {
-    fn call(&self, method: &str, params: &Value) -> Result<Value, String> {
+impl Guard {
+    /// Whether this client may touch the device `query` names, as the error that says why not.
+    fn permit(&self, method: &str, query: &str) -> Result<(), String> {
+        let device = resolve(&*self.inner, query).map_err(|e| unresolved_refusal(method, &e))?;
+        if self.safety.may_touch(&self.client, &self.policy, &device) { Ok(()) } else { Err(device_refusal(&self.policy, method, query, Some(&device))) }
+    }
+}
+
+impl Guard {
+    /// What the policy says about a call, before it runs: the read-only rule and, for a client
+    /// limited to some devices, every device the call names.
+    fn authorize(&self, method: &str, params: &Value) -> Result<(), String> {
         if self.policy.read_only && !tools::read_only(method) {
             return Err(read_only_refusal(method));
         }
-        let restricted = self.policy.devices.is_some();
-        if restricted {
-            let mut queries = device_queries(method, params);
-            if method == "clone" || method == "create" || method == "import" {
-                // A device made here is the client's to touch only if its name allows or created counts.
-                let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-                if !self.policy.allows_new_name(name) {
-                    return Err(format!(
-                        "{REFUSED}`{method}` would make `{name}`, which this client couldn't touch afterwards (its policy allows {}). Pick a name it allows",
-                        self.policy.devices.as_deref().map(|d| d.join(", ")).unwrap_or_default()
-                    ));
-                }
-            }
-            queries.dedup();
-            if matches!(method, "streams" | "camera_links") && params.get("device").is_none_or(Value::is_null) {
+        if self.policy.devices.is_none() {
+            return Ok(());
+        }
+        let mut queries = named_devices(method, params);
+        if method == "clone" || method == "create" || method == "import" {
+            // A device made here is the client's to touch only if its name allows or created counts.
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+            if !self.policy.allows_new_name(name) {
                 return Err(format!(
-                    "{REFUSED}`{method}` without `device` lists every device's, and this client may touch only some: name a device"
+                    "{REFUSED}`{method}` would make `{name}`, which this client couldn't touch afterwards (its policy allows {}). Pick a name it allows",
+                    self.policy.devices.as_deref().map(|d| d.join(", ")).unwrap_or_default()
                 ));
             }
-            for query in queries {
-                let device = resolve(&*self.inner, &query).map_err(|e| unresolved_refusal(method, &e))?;
-                if !self.safety.may_touch(&self.client, &self.policy, &device) {
-                    return Err(device_refusal(&self.policy, method, &query, Some(&device)));
-                }
+        }
+        queries.sort();
+        queries.dedup();
+        if matches!(method, "streams" | "camera_links") && params.get("device").is_none_or(Value::is_null) {
+            return Err(format!("{REFUSED}`{method}` without `device` lists every device's, and this client may touch only some: name a device"));
+        }
+        for query in queries {
+            self.permit(method, &query)?;
+        }
+        // A stream is named by its id, and the device it shows isn't in the call.
+        if matches!(method, "stream_status" | "stream_stop")
+            && let Some(id) = params.get("stream_id").and_then(Value::as_str)
+        {
+            let streams = self.inner.call("streams", &json!({}))?;
+            let owner = streams.as_array().into_iter().flatten().find(|s| s["stream_id"] == id).and_then(|s| s["device"].as_str());
+            if let Some(device) = owner {
+                self.permit(method, device)?;
             }
         }
+        Ok(())
+    }
+}
+
+impl Backend for Guard {
+    fn call(&self, method: &str, params: &Value) -> Result<Value, String> {
+        self.authorize(method, params)?;
+        let restricted = self.policy.devices.is_some();
         let mut result = self.inner.call(method, params)?;
         if restricted {
             match method {
@@ -514,6 +631,10 @@ impl Backend for Guard {
             }
         }
         Ok(result)
+    }
+
+    fn permits(&self, method: &str, params: &Value) -> Result<(), String> {
+        self.authorize(method, params)
     }
 }
 
