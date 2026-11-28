@@ -14,6 +14,7 @@ mod display;
 mod error;
 mod hid;
 pub mod host;
+mod pair;
 pub mod procs;
 mod rt;
 mod service;

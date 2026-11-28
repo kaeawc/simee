@@ -289,7 +289,7 @@ pub enum Appearance {
 /// directory of devices ([`Context::open`]).
 pub struct Context {
     context: Obj,
-    set: Obj,
+    pub(crate) set: Obj,
     kit: Library,
 }
 

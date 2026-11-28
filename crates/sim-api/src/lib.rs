@@ -35,6 +35,7 @@ mod ios;
 #[cfg(not(target_os = "macos"))]
 #[path = "ios_unavailable.rs"]
 mod ios;
+mod links;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod memtools;
 mod methods;

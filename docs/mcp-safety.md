@@ -8,7 +8,7 @@ all of it is on without a flag except the limits on devices and tools, which you
 
 | Default | What it does | How to change it |
 | --- | --- | --- |
-| Destructive tools confirm | `delete`, `erase`, `kill`, `clear_container`, `reset_keychain`, `rm`, `uninstall`, `prefs_delete`, and `shutdown` of a device this client didn't boot ask a person first, as do a `prefs_batch` with a delete in it and a `console` command that stops the emulator or deletes a snapshot | Add tools with `confirm` in the policy file. Nothing turns it off |
+| Destructive tools confirm | `delete`, `erase`, `kill`, `clear_container`, `reset_keychain`, `rm`, `uninstall`, `prefs_delete`, `unlink`, and `shutdown` of a device this client didn't boot ask a person first, as do a `prefs_batch` with a delete in it and a `console` command that stops the emulator or deletes a snapshot | Add tools with `confirm` in the policy file. Nothing turns it off |
 | Boots are admitted | `boot`, `boot_many`, `create` and `clone` fail fast, with the verdict, when the host can't take another device | `--admission ignore` |
 | Calls are audited | Every `tools/call` is a line in `mcp-audit.log` in simee's state directory | `--audit-log PATH`, `--no-audit-log` |
 | No limits on devices or tools | A client may touch any device and use the toolsets the server serves | `--allow-device`, `--created-devices-only`, `--read-only`, `--policy FILE` |
@@ -74,6 +74,7 @@ matches through, so a name `emu` accepts for a deletion can't be one this layer 
 | `reset_keychain` | Every keychain item |
 | `prefs_delete`, and `prefs_batch` when an op has `delete` | A preference key |
 | `kill` | Ends a process on the device |
+| `unlink` | Unpairs a watch, which CoreSimulator may shut down and erase as it does |
 | `shutdown`, and `console` with `kill`, `crash` or `avd stop` | Stops a device. Not asked for one this client booted |
 | `console` with `avd snapshot del` or `delete` | A snapshot's data. Always asked, also for a device this client booted |
 
@@ -126,7 +127,7 @@ worse than none, and a file that doesn't parse stops the server before it serves
 
 How `devices` is applied:
 
-- Every call that names a device (`device`, or `devices` for `boot_many`) resolves the name the way
+- Every call that names a device (`device`, or `devices` for `boot_many` and `link`) resolves the name the way
   the method does, through `info`, and checks the device it is. A UDID, a name and `booted`
   can't be used to name a device around the list. A name that doesn't resolve is refused, since it
   can't be checked.
@@ -135,7 +136,11 @@ How `devices` is applied:
   device's screen on the camera: that device is checked too, however the source id is spelt. A
   stream (`stream_status`, `stream_stop`) is named by its id, and is judged by the device it shows.
   A capture (`audio_capture_stop`) is named by an id that is a counter and says no device, so a
-  client with a device list may stop only the captures it started.
+  client with a device list may stop only the captures it started. A link (`link`, `unlink`,
+  `link_status` with `link`) is named by its id and judged by both its members, read from `links`;
+  an id that isn't there can't be checked, so it is refused. `unlink` and `link_status` by `device`
+  are judged by every link of that device too, and `links` leaves out a link with a member the
+  client may not see.
 - The check is in the backend every tool, resource and subscription reads through, so
   `simee://devices/...` resources and change notifications hide a device the same way `devices` does.
 - A long list a client pages through (`processes`, `logs`, `connections`, `devices_usage`) is

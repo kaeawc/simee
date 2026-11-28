@@ -10,6 +10,7 @@ use crate::rpc::META_CLIENT_INFO;
 
 const CI_1: &str = "UDID-CI-1";
 const CI_2: &str = "UDID-CI-2";
+const CI_2_B: &str = "UDID-CI-2-B";
 const PROD: &str = "UDID-PROD";
 
 /// Devices that answer `info` and `devices` as the API does (the fake answers a method the same way
@@ -51,6 +52,10 @@ impl Backend for World {
         match method {
             "info" => {
                 let devices = self.devices.lock().expect("devices");
+                // In the set `B` ci-2 has another UDID.
+                if params["set"] == "B" && query == "ci-2" {
+                    return Ok(json!({"device": device(CI_2_B, "ci-2", "Booted")}));
+                }
                 found(&devices).map(|d| json!({"device": d})).ok_or_else(|| format!("no device matches `{query}`"))
             }
             "devices" => Ok(Value::Array(self.devices.lock().expect("devices").clone())),
@@ -542,6 +547,137 @@ fn a_stream_is_judged_by_the_device_it_shows() {
         assert!(!is_error(&call(&rig, tool, json!({"stream_id": "stream-9"}))));
     }
     assert_eq!(rig.fake.called("stream_stop"), [json!({"stream_id": "stream-2"}), json!({"stream_id": "stream-9"})]);
+}
+
+/// Two watch pairs as `links` returns them: `PAIR-CI` of ci-1 and ci-2, and `PAIR-PROD` of ci-2 and
+/// prod-1.
+fn answer_links(rig: &Rig) {
+    let member =
+        |udid: &str, name: &str, role: &str| json!({"device": udid, "name": name, "platform": "ios", "role": role, "running": true});
+    rig.fake.answer(
+        "links",
+        Ok(json!([
+            {"id": "PAIR-CI", "kind": "watch-phone", "members": [member(CI_2, "ci-2", "phone"), member(CI_1, "ci-1", "watch")]},
+            {"id": "PAIR-PROD", "kind": "watch-phone", "members": [member(CI_2, "ci-2", "phone"), member(PROD, "prod-1", "watch")]},
+        ])),
+    );
+}
+
+fn link_ids(result: &Value) -> Vec<&str> {
+    result["structuredContent"].as_array().expect("links").iter().filter_map(|l| l["id"].as_str()).collect()
+}
+
+#[test]
+fn a_link_is_judged_by_every_device_it_pairs() {
+    let rig = rig(devices_only(&["ci-*"]));
+    answer_links(&rig);
+    // Pairing a device the client may not touch, however it is named.
+    for devices in [json!(["ci-1", "prod-1"]), json!([PROD, CI_2]), json!(["ci-1", "nothing"])] {
+        let refused = call(&rig, "link", json!({"devices": devices}));
+        assert!(is_error(&refused) && text(&refused).starts_with("refused: "), "{devices}: {refused}");
+    }
+    let refused = call(&rig, "link", json!({"devices": ["ci-1", "prod-1"]}));
+    assert!(text(&refused).contains("may not touch") && text(&refused).contains("`prod-1` (UDID-PROD)"), "{refused}");
+    // An existing pair named by id is judged by its members, in any case.
+    for id in ["PAIR-PROD", "pair-prod"] {
+        let refused = call(&rig, "link", json!({"link": id, "active": true}));
+        assert!(is_error(&refused) && text(&refused).contains("may not touch"), "{id}: {refused}");
+    }
+    assert!(rig.fake.called("link").is_empty(), "nothing was paired");
+    assert!(!is_error(&call(&rig, "link", json!({"devices": ["ci-1", "ci-2"]}))));
+    assert!(!is_error(&call(&rig, "link", json!({"link": "PAIR-CI", "active": true}))));
+    assert_eq!(rig.fake.called("link").len(), 2);
+}
+
+#[test]
+fn a_client_unlinks_only_links_whose_devices_it_may_touch() {
+    let rig = rig(devices_only(&["ci-*"]));
+    answer_links(&rig);
+    for args in [
+        json!({"link": "PAIR-PROD", "confirm": true}),
+        // Every link of ci-2 is PAIR-CI and PAIR-PROD.
+        json!({"device": "ci-2", "confirm": true}),
+        json!({"device": "prod-1", "confirm": true}),
+    ] {
+        let refused = call(&rig, "unlink", args.clone());
+        assert!(is_error(&refused) && text(&refused).contains("may not touch") && text(&refused).contains("prod-1"), "{args}: {refused}");
+    }
+    // An id that isn't there can't be checked.
+    let unknown = call(&rig, "unlink", json!({"link": "PAIR-ELSEWHERE", "confirm": true}));
+    assert!(is_error(&unknown) && text(&unknown).contains("can't be checked") && text(&unknown).contains("PAIR-ELSEWHERE"), "{unknown}");
+    // A client that could be asked isn't: what the policy forbids is refused first.
+    let not_asked = call_as(&rig, "agent", asks(), "unlink", json!({"link": "PAIR-PROD"}));
+    assert!(is_error(&not_asked) && text(&not_asked).contains("may not touch"), "{not_asked}");
+    // A status shows both members, so it is judged the same.
+    for args in [json!({"link": "PAIR-PROD"}), json!({"device": "ci-2"})] {
+        let refused = call(&rig, "link_status", args.clone());
+        assert!(is_error(&refused) && text(&refused).contains("may not touch"), "{args}: {refused}");
+    }
+    assert!(rig.fake.called("unlink").is_empty() && rig.fake.called("link_status").is_empty());
+    // Its own pair it unlinks (with the confirmation) and probes.
+    assert!(!is_error(&call(&rig, "unlink", json!({"link": "PAIR-CI", "confirm": true}))));
+    assert!(!is_error(&call(&rig, "unlink", json!({"device": "ci-1", "confirm": true}))));
+    assert!(!is_error(&call(&rig, "link_status", json!({"link": "PAIR-CI"}))));
+    assert_eq!(rig.fake.called("unlink"), [json!({"link": "PAIR-CI"}), json!({"device": "ci-1"})]);
+}
+
+#[test]
+fn unlink_and_status_by_device_judge_the_partners_in_the_calls_set() {
+    let rig = rig(devices_only(&["ci-*"]));
+    let member =
+        |udid: &str, name: &str, role: &str| json!({"device": udid, "name": name, "platform": "ios", "role": role, "running": true});
+    // In set B, the allowed phone ci-2 (another UDID there) is paired with the forbidden prod-1.
+    rig.fake.answer(
+        "links",
+        Ok(json!([{"id": "PAIR-B", "kind": "watch-phone", "members": [member(CI_2_B, "ci-2", "phone"), member(PROD, "prod-1", "watch")]}])),
+    );
+    for (tool, extra) in [("unlink", json!({"confirm": true})), ("link_status", json!({}))] {
+        let mut args = json!({"device": "ci-2", "set": "B"});
+        args.as_object_mut().expect("object").extend(extra.as_object().expect("object").clone());
+        let refused = call(&rig, tool, args.clone());
+        assert!(is_error(&refused) && text(&refused).contains("may not touch") && text(&refused).contains("prod-1"), "{tool}: {refused}");
+    }
+    assert!(rig.fake.called("unlink").is_empty() && rig.fake.called("link_status").is_empty());
+}
+
+#[test]
+fn links_leaves_out_a_link_with_a_device_the_client_may_not_see() {
+    let rig = rig(devices_only(&["ci-*"]));
+    answer_links(&rig);
+    assert_eq!(link_ids(&call(&rig, "links", json!({}))), ["PAIR-CI"]);
+    assert_eq!(link_ids(&call(&rig, "links", json!({"device": "ci-2"}))), ["PAIR-CI"]);
+    assert!(is_error(&call(&rig, "links", json!({"device": "prod-1"}))));
+}
+
+#[test]
+fn a_client_without_a_device_list_links_and_unlinks_any_device() {
+    let rig = rig(Policy::default());
+    answer_links(&rig);
+    assert!(!is_error(&call(&rig, "link", json!({"devices": ["ci-1", "prod-1"]}))));
+    assert!(!is_error(&call(&rig, "link", json!({"link": "PAIR-PROD", "active": true}))));
+    assert_eq!(link_ids(&call(&rig, "links", json!({}))), ["PAIR-CI", "PAIR-PROD"]);
+    assert!(!is_error(&call(&rig, "link_status", json!({"link": "PAIR-PROD"}))));
+    assert!(!is_error(&call(&rig, "unlink", json!({"link": "PAIR-PROD", "confirm": true}))));
+    assert_eq!(rig.fake.called("unlink"), [json!({"link": "PAIR-PROD"})]);
+}
+
+#[test]
+fn unlink_needs_a_confirmation_since_coresimulator_may_erase_the_watch() {
+    let rig = rig(Policy::default());
+    answer_links(&rig);
+    for args in [json!({"link": "PAIR-CI"}), json!({"device": "ci-2"})] {
+        let refused = call(&rig, "unlink", args.clone());
+        assert!(is_error(&refused) && text(&refused).contains("`unlink` needs the user's confirmation"), "{args}: {refused}");
+        assert!(text(&refused).contains("may shut") && text(&refused).contains("erase"), "says what it may do: {refused}");
+    }
+    assert!(text(&call(&rig, "unlink", json!({"device": "ci-2"}))).contains("every link of `ci-2` (UDID-CI-2)"));
+    // A client that can be asked is asked, whatever `confirm` says.
+    let (ask, _) = input_required(&call_as(&rig, "agent", asks(), "unlink", json!({"link": "PAIR-CI", "confirm": true})));
+    let message = ask["message"].as_str().unwrap_or_default();
+    assert!(message.contains("unlink `PAIR-CI`"), "{ask}");
+    assert!(message.contains("watch `ci-1`") && message.contains("phone `ci-2`"), "names the pair's devices: {ask}");
+    assert!(rig.fake.called("unlink").is_empty());
+    assert!(crate::safety::may_confirm("unlink"));
 }
 
 #[test]

@@ -30,6 +30,8 @@ pub const LONG_RUNNING: &[&str] = &[
     "settle",
     "wait_idle",
     "erase",
+    // A Wear OS or Bluetooth pairing takes many seconds (docs/design/device-links.md).
+    "link",
     "shutdown",
     "export",
     "import",

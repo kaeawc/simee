@@ -52,6 +52,10 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         "raw" | "malloc_stack_logging" => Bool,
         // camera_* and boot's camera links (#323)
         "facing" | "source" | "kind" | "camera_back" | "camera_front" => Str,
+        // link, unlink, links and link_status (docs/design/device-links.md)
+        "link" => Str,
+        "active" => Bool,
+        "state" if method == "links" => Str,
         // boot, boot_many, create and clone's admission, and admission_check (#275)
         "admission" => Str,
         "admission_timeout_s" | "count" => Int,
