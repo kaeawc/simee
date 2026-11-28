@@ -147,6 +147,7 @@ pub const OUTPUTS: &[(&str, &str)] = &[
     ("erase", "null"),
     ("screen", "{width: number, height: number}"),
     ("screenshot", "{width: number, height: number, png?: string, path?: string}"),
+    ("wait_idle", "{waited_ms: number, frames: number, width?: number, height?: number, png?: string, path?: string}"),
     (
         "stream_start",
         "{stream_id: string, whip_resource: string, lease_ttl_s: number, device: string, input?: boolean, input_note?: string}",

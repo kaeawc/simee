@@ -75,6 +75,9 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         "hold_ms" | "duration_ms" | "timeout_s" | "settle_timeout_s" | "concurrency" | "first_port" | "usage" | "pid" | "signal"
         | "ticks" | "pressure" | "level" | "wifi_bars" | "cellular_bars" | "battery_level" | "state" | "port_base" | "port_count"
         | "settle_ms" => Int,
+        // wait_idle (#114)
+        "quiet_ms" | "timeout_ms" => Int,
+        "screenshot" => Bool,
         "booted" | "on" | "suppressed" | "undo" | "shaped" | "settle" | "settle_foreground" | "audio" | "mute" | "sizes" | "offline"
         | "proxy" | "face" | "foreground" | "eraser" | "folded" | "restart" | "stream" | "all" | "allow_mismatch" | "fresh" => Bool,
         "env" => StrMap,
@@ -510,6 +513,8 @@ mod tests {
             (Platform::Ios, "settle") => text(crate::ios::settle_options(p)),
             #[cfg(target_os = "macos")]
             (Platform::Ios, "logs") => text(crate::ios::log_options(p)),
+            #[cfg(target_os = "macos")]
+            (Platform::Ios, "wait_idle") => text(crate::ios::wait_idle_options(p)),
             #[cfg(target_os = "macos")]
             (Platform::Ios, "mem_leaks" | "mem_heap" | "mem_vmmap" | "mem_history") => text(Ok(crate::ios::mem_deadline(p))),
             _ => None,

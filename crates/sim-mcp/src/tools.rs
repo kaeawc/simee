@@ -28,6 +28,7 @@ pub const LONG_RUNNING: &[&str] = &[
     "clone",
     "install",
     "settle",
+    "wait_idle",
     "erase",
     "shutdown",
     "export",
@@ -132,6 +133,14 @@ fn effect(tool: &str) -> Option<Effect> {
 /// comes back in the result instead.
 const WITHHELD: &[(&str, &str, &str)] = &[
     ("screenshot", "path", "The device's screen as a PNG image, returned in the result"),
+    (
+        "wait_idle",
+        "path",
+        "Wait until the screen is still: no frame has changed it for quiet_ms, at most timeout_ms (fails if it kept changing). \
+         Follows the display's frame callback and surface seed, reading no pixels while nothing is presented; where the seed \
+         ticks on a still screen (iOS 26.5, 10 times a second) a content hash decides. Returns waited_ms and frames (seed \
+         changes seen), and with screenshot the still screen as a PNG image in the result",
+    ),
     (
         "contrast_check",
         "path",
@@ -260,6 +269,13 @@ fn output(tool: &str) -> Value {
             properties.insert("image".into(), json!({"type": "number"}));
             properties.insert("image_of".into(), json!({"type": "string"}));
         }
+    }
+    if tool == "wait_idle"
+        && let Some(properties) = schema["properties"].as_object_mut()
+    {
+        // The still screen is an image block, and `path` isn't offered.
+        properties.remove("png");
+        properties.remove("path");
     }
     match paged(tool) {
         Some(None) => {
@@ -546,6 +562,13 @@ pub fn result(name: &str, outcome: Result<Value, String>, era: Era) -> Value {
     }
     if name == "contrast_check" {
         return contrast_result(value);
+    }
+    // `wait_idle`'s still screen, when asked for, is an image block too; the rest stays structure.
+    if let (Some(png), true) = (value.get("png").and_then(Value::as_str), name == "wait_idle") {
+        let mut meta = value.clone();
+        meta.as_object_mut().map(|o| o.remove("png"));
+        return json!({"content": [{"type": "image", "data": png, "mimeType": "image/png"},
+            {"type": "text", "text": meta.to_string()}], "structuredContent": meta});
     }
     let text = if value.is_null() { "ok".to_owned() } else { lifecycle_text(name, &value) };
     json!({"content": [{"type": "text", "text": text}], "structuredContent": structured(value, era)})
