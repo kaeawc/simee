@@ -496,7 +496,7 @@ lower). [#228](https://github.com/kaeawc/simee/issues/228) measured them togethe
 on one 4-vCPU host: three rounds of five warm boots in turn (15 boots), 2026-11-28. The fifth arm
 is an AVD made by the shipped `-create-avd -profile software-lite`. The method, host and every
 run are in [benchmarks.md](../benchmarks.md#software-mode-a-smaller-screen-and-30-hz);
-`scripts/bench/software-profile.sh` reproduces it. Medians:
+`scripts/bench/software-profile.sh --arms "default lcd540 vsync30 lite shipped"` reproduces it. Medians:
 
 | | default | 540x960 only | 30 Hz only | both (`config.ini`) | both (shipped) |
 | --- | --- | --- | --- | --- | --- |
@@ -529,9 +529,9 @@ What it says:
 An earlier 12-boot run of the same script (2026-11-27) found the profile at 0.46 idle against 0.68
 and read as if the halves added. Its idle window was anchored to the launcher, not to
 `sys.boot_completed`, so the arms did not all start at the same offset; the script was fixed and
-the run repeated, and these numbers replace it. The host reported more memory at the end of the
-re-run (7.8 GiB, from 3.8) and the guests' PSS is higher than in the first run, so compare arms
-within a run.
+the run repeated, and these numbers replace it. The host reported 3.8 GiB when the re-run
+started and 7.8 GiB when it ended, at an unrecorded time in between, and the guests' PSS is higher
+than in the first run, so do not compare memory across the runs (details in benchmarks.md).
 
 The decision: the profile ships, opt-in (`-profile software-lite`), with the default AVD unchanged.
 It buys about a tenth less idle CPU and about 17% less swiping CPU on a shared host, and it costs

@@ -322,7 +322,7 @@ emu -avd phone -accel off   # TCG even where /dev/kvm is usable (-accel on: KVM 
   applies to phone images only (the other form factors have screens of their own and are refused),
   RAM and vCPUs stay as `-memory` and `-cores` say, and an explicit `-lcd` wins over its screen. An image's
   golden user data is keyed by screen size, so the first software-lite AVD of an image boots once
-  to settle its own golden. `scripts/bench/software-profile.sh` reproduces the table.
+  to settle its own golden. `scripts/bench/software-profile.sh --arms "default lcd540 vsync30 lite shipped"` reproduces the table (the software-lite column is its `shipped` arm).
 - **KFENCE sampling off** (`kfence.sample_interval=0` on the x86 board's command line). These
   kernels build KFENCE with static keys, so every 500 ms its sampler flips a branch inside every
   slab allocation, live-patching kernel text through an `int3`. Under multi-threaded TCG another

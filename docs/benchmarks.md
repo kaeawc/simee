@@ -47,7 +47,7 @@ recoverable from what was recorded, or they need something the repository doesn'
 | [Software mode, CPU model](#android-software-mode-linux-without-kvm) | zygote 49.4 s | | 4-vCPU Xeon VM, 2026-11-26 | `scripts/bench/software-mode.sh --arms "tcg:…"` |
 | [Software mode, boot](#boot-to-sysboot_completed-with-emus-devices) | 168 s, 0.75 cores idle | SDK emulator `-accel off` 2302 s, 1.09 cores | 4-vCPU Xeon VM, 2026-11-26 | `scripts/bench/software-mode.sh --arms "emu stock"` |
 | [Software mode, `emu -avd`](#software-mode-through-emu--avd) | 161 s, tap 60.8 ms, screenshot 36.9 ms | SDK emulator unusable | 4-vCPU Xeon VM, 2026-11-26 | `android-frames.sh`, `api-steps.sh --android` |
-| [Software mode, software-lite profile](#software-mode-a-smaller-screen-and-30-hz) | 0.53 cores idle, 2.01 cores swiping, p90 frame 200 ms | default profile 0.59, 2.43, 300 ms | 4-vCPU Xeon VM, 2026-11-28 | `scripts/bench/software-profile.sh` |
+| [Software mode, software-lite profile](#software-mode-a-smaller-screen-and-30-hz) | 0.53 cores idle, 2.01 cores swiping, p90 frame 200 ms | default profile 0.59, 2.43, 300 ms | 4-vCPU Xeon VM, 2026-11-28 | `scripts/bench/software-profile.sh --rounds 3 --arms "default lcd540 vsync30 lite shipped"` (the software-lite numbers are the `shipped` arm) |
 | [Android farm](#android-farm) | 8 settled in 266 s | not measured | not recorded, before 2026-11-24 | `scripts/bench/android-farm.sh` |
 | [Device bundles](#android-device-bundles) | 1225 MB, 7.2 s export, 6.7 s import | no stock tool | M3 Max, 2026-11-27 | `scripts/bench/android-bundle.sh` |
 | [iOS boot](#ios-simee-against-simctl) | 15.5 s first, 2.3 s later | `simctl` 18.9 s, 2.3 s | M3 Max, 2026-11-24 | `scripts/bench/ios-boot.sh` |
@@ -580,7 +580,7 @@ guest RAM counted once) and the peak sum of their resident sizes sampled during 
 else running.
 
 ```bash
-scripts/bench/software-profile.sh --qemu <qemu-system-x86_64> --rounds 3
+scripts/bench/software-profile.sh --qemu <qemu-system-x86_64> --rounds 3 --arms "default lcd540 vsync30 lite shipped"
 ```
 
 | Measure | default | 540x960 only | 30 Hz only | software-lite, `config.ini` rewritten | software-lite, made by `-create-avd` |
@@ -629,9 +629,13 @@ An earlier run of this script on 2026-11-27 (12 boots, four arms) measured the p
 at 0.46 against 0.68 and its swipes at 1.99 against 2.41 cores, with an idle window that started
 relative to the launcher and not to `sys.boot_completed`. It is superseded by this table, which
 uses the script that ships; its numbers are not used anywhere. The host also reported 3.8 GiB of RAM
-when the run started and 7.8 GiB when it ended (the VM was resized; its 4 CPUs did not change), and
-the PSS here (about 2.8 GB) is higher than that run's (2.3 GB), so compare arms within a run and
-not across the two.
+when the run started (00:33 UTC) and 7.8 GiB when it ended (03:18 UTC); its 4 CPUs did not change.
+The script records RAM only at those two points, so when it changed is not known and neither is
+which boots ran on each side. Across the 15 boots PSS stays between 2795 and 2868 MB and peak
+resident size between 2562 and 2661 MB in every round, with no step, but that does not show the RAM
+was constant. The PSS here (about 2.8 GB) is higher than the first run's (2.3 GB), so do not compare
+memory across the two runs, and read the arms' differences as the ones within each round, where all
+five arms booted back to back.
 
 ## Android farm
 
