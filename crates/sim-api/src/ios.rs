@@ -1956,7 +1956,13 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         // A device that stops (or is erased, which removes its socket) takes its camera feed with it.
         "shutdown" | "erase" => {
             let d = s.device(p)?;
-            ok(if method == "shutdown" { d.shutdown() } else { d.erase() })?;
+            if method == "shutdown" {
+                ok(d.shutdown())?;
+            } else {
+                // Erasing wipes `<data>/`: the device's copy of its links is kept around it (#535).
+                let dir = std::path::PathBuf::from(d.data_path()).join("simee");
+                crate::links::erase_keeping_links(&dir, || ok(d.erase()))?;
+            }
             crate::camera::ios_stopped(&d.info().udid);
             Ok(Value::Null)
         }

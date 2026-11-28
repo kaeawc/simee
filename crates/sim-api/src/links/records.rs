@@ -54,6 +54,12 @@ pub(crate) trait RecordHost {
     fn new_id(&mut self) -> Result<String, String>;
     /// Now, ISO 8601 in UTC to the second.
     fn now(&mut self) -> String;
+    /// Holds `dev`'s link-making lock until the value is dropped: `link` takes every member's, in
+    /// sorted order, around finding or making the link and saving it, so two calls on one pair
+    /// make one link. Not the file's own lock, which each `update` takes inside it.
+    fn hold(&mut self, dev: &Dev) -> Result<Box<dyn std::any::Any>, String>;
+    /// Says something went wrong that the call carries on past (stderr in the server).
+    fn warn(&mut self, message: &str);
 }
 
 /// The records in a member's `links.json` that name `own` (a clone's copied file names its
@@ -117,37 +123,46 @@ fn wanted_ports(p: &Value, devs: &[Dev]) -> Result<Option<Vec<(String, u16)>>, S
     Ok(Some(out))
 }
 
-/// Every copy `devs` hold, merged.
-fn copies(host: &mut dyn RecordHost, devs: &[Dev]) -> Result<Vec<Record>, String> {
+/// Every record any device holds, merged. A device whose copy can't be read (an AVD whose
+/// directory is gone, a config that doesn't parse) is skipped with a warning: one broken device
+/// doesn't hide every other link.
+pub(crate) fn every(host: &mut dyn RecordHost) -> Result<Vec<Record>, String> {
     let mut all = Vec::new();
-    for d in devs {
-        all.extend(host.read(d)?);
-    }
-    Ok(link::merge(all))
-}
-
-/// The records `dev` is in: its own copy, each merged with its peers' copies.
-pub(crate) fn of_device(host: &mut dyn RecordHost, dev: &Dev) -> Result<Vec<Record>, String> {
-    let own = host.read(dev)?;
-    let mut all = own.clone();
-    for r in &own {
-        for m in &r.members {
-            let Some(platform) = Platform::parse(&m.platform) else { continue };
-            if platform == dev.platform && m.device.eq_ignore_ascii_case(&dev.id) {
-                continue;
-            }
-            if let Some(peer) = host.device(platform, &m.device)? {
-                all.extend(host.read(&peer)?.into_iter().filter(|p| p.id == r.id));
-            }
+    for d in host.all()? {
+        match host.read(&d) {
+            Ok(copy) => all.extend(copy),
+            Err(e) => host.warn(&format!("{}'s links weren't read, so its copy is left out: {e}", d.name)),
         }
     }
     Ok(link::merge(all))
 }
 
-/// Every record any device holds.
-pub(crate) fn every(host: &mut dyn RecordHost) -> Result<Vec<Record>, String> {
-    let devs = host.all()?;
-    copies(host, &devs)
+/// The records `dev` is in, from every device's copy: a member whose own copy is missing (a
+/// write that failed) is still found through its peers'.
+pub(crate) fn of_device(host: &mut dyn RecordHost, dev: &Dev) -> Result<Vec<Record>, String> {
+    Ok(every(host)?.into_iter().filter(|r| r.has(dev.platform, &dev.id)).collect())
+}
+
+/// Runs `erase` (which wipes the simulator's data directory) with the device's `links.json` in
+/// `dir` read first and written back after, so an erased member keeps its links (design,
+/// "Persistence"). The copy is written back even when `erase` fails, if the file went with it.
+pub(crate) fn kept_around<T>(dir: &std::path::Path, erase: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let path = dir.join(LINKS_FILE);
+    let saved = std::fs::read(&path).ok();
+    let result = erase();
+    if let Some(bytes) = saved
+        && !path.exists()
+    {
+        let restored = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, bytes));
+        if let Err(e) = restored {
+            let note = format!("its links weren't kept: writing {} back failed: {e}", path.display());
+            return match result {
+                Ok(_) => Err(format!("erased, but {note}")),
+                Err(err) => Err(format!("{err}; and {note}")),
+            };
+        }
+    }
+    result
 }
 
 /// The record `id` names (any case), or the error naming it.
@@ -254,6 +269,10 @@ pub(crate) fn link(host: &mut dyn RecordHost, kind: LinkKind, devs: &[Dev], role
             .into());
     }
     let ids: Vec<(Platform, &str)> = devs.iter().map(|d| (d.platform, d.id.as_str())).collect();
+    let mut held = Vec::new();
+    for d in sorted(devs) {
+        held.push(host.hold(d)?);
+    }
     let mut each = Vec::new();
     for d in devs {
         each.push(host.read(d)?);
@@ -347,10 +366,17 @@ fn establish(
     }
     for f in &r.params.forwards {
         let kept = next.iter().any(|n| n.device.eq_ignore_ascii_case(&f.device) && n.port == f.port);
-        if let (false, Some(h), Some(i)) = (kept, f.host_port, dev_of(&f.device))
-            && devs[i].running
-        {
-            // Best effort: the adb server drops it with the device's next boot anyway.
+        let (false, Some(h), Some(i)) = (kept, f.host_port, dev_of(&f.device)) else { continue };
+        if !devs[i].running {
+            continue;
+        }
+        if live[i].is_none() {
+            live[i] = host.forwards(&devs[i]).ok();
+        }
+        // Only while the adb server still has it as this device's: a host port the kernel has
+        // since given another forward isn't this link's to remove. Best effort otherwise: the adb
+        // server drops it with the device's next boot anyway.
+        if live[i].as_ref().is_some_and(|l| l.contains(&(h, f.port))) {
             let _ = host.remove_forward(&devs[i], h);
         }
     }
@@ -358,13 +384,18 @@ fn establish(
     Ok(added)
 }
 
+/// `devs` in the order their locks are taken: platform, then id in any case.
+fn sorted(devs: &[Dev]) -> Vec<&Dev> {
+    let mut order: Vec<&Dev> = devs.iter().collect();
+    order.sort_by(|a, b| (a.platform.as_str(), a.id.to_ascii_lowercase()).cmp(&(b.platform.as_str(), b.id.to_ascii_lowercase())));
+    order
+}
+
 /// Writes `r` into every member's copy, in sorted member order (so two calls take the locks in
 /// the same order), replacing the one there. A failure says whether any copy was written.
 fn save(host: &mut dyn RecordHost, r: &Record, devs: &[Dev]) -> Result<(), (bool, String)> {
-    let mut order: Vec<&Dev> = devs.iter().collect();
-    order.sort_by(|a, b| (a.platform.as_str(), a.id.to_ascii_lowercase()).cmp(&(b.platform.as_str(), b.id.to_ascii_lowercase())));
     let (mut saved, mut failed) = (Vec::new(), Vec::new());
-    for d in order {
+    for d in sorted(devs) {
         let mut change = |links: &mut Vec<Record>| {
             links.retain(|l| l.id != r.id);
             links.push(r.clone());
@@ -384,6 +415,9 @@ fn save(host: &mut dyn RecordHost, r: &Record, devs: &[Dev]) -> Result<(), (bool
     }
 }
 
+/// A device's forwards as `adb forward --list` gave them, or why it couldn't.
+type Listed = Result<Vec<(u16, u16)>, String>;
+
 /// `unlink` of records: removes each one's forwards (on the members that run) and every member's
 /// copy. The ids unlinked, and one teardown entry per record (`error` when a step failed).
 pub(crate) fn unlink(host: &mut dyn RecordHost, targets: &[Record]) -> Result<(Vec<Value>, Vec<Value>), String> {
@@ -391,13 +425,25 @@ pub(crate) fn unlink(host: &mut dyn RecordHost, targets: &[Record]) -> Result<(V
     for r in targets {
         let members = members_of(host, r)?;
         let mut errors = Vec::new();
+        let mut live: Vec<(String, Listed)> = Vec::new();
         for f in &r.params.forwards {
             let Some(h) = f.host_port else { continue };
             let dev = members.iter().find(|(m, _)| m.device.eq_ignore_ascii_case(&f.device)).and_then(|(_, d)| d.as_ref());
-            if let Some(dev) = dev.filter(|d| d.running)
-                && let Err(e) = host.remove_forward(dev, h)
-            {
-                errors.push(format!("removing {}'s forward tcp:{h}: {e}", dev.name));
+            let Some(dev) = dev.filter(|d| d.running) else { continue };
+            if !live.iter().any(|(id, _)| *id == dev.id) {
+                live.push((dev.id.clone(), host.forwards(dev)));
+            }
+            let listed = &live.iter().find(|(id, _)| *id == dev.id).expect("just listed").1;
+            match listed {
+                // Gone with a reboot or an adb server restart: nothing to tear down, and the host
+                // port may be another forward's by now.
+                Ok(l) if !l.contains(&(h, f.port)) => {}
+                Ok(_) => {
+                    if let Err(e) = host.remove_forward(dev, h) {
+                        errors.push(format!("removing {}'s forward tcp:{h}: {e}", dev.name));
+                    }
+                }
+                Err(e) => errors.push(format!("listing {}'s forwards: {e}", dev.name)),
             }
         }
         let mut removed = 0;
@@ -544,6 +590,9 @@ pub(crate) mod fake {
         pub refuse_forward: Option<String>,
         /// The devices whose copies can't be written.
         pub refuse_update: Vec<String>,
+        /// The devices whose copies can't be read (an AVD whose directory is gone).
+        pub unreadable: Vec<String>,
+        pub warnings: Vec<String>,
         next_port: u16,
         next_id: u32,
     }
@@ -578,7 +627,7 @@ pub(crate) mod fake {
         }
 
         pub fn changes(&self) -> Vec<&str> {
-            self.calls.iter().map(String::as_str).filter(|c| !c.starts_with("write")).collect()
+            self.calls.iter().map(String::as_str).filter(|c| !c.starts_with("write") && !c.starts_with("hold")).collect()
         }
     }
 
@@ -590,6 +639,9 @@ pub(crate) mod fake {
             Ok(self.devs.clone())
         }
         fn read(&mut self, dev: &Dev) -> Result<Vec<Record>, String> {
+            if self.unreadable.contains(&dev.id) {
+                return Err(format!("{}'s config can't be read", dev.id));
+            }
             Ok(self.copy(dev.platform, &dev.id))
         }
         fn update(&mut self, dev: &Dev, change: &mut dyn FnMut(&mut Vec<Record>)) -> Result<(), String> {
@@ -633,6 +685,13 @@ pub(crate) mod fake {
         }
         fn now(&mut self) -> String {
             "2026-11-28T12:00:00Z".into()
+        }
+        fn hold(&mut self, dev: &Dev) -> Result<Box<dyn std::any::Any>, String> {
+            self.calls.push(format!("hold {}", dev.id));
+            Ok(Box::new(()))
+        }
+        fn warn(&mut self, message: &str) {
+            self.warnings.push(message.into());
         }
     }
 }

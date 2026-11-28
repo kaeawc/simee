@@ -262,6 +262,23 @@ impl RecordHost for Hosts<'_> {
     fn now(&mut self) -> String {
         crate::prefs::Date::from_unix(crate::prefs::Date::now().unix_secs(), 0).to_iso8601()
     }
+    fn hold(&mut self, dev: &Dev) -> Result<Box<dyn std::any::Any>, String> {
+        let dir = self.state_dir(dev)?;
+        Ok(Box::new(sim_android::StateLock::take(&dir, LINKING)?))
+    }
+    fn warn(&mut self, message: &str) {
+        eprintln!("simee: {message}");
+    }
+}
+
+/// The lock `link` holds on each member around finding or making a link and saving it
+/// (`<state>/links-op.lock`), apart from `links.json`'s own lock, which each write takes inside it.
+const LINKING: &str = "links-op";
+
+/// Runs an iOS `erase` with the simulator's `<data>/simee/links.json` kept around it (#535).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn erase_keeping_links<T>(state_dir: &std::path::Path, erase: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    records::kept_around(state_dir, erase)
 }
 
 /// A link method past device resolution (`devices` and `device` as (platform, id)): a watch pair
@@ -1014,6 +1031,12 @@ mod tests {
         fn now(&mut self) -> String {
             self.rec.now()
         }
+        fn hold(&mut self, dev: &Dev) -> Result<Box<dyn std::any::Any>, String> {
+            self.rec.hold(dev)
+        }
+        fn warn(&mut self, message: &str) {
+            self.rec.warn(message)
+        }
     }
 
     /// The standard set with a Vision Pro, and AVDs: a phone, an Android XR headset, a pair of
@@ -1092,10 +1115,10 @@ mod tests {
         assert!(h.set.calls.is_empty(), "nothing reached CoreSimulator");
 
         // The same devices again: the same link, its forward kept, nothing written.
-        let calls = h.rec.calls.len();
+        let changes = h.rec.calls.iter().filter(|c| !c.starts_with("hold")).count();
         let again = on(&mut h, "link", json!({"devices": ["pixel", "xr"], "kind": "headset-phone"})).expect("again")["link"].clone();
         assert_eq!(again, link);
-        assert_eq!(h.rec.calls.len(), calls, "linking again changes nothing more");
+        assert_eq!(h.rec.calls.iter().filter(|c| !c.starts_with("hold")).count(), changes, "linking again writes and forwards nothing");
         assert_eq!(on(&mut h, "links", json!({})).expect("links"), json!([link]));
         assert_eq!(on(&mut h, "links", json!({"device": "xr"})).expect("of xr"), json!([link]));
         assert_eq!(on(&mut h, "links", json!({"device": "pixel2"})).expect("none"), json!([]));
@@ -1322,6 +1345,70 @@ mod tests {
         // Linking by id again writes the winner back to both.
         on(&mut h, "link", json!({"link": "lnk-00000001"})).expect("again");
         assert_eq!(h.rec.copy(Platform::Android, "pixel")[0].rev, 8);
+    }
+
+    #[test]
+    fn a_device_whose_copy_cant_be_read_is_left_out_of_the_listing_with_a_warning() {
+        let mut h = both();
+        on(&mut h, "link", json!({"devices": ["xr", "pixel"]})).expect("linked");
+        on(&mut h, "link", json!({"devices": [WATCH, PHONE]})).expect("a watch pair");
+        // An AVD whose directory is gone still lists: its copy can't be read.
+        h.rec.unreadable = vec!["pixel2".into()];
+        let all = on(&mut h, "links", json!({})).expect("the rest still list");
+        assert_eq!(all.as_array().map(Vec::len), Some(2), "{all}");
+        assert!(h.rec.warnings.iter().any(|w| w.starts_with("pixel2's links weren't read")), "{:?}", h.rec.warnings);
+        assert_eq!(on(&mut h, "link_status", json!({"link": "lnk-00000001"})).expect("by id")["link"]["id"], "lnk-00000001");
+        assert_eq!(on(&mut h, "unlink", json!({"link": "lnk-00000001"})).expect("by id")["unlinked"], json!(["lnk-00000001"]));
+    }
+
+    #[test]
+    fn a_member_whose_copy_is_missing_is_found_through_its_peers() {
+        let mut h = both();
+        on(&mut h, "link", json!({"devices": ["xr", "pixel"], "ports": {"xr": [8080]}})).expect("linked");
+        // pixel's copy went (an erase outside simee, a write that failed).
+        h.rec.files.remove(&records::fake::key(Platform::Android, "pixel"));
+        assert_eq!(on(&mut h, "links", json!({"device": "pixel"})).expect("of pixel")[0]["id"], "lnk-00000001");
+        assert_eq!(on(&mut h, "link_status", json!({"device": "pixel"})).expect("status")["link"]["id"], "lnk-00000001");
+        let r = on(&mut h, "unlink", json!({"device": "pixel"})).expect("unlink");
+        assert_eq!(r["unlinked"], json!(["lnk-00000001"]));
+        assert!(h.rec.files.is_empty() && h.rec.forwards.is_empty(), "xr's copy and the forward went too");
+    }
+
+    #[test]
+    fn a_forward_the_adb_server_dropped_isnt_removed_again() {
+        let mut h = both();
+        on(&mut h, "link", json!({"devices": ["xr", "pixel"], "ports": {"xr": [8080]}})).expect("linked");
+        // xr rebooted: tcp:41001 went, and the kernel gave it to another device's forward.
+        h.rec.forwards = vec![("pixel2".into(), 41001, 22)];
+        on(&mut h, "link", json!({"devices": ["xr", "pixel"], "ports": {"pixel": [5000]}})).expect("other ports");
+        assert!(!h.rec.changes().iter().any(|c| c.starts_with("remove")), "{:?}", h.rec.changes());
+        h.rec.forwards.retain(|(d, ..)| d == "pixel2");
+        let r = on(&mut h, "unlink", json!({"device": "xr"})).expect("unlinked");
+        assert_eq!(r["teardown"], json!([{"id": "lnk-00000001"}]), "nothing left to tear down is no error");
+        assert_eq!(h.rec.forwards, [("pixel2".to_owned(), 41001, 22)], "another forward on that host port stays");
+    }
+
+    #[test]
+    fn link_holds_every_members_lock_in_sorted_order_before_it_reads() {
+        let mut h = both();
+        on(&mut h, "link", json!({"devices": ["xr", "pixel"]})).expect("linked");
+        assert_eq!(h.rec.calls[..2], ["hold pixel".to_owned(), "hold xr".to_owned()], "{:?}", h.rec.calls);
+    }
+
+    #[test]
+    fn an_erase_keeps_the_devices_links_file() {
+        let dir = std::env::temp_dir().join(format!("simee-links-erase-{}", std::process::id()));
+        let state = dir.join("data/simee");
+        std::fs::create_dir_all(&state).expect("state dir");
+        std::fs::write(state.join(records::LINKS_FILE), "{\"links\": []}\n").expect("links.json");
+        let wiped = records::kept_around(&state, || std::fs::remove_dir_all(dir.join("data")).map_err(|e| e.to_string()));
+        assert_eq!(wiped, Ok(()));
+        assert_eq!(std::fs::read_to_string(state.join(records::LINKS_FILE)).expect("kept"), "{\"links\": []}\n");
+        // No file before: none after.
+        std::fs::remove_dir_all(dir.join("data")).expect("wipe");
+        assert_eq!(records::kept_around(&state, || Ok::<_, String>(7)), Ok(7));
+        assert!(!state.join(records::LINKS_FILE).exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
