@@ -266,6 +266,7 @@ shell)
     "pm uninstall com.missing.app") echo "Failure [DELETE_FAILED_INTERNAL_ERROR]";;
     "pm uninstall "*) echo "Success";;
     "pm list packages -3") printf 'package:com.example.app\npackage:com.example.zeta\n';;
+    "pm list packages -3 -f") printf 'package:/data/app/~~Ab==/com.example.app-Cd==/base.apk=com.example.app\n';;
     "pm list packages") printf 'package:com.android.settings\npackage:com.example.zeta\npackage:android\npackage:com.example.app\n';;
     # Device state (#418): settings and SystemUI's demo broadcasts succeed, com.example.app is in
     # the foreground, and a trim-memory signal reaches it.
