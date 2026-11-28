@@ -45,6 +45,7 @@ pub fn call(_: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "devices" | "runtimes" | "device_types" => Ok(Value::Array(Vec::new())),
         "create" => Err(format!("cannot create an iOS device: {REASON}")),
         "boot_many" => Err(format!("cannot boot iOS devices: {REASON}")),
+        "import" => Err(format!("cannot import an iOS device: {REASON}")),
         _ => {
             let q = str_param(p, "device").unwrap_or("booted");
             Err(format!("no device matches `{q}` ({REASON})"))

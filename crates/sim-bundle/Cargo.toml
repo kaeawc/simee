@@ -22,6 +22,11 @@ serde_json.workspace = true
 sim-core.workspace = true
 thiserror.workspace = true
 lz4_flex.workspace = true
+unicode-normalization.workspace = true
+
+# Writing under an import's destination through directory fds, never following a link.
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
 
 [lints]
 workspace = true
