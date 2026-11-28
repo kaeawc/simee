@@ -1,11 +1,79 @@
 //! Network shaping for the NAT, as the console's `network speed|delay` asks for it (stock's
 //! netshaper and netdelay): a token-bucket rate for each direction (0 = unlimited) and a
-//! latency drawn between a minimum and a maximum for each frame inbound. Pure logic over
-//! caller-supplied instants, so it tests without sleeping.
+//! latency drawn between a minimum and a maximum for each frame inbound, and simee's
+//! `network loss`: a percent of each direction's IP packets dropped at random. Pure logic over
+//! caller-supplied instants and seeds, so it tests without sleeping or chance.
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use sim_core::network::Conditions;
+
+use super::packet;
+
+/// xorshift64*: one step of a nonzero state, its top 53 bits as a draw in [0, 1).
+fn draw(state: &mut u64) -> f64 {
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// splitmix64 of `x`: spreads a small seed over the state, so seeds 1 and 2 start far apart.
+fn mix(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// A seed for one boot's loss, from the clock.
+pub fn clock_seed() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64)
+}
+
+/// One direction's loss: the percent dropped and its own random stream.
+struct Lossy {
+    pct: f64,
+    rng: u64,
+}
+
+impl Lossy {
+    fn drops(&mut self, frame: &[u8]) -> bool {
+        // No draw for no loss or for a frame that is never dropped, so neither moves the pattern.
+        self.pct > 0.0 && packet::droppable(frame) && draw(&mut self.rng) * 100.0 < self.pct
+    }
+}
+
+/// `network loss`: each direction drops its percent of the guest's IP packets (TCP, UDP and
+/// ICMP; never ARP) from a stream of its own, seeded once per boot: what one direction carries
+/// never moves the other's pattern, and a fixed seed repeats both exactly.
+pub struct Loss {
+    up: Lossy,
+    down: Lossy,
+}
+
+impl Loss {
+    pub fn new(seed: u64) -> Loss {
+        let stream = |salt: u64| mix(seed ^ salt) | 1;
+        Loss { up: Lossy { pct: 0.0, rng: stream(0x7570) }, down: Lossy { pct: 0.0, rng: stream(0x646f_776e) } }
+    }
+
+    /// Sets each direction's percent (clamped to 0..=100; NaN is none). The streams go on.
+    pub fn set(&mut self, up_pct: f64, down_pct: f64) {
+        let pct = |p: f64| if p.is_nan() { 0.0 } else { p.clamp(0.0, 100.0) };
+        (self.up.pct, self.down.pct) = (pct(up_pct), pct(down_pct));
+    }
+
+    /// Whether to drop a frame from the guest.
+    pub fn drop_up(&mut self, frame: &[u8]) -> bool {
+        self.up.drops(frame)
+    }
+
+    /// Whether to drop a frame for the guest.
+    pub fn drop_down(&mut self, frame: &[u8]) -> bool {
+        self.down.drops(frame)
+    }
+}
 
 /// The smallest burst a bucket holds, in bits: one full-size frame, so a frame always fits.
 const MIN_BURST_BITS: f64 = 12_144.0;
@@ -258,7 +326,112 @@ mod tests {
     const FRAME: usize = 1500;
 
     fn cond(up: f64, down: f64, min: i32, max: i32) -> Conditions {
-        Conditions { upload_bps: up, download_bps: down, min_latency_ms: min, max_latency_ms: max }
+        Conditions { upload_bps: up, download_bps: down, min_latency_ms: min, max_latency_ms: max, ..Conditions::default() }
+    }
+
+    /// An IPv4 frame of `proto` (the rest zero): all `Loss` looks at.
+    fn ip(proto: u8) -> Vec<u8> {
+        let mut f = vec![0u8; 64];
+        f[12..14].copy_from_slice(&[0x08, 0x00]);
+        f[14] = 0x45;
+        f[23] = proto;
+        f
+    }
+
+    fn arp() -> Vec<u8> {
+        let mut f = vec![0u8; 42];
+        f[12..14].copy_from_slice(&[0x08, 0x06]);
+        f
+    }
+
+    /// Which of `n` frames each way a loss drops, as a string of `x` (dropped) and `.`.
+    fn pattern(loss: &mut Loss, up: bool, n: usize) -> String {
+        let f = ip(super::super::packet::PROTO_UDP);
+        (0..n).map(|_| if if up { loss.drop_up(&f) } else { loss.drop_down(&f) } { 'x' } else { '.' }).collect()
+    }
+
+    #[test]
+    fn a_fixed_seed_drops_a_fixed_pattern_at_0_50_and_100_percent() {
+        let mut l = Loss::new(7);
+        assert_eq!(pattern(&mut l, true, 64), ".".repeat(64), "no loss by default");
+        l.set(0.0, 0.0);
+        assert_eq!(pattern(&mut l, false, 64), ".".repeat(64));
+        l.set(100.0, 100.0);
+        assert_eq!(pattern(&mut l, true, 64), "x".repeat(64));
+        assert_eq!(pattern(&mut l, false, 64), "x".repeat(64));
+        let half = |seed| {
+            let mut l = Loss::new(seed);
+            l.set(50.0, 50.0);
+            (pattern(&mut l, true, 32), pattern(&mut l, false, 32))
+        };
+        // The same seed repeats exactly; another seed doesn't.
+        assert_eq!(half(7), half(7));
+        assert_ne!(half(7), half(8));
+        let (up, down) = half(7);
+        assert_eq!((up.as_str(), down.as_str()), PATTERN_SEED_7);
+        // Near half over many draws.
+        let mut l = Loss::new(7);
+        l.set(50.0, 10.0);
+        let up = pattern(&mut l, true, 10_000).matches('x').count();
+        let down = pattern(&mut l, false, 10_000).matches('x').count();
+        assert!((4_800..=5_200).contains(&up), "{up}");
+        assert!((900..=1_100).contains(&down), "{down}");
+    }
+
+    /// Seed 7 at 50% each way: the first 32 decisions up, then down (pinned, so a change to
+    /// the generator is a deliberate one).
+    const PATTERN_SEED_7: (&str, &str) = ("x....xx......x.x..xxx...xxxxxx..", "xx.xxx..x.x...xx..xx...x...xxxx.");
+
+    #[test]
+    fn each_direction_draws_from_its_own_stream() {
+        let only_down = {
+            let mut l = Loss::new(42);
+            l.set(50.0, 50.0);
+            pattern(&mut l, false, 200)
+        };
+        // However much the upload drew first, and at whatever percent, the download's pattern
+        // is the same.
+        for (up_pct, up_draws) in [(50.0, 0), (50.0, 1), (50.0, 333), (100.0, 50), (0.0, 50)] {
+            let mut l = Loss::new(42);
+            l.set(up_pct, 50.0);
+            pattern(&mut l, true, up_draws);
+            assert_eq!(pattern(&mut l, false, 200), only_down, "after {up_draws} upload draws at {up_pct}%");
+        }
+        // And one direction lossless leaves the other lossy.
+        let mut l = Loss::new(42);
+        l.set(0.0, 100.0);
+        assert_eq!((pattern(&mut l, true, 8), pattern(&mut l, false, 8)), (".".repeat(8), "x".repeat(8)));
+    }
+
+    /// TCP, UDP and ICMP packets may be dropped; ARP and anything not IPv4 never are, and
+    /// draw nothing (so they don't move the pattern).
+    #[test]
+    fn only_ip_packets_are_dropped_and_link_control_never() {
+        use super::super::packet::{PROTO_ICMP, PROTO_TCP, PROTO_UDP};
+        let mut l = Loss::new(1);
+        l.set(100.0, 100.0);
+        for p in [PROTO_TCP, PROTO_UDP, PROTO_ICMP] {
+            assert!(l.drop_up(&ip(p)) && l.drop_down(&ip(p)), "proto {p}");
+        }
+        let mut ipv6 = ip(PROTO_TCP);
+        ipv6[12..14].copy_from_slice(&[0x86, 0xdd]);
+        for f in [arp(), ip(2), ipv6, vec![0u8; 10], Vec::new()] {
+            assert!(!l.drop_up(&f) && !l.drop_down(&f), "{f:?}");
+        }
+        let plain = {
+            let mut l = Loss::new(3);
+            l.set(50.0, 50.0);
+            pattern(&mut l, true, 50)
+        };
+        let mut l = Loss::new(3);
+        l.set(50.0, 50.0);
+        let mixed: String = (0..50)
+            .map(|_| {
+                assert!(!l.drop_up(&arp()));
+                if l.drop_up(&ip(PROTO_UDP)) { 'x' } else { '.' }
+            })
+            .collect();
+        assert_eq!(mixed, plain, "ARP draws nothing");
     }
 
     /// Pushes `n` frames at `t0` and returns when the last is due.

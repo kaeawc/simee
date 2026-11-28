@@ -122,6 +122,9 @@ pub struct Step {
     pub args: Vec<String>,
     /// Relative to the repository root.
     pub dir: Option<&'static str>,
+    /// Print the step's output as it runs instead of holding it until it ends, so a hung test
+    /// shows in the log (#509). Only set on Windows; macOS and Linux keep the buffered output.
+    pub stream: bool,
 }
 
 /// A step that is not run, and why (printed as `skipped: ...`).
@@ -132,7 +135,13 @@ pub enum Planned {
 }
 
 fn step(label: &str, program: &str, args: &[&str]) -> Planned {
-    Planned::Run(Step { label: label.into(), program: program.into(), args: args.iter().map(|a| (*a).into()).collect(), dir: None })
+    Planned::Run(Step {
+        label: label.into(),
+        program: program.into(),
+        args: args.iter().map(|a| (*a).into()).collect(),
+        dir: None,
+        stream: false,
+    })
 }
 
 fn skip(label: &str, why: &str) -> Planned {
@@ -207,7 +216,11 @@ pub fn plan(mode: Mode, host: &Host, have: &Tools, changed: &[String]) -> Vec<Pl
             ],
         ));
     } else {
-        steps.push(step("tests", "cargo", &["test", "--workspace", "--no-fail-fast", "--quiet"]));
+        let mut tests = step("tests", "cargo", &["test", "--workspace", "--no-fail-fast", "--quiet"]);
+        if let Planned::Run(s) = &mut tests {
+            s.stream = host.os == "windows";
+        }
+        steps.push(tests);
     }
     if host.os == "macos" {
         steps.push(step(
@@ -230,6 +243,7 @@ pub fn plan(mode: Mode, host: &Host, have: &Tools, changed: &[String]) -> Vec<Pl
                 program: "cargo".into(),
                 args: args.iter().map(|a| (*a).into()).collect(),
                 dir: Some("desktop"),
+                stream: false,
             }));
         }
     }
@@ -256,7 +270,26 @@ fn execute(root: &Path, steps: &[Planned]) -> Result<(), Failure> {
                 print!("check: {:<34}", step.label);
                 let start = Instant::now();
                 let dir = step.dir.map_or_else(|| root.to_path_buf(), |d| root.join(d));
-                let out = Command::new(&step.program).args(&step.args).current_dir(&dir).output();
+                let mut command = Command::new(&step.program);
+                command.args(&step.args).current_dir(&dir);
+                if step.stream {
+                    println!("(streaming)");
+                    let status = command.status();
+                    let secs = start.elapsed().as_secs();
+                    match status {
+                        Ok(s) if s.success() => println!("check: {:<34}ok  ({secs}s)", step.label),
+                        Ok(_) => {
+                            println!("check: {:<34}FAILED ({secs}s)\n\n  rerun: {}", step.label, rerun(step));
+                            return Err(Failure::Check);
+                        }
+                        Err(e) => {
+                            println!("check: {:<34}FAILED ({secs}s)\n\n{}: {e}\n\n  rerun: {}", step.label, step.program, rerun(step));
+                            return Err(Failure::Check);
+                        }
+                    }
+                    continue;
+                }
+                let out = command.output();
                 let secs = start.elapsed().as_secs();
                 match out {
                     Ok(o) if o.status.success() => println!("ok  ({secs}s)"),
@@ -377,6 +410,10 @@ mod tests {
             )
         );
         assert!(!labels(&steps).iter().any(|l| l.starts_with("clippy (")), "no other platform to check from Windows");
+        let streams = |steps: &[Planned]| steps.iter().any(|s| matches!(s, Planned::Run(s) if s.label == "tests" && s.stream));
+        assert!(streams(&steps), "Windows streams the tests so a hung test shows in the log");
+        let linux_steps = plan(Mode::Changed, &linux(), &Tools { nextest: false, ..all_tools() }, &files(&["crates/sim-core/src/lib.rs"]));
+        assert!(!streams(&linux_steps), "Linux and macOS keep the buffered output");
     }
 
     #[test]
@@ -417,7 +454,7 @@ mod tests {
         assert!(steps.iter().any(|s| matches!(s, Planned::Skip { label, why } if label == "desktop tests" && why.contains("#250"))));
         assert!(!steps.iter().any(|s| matches!(s, Planned::Run(s) if s.dir.is_some())));
         assert_eq!(
-            rerun(&Step { label: "x".into(), program: "cargo".into(), args: vec!["test".into()], dir: Some("desktop") }),
+            rerun(&Step { label: "x".into(), program: "cargo".into(), args: vec!["test".into()], dir: Some("desktop"), stream: false }),
             "cd desktop && cargo test"
         );
     }

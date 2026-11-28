@@ -63,9 +63,9 @@ pub fn effect(method: &str) -> Option<Effect> {
         "stream_status" | "streams" => Read,
         "stream_stop" => Destroy,
         "help" | "identity" | "host" | "devices_usage" | "form_factors" | "devices" | "runtimes" | "device_types" | "screen"
-        | "screenshot" | "apps" | "ca_debug_state" | "logs" | "processes" | "connections" | "traffic" | "containers" | "ls" | "read"
-        | "du" | "crash_reports" | "info" | "defaults_read" | "network_state" | "network_flows" | "network_env" | "audio_state"
-        | "settle" | "admission_check" | "camera_sources" | "camera_links" => Read,
+        | "screenshot" | "wait_idle" | "apps" | "ca_debug_state" | "logs" | "processes" | "connections" | "traffic" | "containers"
+        | "ls" | "read" | "du" | "crash_reports" | "info" | "defaults_read" | "network_state" | "network_flows" | "network_env"
+        | "audio_state" | "settle" | "admission_check" | "camera_sources" | "camera_links" => Read,
         // Saved with the device and applied live: linking the same source again changes nothing.
         "camera_link" | "camera_unlink" => Set,
         "appearance" | "location" | "status_bar" | "clear_status_bar" | "content_size" | "increase_contrast" | "dynamic_island"
@@ -170,7 +170,7 @@ pub fn group(method: &str) -> Option<Group> {
         "help" | "identity" | "host" | "devices_usage" => Host,
         "form_factors" | "devices" | "runtimes" | "device_types" | "create" | "delete" | "boot" | "boot_many" | "admission_check"
         | "settle" | "profile" | "clone" | "export" | "import" | "shutdown" | "erase" | "info" => Lifecycle,
-        "screen" | "screenshot" | "contrast_check" | "logs" => Observe,
+        "screen" | "screenshot" | "wait_idle" | "contrast_check" | "logs" => Observe,
         "tap" | "swipe" | "touch" | "button" | "type" | "key" | "rotate" | "fold" | "xr" | "touchpad" | "stylus" | "rotary"
         | "watch_gesture" | "remote_swipe" | "pointer" | "biometric" => Input,
         "open_url" | "install" | "uninstall" | "launch" | "terminate" | "apps" | "privacy" | "push" => Apps,

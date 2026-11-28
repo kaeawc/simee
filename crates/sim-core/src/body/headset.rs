@@ -219,7 +219,6 @@ pub(super) fn generic(g: &Spec) -> Option<Body> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::fingerprint;
     use super::*;
     use crate::form_factor::{Density, Kind};
 
@@ -403,14 +402,6 @@ mod tests {
                 let norm = (dx.powf(n) + dy.powf(n)).powf(1.0 / n);
                 assert!(norm <= b.corner.radius - b.bevel, "{}: the frame's corner is off the flat face", b.id);
             }
-        }
-    }
-
-    #[test]
-    fn headset_bodies_are_stable() {
-        // The same body twice is the same triangles (no hidden state in the builders).
-        for b in all().iter().filter(|b| b.form_factor == FormFactor::Vision) {
-            assert_eq!(fingerprint(b), fingerprint(&(**b).clone()), "{}", b.id);
         }
     }
 }

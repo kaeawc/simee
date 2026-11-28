@@ -654,6 +654,7 @@ fn the_iphone_duo_inner_screen_lies_on_its_side() {
 /// FNV-1a over a body's every field (its `Debug`, whose f32s print exactly; a body with no
 /// extras prints as it did before `extras` existed) and its mesh's bits: equal fingerprints are
 /// the same body and the same triangles.
+#[cfg(target_os = "macos")]
 pub(super) fn fingerprint(b: &Body) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut eat = |bytes: &[u8]| {
@@ -672,6 +673,9 @@ pub(super) fn fingerprint(b: &Body) -> u64 {
     h
 }
 
+// The fingerprints are raw f32 mesh bits, which libm differs on by platform (sin/cos): pinned on
+// macOS, where they were taken.
+#[cfg(target_os = "macos")]
 #[test]
 fn phone_tablet_and_foldable_bodies_are_unchanged_by_the_split() {
     // As they were before each form factor got its module (#500); the watches' own pin is in
