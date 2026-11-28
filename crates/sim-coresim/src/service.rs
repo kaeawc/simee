@@ -299,11 +299,20 @@ impl Context {
         Self::open(None)
     }
 
-    /// Connects to the service on the device set at `set` (an absolute directory, made if
-    /// missing), or on the default set (`~/Library/Developer/CoreSimulator/Devices`) for `None`
-    /// (#409). Simulator.app opens a window for each device of the default set that boots; a
-    /// device of another set (as `simctl --set` makes) boots with no window.
+    /// Connects to the service on the device set at `set` (an absolute directory that exists), or
+    /// on the default set (`~/Library/Developer/CoreSimulator/Devices`) for `None` (#409).
+    /// Simulator.app opens a window for each device of the default set that boots; a device of
+    /// another set (as `simctl --set` makes) boots with no window.
     pub fn open(set: Option<&str>) -> Result<Self> {
+        if let Some(path) = set {
+            if !path.starts_with('/') {
+                return Err(Error::Invalid(format!("a device set is an absolute path, not `{path}`")));
+            }
+            // Opening a set makes nothing: a caller that creates devices makes its directory first.
+            if !std::path::Path::new(path).is_dir() {
+                return Err(Error::Invalid(format!("the device set {path} doesn't exist: `create` a device in it to make it")));
+            }
+        }
         let dir = developer_dir()?;
         Library::open(CORE_SIMULATOR)?;
         let kit = open_simulator_kit(&dir)?;
@@ -322,10 +331,6 @@ impl Context {
                 unsafe { msg_send![&*context, defaultDeviceSetWithError: _] }
             }
             Some(path) => {
-                if !path.starts_with('/') {
-                    return Err(Error::Invalid(format!("a device set is an absolute path, not `{path}`")));
-                }
-                std::fs::create_dir_all(path).map_err(|e| Error::Invalid(format!("device set {path}: {e}")))?;
                 rt::require(&context, sel!(deviceSetWithPath:error:))?;
                 // SAFETY: the method exists (checked) and takes (NSString, NSError**), returning the
                 // device set at that path (nil with the error set on failure).

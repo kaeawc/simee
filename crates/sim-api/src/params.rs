@@ -39,7 +39,22 @@ pub fn device_set_with(p: &Value, env: Option<&str>) -> Result<Option<String>, S
         Some(Value::String(set)) => Some(set.as_str()),
         Some(other) => return Err(format!("set must be a device set's directory (a string), not {other}")),
     };
-    sim_core::device::device_set(param, env)
+    Ok(sim_core::device::device_set(param, env)?.map(|set| real_dir(&set)))
+}
+
+/// `dir` (absolute and plain) with symlinks resolved, so one set has one name whatever it was
+/// called (`/tmp/s` is `/private/tmp/s` on macOS): its deepest existing ancestor's real path, then
+/// the parts not made yet.
+fn real_dir(dir: &str) -> String {
+    let path = std::path::Path::new(dir);
+    for base in path.ancestors() {
+        if let Ok(real) = base.canonicalize() {
+            let rest = path.strip_prefix(base).unwrap_or(std::path::Path::new(""));
+            let real = if rest.as_os_str().is_empty() { real } else { real.join(rest) };
+            return real.display().to_string();
+        }
+    }
+    dir.to_owned()
 }
 
 pub fn need_f64(p: &Value, key: &str) -> Result<f64, String> {
@@ -426,6 +441,23 @@ mod tests {
         let err = device_set_with(&json!({"set": 7}), None).expect_err("not a path");
         assert!(err.contains("set") && err.contains('7'), "{err}");
         assert!(device_set_with(&json!({"set": "rel"}), None).expect_err("relative").contains("absolute"));
+    }
+
+    /// #409: a set is named by its real directory, symlinks resolved (`/tmp` is `/private/tmp` on
+    /// macOS), so two spellings of one set share one connection; a part that doesn't exist yet
+    /// (a set `create` will make) keeps its name under its real parent.
+    #[test]
+    fn a_device_set_is_named_by_its_real_directory() {
+        let dir = std::path::PathBuf::from("/tmp").join(format!("simee-409-real-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("set")).expect("dir");
+        let real = dir.canonicalize().expect("real");
+        let named = |set: String| device_set_with(&json!({"set": set}), None).expect("set").expect("a set");
+        let shown = |p: &std::path::Path| p.display().to_string();
+        assert_eq!(named(shown(&dir.join("set"))), shown(&real.join("set")));
+        assert_eq!(named(format!("{}/./set/", dir.display())), shown(&real.join("set")));
+        assert_eq!(named(shown(&dir.join("new/set"))), shown(&real.join("new/set")), "made later by create");
+        assert_eq!(device_set_with(&json!({}), Some(&shown(&dir.join("set")))), Ok(Some(shown(&real.join("set")))), "the environment's");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

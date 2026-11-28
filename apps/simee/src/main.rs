@@ -30,8 +30,8 @@ struct Cli {
     /// server fail instead of running here.
     #[arg(long, global = true)]
     verbose: bool,
-    /// The iOS device set to work in: a directory of simulators, as `simctl --set` takes (made if
-    /// missing). Its devices boot with no Simulator.app window. Default: `$SIMEE_IOS_DEVICE_SET`,
+    /// The iOS device set to work in: a directory of simulators, as `simctl --set` takes (`create`
+    /// makes it). Its devices boot with no Simulator.app window. Default: `$SIMEE_IOS_DEVICE_SET`,
     /// else the default set; `--set ''` is the default set. For `serve` and `mcp`, set
     /// `SIMEE_IOS_DEVICE_SET` instead.
     #[arg(long, global = true, value_name = "DIR")]
@@ -556,8 +556,8 @@ fn mcp_http_config(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let set = cli.set.as_deref().map(set_arg);
-    if set.is_some() && matches!(cli.command, Cmd::Serve { .. } | Cmd::Mcp { .. }) {
+    let set = command_set(cli.set.as_deref(), std::env::var(sim_core::device::DEVICE_SET_ENV).ok().as_deref());
+    if cli.set.is_some() && matches!(cli.command, Cmd::Serve { .. } | Cmd::Mcp { .. }) {
         anyhow::bail!("--set names the device set of one command; start a server on a set with SIMEE_IOS_DEVICE_SET=<dir>");
     }
     match &cli.command {
@@ -624,7 +624,14 @@ fn set_arg(dir: &str) -> String {
     }
 }
 
-/// `params` with `set` added when `--set` named one and they have none (#409).
+/// The iOS device set this command works in, sent with every call (#409): `--set`, else this
+/// process's `SIMEE_IOS_DEVICE_SET` (`env`), else `""`, the default set. It is always said, so a
+/// server never fills it in from its own environment.
+fn command_set(flag: Option<&str>, env: Option<&str>) -> Option<String> {
+    Some(set_arg(flag.or(env).unwrap_or("")))
+}
+
+/// `params` with the command's `set` added when they have none (#409).
 fn with_set(params: Value, set: Option<&str>) -> Value {
     let Some(set) = set else { return params };
     let mut params = if params.is_null() { json!({}) } else { params };
@@ -661,7 +668,7 @@ struct Transport {
     local: Option<Box<sim_api::Session>>,
     verbose: bool,
     require: bool,
-    /// `--set`: the iOS device set sent with every method.
+    /// The command's iOS device set ([`command_set`]), sent with every method.
     set: Option<String>,
 }
 
@@ -1360,8 +1367,8 @@ mod tests {
     use super::*;
 
     /// #409: `--set` goes with every method a command calls, as an absolute path, before or after
-    /// the subcommand; a `set` the params already have stays; without `--set` nothing is added
-    /// (the process that runs the method reads `SIMEE_IOS_DEVICE_SET`).
+    /// the subcommand; a `set` the params already have stays; with no set at all (a test's
+    /// transport) nothing is added.
     #[test]
     fn the_set_flag_goes_with_every_call_as_an_absolute_path() {
         let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("simee").chain(args.iter().copied())).expect("arguments");
@@ -1754,19 +1761,26 @@ mod tests {
     /// A server on `socket` that records each method it is sent and answers with `answer`; `None`
     /// never answers (a wedged server).
     fn fake_server(socket: &std::path::Path, answer: Option<Answer>) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        fake_server_params(socket, answer).0
+    }
+
+    /// [`fake_server`], recording each request's params too.
+    fn fake_server_params(socket: &std::path::Path, answer: Option<Answer>) -> (Seen<String>, Seen<Value>) {
         use std::io::BufRead;
         let listener = std::os::unix::net::UnixListener::bind(socket).expect("bind");
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let record = seen.clone();
+        let params = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (record, record_params) = (seen.clone(), params.clone());
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let record = record.clone();
+                let (record, record_params) = (record.clone(), record_params.clone());
                 std::thread::spawn(move || {
                     let mut writer = stream.try_clone().expect("clone");
                     for line in std::io::BufReader::new(stream).lines().map_while(Result::ok) {
                         let req: Value = serde_json::from_str(&line).expect("request");
                         let method = req["method"].as_str().unwrap_or("").to_owned();
                         record.lock().expect("lock").push(method.clone());
+                        record_params.lock().expect("lock").push(req["params"].clone());
                         match answer {
                             Some(answer) => {
                                 let reply = match answer(&method) {
@@ -1781,7 +1795,38 @@ mod tests {
                 });
             }
         });
-        seen
+        (seen, params)
+    }
+
+    /// What a fake server has been sent, as it arrives.
+    type Seen<T> = std::sync::Arc<std::sync::Mutex<Vec<T>>>;
+
+    /// #409: the device set is this command's, said on every call: `--set`, else this process's
+    /// `SIMEE_IOS_DEVICE_SET` (made absolute), else the default set (`""`). A server with another
+    /// set in its environment never picks the set (it would be the owner's default set).
+    #[test]
+    fn the_commands_own_device_set_reaches_a_server_on_every_call() {
+        let root = android_root("set-forward");
+        let cwd = std::env::current_dir().expect("cwd");
+        for (i, (flag, env, sent)) in [
+            (None, Some("/farm/sims"), "/farm/sims".to_owned()),
+            (None, Some("farm/sims"), cwd.join("farm/sims").display().to_string()),
+            (Some("/mine"), Some("/farm/sims"), "/mine".to_owned()),
+            (Some(""), Some("/farm/sims"), String::new()),
+            (None, None, String::new()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let socket = root.join(format!("{i}.sock"));
+            let (seen, params) =
+                fake_server_params(&socket, Some(|m| Ok(if m == "identity" { sim_api::identity().clone() } else { Value::Null })));
+            let mut transport = Transport { set: command_set(flag, env), ..Transport::open(&socket) };
+            assert_eq!(outputs(&mut transport, &["shutdown", "booted"]).2, None, "{flag:?} {env:?}");
+            assert_eq!(*seen.lock().expect("lock"), ["identity", "shutdown"], "{flag:?} {env:?}: forwarded");
+            assert_eq!(params.lock().expect("lock")[1], json!({"device": "booted", "set": sent}), "{flag:?} {env:?}");
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

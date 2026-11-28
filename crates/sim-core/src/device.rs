@@ -180,8 +180,8 @@ pub const DEVICE_SET_ENV: &str = "SIMEE_IOS_DEVICE_SET";
 /// else the one `env` ([`DEVICE_SET_ENV`]) names, else `None`, the default set
 /// (`~/Library/Developer/CoreSimulator/Devices`, the one Simulator.app shows). An empty `param`
 /// is the default set even when `env` names another; an empty `env` names none. A set is an
-/// absolute path (the service resolves it, not the caller's working directory), and trailing
-/// slashes are dropped so that one set has one name.
+/// absolute path (the service resolves it, not the caller's working directory), written plainly
+/// (no trailing, doubled or `.` slashes, `..` applied) so that one set has one name.
 pub fn device_set(param: Option<&str>, env: Option<&str>) -> Result<Option<String>, String> {
     let (path, from) = match (param, env) {
         (Some(""), _) | (None, None | Some("")) => return Ok(None),
@@ -191,9 +191,17 @@ pub fn device_set(param: Option<&str>, env: Option<&str>) -> Result<Option<Strin
     if !path.starts_with('/') {
         return Err(format!("{from} must be an absolute path to a device set's directory, not `{path}`"));
     }
-    match path.trim_end_matches('/') {
-        "" => Err(format!("{from} must be a device set's own directory, not `{path}`")),
-        dir => Ok(Some(dir.to_owned())),
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => drop(parts.pop()),
+            part => parts.push(part),
+        }
+    }
+    match parts.is_empty() {
+        true => Err(format!("{from} must be a device set's own directory, not `{path}`")),
+        false => Ok(Some(format!("/{}", parts.join("/")))),
     }
 }
 
@@ -222,6 +230,11 @@ mod tests {
         // One set, one name: trailing slashes are dropped.
         assert_eq!(device_set(Some("/call/set/"), None), Ok(Some("/call/set".into())));
         assert_eq!(device_set(None, Some("/farm/set//")), Ok(Some("/farm/set".into())));
+        // ... and so are `.`, doubled slashes and `..` (#409): each spelling is one connection.
+        for spelling in ["/farm/./set", "/farm//set", "/farm/x/../set", "/farm/set/.", "/../farm/set"] {
+            assert_eq!(device_set(Some(spelling), None), Ok(Some("/farm/set".into())), "{spelling}");
+        }
+        assert_eq!(device_set(Some("/farm/.."), None), Err("set must be a device set's own directory, not `/farm/..`".into()));
     }
 
     #[test]

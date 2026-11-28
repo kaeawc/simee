@@ -271,18 +271,26 @@ const UNAVAILABLE: &str = if cfg!(target_os = "linux") {
 
 /// The device behind the `device` parameter, through `info` (and `screen`, with `screen`).
 fn lookup(s: &mut Session, p: &Value, screen: bool) -> Result<Target, String> {
-    // The device set this call named, said again to the calls below (`""` is the default set).
-    let set = s.ios.set()?;
-    let in_set = json!(set.clone().unwrap_or_default());
-    let mut query = json!({"device": str_param(p, "device").unwrap_or("booted"), "set": in_set});
+    // The device set this call named, said again to the calls below (`""` is the default set). One
+    // it can't use fails an iOS device only (the calls below say why); an Android device needs none.
+    let set = s.ios.set();
+    let mut query = json!({"device": str_param(p, "device").unwrap_or("booted")});
+    if let Ok(set) = &set {
+        query["set"] = json!(set.clone().unwrap_or_default());
+    }
     if let Some(platform) = p.get("platform") {
         query["platform"] = platform.clone();
     }
     let info = crate::methods::call(s, "info", &query)?;
     let device: DeviceInfo = serde_json::from_value(info["device"].clone()).map_err(|e| format!("info: {e}"))?;
     let avd_dir = info.get("avd_dir").and_then(Value::as_str).map(PathBuf::from);
+    let set = match device.platform {
+        Platform::Ios => set?,
+        Platform::Android => None,
+    };
     let screen = match screen && device.state == DeviceState::Booted {
         true => {
+            let in_set = json!(set.clone().unwrap_or_default());
             let size =
                 crate::methods::call(s, "screen", &json!({"device": device.udid, "platform": device.platform.as_str(), "set": in_set}))?;
             let side = |k: &str| size[k].as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| format!("screen has no {k}: {size}"));
@@ -1575,6 +1583,29 @@ pub(crate) mod tests {
             }
             got
         }
+    }
+
+    /// #409: an iOS device set the call can't use (a relative `SIMEE_IOS_DEVICE_SET`) fails only
+    /// what connects to the simulator service: an Android stream's device is still found.
+    #[test]
+    fn an_unusable_device_set_still_finds_an_android_device_to_stream() {
+        let root = std::path::PathBuf::from("/tmp").join(format!("sa-stream-set-{}", std::process::id()));
+        let image = root.join("sdk/system-images/android-36/google_apis/arm64-v8a");
+        std::fs::create_dir_all(&image).expect("image dir");
+        std::fs::write(image.join("system.img"), b"s").expect("system.img");
+        std::fs::write(image.join("source.properties"), "AndroidVersion.ApiLevel=36\nSystemImage.TagId=google_apis\n").expect("props");
+        let mut android = sim_android::Android::new(emu_avd::Env { sdk_root: Some(root.join("sdk")), avd_home: root.join("avd") });
+        android.running_dir = Some(root.join("running"));
+        android.create("pixel", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        let mut s = Session { fake_env_set: Some(Some("farm/sims".into())), ..Session::with_android(android) };
+        let bad = crate::methods::environment_set(&s).expect_err("relative");
+        s.ios.use_set(Err(bad.clone()));
+        let target = lookup(&mut s, &json!({"device": "pixel"}), false).expect("the AVD");
+        assert_eq!((target.platform, target.udid.as_str(), target.set), (Platform::Android, "pixel", None));
+        // An iOS device can't be streamed from that set: the reason is the set's.
+        let err = lookup(&mut s, &json!({"device": "409409A0-0000-4000-8000-000000000409"}), false).expect_err("iOS");
+        assert!(err.contains("absolute"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     fn stage_names(status: &Value) -> Vec<String> {

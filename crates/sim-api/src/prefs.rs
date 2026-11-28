@@ -394,9 +394,9 @@ impl Backend for Unavailable {
 pub struct Session {
     pub(crate) ios: Box<dyn Backend>,
     pub(crate) android: Box<dyn Backend>,
-    /// The iOS backend of each other device set a call has named (#409), by its directory.
+    /// The iOS backend of the other device sets calls named last (#409), by their directory.
     #[cfg(target_os = "macos")]
-    sets: HashMap<String, Box<dyn Backend>>,
+    sets: crate::ios::PerSet<Box<dyn Backend>>,
 }
 
 impl Default for Session {
@@ -409,7 +409,7 @@ impl Default for Session {
             ios,
             android: Box::new(Unavailable(Platform::Android)),
             #[cfg(target_os = "macos")]
-            sets: HashMap::new(),
+            sets: crate::ios::PerSet::default(),
         }
     }
 }
@@ -423,7 +423,9 @@ impl Session {
         if platform == Platform::Ios
             && let Some(set) = ios.set()?
         {
-            let backend = self.sets.entry(set.clone()).or_insert_with(|| Box::new(ios::Ios::in_set(set, ios.opener())));
+            let open = ios.opener();
+            let key = Some(set.clone());
+            let backend = self.sets.get_or_try(&key, || Ok(Box::new(ios::Ios::in_set(set, open))))?;
             return Ok(&mut **backend);
         }
         #[cfg(not(target_os = "macos"))]

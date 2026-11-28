@@ -426,8 +426,9 @@ mod tests {
         assert!(write["properties"]["text"].is_object() && write["properties"]["base64"].is_object());
         assert_eq!(schema("console")["required"], json!(["device"]));
         assert!(schema("console")["properties"]["commands"].is_object());
-        // `audio_route`'s `uid | "default"` is the uid alone, and required: the quoted word is a value, not a name.
-        assert_eq!(schema("audio_route")["properties"].as_object().map(|p| p.len()), Some(3));
+        // `audio_route`'s `uid | "default"` is the uid alone, and required: the quoted word is a value, not a name
+        // (beside `device`, `scope` and the device set).
+        assert_eq!(schema("audio_route")["properties"].as_object().map(|p| p.len()), Some(4));
         assert_eq!(schema("audio_route")["required"], json!(["device", "scope", "uid"]));
         let rotary = schema("rotary");
         assert_eq!(rotary["required"], json!(["device"]));

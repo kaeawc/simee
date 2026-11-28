@@ -340,10 +340,50 @@ fn with_captures<T>(f: impl FnOnce(&mut std::collections::HashMap<String, sim_au
     f(guard.get_or_insert_with(Default::default))
 }
 
+/// How many device sets a session keeps a connection (or a preferences backend) for (#409): the
+/// ones used last. A farm works in a few; a long-lived server asked about many more reconnects to
+/// one it let go of.
+pub(crate) const MAX_SETS: usize = 8;
+
+/// Something kept per device set (`None`: the default set) for the [`MAX_SETS`] sets used last.
+pub(crate) struct PerSet<T>(Vec<(Option<String>, T)>);
+
+impl<T> Default for PerSet<T> {
+    fn default() -> PerSet<T> {
+        PerSet(Vec::new())
+    }
+}
+
+impl<T> PerSet<T> {
+    /// `set`'s, made by `make` when it isn't kept; the set used longest ago is let go of first.
+    pub(crate) fn get_or_try(&mut self, set: &Option<String>, make: impl FnOnce() -> Result<T, String>) -> Result<&mut T, String> {
+        match self.0.iter().position(|(s, _)| s == set) {
+            // The most recently used set is last.
+            Some(i) => {
+                let entry = self.0.remove(i);
+                self.0.push(entry);
+            }
+            None => {
+                let made = make()?;
+                if self.0.len() >= MAX_SETS {
+                    self.0.remove(0);
+                }
+                self.0.push((set.clone(), made));
+            }
+        }
+        Ok(&mut self.0.last_mut().expect("just pushed").1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 /// One simulator service connection, created on first use.
 pub struct Session {
-    /// One connection per device set used (`None`: the default set), each made on first use.
-    ctxs: Vec<(Option<String>, Context)>,
+    /// A connection per device set used (`None`: the default set), each made on first use.
+    ctxs: PerSet<Context>,
     /// The device set of the call in hand ([`Session::use_set`]), or why it can't be used.
     set: Result<Option<String>, String>,
     open: Opener,
@@ -367,7 +407,7 @@ impl Default for Session {
 impl Session {
     /// A session that connects through `open`.
     pub(crate) fn with_opener(open: Opener) -> Session {
-        Session { ctxs: Vec::new(), set: Ok(None), open }
+        Session { ctxs: PerSet::default(), set: Ok(None), open }
     }
 
     /// The device set the next calls use (#409): a path, `None` for the default set, or why the
@@ -388,15 +428,8 @@ impl Session {
 
     fn ctx(&mut self) -> Result<&Context, String> {
         let set = self.set.clone()?;
-        let i = match self.ctxs.iter().position(|(s, _)| *s == set) {
-            Some(i) => i,
-            None => {
-                let ctx = (self.open)(set.as_deref())?;
-                self.ctxs.push((set, ctx));
-                self.ctxs.len() - 1
-            }
-        };
-        Ok(&self.ctxs[i].1)
+        let open = &self.open;
+        self.ctxs.get_or_try(&set, || open(set.as_deref())).map(|ctx| &*ctx)
     }
 
     fn device(&mut self, p: &Value) -> Result<Device, String> {
@@ -1816,6 +1849,10 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "device_types" => serde_json::to_value(s.ctx()?.device_types().map_err(err)?).map_err(err),
         "create" => {
             let device_type = need_str(p, "device_type")?;
+            // The one method that makes a device set's directory (#409): opening a set makes none.
+            if let Some(set) = s.set()? {
+                std::fs::create_dir_all(&set).map_err(|e| format!("the device set {set}: {e}"))?;
+            }
             if let Some(form_factor) = opt_form_factor(p)? {
                 check_form_factor(s.ctx()?, device_type, form_factor)?;
             }
@@ -2762,6 +2799,33 @@ mod tests {
         }
     }
 
+    /// #409: every iOS method that connects to the service says it takes `set`, so its MCP tool
+    /// schema and `help` offer it (a `delete` without it, after a `create` in a farm's set, would
+    /// delete a default-set device of that name). The ones that never connect don't.
+    #[test]
+    fn every_method_that_connects_declares_its_set() {
+        let mut missing = Vec::new();
+        for (method, params, _) in crate::METHODS {
+            if !crate::platforms(method).contains(&sim_core::platform::Platform::Ios) {
+                continue;
+            }
+            let schema = crate::input_schema(method).expect("schema");
+            let set = &schema["properties"]["set"];
+            if NO_SERVICE.contains(method) {
+                assert!(set.is_null(), "`{method}` never connects, so it takes no set: {params}");
+                continue;
+            }
+            if set.is_null() {
+                missing.push(*method);
+                continue;
+            }
+            assert_eq!(set["type"], "string", "{method}");
+            let ios_only = crate::platforms(method) == [sim_core::platform::Platform::Ios];
+            assert_eq!(set.get("description").is_some(), !ios_only, "`{method}`: `set` is iOS only where Android runs it too: {set}");
+        }
+        assert!(missing.is_empty(), "these iOS methods don't declare `set?`: {missing:?}");
+    }
+
     /// A set the call can't use (a relative path) fails the methods that connect, with the reason,
     /// and connects nowhere.
     #[test]
@@ -2793,12 +2857,58 @@ mod tests {
         assert_eq!(default.set_path(), format!("{home}/Library/Developer/CoreSimulator/Devices"));
         assert_eq!(Context::open(None).expect("default set").set_path(), default.set_path());
         let dir = std::env::temp_dir().join(format!("simee-409-set-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the set's directory (`create` makes it)");
         let custom = Context::open(Some(dir.to_str().expect("utf-8"))).expect("custom set");
         // The service names the set by its resolved path (`/var` is `/private/var` on macOS).
         assert_eq!(std::path::PathBuf::from(custom.set_path()), dir.canonicalize().expect("the set's directory, made"));
         assert!(custom.devices().expect("devices").is_empty(), "a new set has no devices");
         drop(custom);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #409: only `create` makes a device set's directory. Any other method (`devices`, read-only,
+    /// among them) refuses a set that doesn't exist, so a mistyped path fails instead of listing
+    /// nothing and leaving a directory behind.
+    #[test]
+    fn only_create_makes_a_device_set() {
+        let root = std::path::PathBuf::from("/tmp").join(format!("simee-409-missing-{}", std::process::id()));
+        let dir = root.join("set");
+        std::fs::remove_dir_all(&root).ok();
+        let set = dir.display().to_string();
+        let err = Context::open(Some(&set)).err().expect("a missing set is refused").to_string();
+        assert!(err.contains(&set) && err.contains("doesn't exist") && err.contains("create"), "{err}");
+        assert!(!root.exists(), "nothing made");
+        let (open, seen) = fake_service();
+        let mut s = crate::methods::Session { ios: Session::with_opener(open), fake_env_set: Some(None), ..Default::default() };
+        let p = json!({"name": "farm-1", "device_type": "iPhone 17", "runtime": "iOS-27-2", "platform": "ios", "set": set});
+        crate::methods::call(&mut s, "create", &p).expect_err("the fake service refuses");
+        assert!(dir.is_dir(), "create made the set");
+        let real = dir.canonicalize().expect("real").display().to_string();
+        assert_eq!(*seen.lock().expect("seen"), [Some(real)]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// #409: what a session keeps per device set is bounded: the sets used last stay, the one used
+    /// longest ago goes first and is made again when asked for; a failed make keeps nothing.
+    #[test]
+    fn per_set_keeps_the_sets_used_last() {
+        let mut kept = PerSet::default();
+        let made = std::cell::Cell::new(0);
+        let get = |kept: &mut PerSet<usize>, n: usize| {
+            let set = Some(format!("/s/{n}"));
+            *kept.get_or_try(&set, || Ok(made.replace(made.get() + 1))).expect("made")
+        };
+        for n in 0..MAX_SETS {
+            get(&mut kept, n);
+        }
+        // `/s/0` used again: `/s/1` is now the one used longest ago.
+        assert_eq!(get(&mut kept, 0), 0, "kept, not made again");
+        get(&mut kept, MAX_SETS);
+        assert_eq!(kept.len(), MAX_SETS);
+        assert_eq!(get(&mut kept, 0), 0, "still kept");
+        assert_eq!(get(&mut kept, 1), MAX_SETS + 1, "let go of, so made again");
+        assert!(kept.get_or_try(&None, || Err("refused".into())).is_err());
+        assert_eq!(kept.len(), MAX_SETS);
     }
 
     /// A session connects on the set of the call in hand, not the one of the call before.
