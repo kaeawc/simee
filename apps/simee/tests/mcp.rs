@@ -312,10 +312,10 @@ fn deleting_a_device_needs_the_users_confirmation_and_every_call_is_in_the_audit
     let refused = mcp.call("delete", json!({"device": "fold"}));
     assert_eq!(refused["isError"], true, "{refused}");
     assert!(text(&refused).contains("needs the user's confirmation") && text(&refused).contains("`confirm: true`"), "{refused}");
-    assert_eq!(mcp.call("devices", json!({}))["structuredContent"][0]["udid"], "fold", "the device is still there");
+    assert_eq!(mcp.call("devices", json!({"platform": "android"}))["structuredContent"][0]["udid"], "fold", "the device is still there");
     // With the user's agreement it goes through.
     assert_eq!(mcp.call("delete", json!({"device": "fold", "confirm": true})).get("isError"), None);
-    assert_eq!(mcp.call("devices", json!({}))["structuredContent"], json!([]));
+    assert_eq!(mcp.call("devices", json!({"platform": "android"}))["structuredContent"], json!([]));
     assert!(mcp.close().success());
 
     // The log has each call, and `simee mcp-audit` reads it.
@@ -352,7 +352,7 @@ fn a_read_only_server_lists_and_runs_only_what_changes_nothing() {
     let refused = mcp.call("create", json!({"name": "fold", "platform": "android", "system_image": IMAGE}));
     assert_eq!(refused["isError"], true);
     assert!(text(&refused).contains("read-only"), "{refused}");
-    assert_eq!(mcp.call("devices", json!({}))["structuredContent"], json!([]));
+    assert_eq!(mcp.call("devices", json!({"platform": "android"}))["structuredContent"], json!([]));
     assert!(mcp.close().success());
     assert!(!e.state().join("mcp-audit.log").exists(), "--no-audit-log keeps none");
 }
@@ -365,7 +365,7 @@ fn the_device_flag_limits_which_devices_a_client_may_make_and_touch() {
     assert!(refused["result"]["content"][0]["text"].as_str().is_some_and(|t| t.contains("couldn't touch afterwards")), "{refused}");
     let made = mcp.task("create", json!({"name": "ci-fold", "platform": "android", "system_image": IMAGE}));
     assert_eq!(made["status"], "completed", "{made}");
-    assert_eq!(mcp.call("devices", json!({}))["structuredContent"][0]["udid"], "ci-fold");
+    assert_eq!(mcp.call("devices", json!({"platform": "android"}))["structuredContent"][0]["udid"], "ci-fold");
     assert!(mcp.close().success());
 }
 
