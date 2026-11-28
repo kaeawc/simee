@@ -149,11 +149,13 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          android_id). iOS: finds the runtime by identifier and build and refuses, naming what to install, when it isn't \
          installed; creates a simulator of the bundle's device type on that exact build in the set and puts the bundle's \
          data directory in as its own (a new UDID; the keychain and app data come along). Before it makes the device, it \
-         refuses a tree with two paths that are one on a case-insensitive volume (case, ß and ss, and Unicode normalization \
-         folded) or a path under a symlink in any such spelling, and a symlink that resolves out of data/ (following the \
-         tree's own symlinks, at most 32) or to a host path: an absolute target, compared folded with // and . collapsed and \
-         /System/Volumes/Data read as /, under or holding /Users, /Volumes, /tmp, /var/folders (or their /private forms) or \
-         /.vol, or with a `..`. It writes nothing through a symlink. An iOS bundle carries app executables and data its apps \
+         refuses a tree with a path or symlink target holding an ignorable or format code point (a zero-width space, a \
+         bidi control), a target over 1023 bytes, two paths that are one on a case-insensitive volume (case, ß and ss, and \
+         Unicode normalization folded) or a path under a symlink in any such spelling, and a symlink that resolves out of \
+         data/ (following the tree's own symlinks, at most 32, only as the tree spells their names) or to a host path: an \
+         absolute target, compared folded with // and . collapsed and /System/Volumes/Data read as /, under or holding \
+         /Users, /Volumes, /tmp, /var/tmp, /var/folders (or their /private forms), /Library/Caches, /opt/homebrew, \
+         /Applications or /.vol, or with a `..`. It writes nothing through a symlink. An iOS bundle carries app executables and data its apps \
          trust: import one as you would run its code",
     ),
     ("shutdown", "device; iOS: set?", "Shut down"),

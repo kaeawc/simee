@@ -7,7 +7,7 @@
 //! The simulator service is behind [`Service`] (`sim-coresim` implements it over CoreSimulator,
 //! tests over a fake), so all of it builds and tests on any host.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -112,8 +112,23 @@ fn mode(meta: &fs::Metadata) -> Option<u32> {
 }
 
 /// Absolute link targets that name this host rather than the device: its users' homes, volumes,
-/// temporary directories, and any file by its inode (`/.vol/<device>/<inode>`).
-const HOST_ROOTS: [&str; 7] = ["/Users", "/Volumes", "/private/var/folders", "/var/folders", "/private/tmp", "/tmp", "/.vol"];
+/// temporary directories, the directories anyone (`/Library/Caches`), its user (`/opt/homebrew`,
+/// which holds what they run) or an admin (`/Applications`) can write, and any file by its inode
+/// (`/.vol/<device>/<inode>`).
+const HOST_ROOTS: [&str; 12] = [
+    "/Users",
+    "/Volumes",
+    "/private/var/folders",
+    "/var/folders",
+    "/private/var/tmp",
+    "/var/tmp",
+    "/private/tmp",
+    "/tmp",
+    "/Library/Caches",
+    "/opt/homebrew",
+    "/Applications",
+    "/.vol",
+];
 
 /// The firmlink that is the data volume's root: `/System/Volumes/Data/Users` is `/Users`.
 const DATA_VOLUME: &str = "/System/Volumes/Data";
@@ -155,15 +170,107 @@ fn under_data(p: &str) -> &str {
     p.strip_prefix(DATA).and_then(|r| r.strip_prefix('/')).unwrap_or("")
 }
 
+/// The most bytes of link paths and targets the walks of one [`refused_links`] may take in all
+/// ([`leaves_data`] charges each link's path and target, and each target it follows): a tree of
+/// many links that each go through a long chain refuses the rest once it is spent, rather than
+/// costing more than a multiple of the manifest's own bytes. A real device's links take a few
+/// kilobytes.
+const WALK_BUDGET: usize = 1 << 24;
+
+/// The bundle's tree under `data/` as a walk looks names up, built once per [`refused_links`]:
+/// each entry's components [folded](crate::manifest::fold) once, keyed by their directory's node
+/// and the folded name, so a walk finds a name in time linear in its length.
+struct Names<'a> {
+    nodes: Vec<Node<'a>>,
+    children: HashMap<(usize, String), usize>,
+}
+
+struct Node<'a> {
+    /// The name as the tree spells it.
+    name: &'a str,
+    /// Whether the tree spells it in two ways that fold alike (`data/Docs` and `data/docs/x`): a
+    /// volume that keeps them apart has two directories there, so no walk goes through it.
+    ambiguous: bool,
+    /// The target, if it is a symlink.
+    link: Option<&'a str>,
+}
+
+/// The node of the data directory itself.
+const ROOT: usize = 0;
+
+impl<'a> Names<'a> {
+    fn new(tree: &'a [Entry]) -> Names<'a> {
+        let mut names = Names { nodes: vec![Node { name: "", ambiguous: false, link: None }], children: HashMap::new() };
+        for e in tree {
+            let rel = under_data(&e.path);
+            if rel.is_empty() {
+                continue;
+            }
+            let mut at = ROOT;
+            for c in rel.split('/') {
+                let next = names.nodes.len();
+                let n = *names.children.entry((at, crate::manifest::fold(c))).or_insert(next);
+                if n == next {
+                    names.nodes.push(Node { name: c, ambiguous: false, link: None });
+                } else if names.nodes[n].name != c {
+                    names.nodes[n].ambiguous = true;
+                }
+                at = n;
+            }
+            if let (EntryKind::Symlink, Some(t)) = (e.kind, &e.target) {
+                names.nodes[at].link.get_or_insert(t);
+            }
+        }
+        names
+    }
+
+    /// What name `c` in directory `dir` is: `Ok(Some)` a node of the tree, spelt exactly as the
+    /// tree spells it; `Ok(None)` a name the tree doesn't have, in any spelling a volume could
+    /// take for it (or in a directory the tree doesn't have), which the walk takes as a directory
+    /// (on the disk it doesn't resolve at all); `Err` a name the tree has only in another
+    /// spelling that folds alike (`ı` for `i`, another case), or in two, which one volume
+    /// follows and another doesn't, so the walk can't say where it leads.
+    fn child(&self, dir: Option<usize>, c: &str) -> std::result::Result<Option<usize>, ()> {
+        let Some(dir) = dir else { return Ok(None) };
+        match self.children.get(&(dir, crate::manifest::fold(c))) {
+            None => Ok(None),
+            Some(&n) if self.nodes[n].name == c && !self.nodes[n].ambiguous => Ok(Some(n)),
+            Some(_) => Err(()),
+        }
+    }
+}
+
+/// Takes `n` bytes from `budget`, or says it is spent.
+fn charge(budget: &mut usize, n: usize) -> bool {
+    match budget.checked_sub(n) {
+        Some(left) => {
+            *budget = left;
+            true
+        }
+        None => false,
+    }
+}
+
 /// Whether a link at `rel` (relative to the data directory) to the relative `target` leads out
 /// of the data directory once resolved as the host resolves it: component by component, through
-/// the tree's own `links` (by folded path under the data directory, so in any spelling the volume
-/// takes for theirs), a `..` past the root leaving it, an absolute link's target judged by
-/// [`names_host`] with what is left of the path, and more than [`MAX_HOPS`] links refused. A name
-/// the tree doesn't have is taken as a directory (on the disk it doesn't resolve at all).
-fn leaves_data<'a>(links: &BTreeMap<String, &'a str>, rel: &'a str, target: &'a str) -> bool {
-    let mut at: Vec<&str> = rel.split('/').collect();
-    at.pop();
+/// the tree's own links ([`Names`]: a name followed only as the tree spells it, and refused in
+/// another spelling that folds alike), a `..` past the root leaving it, an absolute link's target
+/// judged by [`names_host`] with what is left of the path, and more than [`MAX_HOPS`] links
+/// refused. Its work is linear in the bytes it charges to `budget` (`rel`, `target` and each
+/// target it follows); a walk that would spend more than is left is refused.
+fn leaves_data(names: &Names, rel: &str, target: &str, budget: &mut usize) -> bool {
+    if !charge(budget, rel.len() + target.len() + 1) {
+        return true;
+    }
+    let mut parts = rel.split('/');
+    parts.next_back();
+    let mut at: Vec<Option<usize>> = Vec::new();
+    for c in parts {
+        match names.child(at.last().copied().unwrap_or(Some(ROOT)), c) {
+            Ok(n) => at.push(n),
+            Err(()) => return true,
+        }
+    }
     let mut todo: VecDeque<&str> = target.split('/').collect();
     let mut hops = 0;
     while let Some(c) = todo.pop_front() {
@@ -175,13 +282,15 @@ fn leaves_data<'a>(links: &BTreeMap<String, &'a str>, rel: &'a str, target: &'a 
                 }
             }
             name => {
-                at.push(name);
-                let Some(&t) = links.get(&crate::manifest::fold(&at.join("/"))) else { continue };
+                let Ok(n) = names.child(at.last().copied().unwrap_or(Some(ROOT)), name) else { return true };
+                let Some(t) = n.and_then(|n| names.nodes[n].link) else {
+                    at.push(n);
+                    continue;
+                };
                 hops += 1;
-                if hops > MAX_HOPS {
+                if hops > MAX_HOPS || !charge(budget, t.len() + 1) {
                     return true;
                 }
-                at.pop();
                 if t.starts_with('/') {
                     let rest: Vec<&str> = todo.into_iter().collect();
                     return names_host(&format!("{t}/{}", rest.join("/")));
@@ -195,22 +304,19 @@ fn leaves_data<'a>(links: &BTreeMap<String, &'a str>, rel: &'a str, target: &'a 
     false
 }
 
-/// The symlinks in `tree` an import refuses, in tree order: an absolute one that names the host
-/// ([`names_host`]), a relative one that leads out of `data/` through the tree's links
-/// ([`leaves_data`]). The device's daemons run as the host user and would read and write through
-/// them.
+/// The symlinks in `tree` an import refuses, in tree order: one whose target a bundle can't hold
+/// ([`safe_target`](crate::safe_target)), an absolute one that names the host ([`names_host`]),
+/// a relative one that leads out of `data/` through the tree's links ([`leaves_data`], all of
+/// them within [`WALK_BUDGET`]). The device's daemons run as the host user and would read and
+/// write through them.
 fn refused_links(tree: &[Entry]) -> Vec<&Entry> {
-    let links: BTreeMap<String, &str> = tree
-        .iter()
-        .filter_map(|e| match (e.kind, &e.target) {
-            (EntryKind::Symlink, Some(t)) => Some((crate::manifest::fold(under_data(&e.path)), t.as_str())),
-            _ => None,
-        })
-        .collect();
+    let names = Names::new(tree);
+    let mut budget = WALK_BUDGET;
     tree.iter()
         .filter(|e| match (e.kind, &e.target) {
+            (EntryKind::Symlink, Some(t)) if !crate::safe_target(t) => true,
             (EntryKind::Symlink, Some(t)) if t.starts_with('/') => names_host(t),
-            (EntryKind::Symlink, Some(t)) => leaves_data(&links, under_data(&e.path), t),
+            (EntryKind::Symlink, Some(t)) => leaves_data(&names, under_data(&e.path), t, &mut budget),
             _ => false,
         })
         .collect()
@@ -289,6 +395,7 @@ fn walk_dir(root: &Path, dir: &Path, rel: &str, w: &mut Walk) -> Result<()> {
         if kind.is_symlink() {
             let target = fs::read_link(&path).map_err(io(&path))?;
             match portable_target(root, &r, &target) {
+                Some(t) if !crate::safe_target(&t) => w.dropped.push(format!("{at} (a symlink whose target a bundle can't hold)")),
                 Some(t) => w.tree.push(Entry { path: at, kind: EntryKind::Symlink, mode: None, target: Some(t) }),
                 None => w.dropped.push(format!("{at} (a symlink to a host path)")),
             }

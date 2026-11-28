@@ -1,6 +1,7 @@
 use super::*;
 use std::cell::{Cell, RefCell};
 use std::os::unix::fs::symlink;
+use std::time::{Duration, Instant};
 
 const RUNTIME: &str = "com.apple.CoreSimulator.SimRuntime.iOS-26-1";
 const TYPE: &str = "com.apple.CoreSimulator.SimDeviceType.iPhone-17";
@@ -510,6 +511,13 @@ fn imports_refuse_links_out_of_the_data_directory() {
         (None, "data/Library/agents", "/users/someone"),
         (None, "data/Library/agents", "/Library/../Users/someone"),
         (None, "data/Library/agents", "/.vol/16777234/2"),
+        // Directories the host's users can write, or anyone can.
+        (None, "data/Library/tmp", "/var/tmp/x"),
+        (None, "data/Library/tmp", "/private/var/tmp"),
+        (None, "data/Library/tmp", "/Library/Caches/com.apple.x"),
+        (None, "data/Library/tmp", "/opt/homebrew/bin/brew"),
+        (None, "data/Library/tmp", "/Applications/Demo.app"),
+        (None, "data/root", "/opt"),
         // A path that holds a host root: `data/root/Users/...` reaches it.
         (None, "data/root", "/"),
         (None, "data/root", "/private"),
@@ -550,6 +558,94 @@ fn imports_refuse_links_out_of_the_data_directory() {
     let err = Manifest::parse(&m.to_json()).expect_err("too big").to_string();
     assert!(err.contains("add up to more than"), "{err}");
     fs::remove_dir_all(root).ok();
+}
+
+/// The review's escape (#572), reproduced on APFS: a link named `Cookies` and a zero-width space
+/// (a name the volume keeps apart from `Cookies`, which the bundle leaves out) to ten levels of
+/// directories, and `evil` through `Cookies` and nine `..`s. A walk that took the link for
+/// `Cookies` stayed in `data/`; on the disk `evil` dangles until something makes
+/// `Library/Cookies`, and then is `~/Library/LaunchAgents`. Such a name is refused as the
+/// manifest is read, and a walk follows a link only as the tree spells it: another spelling
+/// that folds alike (`ı` for `i`, another case, a directory spelt two ways) is refused, as one
+/// volume follows it and another doesn't.
+#[test]
+fn links_are_followed_only_as_the_tree_spells_them() {
+    let root = scratch("spelling");
+    let fake = Fake::new(&root.join("set"), vec![runtime("23B80")]);
+    let src = fake.add(SOURCE, "golden", true);
+    populate(&src.data_dir);
+    let to = root.join("golden-dir");
+    let ex = export(&fake, SOURCE, &to, &Options::default()).expect("export");
+    let deep = "a/".repeat(10);
+    let evil = format!("Cookies/{}Library/LaunchAgents", "../".repeat(9));
+    let zwsp = "data/Library/Cookies\u{200b}";
+    // The walk itself, without the manifest's checks, doesn't take the link for `Cookies`.
+    let tree = [dir("data"), dir("data/Library"), link(zwsp, &deep), link("data/Library/evil", &evil)];
+    let refused: Vec<&str> = refused_links(&tree).iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(refused, ["data/Library/evil"]);
+    // And the bundle is refused as it opens, for the name alone.
+    let mut m = ex.manifest.clone();
+    m.tree.extend([link(zwsp, &deep), link("data/Library/evil", &evil)]);
+    let err = Manifest::parse(&m.to_json()).expect_err("refused").to_string();
+    assert!(err.contains(&format!("unsafe path `{zwsp}`")), "{err}");
+    for target in ["Preferences\u{feff}/../..".to_owned(), "a/".repeat(crate::MAX_TARGET)] {
+        let mut m = ex.manifest.clone();
+        m.tree.push(link("data/Library/x", &target));
+        let err = Manifest::parse(&m.to_json()).expect_err("refused").to_string();
+        assert!(err.contains("symlink `data/Library/x` needs a target"), "{err}");
+    }
+    // Spellings that fold alike but that a volume may keep apart.
+    for extra in [
+        vec![link("data/Library/Cook\u{131}es", &deep)],
+        vec![link("data/Library/COOKIES", &deep)],
+        vec![dir("data/Library/cookies"), dir("data/Library/Cookies/a")],
+    ] {
+        let mut m = ex.manifest.clone();
+        m.tree.extend(extra);
+        m.tree.push(link("data/Library/evil", &evil));
+        fs::write(to.join(crate::MANIFEST), m.to_json()).expect("manifest");
+        let err = import(&fake, Reader::open(&to).expect("opens"), "copy").expect_err("refused").to_string();
+        assert!(err.contains(&format!("symlink `data/Library/evil` points at `{evil}`")), "{err}");
+        assert_eq!(fake.devices.borrow().len(), 1, "nothing was made");
+    }
+    // As the tree spells it, the link is followed, and the target stays in data/.
+    let mut m = ex.manifest.clone();
+    m.tree.extend([link("data/Library/Cookies", &deep), link("data/Library/evil", &evil)]);
+    fs::write(to.join(crate::MANIFEST), m.to_json()).expect("manifest");
+    import(&fake, Reader::open(&to).expect("opens"), "copy").expect("stays inside");
+    fs::remove_dir_all(root).ok();
+}
+
+/// A walk's work is linear in what it charges to the budget, and all of `refused_links`'s
+/// walks together stop at [`WALK_BUDGET`]: the review's case, a target of a million components
+/// (2 MB), took hours when each component re-folded the path walked so far.
+#[test]
+fn link_walks_take_linear_work_and_stop_at_a_budget() {
+    let tree = [dir("data"), dir("data/d")];
+    let names = Names::new(&tree);
+    let n = 1_000_000;
+    let target = format!("{}{}x", "d/".repeat(n), "../".repeat(n));
+    let mut budget = usize::MAX;
+    let start = Instant::now();
+    assert!(!leaves_data(&names, "l", &target, &mut budget), "it comes back to data/");
+    assert_eq!(usize::MAX - budget, "l".len() + target.len() + 1, "charged its own bytes");
+    assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
+    let mut budget = target.len();
+    assert!(leaves_data(&names, "l", &target, &mut budget), "refused past its budget");
+    // A chain of 30 links of 800-odd bytes each, and a thousand links into it: each takes about
+    // 25 KB to walk, so the budget runs out after some 650 and the rest are refused.
+    let long = format!("{}/", "d".repeat(200)).repeat(4);
+    let mut tree = vec![dir("data")];
+    for k in 0..30 {
+        let next = if k == 29 { ".".to_owned() } else { format!("L{}", k + 1) };
+        tree.push(link(&format!("data/L{k}"), &format!("{long}{}{next}", "../".repeat(4))));
+    }
+    tree.extend((0..1000).map(|i| link(&format!("data/h{i}"), "L0")));
+    let start = Instant::now();
+    let refused: Vec<&str> = refused_links(&tree).iter().map(|e| e.path.as_str()).collect();
+    assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
+    assert!(!refused.contains(&"data/h0") && refused.contains(&"data/h999"), "{} refused", refused.len());
+    assert!((200..500).contains(&refused.len()), "{} refused", refused.len());
 }
 
 const LOW_FD_CHILD: &str = "SIM_BUNDLE_LOW_FD_CHILD";
