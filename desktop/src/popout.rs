@@ -599,8 +599,8 @@ pub fn stage_button(udid: &str, t: Theme) -> El {
 }
 
 /// The device list's mark on a device that's out in its own window.
-pub fn row_mark(i: usize, t: Theme) -> El {
-    icon(&icons::REVEAL, 13.0).key(format!("device-{i}-popped")).label("In its own window").color(t.text_secondary)
+pub fn row_mark(udid: &str, t: Theme) -> El {
+    icon(&icons::REVEAL, 13.0).key(format!("device-{udid}-popped")).label("In its own window").color(t.text_secondary)
 }
 
 /// What the stage shows for a selected device that's out in its own window.
@@ -1054,7 +1054,7 @@ mod tests {
         assert!(main.state.popouts.is_open("A1"));
         assert_eq!(main.state.selected.as_deref(), Some("pixel_9"), "the main window shows the next running device");
         main.frame(1.0 / 60.0);
-        assert!(main.find("device-0-popped").is_some(), "the list marks the device that's out");
+        assert!(main.find("device-A1-popped").is_some(), "the list marks the device that's out");
         let mut win = take_window(&mut main, "A1");
         assert!(win.find("popout-screen").is_some() && win.find("home-button").is_some() && win.find("popin-button").is_some());
         assert!(win.find("scene-3d").is_none(), "pop-outs are flat");
@@ -1070,7 +1070,7 @@ mod tests {
         main.frame(1.0 / 60.0);
         assert!(!main.state.popouts.is_open("A1"));
         assert_eq!(main.state.selected.as_deref(), Some("A1"), "back as the main window's device");
-        assert!(main.find("device-0-popped").is_none());
+        assert!(main.find("device-A1-popped").is_none());
         assert!(main.find("device-screen").is_some());
     }
 
@@ -1134,7 +1134,7 @@ mod tests {
         assert!(!main.state.popouts.is_open("B2"));
         assert_eq!(main.state.status.as_deref(), Some("Boot iPhone 17 Pro Max to pop it out"));
         // The menu itself.
-        let (x, y) = main.find("device-0").unwrap();
+        let (x, y) = main.find("device-A1").unwrap();
         main.secondary_down(x, y);
         main.secondary_up(x, y);
         main.frame(1.0 / 60.0);

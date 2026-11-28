@@ -498,29 +498,22 @@ pub fn list(ctx: &Context) -> Result<Vec<DeviceInfo>, String> {
     Ok(devices)
 }
 
-/// Boots a device on a worker thread (booting blocks for seconds).
-pub fn boot_async(udid: String, done: Arc<AtomicBool>, error: Arc<std::sync::Mutex<Option<String>>>, waker: rune::Waker) {
-    std::thread::spawn(move || {
-        let result = Context::new().and_then(|c| c.device(&udid)).and_then(|d| {
-            if d.state() != DeviceState::Booted {
-                d.boot()?;
-            }
-            for _ in 0..1200 {
-                if d.boot_finished().unwrap_or(true) && d.display().is_ok_and(|x| x.surface().is_some()) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Ok(())
-        });
-        if let Err(e) = result
-            && let Ok(mut slot) = error.lock()
-        {
-            *slot = Some(e.to_string());
+/// Boots a device and waits until its home screen draws (booting blocks for seconds): the window
+/// runs it as the device's job ([`crate::jobs`]).
+pub fn boot(udid: &str) -> Result<(), String> {
+    let result = Context::new().and_then(|c| c.device(udid)).and_then(|d| {
+        if d.state() != DeviceState::Booted {
+            d.boot()?;
         }
-        done.store(true, Ordering::Relaxed);
-        waker();
+        for _ in 0..1200 {
+            if d.boot_finished().unwrap_or(true) && d.display().is_ok_and(|x| x.surface().is_some()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Ok(())
     });
+    result.map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
