@@ -243,8 +243,9 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "exec",
         "device, program, args?, env?; Android: timeout_s?, max_bytes?",
         "Run a program inside the device; returns stdout/stderr. Android: over adb as the shell user, the argv passed through \
-         unchanged (quoted, so nothing in it is expanded), with exit_code; past timeout_s (30) it is stopped and the call fails, \
-         and a stream that reaches max_bytes (8 MiB) is cut there and the program stopped (truncated true, exit_code null)",
+         unchanged (quoted, so nothing in it is expanded; a program can't start with `-`), with exit_code; past timeout_s (30, at \
+         most 86400) it is stopped and the call fails, and a stream that reaches max_bytes (8 MiB) is cut there (truncated true) \
+         and the program stopped if it still ran (exit_code null). Stopping it stops its process group, so what it started too",
     ),
     (
         "logs",
@@ -265,8 +266,9 @@ pub const METHODS: &[(&str, &str, &str)] = &[
         "kill",
         "device, pid | bundle_id, signal?; Android: force?",
         "Signal a device process (default 15, SIGTERM). iOS takes pid only. Android: bundle_id stops the app instead (`am \
-         force-stop`); a process the shell user may not signal is signalled as root (`su 0`, on google_apis images); init, zygote \
-         and system_server are refused unless force",
+         force-stop`); a process the shell user may not signal is signalled as root (`su 0`, on google_apis images); init, zygote, \
+         zygote64, system_server, surfaceflinger, servicemanager, hwservicemanager, vndservicemanager, vold, lmkd, logd, adbd, netd, \
+         installd, ueventd, keystore2 and statsd are refused unless force",
     ),
     ("connections", "device", "Open sockets of device processes"),
     ("traffic", "device", "Bytes in/out per device process"),

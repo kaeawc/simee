@@ -226,24 +226,28 @@ pub(crate) struct Captured {
     pub code: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
-    /// A stream reached its cap, and the command was stopped there.
+    /// A stream reached its cap and was cut there.
     pub truncated: bool,
-    /// It ran past its time and was stopped.
+    /// It ran past its time.
     pub timed_out: bool,
+    /// It was stopped, at a cap or past its time, while it still ran: it never exited by itself.
+    pub stopped: bool,
 }
 
 /// [`output_within`]'s run, keeping at most `caps` bytes of stdout and of stderr: a stream that
-/// reaches its cap stops the command (`truncated`), as running past `limit` does (`timed_out`).
+/// reaches its cap while the command runs stops it (`truncated`, `stopped`), as running past `limit`
+/// does (`timed_out`, `stopped`). One that reaches it in what is read after the command exited is
+/// only cut (`truncated`), the command's status kept.
 pub(crate) fn capture(command: &mut Command, limit: Duration, caps: [usize; 2], what: &str) -> Result<Captured, String> {
     /// How often a quiet command is checked for having exited.
     const TICK: Duration = Duration::from_millis(20);
+    let deadline = Instant::now().checked_add(limit).ok_or_else(|| format!("`{what}`: a time limit of {limit:?} is too long"))?;
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("couldn't run {}: {e}", Path::new(command.get_program()).display()))?;
-    let deadline = Instant::now() + limit;
     let (tx, rx) = mpsc::channel::<(usize, Option<Vec<u8>>)>();
     let pipes: [Option<Box<dyn Read + Send>>; 2] = [
         child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>),
@@ -268,19 +272,22 @@ pub(crate) fn capture(command: &mut Command, limit: Duration, caps: [usize; 2], 
         });
     }
     drop(tx);
+    let mut ran = Captured::default();
     let mut out = [Vec::new(), Vec::new()];
+    // Keeps what fits of `bytes` under stream `i`'s cap; whether any didn't fit.
+    let keep = |out: &mut [Vec<u8>; 2], i: usize, bytes: &[u8]| {
+        let room = caps[i].saturating_sub(out[i].len());
+        out[i].extend_from_slice(&bytes[..bytes.len().min(room)]);
+        bytes.len() > room
+    };
     let status = loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if open > 0 && !left.is_zero() {
             match rx.recv_timeout(left.min(TICK)) {
                 Ok((i, Some(bytes))) => {
-                    let room = caps[i].saturating_sub(out[i].len());
-                    out[i].extend_from_slice(&bytes[..bytes.len().min(room)]);
-                    if bytes.len() > room {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        let [stdout, stderr] = out;
-                        return Ok(Captured { code: None, stdout, stderr, truncated: true, timed_out: false });
+                    if keep(&mut out, i, &bytes) {
+                        ran.truncated = true;
+                        break None;
                     }
                     continue;
                 }
@@ -296,32 +303,31 @@ pub(crate) fn capture(command: &mut Command, limit: Duration, caps: [usize; 2], 
             sleep(left.min(Duration::from_millis(1)));
         }
         if let Some(status) = child.try_wait().map_err(|e| format!("`{what}`: {e}"))? {
-            break status;
+            break Some(status);
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let [stdout, stderr] = out;
-            return Ok(Captured { code: None, stdout, stderr, truncated: false, timed_out: true });
+            ran.timed_out = true;
+            break None;
         }
     };
-    // It exited: what it wrote last may still be on its way from the readers. A process it left
-    // holding the pipes gets a moment, not the deadline.
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        ran.stopped = true;
+    }
+    // What it wrote last, or before it was stopped, may still be on its way from the readers. A
+    // process it left holding the pipes gets a moment, not the deadline.
     let grace = Instant::now() + Duration::from_millis(100);
-    let mut truncated = false;
     while open > 0 {
         match rx.recv_timeout(grace.saturating_duration_since(Instant::now())) {
-            Ok((i, Some(bytes))) => {
-                let room = caps[i].saturating_sub(out[i].len());
-                truncated |= bytes.len() > room;
-                out[i].extend_from_slice(&bytes[..bytes.len().min(room)]);
-            }
+            Ok((i, Some(bytes))) => ran.truncated |= keep(&mut out, i, &bytes),
             Ok((_, None)) => open -= 1,
             Err(_) => break,
         }
     }
-    let [stdout, stderr] = out;
-    Ok(Captured { code: status.code(), stdout, stderr, truncated, timed_out: false })
+    ran.code = status.and_then(|s| s.code());
+    [ran.stdout, ran.stderr] = out;
+    Ok(ran)
 }
 
 /// `name` if it is a package name: dot-separated segments of letters, digits and underscores,

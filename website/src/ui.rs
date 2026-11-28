@@ -188,15 +188,17 @@ pub struct MdCx {
 /// `md` as the site draws Markdown: headings keyed by their anchors, images drawn from the
 /// site's `/img/`, tables sized in the column as a browser sizes them and scrolling sideways
 /// where even their narrowest is wider (a phone), code wrapping, and links that open in this
-/// tab when they are the site's own and in a new one otherwise.
+/// tab when they are the site's own and in a new one otherwise, with their title as a tooltip.
 pub fn markdown(key: &str, md: &str, mc: &MdCx) -> El {
     let pictures = mc.pictures.clone();
+    let titles = content::link_titles(md);
     Markdown::new(md)
         .block_keys(content::block_keys(md))
         .images(move |src| pictures.src(src))
         .scroll_wide(true)
         .wrap_code(true)
         .on_link_tx(|_: &mut State, url: &str, tx: &mut Tx| follow(url, tx))
+        .link_help(move |url| titles.iter().find(|(dest, _)| dest == url).map(|(_, title)| title.clone()))
         .render(&markdown_style().text_width(mc.column))
         .key(key.to_owned())
         .w_full()

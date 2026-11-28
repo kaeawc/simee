@@ -118,6 +118,9 @@ fn app(android: &Android, d: &sim_android::Device, method: &str, p: &Value) -> R
     }
 }
 
+/// The longest `exec` `timeout_s`: a day.
+const MAX_EXEC_TIMEOUT_S: u64 = 86_400;
+
 /// `processes`, `kill` and `exec`, over adb, in iOS's shapes: `processes` rows with each app
 /// process's `package` too, nothing for `kill` (a signal to `pid`, or with `bundle_id` an app stop:
 /// `am force-stop`), and `exec`'s `{pid, stdout, stderr}` with `exit_code` and `truncated`.
@@ -150,14 +153,32 @@ fn debug(android: &Android, d: &sim_android::Device, method: &str, p: &Value) ->
         }
         _ => {
             let program = need_str(p, "program")?;
-            let (args, env) = (crate::params::strings(p, "args"), crate::params::pairs(p, "env"));
+            // Unlike iOS's, a value that isn't a string is refused: dropping it would change the argv.
+            let args = match p.get("args") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(v) => v
+                    .as_array()
+                    .and_then(|a| a.iter().map(|w| w.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>())
+                    .ok_or("`args` must be a list of strings")?,
+            };
+            let env = match p.get("env") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(v) => v
+                    .as_object()
+                    .and_then(|o| o.iter().map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned()))).collect::<Option<Vec<_>>>())
+                    .ok_or("`env` must be an object of strings (names to values)")?,
+            };
             let defaults = sim_android::procs::ExecLimits::default();
             let at_least_1 = |key: &str| match opt_u64(p, key) {
                 Some(0) => Err(format!("{key} must be at least 1")),
                 n => Ok(n),
             };
+            let timeout = match at_least_1("timeout_s")? {
+                Some(s) if s > MAX_EXEC_TIMEOUT_S => return Err(format!("timeout_s must be at most {MAX_EXEC_TIMEOUT_S} (a day)")),
+                s => s,
+            };
             let limits = sim_android::procs::ExecLimits {
-                timeout: at_least_1("timeout_s")?.map_or(defaults.timeout, Duration::from_secs),
+                timeout: timeout.map_or(defaults.timeout, Duration::from_secs),
                 max_bytes: at_least_1("max_bytes")?.map_or(defaults.max_bytes, |n| usize::try_from(n).unwrap_or(usize::MAX)),
             };
             let out = d.adb(android)?.exec(program, &args, &env, limits)?;
@@ -641,6 +662,28 @@ mod tests {
         let err = run(&mut s, "exec", json!({"program": "sleep", "args": ["5"], "timeout_s": 1})).expect_err("timeout");
         assert!(err.starts_with("`sleep` timed out after 1s"), "{err}");
         assert_eq!(run(&mut s, "exec", json!({})), Err("missing string parameter `program`".into()));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn exec_refuses_parameters_it_cant_pass_through() {
+        let (mut s, root, adb, _emulator) = session("execparams");
+        for args in [json!(["a", 1]), json!("a"), json!([null])] {
+            assert_eq!(run(&mut s, "exec", json!({"program": "echo", "args": args})), Err("`args` must be a list of strings".into()));
+        }
+        for env in [json!({"A": 1}), json!(["A=1"])] {
+            assert_eq!(
+                run(&mut s, "exec", json!({"program": "echo", "env": env})),
+                Err("`env` must be an object of strings (names to values)".into())
+            );
+        }
+        for timeout in [u64::MAX, 86_401] {
+            assert_eq!(
+                run(&mut s, "exec", json!({"program": "true", "timeout_s": timeout})),
+                Err("timeout_s must be at most 86400 (a day)".into())
+            );
+        }
+        assert!(adb.calls().is_empty(), "{:?}", adb.calls());
         std::fs::remove_dir_all(root).ok();
     }
 

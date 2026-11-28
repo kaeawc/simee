@@ -11,21 +11,38 @@ harnesses drive it unchanged.
 
 ## Performance
 
-Against the stock tools on the same host and day, medians of 3 or more. Each row links its
-benchmark and the script that reruns it (it creates and deletes its own devices).
+Against the stock tools on the same host and day, medians of 3 or more. Each simee cell reads
+Android / iOS: Android against the SDK emulator (QEMU), iOS against Simulator.app. ↗ opens a
+row's benchmark, Android's first; its tooltip names the host, date and script, which creates and
+deletes its own devices.
 
-| Platform | Measure | simee | Stock tool | Host, date, source |
+| Measure | simee, Android / iOS | Android emulator (QEMU) | Simulator.app | Source |
 | --- | --- | --- | --- | --- |
-| Android | Warm boot, to `sys.boot_completed` | **3.5 s** | 17.1 s (SDK emulator) | M3 Max, 2026-11-24, [row](docs/benchmarks.md#android-emu-against-the-sdk-emulator), `scripts/bench/android-boot.sh` |
-| Android | Cold boot, a new AVD | **9.5 s** | 22.9 s | as above |
-| Android | Peak memory, warm | **2.09 GB** | 3.78 GB | as above |
-| Android | Janky frames swiping the launcher, Pixel Tablet / phone | **0% / 0.25%** | 5.6% / 6.2% | M3 Max, 2026-11-25, [row](docs/benchmarks.md#frame-pacing), `scripts/bench/android-frames.sh` |
-| Android | Idle host CPU, API 29 / API 30 | **2.9% / 2.1%** of a core | 5.4% / 3.7% | M3 Max, 2026-11-26, [row](docs/benchmarks.md#api-29-and-30-first-boots-and-idle-host-cpu), `scripts/bench/android-idle.sh` |
-| Android, Linux without KVM | Warm boot | **168 s** | 2302 s (`-accel off`; 1 of 3 boots never finished in 40 minutes) | 4-vCPU Xeon VM, 2026-11-26, [row](docs/benchmarks.md#boot-to-sysboot_completed-with-emus-devices), `scripts/bench/software-mode.sh` |
-| iOS | Screenshot as a command | **36 ms** (`simee serve`) | 601 ms (`simctl io screenshot`) | M3 Max, loaded host (1-minute load 13-69), 2026-11-26, [row](docs/benchmarks.md#ios-simee-against-simctl), `scripts/bench/ios-command.sh` |
+| Cold boot, a new device | **9.5 s** / 18.6 s | 22.9 s | 18.5 s | [↗](docs/benchmarks.md#android-emu-against-the-sdk-emulator "Android: M3 Max, 2026-11-24, scripts/bench/android-boot.sh") [↗](docs/research/ios-site-measures.md#results "iOS: M3 Max, 2026-11-27, loaded host, no script yet") |
+| Warm boot | **3.5 s** / 6.6 s | 17.1 s | 6.6 s | [↗](docs/benchmarks.md#android-emu-against-the-sdk-emulator "Android: M3 Max, 2026-11-24, scripts/bench/android-boot.sh") [↗](docs/research/ios-site-measures.md#results "iOS: M3 Max, 2026-11-27, loaded host, no script yet") |
+| Peak memory, warm | **2.09 GB** / 2.99 GB | 3.78 GB | 3.11 GB | [↗](docs/benchmarks.md#android-emu-against-the-sdk-emulator "Android: M3 Max, 2026-11-24, scripts/bench/android-boot.sh") [↗](docs/research/ios-site-measures.md#results "iOS: M3 Max, 2026-11-27, loaded host, no script yet") |
+| Screenshot as a command, median | n/m / **23 ms** | n/m | 565 ms | [↗](docs/research/ios-site-measures.md#results "iOS: M3 Max, 2026-11-27, loaded host, no script yet") |
+| Janky frames swiping the launcher, phone | **0.25%** / n/m | 6.2% | n/m | [↗](docs/benchmarks.md#frame-pacing "Android: M3 Max, 2026-11-25, scripts/bench/android-frames.sh") |
+| Idle host CPU, of a core | **2.1%** / 13.6% (noisy) | 3.7% | **12.5%** (noisy) | [↗](docs/benchmarks.md#api-29-and-30-first-boots-and-idle-host-cpu "Android: M3 Max, 2026-11-26, scripts/bench/android-idle.sh") [↗](docs/research/ios-site-measures.md#results "iOS: M3 Max, 2026-11-27, loaded host, no script yet") |
+| Warm boot, Linux without KVM | **168 s** / n/a | 2302 s | n/a | [↗](docs/benchmarks.md#boot-to-sysboot_completed-with-emus-devices "Android: 4-vCPU Xeon VM, 2026-11-26, scripts/bench/software-mode.sh") |
 
-Swiping the tablet's launcher, emu drew about 530 frames to stock's 1350; on the phone both drew
-about 790. `scripts/bench/run-all.sh --list` names every benchmark behind the numbers on this page.
+n/m: not measured. n/a: nothing to compare; iOS devices need a Mac. Bold marks the better of a
+pair; a pair within 5% has none. A boot ends at `sys.boot_completed` on Android and when the boot
+command returns on iOS.
+
+On iOS simee is level with Simulator.app, not ahead. Its 6.6 s warm boot matches Simulator.app
+with its window open, but a headless `simctl` boot on a device set of its own takes 2.6 s, and
+simee can't boot a device in a custom device set yet, so it couldn't be timed that way. The iOS
+idle CPU was measured under high host load (1-minute load 28-60): read it as indicative only. The
+iOS screenshot is `simee screenshot` forwarded to `simee serve`; in its own process it takes
+148 ms, and the p95s are 47 ms against 585 ms.
+
+Android's idle CPU is API 30's; on API 29 it is 2.9% against 5.4%. On the Pixel Tablet 0% of
+frames were janky against 5.6%: emu drew about 530 frames to stock's 1350, and on the phone both
+drew about 790. The Linux row ran on a 4-vCPU Xeon VM with the stock emulator under `-accel off`,
+where 1 of 3 boots never finished in 40 minutes. Every other row ran on an M3 Max: Android
+2026-11-24 to 26, iOS 2026-11-27. `scripts/bench/run-all.sh --list` names every benchmark behind
+the numbers on this page.
 
 ## Compared with the stock tools
 
