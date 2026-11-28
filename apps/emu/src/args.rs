@@ -81,8 +81,9 @@ options:
                     <min>:<max>; reported the same way
   -net-segment SPEC join a link segment (#539): a second NIC, eth1, on a link subnet whose frames
                     go to the other members' emu processes, multicast included, so mDNS reaches them.
-                    SPEC is dir=PATH,subnet=N,member=K (one directory per segment, member 0..15;
-                    `simee` makes it); the NAT and eth0 are unchanged. Apple silicon only
+                    SPEC is dir=PATH,subnet=N,member=K (one directory per segment, created if
+                    missing and kept private to you; member 0..15; the link adapter will plan
+                    these, #535); the NAT and eth0 are unchanged. Apple silicon only
   -camera-back S    the back camera's source: emulated (the test card), webcam0 (the host's first
                     camera; webcam1, ...), none, or a simee source id (pattern:testcard, qr:TEXT,
                     text:TEXT, image:PATH, solid:COLOUR, webcam:NAME); default hw.camera.back

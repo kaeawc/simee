@@ -42,7 +42,9 @@ and those are resource overlays of a system image, which simee does not modify.
 ## How it works
 
 - **One directory per segment**, mode `0700`: `<base>/<name>/m<k>.sock`, member `k` in `0..16`.
-  Each emu process binds its own socket; every datagram is one Ethernet frame.
+  Each emu process binds its own socket; every datagram is one Ethernet frame. The relay trusts
+  whoever can write the directory, so emu refuses one that isn't a directory of its own user's (a
+  link, a file, another uid) and tightens one of the user's own that is open to others.
 - **Addresses are derived**: member `k` of subnet `n` is `10.77.n.(k+1)/24` with MAC
   `52:55:0a:4d:n:(k+1)`. The subnet is the lowest free of 254; the NAT's 10.0.2.0/24 is untouched.
 - **Routing** (`net::segment::route`): a frame to a MAC that a member owns goes to that member; a
@@ -83,6 +85,12 @@ Nothing here was booted: the VM it was written on has no KVM and no Mac.
   (the DT order is tested; the kernel's probe order is reasoned from `of_platform_populate`).
 - That `ip addr add`, multicast on, and the 224.0.0.0/4 route (`SegmentPlan::guest_setup`, run as
   root over adb) work on the image's toybox/iproute2.
+- **That the segment's routes are consulted at all.** Android's netd policy routing has no rule that
+  looks up the `main` table for an interface it doesn't manage, so the connected route that
+  `ip addr add` makes could be skipped and unicast between members fall through to the NAT's
+  `eth0` (link-local mDNS sent with `IP_MULTICAST_IF` skips the FIB and may work regardless).
+  `guest_setup` adds two `ip rule ... lookup main` lines for the subnet and 224.0.0.0/4; whether they
+  are enough is a check on a guest.
 - **That Android offers `eth1` to `NsdManager` and Nearby.** A Linux interface with an address is
   not an Android `Network`: without `EthernetTracker` managing it (an overlay emu can't ship), the
   connectivity stack may ignore it. This is the open risk of the whole design; if it holds, the

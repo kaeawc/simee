@@ -14,7 +14,9 @@
 //!
 //! Sockets are the process's own, in a directory made `0700`: no more reach than the console and
 //! display sockets next to it. A frame is accepted whatever its source address, since only
-//! processes of the same user can write to the directory.
+//! processes of the same user can write to the directory, so [`SegmentPort::open`] refuses a
+//! directory that is someone else's, or a link or a file, and takes back one of this user's that
+//! is open to others.
 use std::collections::VecDeque;
 use std::io;
 #[cfg(unix)]
@@ -87,6 +89,47 @@ fn peers_in<'a>(names: impl IntoIterator<Item = &'a str>, own: u8) -> Vec<u8> {
     peers
 }
 
+/// What to do about the segment directory as found.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum DirCheck {
+    /// Ours and private.
+    Fine,
+    /// Ours, but open to group or others: `chmod 0700` it.
+    Tighten,
+    Refuse(String),
+}
+
+/// Judges a directory by what `lstat` says: its type, owner and mode, against the user running
+/// emu. Anyone who can write to the directory can forge frames or take a member's socket, so
+/// only a directory of this user's counts.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn judge_dir(is_dir: bool, owner: u32, mode: u32, me: u32) -> DirCheck {
+    if !is_dir {
+        DirCheck::Refuse("is not a directory (or is a link to one)".into())
+    } else if owner != me {
+        DirCheck::Refuse(format!("belongs to uid {owner}, not to this user (uid {me})"))
+    } else if mode & 0o077 != 0 {
+        DirCheck::Tighten
+    } else {
+        DirCheck::Fine
+    }
+}
+
+/// Makes sure `dir` is this user's own private directory, as it was made or found.
+#[cfg(unix)]
+fn secure_dir(dir: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let meta = std::fs::symlink_metadata(dir)?;
+    let me = rustix::process::geteuid().as_raw();
+    match judge_dir(meta.file_type().is_dir(), meta.uid(), meta.mode(), me) {
+        DirCheck::Fine => Ok(()),
+        DirCheck::Tighten => std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)),
+        DirCheck::Refuse(why) => Err(io::Error::new(ErrorKind::PermissionDenied, format!("the segment directory {} {why}", dir.display()))),
+    }
+}
+
 /// What the device's worker and the segment's thread share.
 struct Shared {
     to_guest: Mutex<VecDeque<Vec<u8>>>,
@@ -138,6 +181,7 @@ impl SegmentPort {
 
         spec.validate().map_err(|e| io::Error::new(ErrorKind::InvalidInput, e))?;
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&spec.dir)?;
+        secure_dir(&spec.dir)?;
         let path = spec.socket();
         let sock = match UnixDatagram::bind(&path) {
             Ok(s) => s,
@@ -528,26 +572,37 @@ mod tests {
     }
 
     #[test]
-    fn a_full_queue_drops_the_newest_frames_and_counts_them() {
+    fn a_full_queue_is_bounded_never_blocks_the_sender_and_counts_what_it_drops() {
         let d = dir("full");
         let (mut a, b) = (join(&d, 0), join(&d, 1));
         let total = TO_GUEST + 40;
+        let held = |b: &Member| lock(&b.port.shared.to_guest).len() as u64;
+        let seen = |b: &Member| held(b) + b.port.counter(|c| &c.rx_dropped);
         for i in 0..total {
+            // Nobody takes frames, so the guest's queue fills; pace the sender so the socket's own
+            // buffer isn't what overflows first (a loaded host may still drop a send: counted).
+            let ok = a.port.counter(|c| &c.sent);
+            let until = Instant::now() + Duration::from_millis(500);
+            while ok.saturating_sub(seen(&b)) > 16 && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             a.port.transmit(&frame(MDNS_V4, a.mac(), &format!("{i}")));
         }
-        // Every frame is held, dropped by the full queue, or dropped by a full socket: none lost
-        // unaccounted for. Nobody takes frames, so the queue ends full.
-        let accounted = |a: &Member, b: &Member| {
-            lock(&b.port.shared.to_guest).len() as u64 + b.port.counter(|c| &c.rx_dropped) + a.port.counter(|c| &c.tx_dropped)
-        };
+        // Whatever the sender lost to a full socket (`t`), every other frame is either held or
+        // counted as dropped by the full queue, and the queue never grows past its bound.
+        let t = a.port.counter(|c| &c.tx_dropped);
+        let delivered = total as u64 - t;
         let until = Instant::now() + Duration::from_secs(5);
-        while accounted(&a, &b) < total as u64 && Instant::now() < until {
+        while seen(&b) < delivered && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(accounted(&a, &b), total as u64);
-        assert_eq!(lock(&b.port.shared.to_guest).len(), TO_GUEST - a.port.counter(|c| &c.tx_dropped) as usize);
-        let first = b.port.shared.to_guest.lock().expect("queue").pop_front().expect("oldest kept");
-        assert!(first.ends_with(b"0"), "the oldest frame is the one kept");
+        assert_eq!(a.port.counter(|c| &c.sent), delivered, "every send is counted once, as sent or dropped");
+        assert_eq!(held(&b), delivered.min(TO_GUEST as u64));
+        assert_eq!(b.port.counter(|c| &c.rx_dropped), delivered.saturating_sub(TO_GUEST as u64));
+        if t == 0 {
+            let first = lock(&b.port.shared.to_guest).pop_front().expect("oldest kept");
+            assert!(first.ends_with(b"0"), "the oldest frame is the one kept");
+        }
     }
 
     #[test]
@@ -575,6 +630,50 @@ mod tests {
         drop(a);
         assert!(!has_members(&d), "a member that stopped looks like one that isn't running");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_directory_is_judged_by_type_owner_and_mode() {
+        use DirCheck::*;
+        assert_eq!(judge_dir(true, 501, 0o40700, 501), Fine);
+        assert_eq!(judge_dir(true, 501, 0o40500, 501), Fine, "tighter than 0700 is still private");
+        assert_eq!(judge_dir(true, 501, 0o40755, 501), Tighten);
+        assert_eq!(judge_dir(true, 501, 0o40777, 501), Tighten);
+        assert_eq!(judge_dir(true, 501, 0o40710, 501), Tighten, "group access counts");
+        assert!(matches!(judge_dir(true, 502, 0o40700, 501), Refuse(w) if w.contains("uid 502")), "someone else's, even at 0700");
+        assert!(matches!(judge_dir(true, 0, 0o40755, 501), Refuse(_)), "root's too");
+        assert!(matches!(judge_dir(false, 501, 0o100600, 501), Refuse(_)), "a file, or a link");
+    }
+
+    #[test]
+    fn an_existing_directory_open_to_others_is_taken_back_and_a_link_or_file_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o777;
+        let d = dir("shared");
+        std::fs::create_dir_all(&d).expect("dir");
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        let a = join(&d, 0);
+        assert_eq!(mode(&d), 0o700, "ours, so tightened");
+        drop(a);
+
+        // A link to a directory (another user's, say) is not followed.
+        let target = dir("shared-target");
+        std::fs::create_dir_all(&target).expect("target");
+        let link = dir("shared-link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let err = SegmentPort::open(&spec(&link, 3, 0)).err().expect("refused");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("not a directory"), "{err}");
+        assert!(!has_members(&target), "nothing was bound through the link");
+
+        // A file where the directory should be.
+        let file = dir("shared-file");
+        std::fs::write(&file, b"x").expect("file");
+        assert!(SegmentPort::open(&spec(&file, 3, 0)).is_err());
+        for p in [&link, &file] {
+            let _ = std::fs::remove_file(p);
+        }
+        let _ = std::fs::remove_dir_all(&target);
     }
 
     #[test]

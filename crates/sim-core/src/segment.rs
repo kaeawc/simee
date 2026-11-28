@@ -23,7 +23,7 @@ use std::str::FromStr;
 /// ranges home routers and VPNs hand out.
 pub const NET_PREFIX: [u8; 2] = [10, 77];
 /// Subnet numbers `1..=254` (`10.77.n.0/24`).
-pub const MAX_SUBNETS: usize = 254;
+pub const MAX_SUBNETS: u8 = 254;
 /// Members per segment: host numbers `.1` to `.16`.
 pub const MAX_MEMBERS: usize = 16;
 /// The prefix length every member configures.
@@ -33,6 +33,8 @@ pub const PREFIX_LEN: u8 = 24;
 pub const GUEST_IFACE: &str = "eth1";
 /// The longest socket path a member may have: `sun_path` holds 104 bytes on macOS, with its NUL.
 pub const MAX_SOCKET_PATH: usize = 100;
+/// Where the segment's `ip rule`s sit: ahead of Android's own rules for its networks.
+pub const RULE_PRIORITY: u32 = 500;
 /// The longest segment name (it is a directory name).
 pub const MAX_NAME: usize = 32;
 
@@ -47,7 +49,7 @@ pub fn valid_name(name: &str) -> bool {
 
 /// The lowest subnet number (`10.77.n.0/24`) not in `taken`, or `None` when all 254 are.
 pub fn allocate_subnet(taken: &[u8]) -> Option<u8> {
-    (1..=254u8).find(|n| !taken.contains(n))
+    (1..=MAX_SUBNETS).find(|n| !taken.contains(n))
 }
 
 /// The lowest member index not in `taken`, or `None` when the segment is full.
@@ -102,8 +104,8 @@ impl SegmentSpec {
     /// Checks the pieces: a subnet and member this scheme can address, and a socket path that
     /// fits `sun_path`.
     pub fn validate(&self) -> Result<(), String> {
-        if !(1..=254).contains(&self.subnet) {
-            return Err(format!("subnet {} is outside 1..=254", self.subnet));
+        if !(1..=MAX_SUBNETS).contains(&self.subnet) {
+            return Err(format!("subnet {} is outside 1..={MAX_SUBNETS}", self.subnet));
         }
         if usize::from(self.member) >= MAX_MEMBERS {
             return Err(format!("member {} is outside 0..={}", self.member, MAX_MEMBERS - 1));
@@ -190,14 +192,20 @@ impl PlannedMember {
 /// The commands that configure the guest's side of the segment NIC.
 ///
 /// Linux's side only: the NIC needs its address, `MULTICAST`, and a route for 224.0.0.0/4 (the
-/// guest's default route is the NAT's, which would send mDNS there). Whether Android's
-/// connectivity stack then offers the interface to `NsdManager` is not settled without a
-/// booted guest (`docs/design/net-segment.md`, "Not verified").
+/// guest's default route is the NAT's, which would send mDNS there). Android's netd policy
+/// routing has no rule that looks up the `main` table for an interface it doesn't manage, so
+/// the routes those commands make would never be consulted for unicast to the other members; the
+/// two `ip rule`s send the segment's subnet and the multicast range to `main`. Whether that is
+/// enough, and whether Android's connectivity stack then offers the interface to `NsdManager`,
+/// is not settled without a booted guest (`docs/design/net-segment.md`, "Not verified").
 pub fn guest_setup(ip: Ipv4Addr) -> Vec<String> {
+    let [a, b, subnet, _] = ip.octets();
     vec![
         format!("ip addr add {ip}/{PREFIX_LEN} dev {GUEST_IFACE}"),
         format!("ip link set {GUEST_IFACE} multicast on up"),
         format!("ip route add 224.0.0.0/4 dev {GUEST_IFACE}"),
+        format!("ip rule add to {a}.{b}.{subnet}.0/{PREFIX_LEN} lookup main priority {RULE_PRIORITY}"),
+        format!("ip rule add to 224.0.0.0/4 lookup main priority {}", RULE_PRIORITY + 1),
     ]
 }
 
@@ -217,7 +225,7 @@ impl SegmentPlan {
         if !valid_name(name) {
             return Err(format!("'{name}' isn't a segment name (lowercase letters, digits, - and _; at most {MAX_NAME})"));
         }
-        let subnet = allocate_subnet(taken_subnets).ok_or("all 254 segment subnets are in use")?;
+        let subnet = allocate_subnet(taken_subnets).ok_or_else(|| format!("all {MAX_SUBNETS} segment subnets are in use"))?;
         let plan = SegmentPlan { name: name.to_string(), dir: base.join(name), subnet, members: Vec::new() };
         SegmentSpec { dir: plan.dir.clone(), subnet, member: 0 }.validate()?;
         Ok(plan)
@@ -403,7 +411,19 @@ mod tests {
     fn the_guest_setup_addresses_the_second_nic_and_routes_multicast_to_it() {
         let plan = SegmentPlan::of("pair", &base(), &[], &["a", "b"]).expect("plan");
         let cmds = plan.member("b").expect("b").guest_setup();
-        assert_eq!(cmds, ["ip addr add 10.77.1.2/24 dev eth1", "ip link set eth1 multicast on up", "ip route add 224.0.0.0/4 dev eth1"]);
+        assert_eq!(
+            cmds,
+            [
+                "ip addr add 10.77.1.2/24 dev eth1",
+                "ip link set eth1 multicast on up",
+                "ip route add 224.0.0.0/4 dev eth1",
+                "ip rule add to 10.77.1.0/24 lookup main priority 500",
+                "ip rule add to 224.0.0.0/4 lookup main priority 501",
+            ]
+        );
         assert!(cmds.iter().all(|c| !c.contains("eth0")), "the NAT NIC is left alone");
+        // The rule names the member's own subnet, not a fixed one.
+        let other = SegmentPlan::of("two", &base(), &[1], &["a", "b"]).expect("plan");
+        assert!(other.member("a").expect("a").guest_setup().iter().any(|c| c.contains("to 10.77.2.0/24 lookup main")));
     }
 }
