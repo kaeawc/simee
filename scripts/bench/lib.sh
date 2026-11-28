@@ -7,8 +7,13 @@
 # - `--help` prints the script's header comment; `--rounds N` (default 3) rounds, medians;
 #   `--quick` one short round (a smoke test, not a number to publish); `--out DIR` for results
 #   (default bench/results, which git ignores).
-# - The host is recorded at the start and the end (model, OS, CPUs, load average, simee's commit):
-#   scripts/bench/summarize.py host.
+# - The host is quiet before anything is measured (quiet.sh: load, foreign emulators, simulators and
+#   compilers, thermal pressure, battery power; a bounded wait, then a refusal that lists what is
+#   busy, exit status 4). `--no-quiet-gate` skips it, for a smoke run whose numbers aren't
+#   published. docs/research/bench-protocol.md.
+# - The host is recorded at the start and the end (model, chip, cores, memory, OS, load average,
+#   thermal state, power source, simee's commit): scripts/bench/summarize.py host; bench_finish
+#   writes it as <name>-<time>.host.json beside the results, with the spread of every measure.
 # - Every device a run uses it creates itself and deletes on exit (AVDs with `emu -delete-avd`,
 #   simulators with `simctl delete`, by UDID), or, where a script says so (camera.sh), it is a
 #   booted device named on the command line, which the run leaves as it found it. It never touches
@@ -24,8 +29,18 @@ BENCH_OUT=${BENCH_OUT:-$BENCH_REPO/bench/results}
 BENCH_ROUND=0
 BENCH_ARGS="$*"
 BENCH_PIDS=()
+# Devices the run measures but did not boot (UDIDs, AVD names, emulator-PORT serials): the gate
+# doesn't count them as foreign. Set with bench_target before bench_start.
+BENCH_TARGETS=()
 BENCH_CLEANUP=()
 BENCH_SHIFT=1
+BENCH_QUIET_GATE=${BENCH_QUIET_GATE:-1}
+# bench_start sets it ("passed", "passed after 12 s", "disabled"); summarize.py reads it.
+BENCH_GATE_STATUS=""
+BENCH_SCRIPT=$0
+export BENCH_GATE_STATUS BENCH_SCRIPT
+# shellcheck source=quiet.sh
+. "$BENCH_DIR/quiet.sh"
 
 # Devices no benchmark touches, whatever it is told: the owner's and CI's own (emulators by serial,
 # simulators by UDID). $BENCH_PROTECTED_DEVICES (space-separated) adds to them, never replaces them.
@@ -58,6 +73,10 @@ bench_refuse_protected_port() {
 
 bench_help() {
   awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+  echo
+  echo "Every benchmark waits for a quiet host first (scripts/bench/quiet.sh, docs/research/bench-protocol.md)"
+  echo "and refuses, exit status 4, when it stays busy. --no-quiet-gate skips the gate: a smoke run whose"
+  echo "numbers are not published."
 }
 
 bench_die() {
@@ -89,6 +108,7 @@ bench_opt() {
       BENCH_OUT=$2
       BENCH_SHIFT=2
       ;;
+    --no-quiet-gate) BENCH_QUIET_GATE=0 ;;
     *) bench_die "unknown option $1 (--help lists them)" ;;
   esac
 }
@@ -109,9 +129,31 @@ median() {
   grep -E '^-?[0-9.]+$' | sort -n | awk '{ v[NR] = $1 } END { if (NR % 2) print v[(NR + 1) / 2]; else if (NR) printf "%.3f\n", (v[NR / 2] + v[NR / 2 + 1]) / 2 }'
 }
 
-# Starts the run: a work directory, the samples file, the host at the start, the exit trap.
+# bench_target ID...: devices this run measures that were already running.
+bench_target() { BENCH_TARGETS+=("$@"); }
+
+# bench_gate: waits for a quiet host (quiet.sh) and sets BENCH_GATE_STATUS, or refuses with what is
+# busy and exits 4 (run-all.sh stops the run on it: the next benchmark would wait for the same busy
+# host). Processes this run tracks are its own, not foreign (BENCH_PIDS entries: a PID, or
+# "PID|lstart|command", one per line to quiet.sh), and so are the devices it measures that the user
+# booted (bench_target). BENCH_QUIET_GATE=0 (--no-quiet-gate) skips the gate.
+bench_gate() {
+  if [ "$BENCH_QUIET_GATE" = 0 ]; then
+    BENCH_GATE_STATUS="disabled (--no-quiet-gate)"
+    return 0
+  fi
+  bench_log "waiting for a quiet host (up to ${BENCH_QUIET_WAIT:-300} s)"
+  local allow=""
+  [ ${#BENCH_PIDS[@]} -gt 0 ] && allow=$(printf '%s\n' "${BENCH_PIDS[@]}")
+  BENCH_GATE_STATUS=$(BENCH_QUIET_WHO=$(basename "$0") BENCH_QUIET_ALLOW_PIDS="$allow" BENCH_QUIET_TARGETS="${BENCH_TARGETS[*]:-}" quiet_gate) || exit 4
+  bench_log "host is quiet: $BENCH_GATE_STATUS"
+}
+
+# Starts the run: the quiet gate, a work directory, the samples file, the host at the start, the
+# exit trap.
 bench_start() {
   BENCH_NAME=$1
+  bench_gate
   BENCH_WORK=$(mktemp -d "${TMPDIR:-/tmp}/bench-$BENCH_NAME.XXXXXX")
   BENCH_SAMPLES="$BENCH_WORK/samples.tsv"
   : >"$BENCH_SAMPLES"

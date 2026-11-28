@@ -1,0 +1,26 @@
+# The noise budget of each measure: the largest spread its rounds may show before the run is marked
+# noisy and kept out of the published tables. Spread is the interquartile range over the median
+# (IQR / p50) of a measure's numeric samples, so it needs three or more rounds. First match wins;
+# the left column is a glob over the measure's name, lowercased; `-` means the measure is a count
+# or a verdict that has no spread to budget. scripts/bench/summarize.py; docs/research/bench-protocol.md.
+# BENCH_NOISE_BUDGET=0.2 replaces every budget, for a run where the host can't be made quieter.
+*p99*	0.30
+*p95*	0.25
+*p90*	0.20
+*colours*	-
+*share of the dominant*	-
+*pixels differing*	-
+*exit status*	-
+*failures*	-
+*shown (*	-
+*janky*	0.50
+*mb/s*	0.15
+*cpu*	0.25
+*% of a core*	0.25
+*cores*	0.25
+*rss*	0.10
+*, mb*	0.10
+*fps*	0.10
+*, ms*	0.10
+*, s	0.10
+*	0.15
