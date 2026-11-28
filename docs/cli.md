@@ -179,3 +179,9 @@ methods in its own process, like `--in-process`; configure it in the agent as th
 mcp`. It serves the `core` toolset (about twenty tools) unless `SIMEE_MCP_TOOLSETS` names others
 (`core,debug`, or `all`): see [toolsets](mcp.md#toolsets). `simee mcp install <client>` writes the config for
 Claude Code, Cursor, VS Code and others: see [MCP clients](mcp-clients.md).
+
+Destructive tools ask a person first, boots go through the host's admission check, and every call is
+logged. `--read-only`, `--allow-device PATTERN`, `--created-devices-only`, `--policy FILE`,
+`--admission ignore` and `--audit-log PATH` (or `--no-audit-log`) set what a client may do;
+`simee mcp-audit` reads the log back (`--tool`, `--client`, `--status`, `--limit`, `--json`). See
+[MCP safety](mcp-safety.md).

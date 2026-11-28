@@ -38,8 +38,7 @@ reading the sources on 2026-11-28:
   devpts, `/proc` and the host's `/sys` (read-only) and pivots into the result; as root, with the
   container mapped to a range of its own, likewise. Only binderfs fails, as section 1 predicts. Whether Redroid's `/init` then boots, and in
   how long, is still the spike.
-- **Open**: the adb port (no network namespace yet, so the container's adbd takes the host's 5555),
-  display, input and console, cgroup limits, and the numbers for `docs/benchmarks.md`.
+- **Open**: display, input and console, cgroup limits, and the numbers for `docs/benchmarks.md`.
 
 ## Summary
 
@@ -240,7 +239,9 @@ record, tool by tool, in the spike. [inferred]
   worker running someone else's APKs.
 - Redroid also warns not to expose the adb port on a public network
   ([redroid-doc](https://github.com/remote-android/redroid-doc)); emu would publish adb and the
-  console on `127.0.0.1` only, as it does for VMs.
+  console on `127.0.0.1` only, as it does for VMs. The launcher does that from its own network
+  namespace (docs/android.md, "Container backend"): the pinned image's adbd has authentication off
+  and binds every address, so the container never shares the host's namespace.
 - Mitigations to test, in order: a minimal `--cap-add` set with `--device` nodes in place of
   `--privileged`; rootless podman with binderfs mounted in the user namespace (the matrix comment
   says binderfs mounts in a user namespace; whether Redroid's init works unprivileged is untested);

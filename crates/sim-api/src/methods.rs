@@ -166,6 +166,14 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          an iPhone Duo's inner screen as its framebuffer holds it, 2007x2853)",
     ),
     (
+        "wait_idle",
+        "device, quiet_ms?(300), timeout_ms?(10000), screenshot?(false), path?, display?(main|outer|inner|carplay), set?",
+        "Wait until the screen is still: no frame has changed it for quiet_ms, at most timeout_ms (fails if it kept changing). \
+         Follows the display's frame callback and surface seed, reading no pixels while nothing is presented; where the seed \
+         ticks on a still screen (iOS 26.5, 10 times a second) a content hash decides. Returns waited_ms and frames (seed \
+         changes seen), and with screenshot the still screen as screenshot returns it (path, else base64 in `png`)",
+    ),
+    (
         "stream_start",
         "device, whip_url, token?, fps?(30), max_size?(1280), bitrate?(2500000), audio?(false), input?(false); iOS: set?",
         "Stream the screen as H.264 over WebRTC to a WHIP endpoint (plaintext http to a loopback host only, e.g. MediaMTX's \
