@@ -1640,9 +1640,12 @@ pub(crate) mod tests {
         s.ios.use_set(Err(bad.clone()));
         let target = lookup(&mut s, &json!({"device": "pixel"}), false).expect("the AVD");
         assert_eq!((target.platform, target.udid.as_str(), target.set), (Platform::Android, "pixel", None));
-        // An iOS device can't be streamed from that set: the reason is the set's.
+        // An iOS device can't be streamed from that set: the reason is the set's. (Off macOS
+        // there are no iOS devices at all, so the lookup refuses for that reason instead.)
         let err = lookup(&mut s, &json!({"device": "409409A0-0000-4000-8000-000000000409"}), false).expect_err("iOS");
-        assert!(err.contains("absolute"), "{err}");
+        if cfg!(target_os = "macos") {
+            assert!(err.contains("absolute"), "{err}");
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 
