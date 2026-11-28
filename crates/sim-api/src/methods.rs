@@ -153,37 +153,49 @@ pub const METHODS: &[(&str, &str, &str)] = &[
          warm; without one the next boot is a first boot. The AVD keeps its name and config, and the stock emulator's own files \
          are left alone (its `-wipe-data` clears them)",
     ),
-    // Device links (docs/design/device-links.md); iOS watch pairs are CoreSimulator's (#423).
+    // Device links (docs/design/device-links.md); iOS watch pairs are CoreSimulator's (#423), headset-phone links simee's own
+    // records (#535).
     (
         "link",
-        "devices?, kind?(watch-phone|car-phone|headset-phone|network), active?, link?, set?",
-        "Link two devices that work together. iOS: a watch and a phone become a CoreSimulator device pair (as `simctl pair`), kept in \
-         the device set, so it outlives the server and a host reboot. kind is inferred from the form factors (watch-phone); other \
-         form factors (two watches, a watch and an iPad) are refused naming what each device is, and so is a watch already paired \
-         with another phone. Linking a pair that exists returns it. active true makes it the phone's active watch (as \
-         `pair_activate`: a phone may have several watches, one of them active); link (an id) names an existing pair. Returns \
-         `link`: id (the pair's UUID), kind, mechanism (coresim-pair), state (active: both booted and connected; pending: a member \
-         is shut down or the pair isn't connected yet; broken: a member is gone) with reason, active, and members (device, name, \
-         platform, role, running). Android links: not yet (#424)",
+        "devices?, kind?(watch-phone|car-phone|headset-phone|network), ports?, active?, link?; iOS: set?",
+        "Link two devices that work together. kind is inferred from the form factors (watch + phone: watch-phone; vision + phone: \
+         headset-phone); other form factors (two watches, a watch and an iPad) are refused naming what each device is. iOS \
+         watch-phone: a CoreSimulator device pair (as `simctl pair`), kept in the device set, so it outlives the server and a host \
+         reboot; a watch already paired with another phone is refused; active true makes it the phone's active watch (as \
+         `pair_activate`: a phone may have several watches, one of them active). headset-phone (a visionOS or Android XR headset \
+         with a phone of the same platform): saved in each member's links.json; on iOS mechanism network (simulators share the \
+         host's network: a port one listens on is 127.0.0.1:<port> in the other); on Android mechanism net-forward: ports \
+         ({\"<device>\": [8080]}) names the ports members listen on, each forwarded to a host port (`adb forward`) that the other \
+         device dials at 10.0.2.2:<host_port> (the host at 127.0.0.1); a member that isn't running gets its forward when the devices \
+         are linked again, which also re-adds forwards a reboot or an adb server restart dropped. Android XR glasses are refused \
+         until the Bluetooth bridge (#435); Wear OS and Android Automotive links are not yet (#445, #439). Linking devices that are \
+         linked returns their link; link (an id) names an existing one. Returns `link`: id (a pair's UUID, or lnk-…), kind, \
+         mechanism (coresim-pair, network, net-forward), state (active: both booted and, for a pair, connected; pending: a member \
+         is shut down, the pair isn't connected yet or a port isn't forwarded; broken: a member is gone) with reason, since, active \
+         (watch pairs; null otherwise), members (device, name, platform, role, running) and, for net-forward, forwards (device, \
+         port, host_port)",
     ),
     (
         "unlink",
-        "link?, device?, kind?, set?",
-        "Remove a link (link, an id) or every link of device (of kind). iOS: CoreSimulator unpairs it (as `simctl unpair`) and may \
-         shut the watch down and erase it while doing so. Returns unlinked (the ids) and teardown, one entry per link: id, watch, \
-         and shut_down (the watch ran and was shut down) or error",
+        "link?, device?, kind?; iOS: set?",
+        "Remove a link (link, an id) or every link of device (of kind). iOS watch pairs: CoreSimulator unpairs it (as `simctl \
+         unpair`) and may shut the watch down and erase it while doing so. headset-phone: its forwards are removed and every \
+         member's copy. Returns unlinked (the ids) and teardown, one entry per link: id, and for a pair watch and shut_down (the \
+         watch ran and was shut down); error when a step failed",
     ),
     (
         "links",
-        "device?, kind?, state?(pending|active|broken), set?",
-        "Every link (of one device, of a kind, in a state), each as `link` returns it, its state derived now from the device set and \
-         whether each member runs",
+        "device?, kind?, state?(pending|active|broken); iOS: set?",
+        "Every link (of one device, of a kind, in a state), each as `link` returns it, its state derived now from the device set, \
+         the saved links and whether each member runs (no device I/O: a forward the adb server dropped shows in link_status)",
     ),
     (
         "link_status",
-        "link?, device?, set?",
-        "One link (by id, or the one device is in) as `links` shows it, with checks: whether each member exists and runs, whether \
-         CoreSimulator has the pair connected, and whether it is the phone's active watch, each with ok and detail",
+        "link?, device?; iOS: set?",
+        "One link (by id, or the one device is in) as `links` shows it, probed now, with checks, each with ok and detail: whether \
+         each member exists and runs; for a watch pair whether CoreSimulator has it connected and whether it is the phone's active \
+         watch; for a headset-phone on iOS the host network; for net-forward whether each forward is still the adb server's and \
+         whether something in the device listens on its port (a forward gone or a port nothing listens on yet leaves it pending)",
     ),
     (
         "screen",
@@ -767,6 +779,11 @@ const ALL_PLATFORMS: &[&str] = &[
     "audio_state",
     "audio_volume",
     "audio_mute",
+    // Device links: iOS watch pairs through CoreSimulator, headset-phone links on both (#535).
+    "link",
+    "unlink",
+    "links",
+    "link_status",
 ];
 /// Methods only Android devices have.
 const ANDROID_ONLY: &[&str] = &["console", "xr", "vehicle", "touchpad", "export", "import"];
@@ -3209,6 +3226,8 @@ pub(crate) mod tests {
         ("ls", "without a path it lists the device's `/`, in no app's container; android_files.rs runs it on the files fake"),
         ("du", "without a path it sizes the device's `/`, in no app's container; android_files.rs runs it on the files fake"),
         ("kill", "the probe's pid is 1, init, which kill refuses without force (its own tests read its parameters)"),
+        ("link", "takes `devices`, not `device`, and a headset-phone pair: links.rs runs it on its fakes"),
+        ("link_status", "refuses a device in no link before it reads more: links.rs runs it on its fakes"),
     ];
 
     /// The parameters an iOS dispatcher arm reads with `need_*` or reports missing, found in its

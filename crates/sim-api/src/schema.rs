@@ -55,6 +55,7 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         // link, unlink, links and link_status (docs/design/device-links.md)
         "link" => Str,
         "active" => Bool,
+        "ports" if method == "link" => Obj,
         "state" if method == "links" => Str,
         // boot, boot_many, create and clone's admission, and admission_check (#275)
         "admission" => Str,

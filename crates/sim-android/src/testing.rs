@@ -226,7 +226,9 @@ pub fn wait_for(lines: &Mutex<Vec<String>>, n: usize) -> Vec<String> {
 /// profile's `apps.turbo`, `apps.wellbeing` and `partnersetup` (which it refuses to disable) and
 /// not `apps.restore`; what is disabled is kept in `disabled` beside the script. `com.example.app` has
 /// an FCM receiver that a root `am broadcast` reaches (`noroot` beside the script: no `su`), and
-/// `am broadcast -a` succeeds except for the protected `BOOT_COMPLETED`.
+/// `am broadcast -a` succeeds except for the protected `BOOT_COMPLETED`. `forward` keeps the adb
+/// server's forwards (every device's) in `forwards` beside the script, host ports from 41001, and
+/// the TCP tables say 8080 listens.
 pub fn fake_adb(android: &Android) -> FakeAdb {
     let dir = android.env.sdk_root.as_ref().expect("sdk root").join("platform-tools");
     std::fs::create_dir_all(&dir).expect("platform-tools");
@@ -280,7 +282,8 @@ impl FakeAdb {
 }
 
 const FAKE_ADB: &str = r#"echo "$*" >> "$(dirname "$0")/adb.log"
-[ "$1" = "-s" ] && shift 2
+serial=
+[ "$1" = "-s" ] && serial="$2" && shift 2
 # What an API 36 guest's toybox `ps -A -o PID,PPID,%CPU,RSS,ETIME,NAME,CMDLINE` prints (trimmed).
 ps_rows() {
   printf '%s\n' \
@@ -412,6 +415,18 @@ stat() { echo "$1 ($2) S $3 1 1 0 -1 4194560 100 0 0 0 $4 $5 0 0 20 0 1 0 100 0 
 d="$(dirname "$0")"
 installed() { printf 'package:android\npackage:com.android.systemui\npackage:com.google.android.apps.turbo\npackage:com.google.android.apps.wellbeing\npackage:com.google.android.partnersetup\n'; }
 case "$1" in
+# The adb server's forwards, every device's, in `forwards` beside the script; host ports from 41001.
+forward)
+  f="$d/forwards"
+  case "$2" in
+    --list) cat "$f" 2>/dev/null || true;;
+    --remove) grep -v " $3 " "$f" > "$f.new" 2>/dev/null; mv "$f.new" "$f";;
+    tcp:0)
+      n=$(( $(cat "$d/forward.next" 2>/dev/null || echo 41001) ))
+      echo $(( n + 1 )) > "$d/forward.next"
+      echo "$serial tcp:$n $3" >> "$f"; echo "$n";;
+    *) echo "fake adb: unhandled: $*" >&2; exit 2;;
+  esac;;
 install)
   case "$*" in
     *broken.apk*) echo "Performing Streamed Install" >&2; echo "adb: failed to install broken.apk: Failure [INSTALL_PARSE_FAILED_NOT_APK: Failed to parse /data/app/vmdl1.tmp/base.apk]" >&2; exit 1;;
@@ -517,6 +532,8 @@ shell)
     "cmd connectivity airplane-mode disable") echo 0 > "$(dirname "$0")/airplane";;
     # sim_android::net's socket listing, as root (google_apis has su), and its traffic counters.
     *"echo @net:fd;"*) net_sockets;;
+    # sim_android::net's listening ports: the same tables (8080 listens on IPv6).
+    "echo @net:tcp; cat /proc/net/tcp; "*) net_sockets;;
     *"mAppUidStatsMap"*) net_traffic;;
     # exec's argv line runs on the host's sh, as the guest's would run it, in a child that outlives
     # this adb (as adbd's shell outlives an adb client that is stopped). With `exec.slow` beside the

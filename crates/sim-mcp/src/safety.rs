@@ -572,7 +572,12 @@ fn what_it_does(
             Some(id) => {
                 let members = pair.iter().map(|(d, role)| format!("{role} `{}`", d.name)).collect::<Vec<_>>().join(" and ");
                 let named = if members.is_empty() { format!("`{id}`") } else { format!("`{id}` ({members})") };
-                format!("unlink {named}: CoreSimulator may shut its watch down and erase it")
+                if id.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("lnk-")) {
+                    // A link simee keeps (headset-phone): no device is shut down or erased.
+                    format!("unlink {named}: its forwards and each member's saved copy are removed")
+                } else {
+                    format!("unlink {named}: CoreSimulator may shut its watch down and erase it")
+                }
             }
             None => format!("unlink every link of {on}: CoreSimulator may shut each watch down and erase it"),
         },

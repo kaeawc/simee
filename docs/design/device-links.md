@@ -233,6 +233,15 @@ glasses do pair: stock pairs a glasses AVD with one phone AVD over Bluetooth, an
 the phone. A glasses member gets `bt-netsim` under the same kind, and is refused until the
 netsimd bridge (#435) exists. Details: [research/headset-pairing.md](../research/headset-pairing.md).
 
+Implemented (#535, `crates/sim-api/src/links/records.rs`): an iOS pair gets mechanism `network`
+(no transport: the simulators already share the host's network) and an Android XR headset with a
+phone gets `net-forward`, with `ports` naming what each member listens on. Both are records in each
+member's `links.json`. `link_status` probes each forward (`adb forward --list`) and whether its
+port listens in the guest (`/proc/net/tcp`, `tcp6`); a forward the adb server dropped leaves the
+link `pending` until the devices are linked again. A glasses member (`ai-glasses` image) is refused
+naming #435. Not yet: `create {companion}`, `boot {companions}`, and re-adding forwards on a
+member's boot (`member_booted`).
+
 ### A shared virtual network (`network`)
 
 What each platform has today:

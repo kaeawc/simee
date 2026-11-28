@@ -1,6 +1,9 @@
 //! Device links (docs/design/device-links.md): the kinds, the role each member plays, the member
-//! rules checked before anything changes, and what a CoreSimulator device pair's fields mean as a
-//! link's state. Pure: the adapters in `sim-api` do the I/O.
+//! rules checked before anything changes, what a CoreSimulator device pair's fields mean as a
+//! link's state, and the records simee keeps for the other kinds (`headset-phone`'s mechanisms,
+//! `rev` merging, the state derived from the members). Pure: the adapters in `sim-api` do the I/O.
+
+use serde::{Deserialize, Serialize};
 
 use crate::form_factor::FormFactor;
 use crate::platform::Platform;
@@ -101,6 +104,156 @@ impl LinkState {
 
 /// The mechanism of an iOS watch pair: CoreSimulator's own device pair.
 pub const CORESIM_PAIR: &str = "coresim-pair";
+
+/// The mechanism of an iOS headset-phone link: the host's own network. Simulators are host
+/// processes on the host's network stack, so the link carries nothing of its own: it records the
+/// pair and its roles.
+pub const HOST_NETWORK: &str = "network";
+
+/// The mechanism of an Android XR headset-phone link: the ports its members listen on, each
+/// forwarded to the host (`adb forward`), where the other member dials it (10.0.2.2 from an
+/// Android guest, 127.0.0.1 from the host).
+pub const NET_FORWARD: &str = "net-forward";
+
+/// The issue whose netsimd bridge Android XR glasses wait for: they pair with their phone over
+/// Bluetooth (docs/research/headset-pairing.md).
+pub const GLASSES_ISSUE: &str = "#435";
+
+/// The mechanism a `headset-phone` link between two devices of `platform` gets, or why none can
+/// carry it: `glasses` names a member that is a pair of Android XR glasses (an `ai-glasses` image),
+/// which stock pairs with its phone over Bluetooth, and emu's controller has no peers until
+/// netsimd's bridge exists.
+pub fn headset_mechanism(platform: Platform, glasses: Option<&str>) -> Result<&'static str, String> {
+    match (platform, glasses) {
+        (Platform::Ios, _) => Ok(HOST_NETWORK),
+        (Platform::Android, None) => Ok(NET_FORWARD),
+        (Platform::Android, Some(name)) => Err(format!(
+            "{name} is a pair of Android XR glasses: glasses pair with their phone over Bluetooth, which waits for emu's \
+             netsimd bridge ({GLASSES_ISSUE}); an Android XR headset links with net-forward"
+        )),
+    }
+}
+
+/// A port a link forwards: `device` (a member's id) listens on `port`, and the host reaches it at
+/// `host_port` (`None` until the member ran when the link was made).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Forward {
+    pub device: String,
+    pub port: u16,
+    #[serde(default)]
+    pub host_port: Option<u16>,
+}
+
+/// A member as a link record keeps it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordMember {
+    /// `ios` or `android`.
+    pub platform: String,
+    /// Its stable id: a simulator's UDID, an AVD's name.
+    pub device: String,
+    pub role: String,
+}
+
+/// What a mechanism keeps across restarts.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Params {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwards: Vec<Forward>,
+}
+
+/// A link simee keeps itself (every kind but iOS's watch pairs, which are CoreSimulator's): each
+/// member's `links.json` holds a copy (docs/design/device-links.md, "Persistence"). Its state isn't
+/// kept: every read derives it from the members.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Record {
+    /// `lnk-` and 8 hex digits.
+    pub id: String,
+    pub kind: String,
+    pub mechanism: String,
+    /// Raised on every write: of two copies that differ, the higher wins.
+    #[serde(default)]
+    pub rev: u64,
+    pub members: Vec<RecordMember>,
+    #[serde(default)]
+    pub params: Params,
+    /// When it was made or last linked again (ISO 8601, UTC).
+    #[serde(default)]
+    pub since: Option<String>,
+}
+
+impl Record {
+    /// Why it can't be read as a link: an unknown kind, a member of an unknown platform, an id that
+    /// isn't `lnk-` and 8 hex digits, fewer than two members.
+    pub fn check(&self) -> Result<(), String> {
+        let hex = self.id.strip_prefix("lnk-").is_some_and(|h| h.len() == 8 && h.bytes().all(|b| b.is_ascii_hexdigit()));
+        if !hex {
+            return Err(format!("`{}` isn't a link id (lnk- and 8 hex digits)", self.id));
+        }
+        LinkKind::parse(&self.kind)?;
+        if self.members.len() < 2 {
+            return Err(format!("link {} has {} members", self.id, self.members.len()));
+        }
+        for m in &self.members {
+            if Platform::parse(&m.platform).is_none() {
+                return Err(format!("link {}: unknown platform `{}`", self.id, m.platform));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `(platform, id)` is one of its members (ids in any case).
+    pub fn has(&self, platform: Platform, id: &str) -> bool {
+        self.members.iter().any(|m| m.platform == platform.as_str() && m.device.eq_ignore_ascii_case(id))
+    }
+
+    /// Whether its members are exactly `members`, in any order.
+    pub fn same_members(&self, members: &[(Platform, &str)]) -> bool {
+        self.members.len() == members.len() && members.iter().all(|(p, id)| self.has(*p, id))
+    }
+}
+
+/// The copies of several members' files as one list: one record per id, the highest `rev`'s, in
+/// the order each id was first seen.
+pub fn merge(copies: impl IntoIterator<Item = Record>) -> Vec<Record> {
+    let mut out: Vec<Record> = Vec::new();
+    for r in copies {
+        match out.iter_mut().find(|o| o.id == r.id) {
+            Some(o) if r.rev > o.rev => *o = r,
+            Some(_) => {}
+            None => out.push(r),
+        }
+    }
+    out
+}
+
+/// A record link's state from its members alone (what `links` reads, no device I/O): `broken`
+/// when one is gone, `pending` while one is shut down or a running member's port wasn't forwarded
+/// (`unforwarded`: "`name`'s port 8080"), else `active`.
+pub fn record_state(members: &[Member<'_>], unforwarded: &[String]) -> (LinkState, String) {
+    if let Some(gone) = members_state(members) {
+        return gone;
+    }
+    if !unforwarded.is_empty() {
+        let what = unforwarded.join(" and ");
+        return (LinkState::Pending, format!("{what} isn't forwarded: `link` the devices again to forward it"));
+    }
+    (LinkState::Active, "both run".into())
+}
+
+/// `broken` (a member gone) or `pending` (one shut down), with why; `None` when every member runs.
+fn members_state(members: &[Member<'_>]) -> Option<(LinkState, String)> {
+    let missing: Vec<&str> = members.iter().filter_map(|m| if let Member::Missing(n) = m { Some(*n) } else { None }).collect();
+    if !missing.is_empty() {
+        let verb = if missing.len() == 1 { "no longer exists" } else { "no longer exist" };
+        return Some((LinkState::Broken, format!("{} {verb}", missing.join(" and "))));
+    }
+    let stopped: Vec<&str> = members.iter().filter_map(|m| if let Member::Stopped(n) = m { Some(*n) } else { None }).collect();
+    if !stopped.is_empty() {
+        let verb = if stopped.len() == 1 { "is shut down" } else { "are shut down" };
+        return Some((LinkState::Pending, format!("{} {verb}", stopped.join(" and "))));
+    }
+    None
+}
 
 /// The most members a `network` link has.
 pub const MAX_PEERS: usize = 16;
@@ -263,15 +416,8 @@ pub enum Member<'a> {
 /// A CoreSimulator pair's state and why: `broken` when a member no longer exists, `pending` while
 /// one is shut down or the pair isn't connected yet, `active` when both run and it is connected.
 pub fn pair_state(connected: bool, watch: Member<'_>, phone: Member<'_>) -> (LinkState, String) {
-    let missing: Vec<&str> = [watch, phone].iter().filter_map(|m| if let Member::Missing(n) = m { Some(*n) } else { None }).collect();
-    if !missing.is_empty() {
-        let verb = if missing.len() == 1 { "no longer exists" } else { "no longer exist" };
-        return (LinkState::Broken, format!("{} {verb}", missing.join(" and ")));
-    }
-    let stopped: Vec<&str> = [watch, phone].iter().filter_map(|m| if let Member::Stopped(n) = m { Some(*n) } else { None }).collect();
-    if !stopped.is_empty() {
-        let verb = if stopped.len() == 1 { "is shut down" } else { "are shut down" };
-        return (LinkState::Pending, format!("{} {verb}", stopped.join(" and ")));
+    if let Some(gone) = members_state(&[watch, phone]) {
+        return gone;
     }
     if connected { (LinkState::Active, "connected".into()) } else { (LinkState::Pending, "both run; the pair isn't connected yet".into()) }
 }
@@ -370,5 +516,90 @@ mod tests {
         assert_eq!(pair_state(true, Stopped("W"), Running("P")), (LinkState::Pending, "W is shut down".into()));
         assert_eq!(pair_state(false, Stopped("W"), Stopped("P")), (LinkState::Pending, "W and P are shut down".into()));
         assert_eq!(pair_state(false, Missing("W-UDID"), Stopped("P")), (LinkState::Broken, "W-UDID no longer exists".into()));
+    }
+
+    #[test]
+    fn a_headset_or_glasses_and_a_phone_infer_headset_phone_with_the_headset_role() {
+        let headset = Candidate { id: "xr", name: "xr", platform: Platform::Android, form_factor: Some(FormFactor::Vision) };
+        let phone = Candidate { id: "pixel", name: "pixel", platform: Platform::Android, form_factor: Some(FormFactor::Phone) };
+        assert_eq!(plan(None, &[headset, phone]), Ok((LinkKind::HeadsetPhone, vec![Role::Headset, Role::Phone])));
+        let (kind, roles) = plan(None, &[ios("iPhone", FormFactor::Phone), ios("Vision Pro", FormFactor::Vision)]).expect("iOS");
+        assert_eq!((kind, roles), (LinkKind::HeadsetPhone, vec![Role::Phone, Role::Headset]));
+        let e = plan(Some(LinkKind::HeadsetPhone), &[ios("W", FormFactor::Watch), ios("P", FormFactor::Phone)]).expect_err("a watch");
+        assert_eq!(e, "a headset-phone link pairs one headset with one phone: W is a watch and P is a phone");
+    }
+
+    #[test]
+    fn ios_headsets_share_the_host_network_android_headsets_forward_and_glasses_wait_for_bluetooth() {
+        assert_eq!(headset_mechanism(Platform::Ios, None), Ok(HOST_NETWORK));
+        assert_eq!(headset_mechanism(Platform::Android, None), Ok(NET_FORWARD));
+        let e = headset_mechanism(Platform::Android, Some("glasses")).expect_err("glasses");
+        assert!(e.starts_with("glasses is a pair of Android XR glasses") && e.contains("#435"), "{e}");
+    }
+
+    fn record(id: &str, rev: u64) -> Record {
+        Record {
+            id: id.into(),
+            kind: "headset-phone".into(),
+            mechanism: NET_FORWARD.into(),
+            rev,
+            members: vec![
+                RecordMember { platform: "android".into(), device: "pixel".into(), role: "phone".into() },
+                RecordMember { platform: "android".into(), device: "xr".into(), role: "headset".into() },
+            ],
+            params: Params::default(),
+            since: None,
+        }
+    }
+
+    #[test]
+    fn a_record_is_checked_and_matched_by_its_members() {
+        let r = record("lnk-0123abcd", 1);
+        assert_eq!(r.check(), Ok(()));
+        assert!(r.has(Platform::Android, "XR") && !r.has(Platform::Ios, "xr"));
+        assert!(r.same_members(&[(Platform::Android, "xr"), (Platform::Android, "pixel")]));
+        assert!(!r.same_members(&[(Platform::Android, "xr")]));
+        assert!(record("lnk-0123", 1).check().expect_err("short id").contains("isn't a link id"));
+        assert!(record("FA1A0000-0000-4000-8000-000000000001", 1).check().is_err(), "a pair's UUID isn't a record's id");
+        let mut bad = record("lnk-0123abcd", 1);
+        bad.kind = "pair".into();
+        assert!(bad.check().expect_err("kind").contains("unknown link kind"));
+        bad = record("lnk-0123abcd", 1);
+        bad.members[0].platform = "tvos".into();
+        assert!(bad.check().expect_err("platform").contains("unknown platform `tvos`"));
+        bad.members.truncate(1);
+        assert!(bad.check().is_err());
+    }
+
+    #[test]
+    fn copies_merge_to_the_highest_rev_of_each_link() {
+        let merged = merge([record("lnk-00000001", 2), record("lnk-00000002", 1), record("lnk-00000001", 5), record("lnk-00000001", 3)]);
+        let got: Vec<(&str, u64)> = merged.iter().map(|r| (r.id.as_str(), r.rev)).collect();
+        assert_eq!(got, [("lnk-00000001", 5), ("lnk-00000002", 1)]);
+    }
+
+    #[test]
+    fn a_records_state_is_derived_from_its_members_and_forwards() {
+        use Member::*;
+        assert_eq!(record_state(&[Running("P"), Running("XR")], &[]), (LinkState::Active, "both run".into()));
+        assert_eq!(record_state(&[Running("P"), Stopped("XR")], &[]), (LinkState::Pending, "XR is shut down".into()));
+        assert_eq!(record_state(&[Missing("xr"), Stopped("P")], &[]).0, LinkState::Broken);
+        let (state, reason) = record_state(&[Running("P"), Running("XR")], &["XR's port 8080".into()]);
+        assert_eq!(state, LinkState::Pending);
+        assert!(reason.starts_with("XR's port 8080 isn't forwarded"), "{reason}");
+    }
+
+    #[test]
+    fn a_record_round_trips_through_serde_with_its_params() {
+        let mut r = record("lnk-0123abcd", 4);
+        r.params.forwards.push(Forward { device: "xr".into(), port: 8080, host_port: Some(41234) });
+        let text = serde_json::to_string(&r).expect("json");
+        assert!(text.contains(r#""forwards":[{"device":"xr","port":8080,"host_port":41234}]"#), "{text}");
+        assert_eq!(serde_json::from_str::<Record>(&text).expect("parse"), r);
+        let bare: Record = serde_json::from_str(
+            r#"{"id":"lnk-0123abcd","kind":"headset-phone","mechanism":"network","members":[{"platform":"ios","device":"A","role":"phone"},{"platform":"ios","device":"B","role":"headset"}]}"#,
+        )
+        .expect("defaults");
+        assert_eq!((bare.rev, bare.params, bare.since), (0, Params::default(), None));
     }
 }

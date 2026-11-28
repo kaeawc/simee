@@ -4,14 +4,20 @@
 //! removed in-process through `sim-coresim` (`simctl pair`, `pair_activate`, `unpair` and `list
 //! pairs` are the public front of the same calls). CoreSimulator's record (the device set's
 //! `device_set.plist`) is the truth: a link's id is the pair's UUID, and every read re-derives the
-//! state from it and from whether each member runs, so a server restart loses nothing. The other
-//! kinds and Android's adapters (#424, #425, #426) come later and are refused with the reason.
+//! state from it and from whether each member runs, so a server restart loses nothing.
+//!
+//! `headset-phone` links, on both platforms, are records simee keeps in each member's
+//! `links.json` (`records.rs`, #535). Wear OS, Android Automotive and network links (#445, #439,
+//! #427) come later and are refused with the reason.
+
+mod records;
 
 use serde_json::{Value, json};
 use sim_core::form_factor::FormFactor;
-use sim_core::link::{self, LinkKind, LinkState, Member, Pair, Role};
+use sim_core::link::{self, LinkKind, LinkState, Member, Pair, Record, Role};
 use sim_core::platform::Platform;
 
+use self::records::{Dev, RecordHost};
 use crate::methods::Session;
 use crate::params::{opt_bool, str_param, strings};
 
@@ -96,31 +102,295 @@ impl PairHost for Backend<'_> {
     }
 }
 
-/// Runs a link method: each device the call names is resolved across platforms first (an Android
-/// one is refused until #445), then the method runs on the iOS backend.
+/// Runs a link method: each device the call names is resolved across platforms first, then the
+/// method runs on CoreSimulator's pairs, simee's records or both ([`dispatch`]).
 pub(crate) fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
     let mut p = p.clone();
     let mut devices = Vec::new();
     for q in strings(&p, "devices") {
-        devices.push(Value::String(ios_device(s, method, &q, &p)?));
+        devices.push(resolve(s, &q, &p)?);
     }
     if !devices.is_empty() {
-        p["devices"] = Value::Array(devices);
+        p["devices"] = devices.iter().map(|(_, id)| Value::String(id.clone())).collect();
     }
-    if let Some(q) = str_param(&p, "device").map(str::to_owned) {
-        p["device"] = Value::String(ios_device(s, method, &q, &p)?);
+    let device = match str_param(&p, "device").map(str::to_owned) {
+        Some(q) => Some(resolve(s, &q, &p)?),
+        None => None,
+    };
+    if let Some((_, id)) = &device {
+        p["device"] = Value::String(id.clone());
     }
-    run(&mut Backend(&mut s.ios), method, &p)
+    dispatch(&mut Hosts(s), method, &p, &devices, device.as_ref())
 }
 
-/// The id of the iOS device `query` names, or why it can't be linked.
-fn ios_device(s: &mut Session, method: &str, query: &str, p: &Value) -> Result<String, String> {
-    let (platform, id) = crate::methods::resolve(s, &json!({"device": query, "platform": p.get("platform")}))?;
-    match platform {
-        Platform::Ios => Ok(id),
-        Platform::Android => Err(format!(
-            "`{method}` links iOS devices for now: {query} is an Android device (Wear OS links are #445, Android Automotive #439)"
+/// The platform and id of the device `query` names.
+fn resolve(s: &mut Session, query: &str, p: &Value) -> Result<(Platform, String), String> {
+    crate::methods::resolve(s, &json!({"device": query, "platform": p.get("platform")}))
+}
+
+/// Both backends on the call's session: CoreSimulator's pairs ([`PairHost`]) and the devices,
+/// files and forwards simee's records need ([`RecordHost`]).
+struct Hosts<'a>(&'a mut Session);
+
+impl PairHost for Hosts<'_> {
+    fn device(&mut self, query: &str) -> Result<Option<Sim>, String> {
+        Backend(&mut self.0.ios).device(query)
+    }
+    fn pairs(&mut self) -> Result<Vec<Pair>, String> {
+        Backend(&mut self.0.ios).pairs()
+    }
+    fn can_pair(&mut self, watch: &str, phone: &str) -> Result<(), String> {
+        Backend(&mut self.0.ios).can_pair(watch, phone)
+    }
+    fn pair(&mut self, watch: &str, phone: &str) -> Result<Pair, String> {
+        Backend(&mut self.0.ios).pair(watch, phone)
+    }
+    fn activate(&mut self, id: &str) -> Result<(), String> {
+        Backend(&mut self.0.ios).activate(id)
+    }
+    fn unpair(&mut self, id: &str) -> Result<(), String> {
+        Backend(&mut self.0.ios).unpair(id)
+    }
+}
+
+/// An AVD as a record sees it.
+fn android_dev(d: &sim_android::Device) -> Dev {
+    Dev {
+        platform: Platform::Android,
+        id: d.info.udid.clone(),
+        name: d.info.name.clone(),
+        form_factor: d.info.form_factor,
+        glasses: d.is_glasses(),
+        running: d.running.is_some(),
+    }
+}
+
+/// A simulator as a record sees it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn ios_dev(s: Sim) -> Dev {
+    Dev { platform: Platform::Ios, id: s.udid, name: s.name, form_factor: s.form_factor, glasses: false, running: s.running }
+}
+
+impl Hosts<'_> {
+    /// simee's state directory of `dev`: `<avd>/simee/` or `<data>/simee/`.
+    fn state_dir(&mut self, dev: &Dev) -> Result<std::path::PathBuf, String> {
+        match dev.platform {
+            Platform::Android => {
+                self.0.android.backend().device(&dev.id)?.state_dir().ok_or_else(|| format!("{}'s config can't be read", dev.name))
+            }
+            #[cfg(target_os = "macos")]
+            Platform::Ios => crate::ios::link_state_dir(&mut self.0.ios, &dev.id),
+            #[cfg(not(target_os = "macos"))]
+            Platform::Ios => Err(crate::ios::REASON.into()),
+        }
+    }
+
+    /// adb bound to the running Android `dev`.
+    fn adb(&mut self, dev: &Dev) -> Result<sim_android::apps::Adb, String> {
+        if dev.platform == Platform::Ios {
+            return Err("iOS simulators share the host's network: nothing is forwarded".into());
+        }
+        let android = self.0.android.backend();
+        android.device(&dev.id)?.adb(android)
+    }
+
+    fn read_file(&mut self, dev: &Dev, dir: &std::path::Path) -> Result<Vec<Record>, String> {
+        let path = dir.join(records::LINKS_FILE);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let (links, warnings) = records::parse_file(&text, (dev.platform, &dev.id), &path.display().to_string());
+        for w in warnings {
+            eprintln!("simee: {w}");
+        }
+        Ok(links)
+    }
+}
+
+impl RecordHost for Hosts<'_> {
+    fn device(&mut self, platform: Platform, id: &str) -> Result<Option<Dev>, String> {
+        match platform {
+            Platform::Android => {
+                let android = self.0.android.backend();
+                if !android.has_avd(id) {
+                    return Ok(None);
+                }
+                Ok(Some(android_dev(&android.device(id)?)))
+            }
+            #[cfg(target_os = "macos")]
+            Platform::Ios => Ok(crate::ios::link_device(&mut self.0.ios, id)?.map(ios_dev)),
+            #[cfg(not(target_os = "macos"))]
+            Platform::Ios => Ok(None),
+        }
+    }
+    fn all(&mut self) -> Result<Vec<Dev>, String> {
+        let android = self.0.android.backend();
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        let mut out: Vec<Dev> = android.devices().iter().filter_map(|i| android.device(&i.udid).ok()).map(|d| android_dev(&d)).collect();
+        #[cfg(target_os = "macos")]
+        out.extend(crate::ios::link_devices(&mut self.0.ios)?.into_iter().map(ios_dev));
+        Ok(out)
+    }
+    fn read(&mut self, dev: &Dev) -> Result<Vec<Record>, String> {
+        let dir = self.state_dir(dev)?;
+        self.read_file(dev, &dir)
+    }
+    fn update(&mut self, dev: &Dev, change: &mut dyn FnMut(&mut Vec<Record>)) -> Result<(), String> {
+        let dir = self.state_dir(dev)?;
+        let _lock = sim_android::StateLock::take(&dir, records::LINKS_FILE)?;
+        let mut links = self.read_file(dev, &dir)?;
+        change(&mut links);
+        sim_android::write_state_file(&dir, records::LINKS_FILE, records::file_text(&links).as_deref())
+    }
+    fn forward(&mut self, dev: &Dev, port: u16) -> Result<u16, String> {
+        self.adb(dev)?.forward(port)
+    }
+    fn remove_forward(&mut self, dev: &Dev, host_port: u16) -> Result<(), String> {
+        self.adb(dev)?.remove_forward(host_port)
+    }
+    fn forwards(&mut self, dev: &Dev) -> Result<Vec<(u16, u16)>, String> {
+        self.adb(dev)?.forwards()
+    }
+    fn listening(&mut self, dev: &Dev) -> Result<Vec<u16>, String> {
+        self.adb(dev)?.listening()
+    }
+    fn new_id(&mut self) -> Result<String, String> {
+        sim_core::entropy::hex(4).map(|h| format!("lnk-{h}")).map_err(|e| e.to_string())
+    }
+    fn now(&mut self) -> String {
+        crate::prefs::Date::from_unix(crate::prefs::Date::now().unix_secs(), 0).to_iso8601()
+    }
+}
+
+/// A link method past device resolution (`devices` and `device` as (platform, id)): a watch pair
+/// goes to CoreSimulator ([`run`]), a kept link (`lnk-…`, `headset-phone`) to its records, and a
+/// listing, an unlink or a status by device to both.
+pub(crate) fn dispatch<H: PairHost + RecordHost>(
+    h: &mut H,
+    method: &str,
+    p: &Value,
+    devices: &[(Platform, String)],
+    device: Option<&(Platform, String)>,
+) -> Result<Value, String> {
+    match method {
+        "link" => link_any(h, p, devices),
+        "unlink" => unlink_any(h, p, device),
+        "links" => links_any(h, p, device),
+        "link_status" => status_any(h, p, device),
+        other => Err(format!("unknown link method `{other}`")),
+    }
+}
+
+/// The record device `(platform, id)`, or the error naming it.
+fn need_dev(h: &mut dyn RecordHost, (platform, id): &(Platform, String)) -> Result<Dev, String> {
+    h.device(*platform, id)?.ok_or_else(|| format!("no device matches `{id}`"))
+}
+
+fn link_any<H: PairHost + RecordHost>(h: &mut H, p: &Value, devices: &[(Platform, String)]) -> Result<Value, String> {
+    if let Some(id) = str_param(p, "link") {
+        if !records::is_record_id(id) {
+            return run(h, "link", p);
+        }
+        let r = records::find(h, id)?;
+        let devs = records::existing_members(h, &r)?;
+        return link_devs(h, Some(LinkKind::parse(&r.kind)?), &devs, p);
+    }
+    let mut devs = Vec::new();
+    for d in devices {
+        devs.push(need_dev(h, d)?);
+    }
+    link_devs(h, records::opt_kind(p)?, &devs, p)
+}
+
+/// The member rules on `devs`, then the adapter their kind and platform take.
+fn link_devs<H: PairHost + RecordHost>(h: &mut H, kind: Option<LinkKind>, devs: &[Dev], p: &Value) -> Result<Value, String> {
+    let candidates: Vec<link::Candidate<'_>> =
+        devs.iter().map(|d| link::Candidate { id: &d.id, name: &d.name, platform: d.platform, form_factor: d.form_factor }).collect();
+    let (kind, roles) = link::plan(kind, &candidates)?;
+    match (kind, devs[0].platform) {
+        (LinkKind::HeadsetPhone, _) => records::link(h, kind, devs, &roles, p),
+        // CoreSimulator's pairs, and the refusals of the kinds iOS doesn't have yet.
+        (_, Platform::Ios) => run(h, "link", p),
+        (kind, Platform::Android) => Err(format!(
+            "{} links between Android devices aren't implemented yet: only headset-phone (an Android XR headset and a phone, \
+             net-forward); Wear OS links are #445, Android Automotive #439, network links #427",
+            kind.as_str()
         )),
+    }
+}
+
+fn unlink_any<H: PairHost + RecordHost>(h: &mut H, p: &Value, device: Option<&(Platform, String)>) -> Result<Value, String> {
+    let kind = records::opt_kind(p)?;
+    match (str_param(p, "link"), device) {
+        (Some(id), _) if records::is_record_id(id) => {
+            let r = records::find(h, id)?;
+            let (unlinked, teardown) = records::unlink(h, &[r])?;
+            Ok(json!({"unlinked": unlinked, "teardown": teardown}))
+        }
+        (None, Some(d)) => {
+            let mut out = if d.0 == Platform::Ios { run(h, "unlink", p)? } else { json!({"unlinked": [], "teardown": []}) };
+            let Some(dev) = RecordHost::device(h, d.0, &d.1)? else {
+                return if d.0 == Platform::Ios { Ok(out) } else { Err(format!("no device matches `{}`", d.1)) };
+            };
+            let targets: Vec<Record> =
+                records::of_device(h, &dev)?.into_iter().filter(|r| kind.is_none_or(|k| r.kind == k.as_str())).collect();
+            let (unlinked, teardown) = records::unlink(h, &targets)?;
+            for (key, more) in [("unlinked", unlinked), ("teardown", teardown)] {
+                if let Some(list) = out[key].as_array_mut() {
+                    list.extend(more);
+                }
+            }
+            Ok(out)
+        }
+        _ => run(h, "unlink", p),
+    }
+}
+
+fn links_any<H: PairHost + RecordHost>(h: &mut H, p: &Value, device: Option<&(Platform, String)>) -> Result<Value, String> {
+    let kind = records::opt_kind(p)?;
+    let state = str_param(p, "state").map(LinkState::parse).transpose()?;
+    let mut out = match device {
+        Some((Platform::Android, _)) => Vec::new(),
+        _ => run(h, "links", p)?.as_array().cloned().unwrap_or_default(),
+    };
+    let dev = match device {
+        Some(d) => Some(need_dev(h, d)?),
+        None => None,
+    };
+    out.extend(records::links(h, dev.as_ref(), kind, state)?);
+    Ok(Value::Array(out))
+}
+
+fn status_any<H: PairHost + RecordHost>(h: &mut H, p: &Value, device: Option<&(Platform, String)>) -> Result<Value, String> {
+    let d = match (str_param(p, "link"), device) {
+        (Some(id), _) if records::is_record_id(id) => {
+            let r = records::find(h, id)?;
+            return records::status(h, &r);
+        }
+        (None, Some(d)) => d,
+        _ => return run(h, "link_status", p),
+    };
+    let dev = RecordHost::device(h, d.0, &d.1)?;
+    let recs = match &dev {
+        Some(dev) => records::of_device(h, dev)?,
+        None => Vec::new(),
+    };
+    let pairs: Vec<Pair> =
+        if d.0 == Platform::Ios { PairHost::pairs(h)?.into_iter().filter(|q| q.has(&d.1)).collect() } else { Vec::new() };
+    match (recs.as_slice(), pairs.len()) {
+        ([r], 0) => records::status(h, r),
+        ([], 1) => run(h, "link_status", p),
+        ([], 0) => match dev {
+            Some(dev) => Err(format!("{} is in no link", dev.name)),
+            None => run(h, "link_status", p),
+        },
+        _ => {
+            let ids: Vec<&str> = recs.iter().map(|r| r.id.as_str()).chain(pairs.iter().map(|q| q.id.as_str())).collect();
+            let name = dev.as_ref().map_or(d.1.as_str(), |dev| dev.name.as_str());
+            Err(format!("{name} is in {} links ({}); name one with `link`", ids.len(), ids.join(", ")))
+        }
     }
 }
 
@@ -232,8 +502,8 @@ fn pair_devices(host: &mut dyn PairHost, p: &Value) -> Result<(Pair, bool), Stri
     let (kind, roles) = link::plan(kind, &candidates)?;
     if kind != LinkKind::WatchPhone {
         return Err(format!(
-            "{} links between iOS devices aren't implemented yet: only watch-phone, CoreSimulator's device pairs (#423); \
-             headsets on the host network are #535, network links #427",
+            "{} links between iOS devices aren't implemented yet: watch-phone (CoreSimulator's device pairs, #423) and \
+             headset-phone (on the host's network) are; network links are #427",
             kind.as_str()
         ));
     }
@@ -580,7 +850,7 @@ mod tests {
         let e = link_of(&mut set, &[WATCH, IPAD], json!({})).expect_err("an iPad, kind inferred");
         assert!(e.contains("iPad Pro is a tablet"), "{e}");
         let e = link_of(&mut set, &[PHONE, PHONE2], json!({"kind": "network"})).expect_err("network on iOS");
-        assert!(e.contains("network links") && e.contains("only watch-phone"), "{e}");
+        assert!(e.contains("network links are #427") && e.contains("watch-phone"), "{e}");
         assert!(link_of(&mut set, &[WATCH], json!({})).expect_err("one").contains("two or more"));
         assert!(link_of(&mut set, &[WATCH, "nothing"], json!({})).expect_err("missing").contains("no device matches `nothing`"));
         assert!(link_of(&mut set, &[WATCH, PHONE], json!({"kind": "pair"})).expect_err("bad kind").contains("unknown link kind"));
@@ -677,6 +947,383 @@ mod tests {
         assert_eq!(l[0]["members"][1], json!({"device": WATCH, "name": null, "platform": "ios", "role": "watch", "running": false}));
     }
 
+    const VISION: &str = "B0000000-0000-4000-8000-000000000001";
+
+    /// CoreSimulator's set and simee's records on one host, as `call` sees them: the iOS
+    /// simulators are in both (the record host sees what CoreSimulator lists), the AVDs only in
+    /// the records.
+    struct Both {
+        set: FakeSet,
+        rec: records::fake::FakeRecords,
+    }
+
+    impl PairHost for Both {
+        fn device(&mut self, query: &str) -> Result<Option<Sim>, String> {
+            self.set.device(query)
+        }
+        fn pairs(&mut self) -> Result<Vec<Pair>, String> {
+            self.set.pairs()
+        }
+        fn can_pair(&mut self, watch: &str, phone: &str) -> Result<(), String> {
+            self.set.can_pair(watch, phone)
+        }
+        fn pair(&mut self, watch: &str, phone: &str) -> Result<Pair, String> {
+            self.set.pair(watch, phone)
+        }
+        fn activate(&mut self, id: &str) -> Result<(), String> {
+            self.set.activate(id)
+        }
+        fn unpair(&mut self, id: &str) -> Result<(), String> {
+            self.set.unpair(id)
+        }
+    }
+
+    impl RecordHost for Both {
+        fn device(&mut self, platform: Platform, id: &str) -> Result<Option<Dev>, String> {
+            if platform == Platform::Ios {
+                return Ok(self.set.device(id)?.map(ios_dev));
+            }
+            self.rec.device(platform, id)
+        }
+        fn all(&mut self) -> Result<Vec<Dev>, String> {
+            let mut all = self.rec.all()?;
+            all.extend(self.set.sims.values().cloned().map(ios_dev));
+            Ok(all)
+        }
+        fn read(&mut self, dev: &Dev) -> Result<Vec<Record>, String> {
+            self.rec.read(dev)
+        }
+        fn update(&mut self, dev: &Dev, change: &mut dyn FnMut(&mut Vec<Record>)) -> Result<(), String> {
+            self.rec.update(dev, change)
+        }
+        fn forward(&mut self, dev: &Dev, port: u16) -> Result<u16, String> {
+            self.rec.forward(dev, port)
+        }
+        fn remove_forward(&mut self, dev: &Dev, host_port: u16) -> Result<(), String> {
+            self.rec.remove_forward(dev, host_port)
+        }
+        fn forwards(&mut self, dev: &Dev) -> Result<Vec<(u16, u16)>, String> {
+            self.rec.forwards(dev)
+        }
+        fn listening(&mut self, dev: &Dev) -> Result<Vec<u16>, String> {
+            self.rec.listening(dev)
+        }
+        fn new_id(&mut self) -> Result<String, String> {
+            self.rec.new_id()
+        }
+        fn now(&mut self) -> String {
+            self.rec.now()
+        }
+    }
+
+    /// The standard set with a Vision Pro, and AVDs: a phone, an Android XR headset, a pair of
+    /// glasses and a Wear OS watch, all running but the second phone.
+    fn both() -> Both {
+        let mut set = FakeSet::standard();
+        set.sims.insert(
+            VISION.into(),
+            Sim { udid: VISION.into(), name: "Apple Vision Pro".into(), form_factor: Some(FormFactor::Vision), running: true },
+        );
+        let mut rec = records::fake::FakeRecords::with(&[
+            (Platform::Android, "pixel", FormFactor::Phone, true),
+            (Platform::Android, "pixel2", FormFactor::Phone, false),
+            (Platform::Android, "xr", FormFactor::Vision, true),
+            (Platform::Android, "glasses", FormFactor::Vision, true),
+            (Platform::Android, "wear", FormFactor::Watch, true),
+        ]);
+        rec.dev_mut("glasses").glasses = true;
+        Both { set, rec }
+    }
+
+    /// What `call` does past `methods::resolve`: an AVD by name, else a simulator by UDID or name.
+    fn on(h: &mut Both, method: &str, p: Value) -> Result<Value, String> {
+        let lookup = |h: &mut Both, q: &str| -> (Platform, String) {
+            if let Some(d) = h.rec.devs.iter().find(|d| d.id.eq_ignore_ascii_case(q)) {
+                return (Platform::Android, d.id.clone());
+            }
+            let udid = h.set.sims.values().find(|s| s.name == q).map_or_else(|| q.to_owned(), |s| s.udid.clone());
+            (Platform::Ios, udid)
+        };
+        let devices: Vec<(Platform, String)> = strings(&p, "devices").iter().map(|q| lookup(h, q)).collect();
+        let device = str_param(&p, "device").map(|q| lookup(h, q));
+        let mut p = p;
+        if !devices.is_empty() {
+            p["devices"] = devices.iter().map(|(_, id)| json!(id)).collect();
+        }
+        if let Some((_, id)) = &device {
+            p["device"] = json!(id);
+        }
+        dispatch(h, method, &p, &devices, device.as_ref())
+    }
+
+    fn check_list(status: &Value) -> Vec<(String, bool)> {
+        status["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .map(|c| (c["name"].as_str().expect("name").to_owned(), c["ok"].as_bool().expect("ok")))
+            .collect()
+    }
+
+    #[test]
+    fn an_android_xr_headset_and_a_phone_link_with_net_forward() {
+        let mut h = both();
+        let link = on(&mut h, "link", json!({"devices": ["xr", "pixel"], "ports": {"xr": [8080]}})).expect("linked")["link"].clone();
+        assert_eq!(link["id"], "lnk-00000001");
+        assert_eq!(link["kind"], "headset-phone", "inferred from vision + phone");
+        assert_eq!(link["mechanism"], "net-forward");
+        assert_eq!(link["state"], "active");
+        assert_eq!(link["active"], Value::Null, "only a watch pair has an active one");
+        assert_eq!(link["since"], "2026-11-28T12:00:00Z");
+        assert_eq!(
+            link["members"],
+            json!([
+                {"device": "pixel", "name": "pixel", "platform": "android", "role": "phone", "running": true},
+                {"device": "xr", "name": "xr", "platform": "android", "role": "headset", "running": true},
+            ])
+        );
+        assert_eq!(link["forwards"], json!([{"device": "xr", "port": 8080, "host_port": 41001}]));
+        assert_eq!(h.rec.changes(), ["forward xr 8080 -> 41001"]);
+        for member in ["pixel", "xr"] {
+            let copy = h.rec.copy(Platform::Android, member);
+            assert_eq!(copy.len(), 1, "{member} keeps a copy");
+            assert_eq!((copy[0].id.as_str(), copy[0].rev), ("lnk-00000001", 1));
+        }
+        assert!(h.set.calls.is_empty(), "nothing reached CoreSimulator");
+
+        // The same devices again: the same link, its forward kept, nothing written.
+        let calls = h.rec.calls.len();
+        let again = on(&mut h, "link", json!({"devices": ["pixel", "xr"], "kind": "headset-phone"})).expect("again")["link"].clone();
+        assert_eq!(again, link);
+        assert_eq!(h.rec.calls.len(), calls, "linking again changes nothing more");
+        assert_eq!(on(&mut h, "links", json!({})).expect("links"), json!([link]));
+        assert_eq!(on(&mut h, "links", json!({"device": "xr"})).expect("of xr"), json!([link]));
+        assert_eq!(on(&mut h, "links", json!({"device": "pixel2"})).expect("none"), json!([]));
+        assert_eq!(on(&mut h, "links", json!({"kind": "watch-phone"})).expect("kind"), json!([]));
+    }
+
+    #[test]
+    fn link_status_says_which_ports_are_forwarded_and_listen() {
+        let mut h = both();
+        on(&mut h, "link", json!({"devices": ["xr", "pixel"], "ports": {"xr": [8080], "pixel": [9000]}})).expect("linked");
+        h.rec.listening.insert("xr".into(), vec![8080]);
+        let status = on(&mut h, "link_status", json!({"device": "xr"})).expect("status");
+        let want = [
+            ("phone exists", true),
+            ("headset exists", true),
+            ("phone running", true),
+            ("headset running", true),
+            // `ports` in the order its keys sort.
+            ("forward pixel:9000", true),
+            ("pixel listens on 9000", false),
+            ("forward xr:8080", true),
+            ("xr listens on 8080", true),
+        ];
+        assert_eq!(check_list(&status), want.map(|(n, ok)| (n.to_owned(), ok)));
+        assert_eq!(
+            status["checks"][6]["detail"],
+            "127.0.0.1:41002 on the host, 10.0.2.2:41002 from the other device, reaches xr's port 8080"
+        );
+        assert_eq!(status["link"]["state"], "pending", "a forwarded port nothing listens on yet");
+        assert_eq!(status["link"]["reason"], "nothing in pixel listens on 9000 yet");
+
+        h.rec.listening.insert("pixel".into(), vec![9000]);
+        let status = on(&mut h, "link_status", json!({"link": "lnk-00000001"})).expect("by id");
+        assert_eq!(status["link"]["state"], "active");
+
+        // An adb server restart drops the forwards: the probe sees it, the files don't.
+        h.rec.forwards.clear();
+        let status = on(&mut h, "link_status", json!({"device": "pixel"})).expect("status");
+        assert_eq!(status["link"]["state"], "pending");
+        assert!(status["link"]["reason"].as_str().expect("reason").contains("tcp:41001 to pixel's port 9000 is gone"), "{status}");
+        assert_eq!(on(&mut h, "links", json!({})).expect("links")[0]["state"], "active", "`links` reads the files only");
+        // Linking again forwards them anew.
+        let again = on(&mut h, "link", json!({"devices": ["xr", "pixel"]})).expect("again")["link"].clone();
+        assert_eq!(
+            again["forwards"],
+            json!([{"device": "pixel", "port": 9000, "host_port": 41003}, {"device": "xr", "port": 8080, "host_port": 41004}])
+        );
+        assert_eq!(h.rec.copy(Platform::Android, "xr")[0].rev, 2);
+        assert_eq!(on(&mut h, "link_status", json!({"device": "xr"})).expect("status")["link"]["state"], "active");
+    }
+
+    #[test]
+    fn a_shut_down_member_leaves_its_port_unforwarded_until_linked_again() {
+        let mut h = both();
+        h.rec.dev_mut("xr").running = false;
+        let link = on(&mut h, "link", json!({"devices": ["xr", "pixel"], "ports": {"xr": 8080}})).expect("linked")["link"].clone();
+        assert_eq!((link["state"].as_str(), link["reason"].as_str()), (Some("pending"), Some("xr is shut down")));
+        assert_eq!(link["forwards"], json!([{"device": "xr", "port": 8080, "host_port": null}]));
+        assert!(h.rec.changes().is_empty(), "no forward on a device that isn't running");
+        h.rec.dev_mut("xr").running = true;
+        let listed = on(&mut h, "links", json!({})).expect("links");
+        assert_eq!(listed[0]["state"], "pending");
+        assert!(listed[0]["reason"].as_str().expect("reason").starts_with("xr's port 8080 isn't forwarded"), "{listed}");
+        let status = on(&mut h, "link_status", json!({"device": "xr"})).expect("status");
+        assert_eq!(check_list(&status)[4], ("forward xr:8080".to_owned(), false));
+        let link = on(&mut h, "link", json!({"devices": ["xr", "pixel"]})).expect("again")["link"].clone();
+        assert_eq!((link["state"].as_str(), &link["forwards"][0]["host_port"]), (Some("active"), &json!(41001)));
+        // Ports the call names replace the ones the link had.
+        let link =
+            on(&mut h, "link", json!({"devices": ["xr", "pixel"], "ports": {"pixel": [5000]}})).expect("other ports")["link"].clone();
+        assert_eq!(link["forwards"], json!([{"device": "pixel", "port": 5000, "host_port": 41002}]));
+        assert_eq!(h.rec.changes().last().copied(), Some("remove xr 41001"));
+    }
+
+    #[test]
+    fn glasses_are_refused_until_the_bluetooth_bridge() {
+        let mut h = both();
+        let e = on(&mut h, "link", json!({"devices": ["glasses", "pixel"]})).expect_err("glasses");
+        assert!(e.starts_with("glasses is a pair of Android XR glasses") && e.contains("#435"), "{e}");
+        let e = on(&mut h, "link", json!({"devices": ["pixel", "glasses"], "kind": "headset-phone"})).expect_err("glasses");
+        assert!(e.contains("#435"), "{e}");
+        assert!(h.rec.calls.is_empty() && h.rec.files.is_empty(), "nothing changed");
+    }
+
+    #[test]
+    fn other_android_kinds_and_wrong_members_are_refused_before_anything_changes() {
+        let mut h = both();
+        let e = on(&mut h, "link", json!({"devices": ["wear", "pixel"]})).expect_err("wear os");
+        assert!(e.starts_with("watch-phone links between Android devices aren't implemented yet") && e.contains("#445"), "{e}");
+        let e = on(&mut h, "link", json!({"devices": ["xr", "wear"], "kind": "headset-phone"})).expect_err("a watch");
+        assert_eq!(e, "a headset-phone link pairs one headset with one phone: xr is a vision and wear is a watch");
+        let e = on(&mut h, "link", json!({"devices": ["xr", PHONE]})).expect_err("cross-platform");
+        assert!(e.starts_with("only network links cross platforms"), "{e}");
+        let e = on(&mut h, "link", json!({"devices": ["xr", "pixel"], "active": true})).expect_err("active");
+        assert!(e.contains("a headset-phone link has none"), "{e}");
+        let e = on(&mut h, "link", json!({"devices": ["xr", "pixel"], "ports": {"wear": [1]}})).expect_err("ports of another");
+        assert!(e.contains("`ports` names `wear`"), "{e}");
+        h.rec.refuse_forward = Some("adb: error: cannot bind listener".into());
+        let e = on(&mut h, "link", json!({"devices": ["xr", "pixel"], "ports": {"xr": [8080]}})).expect_err("forward fails");
+        assert_eq!(e, "forwarding xr's port 8080: adb: error: cannot bind listener");
+        assert!(h.rec.files.is_empty() && h.rec.changes().is_empty() && h.set.calls.is_empty());
+    }
+
+    #[test]
+    fn a_copy_that_cant_be_written_is_written_by_the_next_link_and_one_written_nowhere_takes_its_forwards_back() {
+        let mut h = both();
+        h.rec.refuse_update = vec!["pixel".into()];
+        let e = on(&mut h, "link", json!({"devices": ["xr", "pixel"], "ports": {"xr": [8080]}})).expect_err("pixel's copy");
+        assert!(e.contains("was saved with xr but not with pixel: read-only file system"), "{e}");
+        assert_eq!(h.rec.forwards.len(), 1, "the link exists in xr's copy and holds its forward");
+        h.rec.refuse_update.clear();
+        let link = on(&mut h, "link", json!({"devices": ["xr", "pixel"]})).expect("again")["link"].clone();
+        assert_eq!(h.rec.copy(Platform::Android, "pixel")[0].id, link["id"].as_str().expect("id"), "the missing copy is written");
+        assert_eq!(h.rec.copy(Platform::Android, "pixel")[0].rev, 1, "the same record, not a new revision");
+
+        let mut h = both();
+        h.rec.refuse_update = vec!["xr".into(), "pixel".into()];
+        let e = on(&mut h, "link", json!({"devices": ["xr", "pixel"], "ports": {"xr": [8080]}})).expect_err("no copy");
+        assert!(e.contains("lnk-00000001 wasn't saved"), "{e}");
+        assert!(h.rec.forwards.is_empty(), "nothing records the forward, so it went");
+        assert_eq!(h.rec.changes(), ["forward xr 8080 -> 41001", "remove xr 41001"]);
+    }
+
+    #[test]
+    fn an_ios_headset_and_phone_link_on_the_host_network() {
+        let mut h = both();
+        let link = on(&mut h, "link", json!({"devices": [VISION, PHONE]})).expect("linked")["link"].clone();
+        assert_eq!((link["kind"].as_str(), link["mechanism"].as_str()), (Some("headset-phone"), Some("network")));
+        assert_eq!(link["state"], "active");
+        assert!(link.get("forwards").is_none(), "nothing is forwarded on the host network");
+        assert_eq!(
+            link["members"],
+            json!([
+                {"device": PHONE, "name": "iPhone 17", "platform": "ios", "role": "phone", "running": true},
+                {"device": VISION, "name": "Apple Vision Pro", "platform": "ios", "role": "headset", "running": true},
+            ])
+        );
+        assert!(h.set.calls.is_empty(), "CoreSimulator has no headset pairs: nothing asked of it");
+        assert_eq!(h.rec.copy(Platform::Ios, VISION).len(), 1);
+        let status = on(&mut h, "link_status", json!({"device": "Apple Vision Pro"})).expect("status");
+        let want =
+            [("phone exists", true), ("headset exists", true), ("phone running", true), ("headset running", true), ("host network", true)];
+        assert_eq!(check_list(&status), want.map(|(n, ok)| (n.to_owned(), ok)));
+        let e = on(&mut h, "link", json!({"devices": [VISION, PHONE], "ports": {"Apple Vision Pro": [8080]}})).expect_err("ports");
+        assert!(e.starts_with("iOS simulators share the host's network"), "{e}");
+        h.set.sims.get_mut(VISION).expect("vision").running = false;
+        let listed = on(&mut h, "links", json!({"device": PHONE})).expect("links");
+        assert_eq!((listed[0]["state"].as_str(), listed[0]["reason"].as_str()), (Some("pending"), Some("Apple Vision Pro is shut down")));
+    }
+
+    #[test]
+    fn watch_pairs_and_records_list_unlink_and_report_together() {
+        let mut h = both();
+        let pair = on(&mut h, "link", json!({"devices": [WATCH, PHONE]})).expect("watch")["link"].clone();
+        assert_eq!(pair["mechanism"], "coresim-pair", "a watch still pairs through CoreSimulator");
+        let headset = on(&mut h, "link", json!({"devices": [VISION, PHONE]})).expect("headset")["link"].clone();
+        let all = on(&mut h, "links", json!({})).expect("links");
+        assert_eq!(all, json!([pair, headset]));
+        assert_eq!(on(&mut h, "links", json!({"kind": "headset-phone"})).expect("kind"), json!([headset]));
+        let e = on(&mut h, "link_status", json!({"device": PHONE})).expect_err("two links");
+        assert!(e.starts_with("iPhone 17 is in 2 links (lnk-00000001, FA1A0000-"), "{e}");
+        assert_eq!(on(&mut h, "link_status", json!({"device": WATCH})).expect("the pair")["link"]["id"], pair["id"]);
+        assert_eq!(on(&mut h, "link_status", json!({"device": VISION})).expect("the record")["link"]["id"], headset["id"]);
+
+        let r = on(&mut h, "unlink", json!({"device": PHONE, "kind": "headset-phone"})).expect("headsets only");
+        assert_eq!(r, json!({"unlinked": [headset["id"]], "teardown": [{"id": headset["id"]}]}));
+        assert!(h.rec.copy(Platform::Ios, PHONE).is_empty() && h.rec.copy(Platform::Ios, VISION).is_empty());
+        assert_eq!(h.set.pairs.len(), 1, "the watch pair stays");
+        let r = on(&mut h, "unlink", json!({"device": PHONE})).expect("the rest");
+        assert_eq!(r["unlinked"], json!([pair["id"]]));
+        assert_eq!(on(&mut h, "links", json!({})).expect("none"), json!([]));
+        assert!(on(&mut h, "link_status", json!({"device": VISION})).expect_err("none").contains("Apple Vision Pro is in no link"));
+    }
+
+    #[test]
+    fn unlink_by_id_removes_the_forwards_and_every_copy() {
+        let mut h = both();
+        let id = on(&mut h, "link", json!({"devices": ["xr", "pixel"], "ports": {"xr": [8080]}})).expect("linked")["link"]["id"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+        let r = on(&mut h, "unlink", json!({"link": id})).expect("unlinked");
+        assert_eq!(r, json!({"unlinked": [id], "teardown": [{"id": id}]}));
+        assert!(h.rec.forwards.is_empty() && h.rec.files.is_empty(), "forwards and both copies gone");
+        assert_eq!(h.rec.changes().last().copied(), Some("remove xr 41001"));
+        assert!(on(&mut h, "unlink", json!({"link": id})).expect_err("gone").contains(&format!("no link `{id}`")));
+        assert_eq!(on(&mut h, "unlink", json!({"device": "xr"})).expect("none"), json!({"unlinked": [], "teardown": []}));
+    }
+
+    #[test]
+    fn a_member_gone_breaks_the_link_and_a_clones_copy_is_ignored() {
+        let mut h = both();
+        on(&mut h, "link", json!({"devices": ["xr", "pixel"]})).expect("linked");
+        // A clone of pixel copies its file; it isn't a member, so its copy names another device.
+        let text = h.rec.files[&records::fake::key(Platform::Android, "pixel")].clone();
+        h.rec.files.insert(records::fake::key(Platform::Android, "pixel2"), text);
+        assert_eq!(on(&mut h, "links", json!({"device": "pixel2"})).expect("clone"), json!([]));
+        assert_eq!(on(&mut h, "links", json!({})).expect("links").as_array().map(Vec::len), Some(1));
+
+        h.rec.devs.retain(|d| d.id != "xr");
+        let listed = on(&mut h, "links", json!({})).expect("links");
+        assert_eq!((listed[0]["state"].as_str(), listed[0]["reason"].as_str()), (Some("broken"), Some("xr no longer exists")));
+        assert_eq!(
+            listed[0]["members"][1],
+            json!({"device": "xr", "name": null, "platform": "android", "role": "headset", "running": false})
+        );
+        let e = on(&mut h, "link", json!({"link": "lnk-00000001"})).expect_err("broken");
+        assert_eq!(e, "link lnk-00000001 is broken: xr no longer exists; `unlink` it");
+        let r = on(&mut h, "unlink", json!({"link": "lnk-00000001"})).expect("unlink clears it");
+        assert_eq!(r["unlinked"], json!(["lnk-00000001"]));
+    }
+
+    #[test]
+    fn the_higher_rev_of_two_copies_wins() {
+        let mut h = both();
+        on(&mut h, "link", json!({"devices": ["xr", "pixel"], "ports": {"xr": [8080]}})).expect("linked");
+        // xr's copy was written by a later call that pixel's write missed.
+        let mut newer = h.rec.copy(Platform::Android, "xr");
+        newer[0].rev = 7;
+        newer[0].params.forwards[0].port = 9000;
+        h.rec.files.insert(records::fake::key(Platform::Android, "xr"), records::file_text(&newer).expect("text"));
+        let listed = on(&mut h, "links", json!({"device": "pixel"})).expect("of pixel");
+        assert_eq!(listed[0]["forwards"][0]["port"], 9000, "pixel's own copy is older");
+        // Linking by id again writes the winner back to both.
+        on(&mut h, "link", json!({"link": "lnk-00000001"})).expect("again");
+        assert_eq!(h.rec.copy(Platform::Android, "pixel")[0].rev, 8);
+    }
+
     #[test]
     fn the_docs_and_schemas_agree_with_the_method_table() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -705,7 +1352,7 @@ mod tests {
         use crate::catalog::{Effect, Group, effect, group};
         for m in METHODS {
             assert_eq!(group(m), Some(Group::Lifecycle), "{m}");
-            assert_eq!(crate::platforms(m), [Platform::Ios], "{m}: iOS until the Android adapters land");
+            assert_eq!(crate::platforms(m), Platform::ALL, "{m}: watch pairs on iOS, headset-phone links on both");
         }
         assert_eq!(effect("links"), Some(Effect::Read));
         assert_eq!(effect("link_status"), Some(Effect::Read));
