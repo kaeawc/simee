@@ -9,6 +9,7 @@ set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/test-lib.XXXXXX")
 pids=()
+# shellcheck disable=SC2329 # run by the EXIT trap below
 cleanup() {
   local p
   for p in ${pids[@]+"${pids[@]}"}; do kill "$p" 2>/dev/null; done
@@ -24,9 +25,11 @@ check() { # description, condition result
 }
 yes_if() { if "$@"; then echo ok; fi; }
 no_if() { if ! "$@"; then echo ok; fi; }
+# shellcheck disable=SC2329 # named as the command of yes_if and no_if
 alive() { kill -0 "$1" 2>/dev/null; }
 # shellcheck disable=SC1091 # the script under test
 . "$here/lib.sh"
+# shellcheck disable=SC2329 # lib.sh's calls it: silenced here
 bench_log() { :; }
 BENCH_KEEP_WORK=1
 STALE="Thu Jan  1 00:00:00 1970"
