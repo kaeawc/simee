@@ -55,6 +55,8 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         // boot, boot_many, create and clone's admission, and admission_check (#275)
         "admission" => Str,
         "admission_timeout_s" | "count" => Int,
+        // every iOS method's device set (#409)
+        "set" => Str,
         // Android's kill and exec (#414)
         "force" => Bool,
         "max_bytes" => Int,
@@ -75,6 +77,8 @@ fn param_type(method: &str, name: &str) -> Option<Ty> {
         | "settle_ms" => Int,
         "booted" | "on" | "suppressed" | "undo" | "shaped" | "settle" | "settle_foreground" | "audio" | "mute" | "sizes" | "offline"
         | "proxy" | "face" | "foreground" | "eraser" | "folded" | "restart" | "stream" | "all" | "allow_mismatch" | "fresh" => Bool,
+        // The Android file methods' opt-ins: `adb root` and `pm clear`.
+        "root" | "pm_clear" => Bool,
         "env" => StrMap,
         "payload" | "region" => Obj,
         "rules" => Objects,
@@ -427,16 +431,18 @@ mod tests {
         assert!(write["properties"]["text"].is_object() && write["properties"]["base64"].is_object());
         assert_eq!(schema("console")["required"], json!(["device"]));
         assert!(schema("console")["properties"]["commands"].is_object());
-        // `audio_route`'s `uid | "default"` is the uid alone, and required: the quoted word is a value, not a name.
-        assert_eq!(schema("audio_route")["properties"].as_object().map(|p| p.len()), Some(3));
+        // `audio_route`'s `uid | "default"` is the uid alone, and required: the quoted word is a value, not a name
+        // (beside `device`, `scope` and the device set).
+        assert_eq!(schema("audio_route")["properties"].as_object().map(|p| p.len()), Some(4));
         assert_eq!(schema("audio_route")["required"], json!(["device", "scope", "uid"]));
         let rotary = schema("rotary");
         assert_eq!(rotary["required"], json!(["device"]));
         assert_eq!(rotary["properties"]["delta"]["description"], "Digital Crown units; iOS; give one of `ticks`, `delta`");
         assert_eq!(one_of("fold"), [["folded", "angle", "posture"]]);
         assert_eq!(one_of("console"), [["command", "commands"]]);
+        assert_eq!(one_of("write"), [["text", "base64"]]);
         // `text? | base64?` are both optional, and a lone name or a quoted word is no group.
-        assert!(one_of("write").is_empty() && one_of("audio_route").is_empty() && one_of("tap").is_empty());
+        assert!(parse("device, text? | base64?").1.is_empty() && one_of("audio_route").is_empty() && one_of("tap").is_empty());
     }
 
     #[test]
@@ -491,6 +497,8 @@ mod tests {
             (Platform::Android, "boot") => text(crate::android::boot_options(p)),
             (Platform::Android, "boot_many") => text(crate::android::boot_many_options(p)),
             (Platform::Android, "import") => text(crate::android::import_allows_mismatch(p)),
+            // Android's `settle` reads what iOS's does.
+            (Platform::Android, "settle") => text(crate::settle::options(p)),
             // It needs a platform to read the rest.
             (_, "admission_check") => text(crate::methods::check_params(&{
                 let mut p = p.clone();

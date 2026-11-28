@@ -49,6 +49,8 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
     let cameras: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
     let camera_link_fails: Arc<Mutex<Option<String>>> = Arc::default();
     let (links, fails) = (cameras.clone(), camera_link_fails.clone());
+    // `network speed|delay|status`, shared by every console session as the emulator's NAT is.
+    let network: Arc<Mutex<sim_core::network::Conditions>> = Arc::default();
     // The advertised adb port is the console's plus one, so the console must not be on 65535 (an
     // ephemeral port the OS hands out now and then): bind again, keeping the unusable one held so
     // the next bind gets another.
@@ -67,7 +69,7 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
         for stream in listener.incoming().flatten() {
             // A thread per connection, so concurrent clients are served concurrently.
             let (log, status, turned) = (log.clone(), status.clone(), turned.clone());
-            let (links, fails) = (links.clone(), fails.clone());
+            let (links, fails, network) = (links.clone(), fails.clone(), network.clone());
             std::thread::spawn(move || {
                 let mut out = stream.try_clone().expect("clone");
                 let _ = out.write_all(b"Android Console: type 'help' for a list of commands\r\nOK\r\n");
@@ -120,6 +122,16 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
                                 "OK".to_owned()
                             }
                         }
+                        // As emu's console (and stock's) answer them.
+                        ["network", "status"] => format!("{}\r\nOK", network.lock().expect("network").status()),
+                        ["network", "speed", speed] => match network.lock().expect("network").set_speed(speed) {
+                            true => "OK".to_owned(),
+                            false => "KO: invalid <speed> argument, see 'help network speed' for valid values".to_owned(),
+                        },
+                        ["network", "delay", delay] => match network.lock().expect("network").set_latency(delay) {
+                            true => "OK".to_owned(),
+                            false => "KO: invalid <delay> argument, see 'help network delay' for valid values".to_owned(),
+                        },
                         ["screenshot", path] => {
                             let frame = Frame { width: 2, height: 1, rgba: vec![9, 9, 9, 255, 8, 8, 8, 255] };
                             std::fs::write(path, sim_core::frame::encode_png(&frame).expect("png")).expect("write png");
@@ -178,7 +190,15 @@ pub fn wait_for(lines: &Mutex<Vec<String>>, n: usize) -> Vec<String> {
 /// script first). `ps` lists a guest's processes (init, zygote, system_server, the native daemons,
 /// apps); `kill` succeeds (logged only: no host process is signalled) except on pids 520
 /// (surfaceflinger) and 530 (cameraserver), which need `su 0` (present for `-9`, missing for 530's
-/// `-15`); and an `exec` line, and its stop, run on the host's `sh`.
+/// `-15`); and an `exec` line, and its stop, run on the host's `sh`. Airplane mode is a file
+/// beside the script that `cmd connectivity airplane-mode` (or `settings put`) sets; `sdk` beside it sets the API level (36 without it) and `settings get` reads; the
+/// network listings (`sim_android::net`) answer with a root listing of the kernel's socket tables
+/// and an eBPF per-uid stats dump. The settle probe
+/// (`sim_android::settle::PROBE`) answers a booted guest whose uptime moves 1 s per probe and whose
+/// system_server uses 60% of a core between the first two probes and 2% after (the probe's own
+/// shell and `cat` busy throughout, as they are left out). The package manager has the `slim`
+/// profile's `apps.turbo`, `apps.wellbeing` and `partnersetup` (which it refuses to disable) and
+/// not `apps.restore`; what is disabled is kept in `disabled` beside the script.
 pub fn fake_adb(android: &Android) -> FakeAdb {
     let dir = android.env.sdk_root.as_ref().expect("sdk root").join("platform-tools");
     std::fs::create_dir_all(&dir).expect("platform-tools");
@@ -254,6 +274,37 @@ ps_rows() {
 ' 4400   310  7.9  60112   00:40 com.example.app:remote  com.example.app:remote' \
 ' 4500   310  0.0  50000   00:30 com.google.android.gms.persistent com.google.android.gms.persistent'
 }
+# The network listings' tables: an API 36 guest's /proc/net, fds, ps and pm (trimmed).
+net_owners() {
+  printf '%s\n' '@net:ps' '  PID   UID USER           NAME' '    1     0 root           init' \
+'  612  1000 system         system_server' ' 4321 10086 u0_a86         com.example.app' \
+'@net:packages' 'package:com.example.app uid:10086' 'package:android uid:1000' 'package:com.android.settings uid:1000'
+}
+net_sockets() {
+  printf '%s\n' '@net:root' '@net:tcp' \
+'  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode' \
+'   0: 0F02000A:A1B2 2E2E3AD8:01BB 01 00000000:00000000 02:000A7B2C 00000000 10086        0 18002 2 0000000000000000 20 4 30 10 -1' \
+'@net:tcp6' \
+'  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode' \
+'   0: 00000000000000000000000000000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 18003 1 0000000000000000 100 0 0 10 0' \
+'   1: 0000000000000000FFFF00000F02000A:B000 0000000000000000FFFF00002E2E3AD8:01BB 01 00000000:00000000 02:000A7B2C 00000000 10086        0 18004 2 0000000000000000 20 4 30 10 -1' \
+'@net:udp' \
+'  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops' \
+'  100: 00000000:14E9 00000000:0000 07 00000000:00000000 00:00000000 00000000  1021        0 18005 2 0000000000000000 0' \
+'@net:udp6' '@net:fd' '/proc/612/fd:' 'lrwx------ 1 system system 64 2026-11-28 10:00 300 -> socket:[18003]' '' \
+'/proc/4321/fd:' 'lrwx------ 1 u0_a86 u0_a86 64 2026-11-28 10:00 57 -> socket:[18002]' \
+'lrwx------ 1 u0_a86 u0_a86 64 2026-11-28 10:00 58 -> socket:[18004]'
+  net_owners
+}
+net_traffic() {
+  printf '%s\n' '@net:bpf' 'BPF map status:' '  mAppUidStatsMap: OK' '  mStatsMapA: OK' 'TrafficController:' '  mAppUidStatsMap:' '    uid rxBytes rxPackets txBytes txPackets' \
+'    1000 4096 10 2048 8' '    10086 123456 100 23456 50' '  mStatsMapA:'
+  net_owners
+}
+# One /proc/<pid>/stat line: pid, comm, ppid, utime and stime ticks.
+stat() { echo "$1 ($2) S $3 1 1 0 -1 4194560 100 0 0 0 $4 $5 0 0 20 0 1 0 100 0 0"; }
+d="$(dirname "$0")"
+installed() { printf 'package:android\npackage:com.android.systemui\npackage:com.google.android.apps.turbo\npackage:com.google.android.apps.wellbeing\npackage:com.google.android.partnersetup\n'; }
 case "$1" in
 install)
   case "$*" in
@@ -266,6 +317,30 @@ shell)
     "pm uninstall com.missing.app") echo "Failure [DELETE_FAILED_INTERNAL_ERROR]";;
     "pm uninstall "*) echo "Success";;
     "pm list packages -3") printf 'package:com.example.app\npackage:com.example.zeta\n';;
+    "pm list packages; echo @disabled; pm list packages -d") installed; echo @disabled; cat "$d/disabled" 2>/dev/null || true;;
+    "pm disable-user "*|"pm enable "*)
+      echo "$2" | tr ';' '\n' | while read -r c; do
+        p=${c##* }
+        case "$c" in
+          "pm disable-user --user 0 com.google.android.partnersetup")
+            echo "Error: java.lang.IllegalArgumentException: Cannot disable a protected package: $p";;
+          "pm disable-user --user 0 "*)
+            grep -qx "package:$p" "$d/disabled" 2>/dev/null || echo "package:$p" >> "$d/disabled"
+            echo "Package $p new state: disabled-user";;
+          "pm enable --user 0 "*)
+            grep -vx "package:$p" "$d/disabled" > "$d/disabled.tmp"; mv "$d/disabled.tmp" "$d/disabled"
+            echo "Package $p new state: enabled";;
+          "echo @disabled") echo @disabled;;
+          "pm list packages -d") cat "$d/disabled" 2>/dev/null || true;;
+        esac
+      done;;
+    "echo @self \$\$; cat /proc/uptime; getprop sys.boot_completed; cat /proc/[0-9]*/stat 2>/dev/null; true")
+      n=$(cat "$d/settle.n" 2>/dev/null || echo 0); echo $((n + 1)) > "$d/settle.n"
+      busy=$(( n == 0 ? 0 : 60 + (n - 1) * 2 ))
+      echo "@self 7000"; echo "$n.00 1.00"; echo 1
+      stat 1 init 0 10 20; stat 612 system_server 310 "$busy" 0; stat 900 ndroid.systemui 310 50 10
+      stat 7000 sh 206 $((n * 100)) 0; stat 7001 cat 7000 $((n * 100)) 0;;
+    "pm list packages -3 -f") printf 'package:/data/app/~~Ab==/com.example.app-Cd==/base.apk=com.example.app\n';;
     "pm list packages") printf 'package:com.android.settings\npackage:com.example.zeta\npackage:android\npackage:com.example.app\n';;
     "cmd package query-activities --brief --components -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.example.app") echo 'com.example.app/.MainActivity';;
     "cmd package query-activities --brief --components -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.example.crash") echo 'com.example.crash/.Gone';;
@@ -296,6 +371,15 @@ shell)
     "su 0 kill -15 530") echo "/system/bin/sh: su: inaccessible or not found" >&2; exit 127;;
     # Every other signal succeeds, and is only logged: the fake never signals a host process.
     "kill -"*) ;;
+    "settings get global airplane_mode_on") cat "$(dirname "$0")/airplane" 2>/dev/null || echo 0;;
+    "getprop ro.build.version.sdk") cat "$(dirname "$0")/sdk" 2>/dev/null || echo 36;;
+    "settings put global airplane_mode_on "*) echo "${2##* }" > "$(dirname "$0")/airplane";;
+    "am broadcast -a android.intent.action.AIRPLANE_MODE"*) echo "Broadcast completed: result=0";;
+    "cmd connectivity airplane-mode enable") echo 1 > "$(dirname "$0")/airplane";;
+    "cmd connectivity airplane-mode disable") echo 0 > "$(dirname "$0")/airplane";;
+    # sim_android::net's socket listing, as root (google_apis has su), and its traffic counters.
+    *"echo @net:fd;"*) net_sockets;;
+    *"mAppUidStatsMap"*) net_traffic;;
     # exec's argv line runs on the host's sh, as the guest's would run it, in a child that outlives
     # this adb (as adbd's shell outlives an adb client that is stopped). With `exec.slow` beside the
     # script, adb takes a second to reach the device first.

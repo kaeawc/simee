@@ -160,6 +160,22 @@ impl Conditions {
             self.max_latency_ms
         )
     }
+
+    /// The conditions a `network status` report (as [`status`](Self::status) prints it, from
+    /// simee's emulator or the stock one) says are set; `None` when a line is missing or isn't
+    /// a number. Lines may end in CRLF or LF, and a trailing `OK` is ignored.
+    pub fn from_status(report: &str) -> Option<Conditions> {
+        let value = |label: &str| -> Option<i64> {
+            let line = report.lines().map(str::trim).find_map(|l| l.strip_prefix(label))?;
+            line.split_whitespace().next()?.parse().ok()
+        };
+        Some(Conditions {
+            download_bps: value("download speed:")? as f64,
+            upload_bps: value("upload speed:")? as f64,
+            min_latency_ms: i32::try_from(value("minimum latency:")?).ok()?,
+            max_latency_ms: i32::try_from(value("maximum latency:")?).ok()?,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -255,5 +271,21 @@ mod tests {
         );
         assert!(c.set_speed("lte"));
         assert!(c.status().contains("download speed:   173000000 bits/s (21118.2 KB/s)"), "wider than 8 digits isn't cut");
+    }
+
+    /// What a client reads back from `network status` is what was set, from either line ending
+    /// (the console's CRLF, or lines a client split and joined with LF), with or without `OK`.
+    #[test]
+    fn status_reads_back_as_the_conditions() {
+        let mut c = Conditions::default();
+        assert_eq!(Conditions::from_status(&c.status()), Some(c));
+        assert!(c.set_speed("330:780") && c.set_latency("150:550"));
+        assert_eq!(Conditions::from_status(&c.status()), Some(c));
+        assert_eq!(Conditions::from_status(&c.status().replace("\r\n", "\n")), Some(c));
+        assert_eq!(Conditions::from_status(&format!("{}\r\nOK", c.status())), Some(c));
+        assert!(c.set_speed("lte"));
+        assert_eq!(Conditions::from_status(&c.status()), Some(c), "wider than 8 digits");
+        assert_eq!(Conditions::from_status("OK"), None);
+        assert_eq!(Conditions::from_status("Current network status:\r\n  download speed:   x bits/s"), None);
     }
 }

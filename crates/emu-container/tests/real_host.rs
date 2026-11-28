@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! The launcher against the real kernel. Each test needs `unshare`, `sh`, `ldd` and a kernel that
 //! lets this user mount an overlay inside a user namespace, and returns at once unless
 //! `SIMEE_E2E_CONTAINER=1`. Run as root and as an unprivileged user with a `/etc/subuid` range.

@@ -24,8 +24,8 @@ Six arms, each chosen through the environment emu leaves alone when it is alread
 
 | Arm | `-gpu` | Environment |
 | --- | --- | --- |
-| MoltenVK + ANGLE-Metal | `host` | `ANGLE_DEFAULT_PLATFORM=metal` |
-| MoltenVK + SwANGLE | `host` | `ANGLE_DEFAULT_PLATFORM=swiftshader` |
+| MoltenVK + ANGLE-Metal | `host` | `ANDROID_EMU_VK_ICD=moltenvk`, `ANGLE_DEFAULT_PLATFORM=metal` |
+| MoltenVK + SwANGLE | `host` | `ANDROID_EMU_VK_ICD=moltenvk`, `ANGLE_DEFAULT_PLATFORM=swiftshader` |
 | KosmicKrisp + ANGLE-Metal | `host` | `ANDROID_EMU_VK_ICD=kosmickrisp`, `VK_DRIVER_FILES`/`VK_ICD_FILENAMES` = `lib64/vulkan/libkosmickrisp_icd.json`, `ANGLE_DEFAULT_PLATFORM=metal` |
 | KosmicKrisp + SwANGLE | `host` | the same with `ANGLE_DEFAULT_PLATFORM=swiftshader` |
 | lavapipe | `lavapipe` | none (host GLES as emu picks it) |
@@ -33,7 +33,11 @@ Six arms, each chosen through the environment emu leaves alone when it is alread
 
 gfxstream itself points the Vulkan loader at the manifest that `ANDROID_EMU_VK_ICD` names:
 with `VK_LOADER_DEBUG=driver` the KosmicKrisp arm loads `libvulkan_kosmickrisp.dylib`, and
-the default loads `libMoltenVK.dylib`. All the ICDs come from the SDK emulator's
+the MoltenVK arms load `libMoltenVK.dylib`. Every Vulkan arm sets
+`ANDROID_EMU_VK_ICD`, MoltenVK's included, so an arm means the same driver on every API: from #412
+on, emu's default for an unset one depends on the API level (KosmicKrisp where MoltenVK can't
+compile a guest's pipelines). The tables below were measured on APIs 36 and 30 with the variable
+unset for the MoltenVK arms, where the default was MoltenVK. All the ICDs come from the SDK emulator's
 `lib64/vulkan` (37.2.13); nothing was downloaded.
 
 For each API, the script creates one AVD with `emu -create-avd -no-golden` (google_apis arm64,
@@ -48,8 +52,8 @@ in turn (the order is reversed every other round):
   process tree over 60 s. Then `scripts/android-jank.sh`: 10 app-drawer swipes up and down on
   the launcher, then the launcher's `dumpsys gfxinfo`. Peak memory is the larger of the boot's
   peak RSS and the RSS after the swipes.
-- **Correctness**: two screenshots per warm boot, both under the lane's `shots/` directory.
-  One is the home screen. The other is Settings search
+- **Correctness**: two screenshots per warm boot, both under `renderers-shots/` in the output
+  directory (`--out`). One is the home screen. The other is Settings search
   (`am start -a com.android.settings.action.SETTINGS_SEARCH`) with Gboard up. The script checks
   that Gboard is shown with `dumpsys input_method`. Each region is scored by the share of its
   dominant colour (a blank buffer is one flat colour: 1.0) and by the share of pixels that
@@ -70,11 +74,13 @@ never enters a median, and the note under each table counts the failures per arm
 
 The script drives one device on `--port` (default 5700, adb 5701). It refuses an odd port, and a
 port whose serial or adb port's serial is on the protected list in `scripts/bench/lib.sh`, whether
-or not that device is up. It re-checks that the ports are free before each boot. It sends the
-console quit only to the emulator it started and only while that process listens on the port. It
-signals a PID only while the PID still has the start time it had at launch. Its AVDs live in a
-private `ANDROID_AVD_HOME` under the work directory, never in `~/.android/avd`.
-`scripts/bench/test-renderers.sh` tests these guards without a device.
+or not that device is up. It re-checks that the ports are free before each boot, after the wait for
+a boot slot, right before the launch. It sends the console quit only to the emulator it started and
+only while that process listens on the port. It signals a PID only while the PID still has the
+start time and command it had at launch, recorded when the process started (`lib.sh` does the same
+for every PID a bench tracks). Its AVDs live in a private `ANDROID_AVD_HOME` under the work
+directory, never in `~/.android/avd`. `scripts/bench/test-renderers.sh` and
+`scripts/bench/test-lib.sh` test these guards without a device.
 
 ```bash
 scripts/bench/renderers.sh --cold-only --rounds 5
@@ -153,10 +159,10 @@ round at every load.
 
 ² In round 2, MoltenVK + ANGLE-Metal's warm boot crashed with SIGSEGV after
 `sys.boot_completed`. It is a failed run, 1 of 3 warm boots for that arm, and is left out of
-the medians: the idle CPU cell is the median of 4.0 and 6.7. The crash came at host load 90 and followed a stream of
-`Failed to find ColorBuffer: 36` and `Failed to bind to texture: invalid color buffer` from
-`emulation_gl.cpp`. That was 1 of 6 ANGLE-Metal warm boots on API 30; KosmicKrisp + ANGLE-Metal
-had none in 3.
+the medians: the idle CPU cell is the median of 4.0 and 6.7. The crash came at host load 90 and
+followed a stream of `Failed to find ColorBuffer: 36` and
+`Failed to bind to texture: invalid color buffer` from `emulation_gl.cpp`. That was 1 of 6
+ANGLE-Metal warm boots on API 30; KosmicKrisp + ANGLE-Metal had none in 3.
 
 ## Correctness
 
@@ -165,7 +171,7 @@ had none in 3.
 | API 36: launcher icons | draw 3/3 | draw 3/3 | draw 3/3 | draw 3/3 | draw 3/3 | no boot |
 | API 36: Gboard keyboard | draws 3/3 | draws 3/3 | draws 3/3 | draws 3/3 | draws 3/3 | no boot |
 | API 36: Gboard against lavapipe's | 0% of pixels differ | 0% | 0% | 0% | (reference) | — |
-| API 30: launcher icons | draw 2/2 (the third boot crashed) | draw 3/3 | draw 3/3 | draw 3/3 | draw 2/3 (an ANR dialog over the third) | no boot |
+| API 30: launcher icons | draw 2/2 (the round-2 boot crashed) | draw 3/3 | draw 3/3 | draw 3/3 | draw 2/3 (an ANR dialog over the third) | no boot |
 | API 30: Gboard keyboard | draws 2/2 | draws 3/3 | draws 3/3 | draws 3/3 | draws 2/3 (the same ANR) | no boot |
 
 On API 36, the dominant colour covers 0.486 of every arm's Gboard region, against 1.0 for a

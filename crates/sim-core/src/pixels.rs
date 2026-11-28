@@ -293,6 +293,17 @@ pub fn downscale_factor(width: u32, max_width: u32) -> u32 {
     width.div_ceil(max_width.max(1)).max(1)
 }
 
+/// The `hello` width that makes emu send a `width` x `height` display with its longest side at
+/// or over `max_size`, as close to it as a whole factor allows: emu shrinks by the whole factor
+/// `ceil(width / hint)`, so this asks for the factor `floor(long / max_size)` (at least 1). The
+/// frame is then at or over the cap, never under it (the encoder can't scale a picture back up,
+/// so a smaller one would lose resolution); the encoder's own scaling finishes it to the exact
+/// size. Never 0 (that pauses the stream).
+pub fn hello_width_for((width, height): (u32, u32), max_size: u32) -> u32 {
+    let factor = (width.max(height) / max_size.max(1)).max(1);
+    width.div_ceil(factor).max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,5 +539,25 @@ mod tests {
         assert_eq!(downscale(2, 2, &px, 2), (1, 1, vec![63, 63, 63, 255]));
         assert_eq!(downscale(2, 2, &px, 1).2, px.to_vec());
         assert_eq!((downscale_factor(1080, 720), downscale_factor(720, 720), downscale_factor(720, 0)), (2, 1, 720));
+    }
+
+    #[test]
+    fn the_hello_width_asks_for_the_factor_that_keeps_the_longest_side_at_or_over_the_cap() {
+        let frame = |size: (u32, u32), max| {
+            let hint = hello_width_for(size, max);
+            let f = downscale_factor(size.0, hint);
+            (hint, downscaled_size(size.0, size.1, f))
+        };
+        assert_eq!(frame((1440, 3120), 1280), (720, (720, 1560)), "factor 2; not 3, which would leave 480x1040");
+        assert_eq!(frame((1200, 1920), 1280), (1200, (1200, 1920)), "factor 1: halving would leave 960");
+        assert_eq!(frame((1080, 2400), 1280), (1080, (1080, 2400)), "factor 1");
+        assert_eq!(frame((2560, 1600), 1280), (1280, (1280, 800)), "a tablet, landscape");
+        assert_eq!(frame((1080, 2400), 600).1, (270, 600), "factor 4");
+        assert_eq!(frame((1080, 2400), 4000).1, (1080, 2400), "already small enough: full size");
+        for size in [(1440, 3120), (1200, 1920), (1080, 2400), (1179, 2556), (2560, 1600)] {
+            let (w, h) = frame(size, 1280).1;
+            assert!(w.max(h) >= 1280, "{size:?} stays at or over the cap: {w}x{h}");
+        }
+        assert_eq!(hello_width_for((1, 1), 1000), 1, "never 0, which pauses the stream");
     }
 }

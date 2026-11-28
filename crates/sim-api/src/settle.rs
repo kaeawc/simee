@@ -15,9 +15,16 @@
 //! CPU is split into background (maintenance and background QoS: darwinbg work, which runs on the
 //! efficiency cores) and the rest; [`Rule::foreground`] (the default) judges a tree on the rest
 //! only.
+//!
+//! An Android device's tree is the guest's own processes, read over adb (`sim_android::settle`):
+//! the same [`Rule`], [`Settler`] and result ([`options`], [`put_load`]), sampled by [`wait`].
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
+
+use serde_json::{Value, json};
+
+use crate::params::{opt_bool, opt_u64};
 
 /// One process's accumulated CPU time, seconds.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -233,6 +240,114 @@ pub fn default_concurrency(cpus: usize) -> usize {
 /// (docs/farm.md), and K storms at once make each one longer.
 pub fn default_settle_timeout(concurrent: usize) -> Duration {
     Duration::from_secs(600.max(150 * concurrent as u64))
+}
+
+/// The settle rule from `prefix` + `cpu_pct`, `window_s` and `foreground` (the defaults where
+/// absent): `settle_` for `boot` and `boot_many`, none for `settle`. The same on both platforms.
+pub(crate) fn rule(p: &Value, prefix: &str) -> Result<Rule, String> {
+    let mut rule = Rule::default();
+    let key = |name: &str| format!("{prefix}{name}");
+    match p.get(key("cpu_pct")) {
+        None | Some(Value::Null) => {}
+        Some(v) => {
+            rule.cpu_pct =
+                v.as_f64().filter(|x| *x >= 0.0).ok_or_else(|| format!("{} must be a number of % of a core, not {v}", key("cpu_pct")))?
+        }
+    }
+    match p.get(key("window_s")) {
+        None | Some(Value::Null) => {}
+        Some(v) => {
+            rule.window = Duration::from_secs(v.as_u64().ok_or_else(|| format!("{} must be whole seconds, not {v}", key("window_s")))?)
+        }
+    }
+    if let Some(fg) = opt_bool(p, &key("foreground"))? {
+        rule.foreground = fg;
+    }
+    Ok(rule)
+}
+
+/// `settle`'s rule and how long it waits (`timeout_s`, default 600 s).
+pub(crate) fn options(p: &Value) -> Result<(Rule, Duration), String> {
+    let rule = rule(p, "")?;
+    Ok((rule, opt_u64(p, "timeout_s").map_or_else(|| default_settle_timeout(1), Duration::from_secs)))
+}
+
+/// Why a wait that ran out of time didn't settle.
+pub(crate) fn not_settled(settler: &Settler, rule: Rule, timeout: Duration) -> String {
+    let what = if rule.foreground { " in the foreground" } else { "" };
+    let pct = settler.load().map_or_else(|| "no process tree".to_owned(), |l| format!("{:.0} % of a core{what}", l.judged_pct(&rule)));
+    format!("device did not settle within {}s ({pct} over the last {}s)", timeout.as_secs(), rule.window.as_secs())
+}
+
+/// A settle wait's last figures: processes, and CPU over the window (all of it, and the
+/// background-QoS and foreground parts); and the CPU seconds the tree used over the whole wait
+/// (from the boot when the wait followed one).
+pub(crate) fn put_load(result: &mut Value, settler: &Settler) {
+    let load = settler.load();
+    let used = settler.used();
+    result["cpu_s"] = json!(round(used.total_s));
+    result["background_cpu_s"] = json!(round(used.background_s));
+    result["procs"] = json!(settler.procs());
+    result["cpu_pct"] = json!(load.map(|l| round(l.total_pct)));
+    result["background_cpu_pct"] = json!(load.map(|l| round(l.background_pct)));
+    result["foreground_cpu_pct"] = json!(load.map(|l| round(l.foreground_pct())));
+}
+
+/// To a tenth, as every timing and percentage in a result is.
+pub(crate) fn round(x: f64) -> f64 {
+    (x * 10.0).round() / 10.0
+}
+
+/// How a settle wait ended: `at` seconds after it started, or `None` when it ran out of time;
+/// the settler holds the last CPU figure and process count either way.
+pub(crate) struct Settled {
+    pub at: Option<f64>,
+    pub settler: Settler,
+}
+
+/// A settle wait's clock: seconds from any origin, and the pause between two samples.
+pub(crate) trait Clock {
+    fn now(&mut self) -> f64;
+    fn pause(&mut self);
+}
+
+/// The host's clock, sampling once a second (as iOS's wait does).
+pub(crate) struct Host(pub std::time::Instant);
+
+impl Clock for Host {
+    fn now(&mut self) -> f64 {
+        self.0.elapsed().as_secs_f64()
+    }
+
+    fn pause(&mut self) {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Waits until a device is settled by `rule`, for at most `timeout`: `sample` reads it once per
+/// [`Clock::pause`], as (seconds on its own clock, its process tree), or `None` when it couldn't
+/// be read this time (a probe that failed; the wait goes on). `at` is the clock's time from the
+/// start. `since_boot`: as [`Settler::since_boot`].
+pub(crate) fn wait(
+    rule: Rule,
+    timeout: Duration,
+    since_boot: bool,
+    mut sample: impl FnMut() -> Option<(f64, Tree)>,
+    clock: &mut impl Clock,
+) -> Settled {
+    let mut settler = if since_boot { Settler::since_boot(rule) } else { Settler::new(rule) };
+    let start = clock.now();
+    loop {
+        if let Some((t, tree)) = sample()
+            && settler.push(t, tree)
+        {
+            return Settled { at: Some(clock.now() - start), settler };
+        }
+        if clock.now() - start >= timeout.as_secs_f64() {
+            return Settled { at: None, settler };
+        }
+        clock.pause();
+    }
 }
 
 #[cfg(test)]
@@ -454,6 +569,112 @@ mod tests {
         assert_eq!(default_settle_timeout(1), Duration::from_secs(600));
         assert_eq!(default_settle_timeout(4), Duration::from_secs(600));
         assert_eq!(default_settle_timeout(8), Duration::from_secs(1200));
+    }
+
+    /// iOS's `settle` reads these: the same defaults, keys and messages as before Android shared
+    /// them (`ios.rs`'s own tests pin them on macOS too).
+    #[test]
+    fn settle_options_are_unchanged_for_ios() {
+        let (rule_, timeout) = options(&json!({})).expect("defaults");
+        assert_eq!(rule_, Rule { cpu_pct: 10.0, window: Duration::from_secs(10), foreground: true });
+        assert_eq!(timeout, Duration::from_secs(600));
+        let p = json!({"cpu_pct": 7.5, "window_s": 3, "foreground": false, "timeout_s": 30});
+        assert_eq!(
+            options(&p).expect("given"),
+            (Rule { cpu_pct: 7.5, window: Duration::from_secs(3), foreground: false }, Duration::from_secs(30))
+        );
+        let boot = json!({"settle_cpu_pct": 5.0, "settle_window_s": 20, "settle_foreground": false, "cpu_pct": 99.0});
+        assert_eq!(rule(&boot, "settle_").expect("boot"), Rule { cpu_pct: 5.0, window: Duration::from_secs(20), foreground: false });
+        assert_eq!(options(&json!({"cpu_pct": "5"})), Err("cpu_pct must be a number of % of a core, not \"5\"".into()));
+        assert_eq!(options(&json!({"window_s": -1})), Err("window_s must be whole seconds, not -1".into()));
+        assert!(options(&json!({"foreground": "yes"})).is_err());
+        assert_eq!(options(&json!({"cpu_pct": null, "window_s": null})).expect("nulls").0, Rule::default());
+    }
+
+    #[test]
+    fn a_settle_result_is_unchanged_for_ios() {
+        let mut settler = Settler::new(Rule::default());
+        let tree = |total_s, background_s| Tree { cpu: [(1, Cpu { total_s, background_s })].into(), springboard: true };
+        settler.push(0.0, tree(0.0, 0.0));
+        settler.push(10.0, tree(3.0, 2.0));
+        let mut r = json!({});
+        put_load(&mut r, &settler);
+        assert_eq!(
+            r,
+            json!({"procs": 1, "cpu_pct": 30.0, "background_cpu_pct": 20.0, "foreground_cpu_pct": 10.0, "cpu_s": 3.0, "background_cpu_s": 2.0})
+        );
+        assert_eq!(
+            not_settled(&settler, Rule::default(), Duration::from_secs(60)),
+            "device did not settle within 60s (10 % of a core in the foreground over the last 10s)"
+        );
+        assert_eq!(
+            not_settled(&Settler::new(Rule::default()), Rule { foreground: false, ..Rule::default() }, Duration::from_secs(5)),
+            "device did not settle within 5s (no process tree over the last 10s)"
+        );
+    }
+
+    /// A clock that moves a second per pause, and counts them.
+    #[derive(Default)]
+    struct Ticks {
+        t: f64,
+        pauses: usize,
+    }
+
+    impl Clock for Ticks {
+        fn now(&mut self) -> f64 {
+            self.t
+        }
+
+        fn pause(&mut self) {
+            self.t += 1.0;
+            self.pauses += 1;
+        }
+    }
+
+    #[test]
+    fn a_wait_samples_until_settled_on_the_samples_own_clock() {
+        // 50 % for the first 2 s, then 1 %; the device's clock starts at 1000 s.
+        let mut cpu = 0.0;
+        let mut n = 0;
+        let mut clock = Ticks::default();
+        let rule = Rule { cpu_pct: 10.0, window: Duration::from_secs(2), foreground: true };
+        let settled = wait(
+            rule,
+            Duration::from_secs(60),
+            false,
+            || {
+                cpu += if n < 2 { 0.5 } else { 0.01 };
+                n += 1;
+                Some((1000.0 + f64::from(n), sample(cpu)))
+            },
+            &mut clock,
+        );
+        // The fourth sample's window no longer holds the busy interval: three pauses in.
+        assert_eq!((settled.at, clock.pauses), (Some(3.0), 3));
+        assert!(settled.settler.cpu_pct().is_some_and(|p| (p - 1.0).abs() < 0.01), "{:?}", settled.settler.cpu_pct());
+    }
+
+    #[test]
+    fn a_wait_rides_out_failed_samples_and_stops_at_its_timeout() {
+        let mut clock = Ticks::default();
+        let mut tries = 0;
+        let busy = wait(
+            Rule { window: Duration::from_secs(1), ..Rule::default() },
+            Duration::from_secs(5),
+            false,
+            || {
+                tries += 1;
+                // Every other probe fails; the others find a device at 100 %.
+                (tries % 2 == 0).then(|| (f64::from(tries), sample(f64::from(tries))))
+            },
+            &mut clock,
+        );
+        assert_eq!(busy.at, None);
+        assert_eq!((tries, clock.pauses), (6, 5), "a sample at 0..=5 s, then the timeout");
+        assert!(busy.settler.cpu_pct().is_some_and(|p| p > 90.0));
+        let mut clock = Ticks::default();
+        let never = wait(Rule::default(), Duration::from_secs(2), false, || None, &mut clock);
+        assert!(never.at.is_none() && never.settler.load().is_none());
     }
 
     #[test]

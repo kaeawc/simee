@@ -20,9 +20,9 @@
 //! record saying how to turn them, so it turns them as it draws and nothing here turns them; any
 //! other client gets them turned upright ([`FrameStore::latest_upright`]). Touches are in pixels
 //! of the upright screen either way ([`FrameStore::to_scanout`]).
+use sim_core::hostfs::OpenOptionsExt;
+use sim_core::net::{UnixListener, UnixStream};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -202,6 +202,8 @@ fn client(conn: UnixStream, display: Arc<FrameStore>, inputs: Arc<Mutex<Option<e
         match (input, g.as_ref()) {
             (Input::Hello { max_width: mw }, _) => {
                 wants.set_max_width(mw);
+                // A stream waiting for a newer frame notices the new width now, not at its timeout.
+                display.wake();
                 if let Some(writer) = writer.take() {
                     let (display, wants, stop, dir) = (display.clone(), wants.clone(), stop.clone(), dir.clone());
                     let _ = std::thread::Builder::new()
@@ -277,6 +279,9 @@ enum Turn {
 
 fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &AtomicBool, dir: &Path) {
     let mut sent = 0u64;
+    // The `hello` width the last frame went out for: a client that asks for another size of a
+    // screen that isn't drawing gets the newest frame again at that size.
+    let mut sent_mw = 0u32;
     // Pacing is a GCRA (a token bucket kept as one instant): `tat` is when the next frame would
     // be due at exactly one per interval; a frame may go up to half an interval before that.
     // The long-run rate stays at most one per interval, while a frame that comes in a little
@@ -300,9 +305,15 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
         // Wait for a new frame (woken by the frame, or by `wake` when the client goes away; the
         // 1 s timeout only notices the emulator stopping); then, if it's early, wait until it may
         // go and send the newest by then. A client that was idle gets it at once.
-        let n = display.wait_newer(sent, Duration::from_secs(1));
+        // (Not when a new width is already asked for: a wake that came before this wait is gone.)
+        let asked = wants.max_width.load(Ordering::Relaxed);
+        let n = if sent_mw != 0 && asked != 0 && asked != sent_mw {
+            display.frames()
+        } else {
+            display.wait_newer(sent, Duration::from_secs(1))
+        };
         let mw = wants.max_width.load(Ordering::Relaxed);
-        if mw == 0 || n == sent {
+        if mw == 0 || (n == sent && mw == sent_mw) {
             continue;
         }
         let interval = wants.interval();
@@ -329,6 +340,7 @@ fn frames(mut out: UnixStream, display: &FrameStore, wants: &Wants, stop: &Atomi
             tat = Some(Instant::now() + interval);
             continue;
         };
+        sent_mw = mw;
         let captured = started.elapsed();
         // Read after the frame: a turn counts the frame again once it's set, so a frame taken
         // before a turn is followed by one that carries it.
@@ -586,7 +598,7 @@ impl Ring {
     }
 
     fn fill_zero(file: &std::fs::File, len: u64) -> std::io::Result<()> {
-        use std::os::unix::fs::FileExt;
+        use sim_core::hostfs::FileExt;
         let zeros = vec![0u8; 1 << 20];
         let mut at = 0;
         while at < len {
@@ -636,6 +648,17 @@ impl Drop for Ring {
     }
 }
 
+/// Whether no process `pid` exists (another user's live process answers EPERM, so isn't gone).
+#[cfg(unix)]
+fn process_gone(pid: i32) -> bool {
+    rustix::process::Pid::from_raw(pid).is_none_or(|p| rustix::process::test_kill_process(p).is_err_and(|e| e == rustix::io::Errno::SRCH))
+}
+
+#[cfg(windows)]
+fn process_gone(pid: i32) -> bool {
+    u32::try_from(pid).is_ok_and(|p| !emu_hvf::host::process_alive(p))
+}
+
 /// Removes rings left by emulators that are gone (a crash skips their cleanup).
 fn remove_stale_rings(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
@@ -643,16 +666,15 @@ fn remove_stale_rings(dir: &Path) {
         let name = e.file_name();
         let Some(name) = name.to_str().filter(|n| n.ends_with(".ring")) else { continue };
         let Some(pid) = name.strip_prefix("frames-").and_then(|n| n.split('-').next()?.parse::<i32>().ok()) else { continue };
-        // Gone only if no such process (another user's live process answers EPERM).
-        let gone = rustix::process::Pid::from_raw(pid)
-            .is_none_or(|p| rustix::process::test_kill_process(p).is_err_and(|e| e == rustix::io::Errno::SRCH));
-        if gone {
+        if process_gone(pid) {
             let _ = std::fs::remove_file(e.path());
         }
     }
 }
 
-#[cfg(test)]
+// Unix only: the tests drive the server over real Unix sockets, which Windows has none of yet
+// (`sim_core::net`).
+#[cfg(all(test, unix))]
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
@@ -1181,6 +1203,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A client that asks for another width of a screen that isn't drawing gets the newest frame
+    /// again at that size, at once: the new `hello` wakes the stream out of its wait for a frame
+    /// (which times out after a second), so the answer comes well before that.
+    #[test]
+    fn a_new_hello_width_on_a_static_screen_resends_the_newest_frame_at_that_size_without_waiting() {
+        let rig = Rig::new("rehello");
+        let (w, h) = (8u32, 4u32);
+        rig.store.posted(w, h);
+        let (mut client, mut frames_in) = rig.connect(false, 4096);
+        let (full, _) = read_frame(&mut frames_in).expect("frame");
+        assert_eq!((full.width, full.height), (w, h));
+        // The guest draws nothing more, and the stream is waiting for a frame that won't come.
+        std::thread::sleep(Duration::from_millis(100));
+        let asked = Instant::now();
+        client.send(&Input::Hello { max_width: 4 }).expect("hello");
+        let (half, rgba) = read_frame(&mut frames_in).expect("the same frame, resized");
+        let took = asked.elapsed();
+        assert_eq!((half.frame, half.width, half.height), (full.frame, 4, 2));
+        assert_eq!(rgba, downscale(w, h, &pixels(w, h, rig.store.frames()), 2).2);
+        assert!(took < Duration::from_millis(900), "took {took:?}: it waited out the frame timeout");
     }
 
     /// `hello 0` pauses a stream (the desktop's switched-away screen). While the guest keeps

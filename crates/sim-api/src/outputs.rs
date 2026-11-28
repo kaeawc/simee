@@ -35,7 +35,7 @@ const DEFS: &[(&str, &str)] = &[
         "admission",
         r#"{verdict: "admit"|"hold"|"backoff", reasons: [string], predicted: {subject: string, devices: number, admissible: number,
             costs: [object], boot_cpu_pct: number, idle_cpu_pct: number, boot_memory_bytes: number, idle_memory_bytes: number,
-            memory_used_pct: object|null, memory_available_bytes: object|null, load: object|null}}"#,
+            memory_used_pct: object|null, memory_available_bytes: object|null, load: object|null}, host_basis?: string}"#,
     ),
     ("pacing", "{waited_s: number, timed_out: boolean, cancelled: boolean, steps: [object]}"),
     ("rate", r#"{"1s": number|null, "1m": number|null}"#),
@@ -98,7 +98,7 @@ pub const OUTPUTS: &[(&str, &str)] = &[
     (
         "host",
         r#"{snapshot: object, averages: [object], load_trend: string, thermal_state: string|null, thresholds: object,
-            verdict: {verdict: "admit"|"hold"|"backoff", reason: string, reasons: [string], load_limit: number|null}, reasons: [string]}"#,
+            verdict: {verdict: "admit"|"hold"|"backoff", reason: string, reasons: [string], load_limit: number|null}, reasons: [string], history_note?: string}"#,
     ),
     (
         "devices_usage",
@@ -196,8 +196,8 @@ pub const OUTPUTS: &[(&str, &str)] = &[
         "[{pid: number, ppid: number, cpu: number, rss_kb: number, elapsed: string, name: string, path: string, package?: string|null}]",
     ),
     ("kill", "null"),
-    ("connections", "[{pid: number, process: string, protocol: string, local: string, remote: string, state: string}]"),
-    ("traffic", "[{pid: number, process: string, bytes_in: number, bytes_out: number}]"),
+    ("connections", "[{pid: number|null, process: string, protocol: string, local: string, remote: string, state: string, uid?: number}]"),
+    ("traffic", "[{pid: number|null, process: string, bytes_in: number, bytes_out: number, uid?: number}]"),
     (
         "mem_leaks",
         "{...@mem, leak_count: number, stacks: boolean, leaks: [object], nodes?: number|null, malloced_bytes?: number|null,
@@ -240,9 +240,10 @@ pub const OUTPUTS: &[(&str, &str)] = &[
     ),
     (
         "network_shape",
-        r#"{profile: @shape, proxy_port: number|null, injected: boolean, inject_mode: "none"|"launchd"|"boot", profile_path: string}"#,
+        r#"{profile: @shape, proxy_port: number|null, injected: boolean, inject_mode: "none"|"launchd"|"boot", profile_path?: string,
+            commands?: [string]}"#,
     ),
-    ("network_state", "{profile: @shape, proxy_port: number|null, injected: boolean, boot_injected: boolean}"),
+    ("network_state", "{profile: @shape, proxy_port: number|null, injected: boolean, boot_injected: boolean, network_status?: [string]}"),
     (
         "network_flows",
         "[{started: number, method: string, host: string, port: number, outcome: string, bytes_up: number, bytes_down: number,

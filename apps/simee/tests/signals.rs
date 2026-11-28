@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! `simee serve` and `simee mcp` on SIGINT and SIGTERM (#388): the real binary as a subprocess,
 //! with its own SDK, AVD home and `$HOME`, so no device is reached. It shuts down in order,
 //! removes its socket and exits with 128 + the signal. (`sim-api`'s `shutdown` tests cover the

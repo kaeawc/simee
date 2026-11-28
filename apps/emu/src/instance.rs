@@ -7,7 +7,7 @@
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
 use std::fs::File;
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
@@ -505,7 +505,7 @@ fn port_free(p: u16) -> bool {
 /// Creates `image` as a sparse, empty ext4 filesystem of `size` bytes.
 fn create_userdata(image: &std::path::Path, size: u64) -> Result<()> {
     let mut uuid = [0u8; 16];
-    File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut uuid)).context("reading /dev/urandom")?;
+    sim_core::entropy::fill(&mut uuid).context("reading random bytes from the OS")?;
     uuid[6] = (uuid[6] & 0x0F) | 0x40; // RFC 4122 version 4 (random)
     uuid[8] = (uuid[8] & 0x3F) | 0x80;
     let file = File::options().read(true).write(true).create_new(true).open(image)?;
@@ -1013,6 +1013,7 @@ const KOSMICKRISP_NOTICE: &str = "emu: the UI draws with Skia GL on the guest's 
 /// level as well as by the missing `VulkanVirtualQueue` tag: an API 36 image without it (Wear
 /// OS 36) stays on MoltenVK until a device check shows KosmicKrisp draws it. See
 /// docs/research/api34-moltenvk.md.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
 fn host_gpu_icd(avd: &Avd, egl: &str, kosmickrisp: bool, asked: Option<&str>) -> emu_gfxstream::Icd {
     let api_34_35 = avd.api_level().is_some_and(|api| (34..=35).contains(&api));
@@ -1395,6 +1396,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn the_host_gpu_driver_per_api_is_kosmickrisp_only_where_the_ui_is_skia_gl_on_angle() {
         use emu_gfxstream::Icd::{KosmicKrisp, MoltenVk};

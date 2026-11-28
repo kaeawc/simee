@@ -90,6 +90,8 @@ pub(crate) struct Target {
     pub avd_dir: Option<PathBuf>,
     /// The size `touch` and `swipe` take, in pixels (asked for only with `input`).
     pub screen: Option<(u32, u32)>,
+    /// An iOS device's device set (#409): `None` is the default set.
+    pub set: Option<String>,
 }
 
 /// The encode loop on a device's frames.
@@ -124,7 +126,7 @@ pub(crate) struct Connected {
     pub input_note: Option<String>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Connected {
     pub fn new(publication: Box<dyn Publication>) -> Connected {
         Connected { publication, input_note: None }
@@ -227,7 +229,7 @@ impl Media for HostMedia {
         match target.platform {
             Platform::Ios => {
                 // The context, the display and the source stay on this thread.
-                let context = sim_coresim::Context::new().map_err(|e| e.to_string())?;
+                let context = sim_coresim::Context::open(target.set.as_deref()).map_err(|e| e.to_string())?;
                 let display = context.device(&target.udid).and_then(|d| d.display()).map_err(|e| e.to_string())?;
                 let mut source = sim_encode::IosSource::new(display).map_err(text)?;
                 sim_encode::stream::run(&mut source, &mut encoder, pacing, controls, sink).map(drop).map_err(text)
@@ -255,7 +257,13 @@ impl Media for HostMedia {
             Platform::Android => {
                 let dir = target.avd_dir.as_ref().ok_or_else(|| format!("{}: no AVD directory", target.name))?;
                 let mut encoder = sim_encode::OpenH264Encoder::new(config.clone()).map_err(text)?;
-                let mut source = sim_encode::AndroidSource::connect(dir, 0).map_err(text)?;
+                // Frames at the stream's size from emu, so the encoder's colour conversion has
+                // little to scale; full size when the stream is.
+                let mut source = match config.max_size {
+                    Some(max) => sim_encode::AndroidSource::connect_fitted(dir, max, target.screen),
+                    None => sim_encode::AndroidSource::connect(dir, 0),
+                }
+                .map_err(text)?;
                 sim_encode::stream::run(&mut source, &mut encoder, pacing, controls, sink).map(drop).map_err(text)
             }
         }
@@ -284,22 +292,34 @@ const UNAVAILABLE: &str = if cfg!(target_os = "linux") {
 
 /// The device behind the `device` parameter, through `info` (and `screen`, with `screen`).
 fn lookup(s: &mut Session, p: &Value, screen: bool) -> Result<Target, String> {
+    // The device set this call named, said again to the calls below (`""` is the default set). One
+    // it can't use fails an iOS device only (the calls below say why); an Android device needs none.
+    let set = s.ios.set();
     let mut query = json!({"device": str_param(p, "device").unwrap_or("booted")});
+    if let Ok(set) = &set {
+        query["set"] = json!(set.clone().unwrap_or_default());
+    }
     if let Some(platform) = p.get("platform") {
         query["platform"] = platform.clone();
     }
     let info = crate::methods::call(s, "info", &query)?;
     let device: DeviceInfo = serde_json::from_value(info["device"].clone()).map_err(|e| format!("info: {e}"))?;
     let avd_dir = info.get("avd_dir").and_then(Value::as_str).map(PathBuf::from);
+    let set = match device.platform {
+        Platform::Ios => set?,
+        Platform::Android => None,
+    };
     let screen = match screen && device.state == DeviceState::Booted {
         true => {
-            let size = crate::methods::call(s, "screen", &json!({"device": device.udid, "platform": device.platform.as_str()}))?;
+            let in_set = json!(set.clone().unwrap_or_default());
+            let size =
+                crate::methods::call(s, "screen", &json!({"device": device.udid, "platform": device.platform.as_str(), "set": in_set}))?;
             let side = |k: &str| size[k].as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| format!("screen has no {k}: {size}"));
             Some((side("width")?, side("height")?))
         }
         false => None,
     };
-    Ok(Target { platform: device.platform, udid: device.udid, name: device.name, state: device.state, avd_dir, screen })
+    Ok(Target { platform: device.platform, udid: device.udid, name: device.name, state: device.state, avd_dir, screen, set })
 }
 
 static GLOBAL: OnceLock<Arc<Streams>> = OnceLock::new();
@@ -586,7 +606,14 @@ impl Streams {
     fn start(&self, p: &Value, lookup: &mut Lookup<'_>) -> Result<Value, String> {
         let options = options(p)?;
         self.media.available()?;
-        let target = lookup(p, options.settings.input)?;
+        // Linux sizes emu's frames from the screen, so a capped stream asks for it without input
+        // too; when it can't be had, the stream goes without the hint (full frames, scaled on the
+        // CPU) and says so.
+        let hint = cfg!(target_os = "linux") && options.settings.max_size.is_some() && !options.settings.input;
+        let (target, screen_note) = match lookup(p, options.settings.input || hint) {
+            Err(e) if hint => (lookup(p, false)?, Some(format!("no screen size for sizing frames ({e}): frames are scaled on the CPU"))),
+            found => (found?, None),
+        };
         if target.state != DeviceState::Booted {
             return Err(format!("{} isn't booted ({:?}): boot it before streaming it", target.name, target.state));
         }
@@ -678,6 +705,9 @@ impl Streams {
                     "lease_ttl_s": self.ttl.as_secs(),
                     "device": target.udid,
                 });
+                if let Some(note) = screen_note {
+                    started["screen_note"] = json!(note);
+                }
                 if options.settings.input {
                     let note = shared.lock().input_note.clone();
                     started["input"] = json!(note.is_none());
@@ -1061,7 +1091,7 @@ fn spawn_input(
     shared: Arc<Shared>,
     target: &Target,
 ) -> Option<InputThread> {
-    let device = json!({"device": target.udid, "platform": target.platform.as_str()});
+    let device = json!({"device": target.udid, "platform": target.platform.as_str(), "set": target.set.clone().unwrap_or_default()});
     let (done_tx, done_rx) = sync_channel(1);
     let handle = std::thread::Builder::new()
         .name("simee-stream-input".into())
@@ -1070,6 +1100,7 @@ fn spawn_input(
             while let Some((method, mut params)) = queue.pop(&shared.stopping) {
                 params["device"] = device["device"].clone();
                 params["platform"] = device["platform"].clone();
+                params["set"] = device["set"].clone();
                 let result = input.call(method, &params);
                 shared.input_done(&result);
                 if result.is_ok() && matches!(method, "rotate" | "fold") {
@@ -1482,7 +1513,7 @@ pub(crate) mod tests {
     }
 
     fn device(udid: &str, platform: Platform, state: DeviceState) -> Target {
-        Target { platform, udid: udid.into(), name: udid.into(), state, avd_dir: None, screen: Some((1179, 2556)) }
+        Target { platform, udid: udid.into(), name: udid.into(), state, avd_dir: None, screen: Some((1179, 2556)), set: None }
     }
 
     /// `iphone` (the default) and `pixel` are booted, `off` isn't.
@@ -1497,71 +1528,101 @@ pub(crate) mod tests {
 
     const URL: &str = "http://127.0.0.1:8889/sim/whip";
 
-    /// A WHIP session that appends its DELETE to a file another process reads (`shutdown`'s
-    /// tests), or, `wedged`, never finishes it.
-    struct FilePublication {
-        resource: String,
-        log: PathBuf,
-        wedged: bool,
+    /// A capped stream on Linux asks for the screen to size emu's frames; when that fails the
+    /// stream still starts, with a note, and a stream that needs no hint never asks.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failing_screen_lookup_costs_the_size_hint_not_the_stream() {
+        let f = fixture();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let mut lookup = |p: &Value, screen: bool| {
+            asked.borrow_mut().push(screen);
+            if screen { Err("screen: not answering".to_owned()) } else { devices(p, screen) }
+        };
+        let started = f.streams.call("stream_start", &json!({"device": "pixel", "whip_url": URL}), &mut lookup).expect("starts");
+        assert_eq!(*asked.borrow(), [true, false]);
+        assert!(started["screen_note"].as_str().is_some_and(|n| n.contains("not answering") && n.contains("CPU")), "{started}");
+        asked.borrow_mut().clear();
+        let uncapped = json!({"device": "pixel", "whip_url": "http://127.0.0.1:8889/other/whip", "max_size": 0});
+        let started = f.streams.call("stream_start", &uncapped, &mut lookup).expect("starts");
+        assert_eq!(*asked.borrow(), [false], "full size needs no screen");
+        assert!(started.get("screen_note").is_none());
     }
 
-    impl Publication for FilePublication {
-        fn send(&mut self, access_unit: &[u8], _: Duration) -> sim_rtc::Result<Sent> {
-            Ok(Sent::Queued { packets: 1, keyframe: access_unit.get(4) == Some(&0x67) })
+    /// The fakes `shutdown`'s tests start in a child process (unix: they need its signals).
+    #[cfg(unix)]
+    mod global {
+        use super::*;
+
+        /// A WHIP session that appends its DELETE to a file another process reads (`shutdown`'s
+        /// tests), or, `wedged`, never finishes it.
+        struct FilePublication {
+            resource: String,
+            log: PathBuf,
+            wedged: bool,
         }
 
-        fn resource(&self) -> String {
-            self.resource.clone()
-        }
-
-        fn close(self: Box<Self>) -> sim_rtc::Result<()> {
-            if self.wedged {
-                loop {
-                    std::thread::park();
-                }
+        impl Publication for FilePublication {
+            fn send(&mut self, access_unit: &[u8], _: Duration) -> sim_rtc::Result<Sent> {
+                Ok(Sent::Queued { packets: 1, keyframe: access_unit.get(4) == Some(&0x67) })
             }
-            use std::io::Write as _;
-            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.log).expect("log");
-            writeln!(f, "DELETE {}", self.resource).expect("write");
-            Ok(())
+
+            fn resource(&self) -> String {
+                self.resource.clone()
+            }
+
+            fn close(self: Box<Self>) -> sim_rtc::Result<()> {
+                if self.wedged {
+                    loop {
+                        std::thread::park();
+                    }
+                }
+                use std::io::Write as _;
+                let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.log).expect("log");
+                writeln!(f, "DELETE {}", self.resource).expect("write");
+                Ok(())
+            }
+        }
+
+        struct FileWhip {
+            log: PathBuf,
+            wedged: bool,
+        }
+
+        impl Whip for FileWhip {
+            fn connect(
+                &self,
+                config: PublisherConfig,
+                _: Option<InputSession>,
+                _: Box<dyn FnMut(PublisherEvent) + Send>,
+            ) -> sim_rtc::Result<Connected> {
+                let resource = format!("{}/session-0", config.endpoint);
+                Ok(Connected::new(Box::new(FilePublication { resource, log: self.log.clone(), wedged: self.wedged })))
+            }
+        }
+
+        struct NoInput;
+
+        impl DeviceInput for NoInput {
+            fn call(&mut self, _: &str, _: &Value) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+        }
+
+        /// Makes this process's streams (the ones the server stops as it exits) run on fakes whose
+        /// DELETE goes to `log` (or never finishes, `wedged`), and starts one; its id.
+        pub(crate) fn start_global_fake_stream(log: &std::path::Path, wedged: bool) -> String {
+            let make: MakeInput = Arc::new(|| Box::new(NoInput));
+            let whip = Arc::new(FileWhip { log: log.to_owned(), wedged });
+            let streams = Arc::new(Streams::new(Arc::new(SystemClock), Arc::new(FakeMedia::default()), whip, make));
+            assert!(GLOBAL.set(streams.clone()).is_ok(), "this process's streams were already made");
+            let started = streams.call("stream_start", &json!({"whip_url": URL}), &mut devices).expect("start");
+            started["stream_id"].as_str().expect("id").to_owned()
         }
     }
 
-    struct FileWhip {
-        log: PathBuf,
-        wedged: bool,
-    }
-
-    impl Whip for FileWhip {
-        fn connect(
-            &self,
-            config: PublisherConfig,
-            _: Option<InputSession>,
-            _: Box<dyn FnMut(PublisherEvent) + Send>,
-        ) -> sim_rtc::Result<Connected> {
-            let resource = format!("{}/session-0", config.endpoint);
-            Ok(Connected::new(Box::new(FilePublication { resource, log: self.log.clone(), wedged: self.wedged })))
-        }
-    }
-
-    struct NoInput;
-
-    impl DeviceInput for NoInput {
-        fn call(&mut self, _: &str, _: &Value) -> Result<Value, String> {
-            Ok(Value::Null)
-        }
-    }
-
-    /// Makes this process's streams (the ones the server stops as it exits) run on fakes whose
-    /// DELETE goes to `log` (or never finishes, `wedged`), and starts one; its id.
-    pub(crate) fn start_global_fake_stream(log: &std::path::Path, wedged: bool) -> String {
-        let make: MakeInput = Arc::new(|| Box::new(NoInput));
-        let whip = Arc::new(FileWhip { log: log.to_owned(), wedged });
-        let streams = Arc::new(Streams::new(Arc::new(SystemClock), Arc::new(FakeMedia::default()), whip, make));
-        assert!(GLOBAL.set(streams.clone()).is_ok(), "this process's streams were already made");
-        let started = streams.call("stream_start", &json!({"whip_url": URL}), &mut devices).expect("start");
-        started["stream_id"].as_str().expect("id").to_owned()
-    }
+    #[cfg(unix)]
+    pub(crate) use global::start_global_fake_stream;
 
     impl Fixture {
         fn call(&self, method: &str, p: Value) -> Result<Value, String> {
@@ -1590,7 +1651,7 @@ pub(crate) mod tests {
         }
 
         /// The next `n` device calls the input thread made (`screen` aside), without the device
-        /// fields (each names the iPhone).
+        /// fields (each names the iPhone, in the stream's device set: the default one here).
         fn device_calls(&self, n: usize) -> Vec<(String, Value)> {
             let mut got = Vec::new();
             while got.len() < n {
@@ -1599,12 +1660,39 @@ pub(crate) mod tests {
                 };
                 let o = params.as_object_mut().expect("object");
                 assert_eq!((o.remove("device"), o.remove("platform")), (Some(json!("iphone")), Some(json!("ios"))), "{method}");
+                assert_eq!(o.remove("set"), Some(json!("")), "{method}: the default set, said so");
                 if method != "screen" {
                     got.push((method, params));
                 }
             }
             got
         }
+    }
+
+    /// #409: an iOS device set the call can't use (a relative `SIMEE_IOS_DEVICE_SET`) fails only
+    /// what connects to the simulator service: an Android stream's device is still found.
+    #[test]
+    fn an_unusable_device_set_still_finds_an_android_device_to_stream() {
+        let root = std::path::PathBuf::from("/tmp").join(format!("sa-stream-set-{}", std::process::id()));
+        let image = root.join("sdk/system-images/android-36/google_apis/arm64-v8a");
+        std::fs::create_dir_all(&image).expect("image dir");
+        std::fs::write(image.join("system.img"), b"s").expect("system.img");
+        std::fs::write(image.join("source.properties"), "AndroidVersion.ApiLevel=36\nSystemImage.TagId=google_apis\n").expect("props");
+        let mut android = sim_android::Android::new(emu_avd::Env { sdk_root: Some(root.join("sdk")), avd_home: root.join("avd") });
+        android.running_dir = Some(root.join("running"));
+        android.create("pixel", "system-images;android-36;google_apis;arm64-v8a", None).expect("create");
+        let mut s = Session { fake_env_set: Some(Some("farm/sims".into())), ..Session::with_android(android) };
+        let bad = crate::methods::environment_set(&s).expect_err("relative");
+        s.ios.use_set(Err(bad.clone()));
+        let target = lookup(&mut s, &json!({"device": "pixel"}), false).expect("the AVD");
+        assert_eq!((target.platform, target.udid.as_str(), target.set), (Platform::Android, "pixel", None));
+        // An iOS device can't be streamed from that set: the reason is the set's. (Off macOS
+        // there are no iOS devices at all, so the lookup refuses for that reason instead.)
+        let err = lookup(&mut s, &json!({"device": "409409A0-0000-4000-8000-000000000409"}), false).expect_err("iOS");
+        if cfg!(target_os = "macos") {
+            assert!(err.contains("absolute"), "{err}");
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 
     fn stage_names(status: &Value) -> Vec<String> {
@@ -2059,7 +2147,7 @@ pub(crate) mod tests {
 /// sink Annex B access units that decode.
 #[cfg(all(test, target_os = "linux", feature = "openh264"))]
 mod linux_media {
-    use std::io::{Read, Write};
+    use std::io::{BufRead, Write};
     use std::os::unix::net::UnixListener;
 
     use sim_core::stream::FrameHeader;
@@ -2074,10 +2162,18 @@ mod linux_media {
     struct FakeDisplay {
         dir: PathBuf,
         done: Option<std::sync::mpsc::Sender<()>>,
+        /// The client's `hello` lines.
+        hellos: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeDisplay {
         fn new(frames: u8) -> FakeDisplay {
+            FakeDisplay::honouring(frames, false)
+        }
+
+        /// An emu whose frames are shrunk by the whole factor the first `hello` asks for when it
+        /// `honours` that, and full size otherwise.
+        fn honouring(frames: u8, honours: bool) -> FakeDisplay {
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             // Not under TMPDIR: a socket path has to fit in SUN_LEN.
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2086,17 +2182,38 @@ mod linux_media {
             std::fs::create_dir_all(&state).expect("state dir");
             let listener = UnixListener::bind(state.join("display.sock")).expect("bind");
             let (done, done_rx) = std::sync::mpsc::channel::<()>();
+            let hellos = Arc::new(Mutex::new(Vec::<String>::new()));
+            let seen = hellos.clone();
             std::thread::spawn(move || {
                 let Ok((mut conn, _)) = listener.accept() else { return };
-                // The client's request lines come first; any byte means it is connected.
-                let mut hello = [0u8; 1];
-                let _ = conn.read(&mut hello);
+                let lines = conn.try_clone().expect("clone");
+                let recorded = seen.clone();
+                std::thread::spawn(move || {
+                    for line in std::io::BufReader::new(lines).lines().map_while(Result::ok) {
+                        if line.starts_with("hello ") {
+                            recorded.lock().expect("hellos").push(line);
+                        }
+                    }
+                });
+                // The client's request lines come first: frames go once its `hello` is in.
+                let hello = loop {
+                    let first = seen.lock().expect("hellos").first().and_then(|l| l.strip_prefix("hello ")?.parse::<u32>().ok());
+                    if let Some(h) = first {
+                        break h;
+                    }
+                    if done_rx.try_recv() == Err(std::sync::mpsc::TryRecvError::Disconnected) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                let factor = if honours { sim_core::pixels::downscale_factor(SIZE.0, hello) } else { 1 };
+                let (w, h) = sim_core::pixels::downscaled_size(SIZE.0, SIZE.1, factor);
                 for i in 0..frames {
-                    let header = FrameHeader::new(SIZE.0, SIZE.1, SIZE.0, SIZE.1, u64::from(i)).expect("header");
+                    let header = FrameHeader::new(w, h, SIZE.0, SIZE.1, u64::from(i)).expect("header");
                     let mut out = header.encode().to_vec();
                     // The same gradient with a bar moving down it: a small change, not a scene cut
                     // (OpenH264 starts its own IDR when most of the screen changes at once).
-                    let stride = SIZE.0 as usize * 4;
+                    let stride = w as usize * 4;
                     out.extend((0..header.len as usize).map(|p| {
                         let (row, col) = (p / stride, p % stride / 4);
                         if p % 4 == 3 || row / 8 == usize::from(i) { 255 } else { (col + row) as u8 }
@@ -2107,7 +2224,7 @@ mod linux_media {
                 }
                 let _ = done_rx.recv();
             });
-            FakeDisplay { dir, done: Some(done) }
+            FakeDisplay { dir, done: Some(done), hellos }
         }
 
         fn target(&self, platform: Platform) -> Target {
@@ -2118,6 +2235,7 @@ mod linux_media {
                 state: DeviceState::Booted,
                 avd_dir: Some(self.dir.clone()),
                 screen: None,
+                set: None,
             }
         }
     }
@@ -2176,6 +2294,43 @@ mod linux_media {
         assert!(units.windows(2).all(|w| w[1].pts > w[0].pts), "strictly increasing timestamps");
     }
 
+    /// Runs a stream capped at `max_size` for three pictures on `display`, and returns the size
+    /// the decoder saw in each access unit.
+    fn decoded_sizes(display: &FakeDisplay, max_size: Option<u32>) -> Vec<(u32, u32)> {
+        let config = EncoderConfig { max_size, keyframe_interval: Duration::from_secs(60), ..EncoderConfig::default() };
+        let target = Target { screen: Some(SIZE), ..display.target(Platform::Android) };
+        let mut units: Vec<AccessUnit> = Vec::new();
+        HostMedia
+            .run(&target, &config, Pacing::new(60, Some(Duration::from_millis(10))), &Controls::default(), &mut |unit| {
+                units.push(unit);
+                Ok(if units.len() == 3 { Flow::Stop } else { Flow::Continue })
+            })
+            .expect("run");
+        let mut decoder = sim_encode::Decoder::new().expect("decoder");
+        units.iter().map(|u| decoder.decode(&u.data).expect("decodes")).collect()
+    }
+
+    #[test]
+    fn a_capped_stream_asks_emu_for_frames_at_its_size_and_a_full_size_stream_asks_for_full_frames() {
+        let display = FakeDisplay::honouring(3, true);
+        decoded_sizes(&display, Some(80));
+        assert_eq!(*display.hellos.lock().expect("hellos"), ["hello 48"], "factor 2 leaves the 160-pixel side at 80");
+        let display = FakeDisplay::honouring(3, true);
+        assert_eq!(decoded_sizes(&display, None), [SIZE; 3]);
+        assert_eq!(*display.hellos.lock().expect("hellos"), [format!("hello {}", u32::MAX)]);
+    }
+
+    #[test]
+    fn frames_come_out_at_the_streams_size_whether_emu_shrinks_them_or_the_encoder_does() {
+        // Shrunk by emu to 48x80, which the encoder takes as it is.
+        let honoured = FakeDisplay::honouring(3, true);
+        assert_eq!(decoded_sizes(&honoured, Some(80)), [(48, 80); 3]);
+        // Sent at 96x160 by an emu that ignores the request: the encoder scales to the same size.
+        let ignored = FakeDisplay::honouring(3, false);
+        assert_eq!(decoded_sizes(&ignored, Some(80)), [(48, 80); 3]);
+        assert_eq!(ignored.hellos.lock().expect("hellos").len(), 1, "an ignored request isn't repeated");
+    }
+
     #[test]
     fn an_ios_device_and_an_android_device_with_no_display_are_refused_with_a_reason() {
         let display = FakeDisplay::new(0);
@@ -2208,6 +2363,7 @@ mod linux_without_the_encoder {
             state: DeviceState::Booted,
             avd_dir: None,
             screen: None,
+            set: None,
         };
         let run = HostMedia.run(&target, &EncoderConfig::default(), Pacing::new(30, None), &Controls::default(), &mut |_| Ok(Flow::Stop));
         assert_eq!(run, Err(err), "run refuses with the same reason");

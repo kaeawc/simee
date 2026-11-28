@@ -47,6 +47,22 @@ external display of an iPhone simulator rather than a device type: `--form-facto
 and `carplay on` attaches it. See [docs/form-factors.md](form-factors.md) for how each
 Apple input is sent.
 
+**Headless devices (`--set`).** Simulator.app opens a window for every device of the default
+device set that boots, which slows each warm boot. `--set <dir>` (any command, or
+`SIMEE_IOS_DEVICE_SET=<dir>` for every command and for `simee serve` / `simee mcp`) works in another
+CoreSimulator device set, the directory `simctl --set` takes (`create` makes it; other commands
+refuse one that doesn't exist); no window ever attaches to its devices, and Simulator.app's own
+devices stay where they are. `--set ''` is the default set. The command's set goes with every call,
+so a running server works in it whatever its own environment says.
+
+```bash
+simee --set ~/farm/sims create farm-1 "iPhone 17" "iOS 27.2"
+simee --set ~/farm/sims boot farm-1          # no Simulator.app window
+simee --set ~/farm/sims screenshot farm-1 shot.png
+simee --set ~/farm/sims list
+simee --set ~/farm/sims shutdown farm-1 && simee --set ~/farm/sims delete farm-1
+```
+
 ## Android
 
 ```bash
@@ -61,7 +77,10 @@ simee create Wear    --platform android --system-image "system-images;android-34
 simee create TV      --platform android --system-image "system-images;android-34;google-tv;arm64-v8a"
 simee create Car     --platform android --system-image "system-images;android-34-ext9;android-automotive;arm64-v8a"
 simee create XR      --platform android --system-image "system-images;android-34;google-xr;arm64-v8a"
+simee device-types                           # Android's too: phone, tablet, pixel_fold, surface_duo, ...
 simee boot Pixel                             # starts emu; waits for sys.boot_completed
+simee settle Pixel                           # then until the guest's processes are quiet
+simee profile Pixel slim                     # packages a farm doesn't need, off for good (--undo)
 adb -s emulator-5554 shell                    # it is an ordinary emulator to every tool
 simee fold Fold fold                         # the outer screen; `unfold`, a posture or an angle
 simee rotary Wear 3                          # the rotary input (watches only)
@@ -158,4 +177,5 @@ The desktop window serves the same API on `$TMPDIR/simee-desktop.sock`. Full ref
 with resources for devices and their screens, tasks for boots, and a device view. It runs the
 methods in its own process, like `--in-process`; configure it in the agent as the command `simee
 mcp`. It serves the `core` toolset (about twenty tools) unless `SIMEE_MCP_TOOLSETS` names others
-(`core,debug`, or `all`): see [toolsets](mcp.md#toolsets).
+(`core,debug`, or `all`): see [toolsets](mcp.md#toolsets). `simee mcp install <client>` writes the config for
+Claude Code, Cursor, VS Code and others: see [MCP clients](mcp-clients.md).

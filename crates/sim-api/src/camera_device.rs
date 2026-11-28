@@ -121,7 +121,8 @@ pub(crate) fn describe(query: &str) -> std::result::Result<Option<SourceDevice>,
 fn ios_describe(query: &str) -> std::result::Result<Option<SourceDevice>, String> {
     use sim_core::device::DeviceState;
     sim_coresim::autoreleasepool(|| {
-        let Ok(context) = sim_coresim::Context::new() else { return Ok(None) };
+        let Ok(set) = crate::params::device_set(&serde_json::Value::Null) else { return Ok(None) };
+        let Ok(context) = sim_coresim::Context::open(set.as_deref()) else { return Ok(None) };
         let Ok(device) = context.device(query) else { return Ok(None) };
         let info = device.selection_info();
         let screen = (info.state == DeviceState::Booted).then(|| device.display().and_then(|d| d.size()).ok()).flatten();
@@ -358,7 +359,10 @@ mod ios {
     }
 
     fn open(name: &str, presented: &Arc<Presented>) -> Result<(Context, Device, Display, FrameWatch)> {
-        let context = Context::new().map_err(|e| Error::Unavailable(format!("device:{name}: the simulator service: {e}")))?;
+        // A device a camera follows is in the environment's device set (#409), as the link outlives the call.
+        let set = crate::params::device_set(&serde_json::Value::Null).map_err(|e| Error::Invalid(format!("device:{name}: {e}")))?;
+        let context =
+            Context::open(set.as_deref()).map_err(|e| Error::Unavailable(format!("device:{name}: the simulator service: {e}")))?;
         let device =
             context.device(name).map_err(|e| Error::Invalid(format!("device:{name}: no AVD or simulator is named {name:?} ({e})")))?;
         if device.state() != DeviceState::Booted {

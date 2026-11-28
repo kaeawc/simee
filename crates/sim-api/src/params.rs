@@ -26,6 +26,37 @@ pub fn need_str<'a>(p: &'a Value, key: &str) -> Result<&'a str, String> {
     str_param(p, key).ok_or_else(|| format!("missing string parameter `{key}`"))
 }
 
+/// The iOS device set a call uses (#409): its `set`, else `$SIMEE_IOS_DEVICE_SET`, else `None`
+/// (the default set); see [`sim_core::device::device_set`].
+pub fn device_set(p: &Value) -> Result<Option<String>, String> {
+    device_set_with(p, std::env::var(sim_core::device::DEVICE_SET_ENV).ok().as_deref())
+}
+
+/// [`device_set`] with `env` as the environment's set.
+pub fn device_set_with(p: &Value, env: Option<&str>) -> Result<Option<String>, String> {
+    let param = match p.get("set") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(set)) => Some(set.as_str()),
+        Some(other) => return Err(format!("set must be a device set's directory (a string), not {other}")),
+    };
+    Ok(sim_core::device::device_set(param, env)?.map(|set| real_dir(&set)))
+}
+
+/// `dir` (absolute and plain) with symlinks resolved, so one set has one name whatever it was
+/// called (`/tmp/s` is `/private/tmp/s` on macOS): its deepest existing ancestor's real path, then
+/// the parts not made yet.
+fn real_dir(dir: &str) -> String {
+    let path = std::path::Path::new(dir);
+    for base in path.ancestors() {
+        if let Ok(real) = base.canonicalize() {
+            let rest = path.strip_prefix(base).unwrap_or(std::path::Path::new(""));
+            let real = if rest.as_os_str().is_empty() { real } else { real.join(rest) };
+            return real.display().to_string();
+        }
+    }
+    dir.to_owned()
+}
+
 pub fn need_f64(p: &Value, key: &str) -> Result<f64, String> {
     p.get(key).and_then(Value::as_f64).ok_or_else(|| format!("missing number parameter `{key}`"))
 }
@@ -73,6 +104,41 @@ pub fn pairs(p: &Value, key: &str) -> Vec<(String, String)> {
 
 pub fn err<E: ToString>(e: E) -> String {
     e.to_string()
+}
+
+/// `network_shape`'s profile: `preset` (else `base`, what the device has now), then each field
+/// given over it. iOS shapes all of it; Android refuses what its emulator can't shape first.
+pub fn shape_profile(p: &Value, base: sim_netshape::Profile) -> Result<sim_netshape::Profile, String> {
+    let mut profile = match str_param(p, "preset") {
+        Some(name) => sim_netshape::Profile::preset(name).ok_or_else(|| format!("unknown preset `{name}`"))?,
+        None => base,
+    };
+    let num = |key: &str| p.get(key).and_then(Value::as_u64);
+    if let Some(v) = p.get("offline").and_then(Value::as_bool) {
+        profile.offline = v;
+    }
+    if let Some(v) = num("latency_ms") {
+        profile.latency_ms = v as u32;
+    }
+    if let Some(v) = num("down_kbps") {
+        profile.down_kbps = v as u32;
+    }
+    if let Some(v) = num("up_kbps") {
+        profile.up_kbps = v as u32;
+    }
+    if let Some(v) = num("loss_pct") {
+        profile.loss_pct = (v as u32).min(100);
+    }
+    if let Some(v) = num("port_base") {
+        profile.port_base = u16::try_from(v).map_err(err)?;
+    }
+    if let Some(v) = num("port_count") {
+        profile.port_count = u16::try_from(v).map_err(err)?;
+    }
+    if let Some(rules) = p.get("rules") {
+        profile.rules = serde_json::from_value(rules.clone()).map_err(|e| format!("bad rules: {e}"))?;
+    }
+    Ok(profile)
 }
 
 /// The optional `platform` parameter.
@@ -393,6 +459,74 @@ fn bytes_field(bytes: Cow<'_, [u8]>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `network_shape`'s profile, as iOS has always read it (#416 moved it here for Android to
+    /// share): a preset replaces the base, each field then overrides it, loss is capped at 100.
+    #[test]
+    fn the_shape_profile_reads_as_ios_always_did() {
+        use sim_netshape::Profile;
+        let base = Profile { latency_ms: 7, down_kbps: 9, ..Profile::default() };
+        assert_eq!(shape_profile(&json!({}), base.clone()), Ok(base.clone()), "nothing asked keeps the base");
+        assert_eq!(shape_profile(&json!({"preset": "3g"}), base.clone()), Ok(Profile::preset("3g").expect("3g")));
+        let p = shape_profile(
+            &json!({"preset": "lte", "latency_ms": 80, "up_kbps": 1, "loss_pct": 400, "offline": true, "port_base": 40000, "port_count": 10}),
+            base.clone(),
+        )
+        .expect("profile");
+        assert_eq!(
+            p,
+            Profile {
+                offline: true,
+                latency_ms: 80,
+                down_kbps: 12_000,
+                up_kbps: 1,
+                loss_pct: 100,
+                port_base: 40000,
+                port_count: 10,
+                rules: vec![]
+            }
+        );
+        let ruled = shape_profile(&json!({"rules": [{"pattern": "example.com", "offline": true}]}), base.clone()).expect("rules");
+        assert_eq!((ruled.rules.len(), ruled.rules[0].offline), (1, Some(true)));
+        assert_eq!(shape_profile(&json!({"preset": "warp"}), base.clone()), Err("unknown preset `warp`".into()));
+        assert!(shape_profile(&json!({"port_base": 70000}), base.clone()).is_err());
+        assert!(shape_profile(&json!({"rules": "x"}), base).expect_err("bad rules").starts_with("bad rules: "));
+    }
+
+    // Unix paths; device sets are iOS (macOS) only.
+    #[cfg(unix)]
+    #[test]
+    fn the_device_set_is_the_set_param_then_the_environment_then_the_default() {
+        let env = Some("/farm/set");
+        // The default: nothing names a set.
+        assert_eq!(device_set_with(&json!({}), None), Ok(None));
+        assert_eq!(device_set_with(&json!({"set": null}), None), Ok(None), "null is a missing set");
+        // The environment's set, when the call names none.
+        assert_eq!(device_set_with(&json!({"device": "booted"}), env), Ok(Some("/farm/set".into())));
+        // The call's set, over the environment's; an empty one is the default set.
+        assert_eq!(device_set_with(&json!({"set": "/call/set"}), env), Ok(Some("/call/set".into())));
+        assert_eq!(device_set_with(&json!({"set": ""}), env), Ok(None));
+        let err = device_set_with(&json!({"set": 7}), None).expect_err("not a path");
+        assert!(err.contains("set") && err.contains('7'), "{err}");
+        assert!(device_set_with(&json!({"set": "rel"}), None).expect_err("relative").contains("absolute"));
+    }
+
+    /// #409: a set is named by its real directory, symlinks resolved (`/tmp` is `/private/tmp` on
+    /// macOS), so two spellings of one set share one connection; a part that doesn't exist yet
+    /// (a set `create` will make) keeps its name under its real parent.
+    #[test]
+    fn a_device_set_is_named_by_its_real_directory() {
+        let dir = std::path::PathBuf::from("/tmp").join(format!("simee-409-real-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("set")).expect("dir");
+        let real = dir.canonicalize().expect("real");
+        let named = |set: String| device_set_with(&json!({"set": set}), None).expect("set").expect("a set");
+        let shown = |p: &std::path::Path| p.display().to_string();
+        assert_eq!(named(shown(&dir.join("set"))), shown(&real.join("set")));
+        assert_eq!(named(format!("{}/./set/", dir.display())), shown(&real.join("set")));
+        assert_eq!(named(shown(&dir.join("new/set"))), shown(&real.join("new/set")), "made later by create");
+        assert_eq!(device_set_with(&json!({}), Some(&shown(&dir.join("set")))), Ok(Some(shown(&real.join("set")))), "the environment's");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn a_tap_or_button_holds_the_platform_default_unless_hold_ms_says() {

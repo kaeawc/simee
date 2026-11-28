@@ -347,7 +347,8 @@ mod tests {
             assert!(file.exists());
         }
         std::fs::remove_dir_all(dir).ok();
-        assert_eq!(beside("/a/b/c", Mode::Dark), "/a/b/c-dark");
+        // The host's own separator joins the new name (a `\` on Windows).
+        assert_eq!(beside("/a/b/c", Mode::Dark), std::path::Path::new("/a/b").join("c-dark").to_string_lossy());
     }
 
     #[test]

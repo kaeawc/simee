@@ -18,7 +18,10 @@
 //! macOS hosts; elsewhere they fail with a clear reason.
 
 mod android;
+mod android_files;
+mod android_net;
 mod camera;
+#[cfg_attr(not(unix), allow(dead_code))]
 mod camera_device;
 pub mod catalog;
 mod contrast;
@@ -44,8 +47,8 @@ pub mod shutdown;
 mod stream;
 mod usage;
 
+use sim_core::net::{UnixListener, UnixStream};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
@@ -283,8 +286,9 @@ pub fn stop_streams() {
 }
 
 /// How long a shutdown gives the calls in flight to finish, or to stop at a safe point, before it
-/// stops the streams and exits anyway.
-const DRAIN: Duration = Duration::from_secs(10);
+/// stops the streams and exits anyway. On every host (callers outside this crate size their own
+/// drain by it), though only unix has the signals that start one.
+pub const DRAIN: Duration = Duration::from_secs(10);
 
 /// Listens on `path` (replacing a stale socket) and serves connections until SIGINT or SIGTERM
 /// (#388). Then it shuts down in order: calls in flight get up to 10 s (each stops at its next
@@ -296,13 +300,21 @@ const DRAIN: Duration = Duration::from_secs(10);
 ///
 /// Once a signal arrives, [`call_cancelled`] is true for every call in this process, as a watched
 /// caller's cancel is for its own call.
+#[cfg(unix)]
 pub fn serve(path: &Path) -> std::io::Result<i32> {
     serve_until_signal(path, Arc::new(methods::Session::default), DRAIN, || ())
+}
+
+/// The API socket is a Unix socket, and Windows has none here yet ([`sim_core::net`]).
+#[cfg(not(unix))]
+pub fn serve(_path: &Path) -> std::io::Result<i32> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "the API socket isn't implemented on Windows yet"))
 }
 
 /// [`serve`]'s loop and shutdown, with each connection's session made by `make` and `drain` for
 /// how long the calls in flight get; `ready` is called once the socket is bound and the signals
 /// are watched.
+#[cfg(unix)]
 fn serve_until_signal(path: &Path, make: MakeSession, drain: Duration, ready: impl FnOnce()) -> std::io::Result<i32> {
     let listener = bind(path)?;
     // Held until the shutdown has removed the file: a socket still bound keeps its inode.
@@ -327,6 +339,7 @@ fn serve_until_signal(path: &Path, make: MakeSession, drain: Duration, ready: im
 
 /// [`serve`]'s shutdown: the calls in flight get `drain`, then the streams stop and the sockets
 /// are removed.
+#[cfg(unix)]
 fn shut_down(drain: Duration) {
     if !shutdown::drain(drain) {
         shutdown::say!("simee: calls still running after {} s: stopping anyway", drain.as_secs());
@@ -336,6 +349,7 @@ fn shut_down(drain: Duration) {
 }
 
 /// Serves the connections `listener` (non-blocking) accepts until `done` is readable.
+#[cfg(unix)]
 fn accept_until_done(listener: &UnixListener, done: &UnixStream, threads: &Arc<Threads>) -> std::io::Result<()> {
     use rustix::event::{PollFd, PollFlags, poll};
     loop {
@@ -393,10 +407,8 @@ fn bind(path: &Path) -> std::io::Result<UnixListener> {
     // Fix this server's identity now, before its executable can be rebuilt under it.
     identity();
     SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
-    // Start the host sampler now, off this thread, so its history exists at the first `host` call.
-    let _ = std::thread::Builder::new().name("simee-host-start".into()).spawn(|| {
-        sim_host::global();
-    });
+    // The host sampler is not started here: it starts at the first read (`host`, `devices_usage`,
+    // an admission check) and parks again a minute after the last (`sim_host::LINGER`).
     if path.exists() && UnixStream::connect(path).is_err() {
         std::fs::remove_file(path)?;
     }
@@ -485,7 +497,7 @@ impl Client {
 
 /// A socket path for tests: under the temp dir when it fits a `sockaddr_un` (104 bytes on macOS),
 /// else under `/tmp`, since build wrappers point `TMPDIR` at long private directories.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn test_socket(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(name);
     let path = if path.as_os_str().len() < 100 { path } else { PathBuf::from("/tmp").join(name) };
@@ -493,7 +505,7 @@ pub(crate) fn test_socket(name: &str) -> PathBuf {
     path
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use serde_json::json;
 
