@@ -121,7 +121,8 @@ fn the_captured_package_versions_parse() {
     assert!(Feature::ALL.iter().all(|f| f.in_version(gms.code.expect("code"))), "that Play services has every gate");
     let app = parse_package_version(WEAR_APP_WATCH);
     assert_eq!(app, PackageVersion { code: Some(790_472_107), name: Some("1.31.58.829364773".into()) });
-    assert!(companion_has_emulator_activity(LEGACY_COMPANION, app.code));
+    // That is the watch's own Wear OS app: it says nothing of the phone's companion, and its
+    // version doesn't back `LEGACY_EMULATOR_ACTIVITY_VERSION` (no phone with the companion was captured).
     // The phone had neither companion: `dumpsys` printed nothing.
     assert!(!parse_package_version("").installed());
 }

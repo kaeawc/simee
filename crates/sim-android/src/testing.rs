@@ -470,7 +470,7 @@ impl FakeAdb {
     /// What a Wear OS pairing reads from `serial` (`sim_android::wear`): `what` is `status` (the
     /// text `get-pairing-status` prints after its `Broadcasting:` line), `setting` and `prop` (the
     /// watch's companion choice), `abis`, `primer` (the line `logcat -T 1` prints first, after a buffer divider),
-    /// `logcat` (the lines the pairing logs once the companion's activity starts), `logcat.exit` (the log
+    /// `logcat` (the lines the pairing logs once the companion's activity starts), `refresh.fail` (the refresh broadcast fails, as when adb times out), `logcat.exit` (the log
     /// ends after them instead of staying open), `noactivity`
     /// (the companion has no `EmulatorActivity`: any text), or `pkg.<package>` (what `dumpsys
     /// package` greps: `versionCode=` and `versionName=` lines; a package without one isn't
@@ -746,6 +746,7 @@ shell)
       if [ -e "$d/wear.status.$serial" ]; then cat "$d/wear.status.$serial"
       else echo "Broadcast completed: result=1, data=\"Local:[node-$serial]\""; fi;;
     "am broadcast -a com.google.android.gms.wearable.EMULATOR --es operation refresh-emulator-connection")
+      if [ -e "$d/wear.refresh.fail.$serial" ]; then echo "error: closed" >&2; exit 1; fi
       printf 'Broadcasting: Intent { act=com.google.android.gms.wearable.EMULATOR flg=0x400000 (has extras) }\nBroadcast completed: result=1, data="Emulator connection refresh succeeded."\n';;
     "settings get secure cw.oem_companion_package") cat "$d/wear.setting.$serial" 2>/dev/null || echo null;;
     "getprop ro.oem.companion_package") cat "$d/wear.prop.$serial" 2>/dev/null || echo;;

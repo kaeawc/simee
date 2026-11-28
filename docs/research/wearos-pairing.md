@@ -242,7 +242,11 @@ they do; the Android adapter below is the part this issue owns.
   both devices of a saved pair are running and it is down: at start, on a device's boot, and
   when the adb server restarts (poll `adb forward --list` and `reverse --list`). It picks a free
   port again if the saved one is taken, runs the three bridge commands from step 6 and the status
-  check. No companion step: GMS kept the pairing.
+  check. No companion step: GMS kept the pairing. A phone's reboot drops all its forwards, so a
+  pair that is down looks like a free port: the reconciler passes `bridge_with` the saved ports of
+  the phone's other pairs (`reserved`), and `unbridge` the same, so a new watch never takes a down
+  pair's port and unbridging one pair never removes another's forward or clears the companion
+  while another pair remains.
 - Boot order: the phone first (#427); booting a watch with a saved pair boots its phone, if the
   API method that boots takes the companion.
 - Shutdown or deletion of one device: the other's pair is `broken` (`peer not running`), not
