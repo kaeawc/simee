@@ -8,8 +8,8 @@
 //!     cargo build --release -p simee
 //!     cargo run --release -p simee-api --example api_overhead -- \
 //!         [--rounds 5] [--socket-dir DIR] before=/path/to/old/simee after=target/release/simee
+use sim_core::net::UnixStream;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -39,8 +39,14 @@ struct Mcp {
 
 impl Mcp {
     fn start(exe: &Path) -> Mcp {
-        let mut child =
-            Command::new(exe).arg("mcp").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().expect("simee mcp");
+        let mut child = Command::new(exe)
+            .arg("mcp")
+            .env("SIMEE_MCP_TOOLSETS", "all")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("simee mcp");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
         Mcp { child, stdin, stdout, next_id: 1 }
@@ -58,6 +64,8 @@ impl Mcp {
         line.clear();
         self.stdout.read_until(b'\n', line).expect("mcp read");
         assert!(!line.is_empty(), "simee mcp closed its stdout");
+        let reply = String::from_utf8_lossy(line);
+        assert!(!reply.contains("\"error\":") && !reply.contains("\"isError\":true"), "simee mcp refused `{tool}`: {reply}");
     }
 }
 

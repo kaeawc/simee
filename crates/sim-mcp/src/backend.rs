@@ -143,6 +143,13 @@ pub mod fake {
         pub answers: Mutex<HashMap<String, Result<Value, String>>>,
         pub calls: Mutex<Vec<(String, Value)>>,
         pub gates: Mutex<HashMap<String, std::sync::Arc<Gate>>>,
+        /// What a method tells its caller it waits on (as admission does), before its gate.
+        pub says: Mutex<HashMap<String, String>>,
+        /// Whether the caller had cancelled each call once its gate opened: (method, cancelled).
+        pub saw_cancel: Mutex<Vec<(String, bool)>>,
+        /// Each call's method once it took its answer, under the answers' lock, so no later
+        /// [`Fake::answer`] can be what that call returned.
+        pub answered: Mutex<Vec<String>>,
     }
 
     impl Fake {
@@ -154,6 +161,13 @@ pub mod fake {
             let gate = std::sync::Arc::new(Gate::default());
             self.gates.lock().expect("gates").insert(method.to_owned(), gate.clone());
             gate
+        }
+
+        /// How many calls of `method` have taken their answer. [`Fake::called`] counts a call once
+        /// it starts, before a gate and its hooks: a test that changes the answer next must wait on
+        /// this instead, or the call it waited for may return the new answer.
+        pub fn answered(&self, method: &str) -> usize {
+            self.answered.lock().expect("answered").iter().filter(|m| *m == method).count()
         }
 
         pub fn called(&self, method: &str) -> Vec<Value> {
@@ -178,11 +192,18 @@ pub mod fake {
     impl Backend for Fake {
         fn call(&self, method: &str, params: &Value) -> Result<Value, String> {
             self.calls.lock().expect("calls").push((method.to_owned(), params.clone()));
+            let says = self.says.lock().expect("says").get(method).cloned();
+            if let Some(says) = says {
+                sim_api::call_progress(&says);
+            }
             let gate = self.gates.lock().expect("gates").get(method).cloned();
             if let Some(gate) = gate {
                 gate.wait();
             }
-            self.answers.lock().expect("answers").get(method).cloned().unwrap_or(Ok(Value::Null))
+            self.saw_cancel.lock().expect("saw_cancel").push((method.to_owned(), sim_api::call_cancelled()));
+            let answers = self.answers.lock().expect("answers");
+            self.answered.lock().expect("answered").push(method.to_owned());
+            answers.get(method).cloned().unwrap_or(Ok(Value::Null))
         }
     }
 }
@@ -192,6 +213,24 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn the_fake_counts_a_call_answered_only_once_it_took_its_answer() {
+        let fake = Arc::new(fake::Fake::default());
+        fake.answer("info", Ok(json!("before")));
+        let gate = fake.gate("info");
+        let caller = fake.clone();
+        let call = std::thread::spawn(move || caller.call("info", &json!({})));
+        while fake.called("info").is_empty() {
+            std::thread::yield_now();
+        }
+        // Started but not answered: an answer set now is the one it returns.
+        assert_eq!(fake.answered("info"), 0);
+        fake.answer("info", Ok(json!("after")));
+        gate.release();
+        assert_eq!(call.join().expect("call"), Ok(json!("after")));
+        assert_eq!(fake.answered("info"), 1);
+    }
 
     #[test]
     fn the_api_backend_keeps_a_session_per_thread_and_runs_methods() {

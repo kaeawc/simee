@@ -28,7 +28,7 @@ fn apple_type(id: &str, name: &str, family: &str, (w, h): (u32, u32), scale: u32
         screen_height: f64::from(h),
         screen_scale: f64::from(scale),
         platform: Platform::Ios,
-        form_factor: crate::form_factor::apple_family_form_factor(family),
+        form_factor: crate::form_factor::apple_type_form_factor(&format!("com.apple.CoreSimulator.SimDeviceType.{id}"), family),
     }
 }
 

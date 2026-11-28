@@ -17,6 +17,9 @@ pub mod host;
 pub mod procs;
 mod rt;
 mod service;
+pub mod surface_port;
+#[cfg(feature = "videotoolbox")]
+pub mod videotoolbox;
 mod watch;
 
 pub use display::{Display, FrameWatch, Surface};
@@ -25,6 +28,7 @@ pub use hid::{Hid, track_sends, wait_sent};
 pub use service::{Appearance, BootOptions, Context, Device, ExecOutput, StateWatch, StatusBar, developer_dir};
 pub use sim_core::frame::Frame;
 pub use sim_core::hid::{Direction, Orientation, WatchGesture};
+pub use surface_port::{SurfaceInbox, SurfaceOutbox};
 pub use watch::FileWatch;
 
 /// Runs `f` in an autorelease pool. Long-lived threads that call the service (API input workers,

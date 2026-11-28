@@ -81,6 +81,28 @@ pub fn bgra_to_rgba(src: &[u8], width: usize, height: usize, stride: usize) -> O
     to_rgba(src, width, height, stride, PixelFormat::Bgrx)
 }
 
+/// Copies `height` rows of `width` pixels from `src` (`stride` bytes per row) into `dst`
+/// (`dst_stride` bytes per row), swapping the first and third byte of each: RGBA into BGRA (or
+/// back) in the one pass that writes the destination, for an encoder's BGRA pixel buffer (CoreVideo
+/// allocates no RGBA ones). Bytes past each row's pixels are left alone. False, with `dst`
+/// untouched, when either side is too short.
+pub fn swap_red_blue_into(src: &[u8], stride: usize, dst: &mut [u8], dst_stride: usize, width: usize, height: usize) -> bool {
+    let Some(row) = width.checked_mul(4) else { return false };
+    let fits = |len: usize, stride: usize| {
+        height == 0 || stride.checked_mul(height - 1).and_then(|n| n.checked_add(row)).is_some_and(|n| len >= n)
+    };
+    if stride < row || dst_stride < row || !fits(src.len(), stride) || !fits(dst.len(), dst_stride) {
+        return false;
+    }
+    for y in 0..height {
+        let (s, d) = (&src[y * stride..y * stride + row], &mut dst[y * dst_stride..y * dst_stride + row]);
+        for (d, s) in d.as_chunks_mut::<4>().0.iter_mut().zip(s.as_chunks::<4>().0) {
+            *d = [s[2], s[1], s[0], s[3]];
+        }
+    }
+    true
+}
+
 /// Shrinks tightly packed RGBA by a whole `factor`, averaging each `factor` x `factor` block.
 /// Factors of 0 and 1 return the image unchanged.
 pub fn downscale(width: u32, height: u32, rgba: &[u8], factor: u32) -> (u32, u32, Vec<u8>) {
@@ -294,6 +316,19 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn swap_red_blue_into_copies_rows_between_strides() {
+        // Two rows of two pixels, the source padded to 12 bytes a row, the destination to 10.
+        let src = [1, 2, 3, 4, 5, 6, 7, 8, 0xee, 0xee, 0xee, 0xee, 9, 10, 11, 12, 13, 14, 15, 16];
+        let mut dst = [0u8; 18];
+        assert!(swap_red_blue_into(&src, 12, &mut dst, 10, 2, 2));
+        assert_eq!(dst, [3, 2, 1, 4, 7, 6, 5, 8, 0, 0, 11, 10, 9, 12, 15, 14, 13, 16]);
+        assert!(!swap_red_blue_into(&src, 12, &mut dst[..17], 10, 2, 2), "destination too short");
+        assert!(!swap_red_blue_into(&src[..19], 12, &mut dst, 10, 2, 2), "source too short");
+        assert!(!swap_red_blue_into(&src, 7, &mut dst, 10, 2, 2), "stride below a row");
+        assert!(swap_red_blue_into(&[], 0, &mut [], 0, 0, 0));
     }
 
     #[test]

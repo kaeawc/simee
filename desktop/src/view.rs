@@ -11,23 +11,19 @@ use sim_core::rotation::Rotation;
 
 use crate::{Action, Input, State, icons};
 
-const GREEN: Color = Color { r: 0.20, g: 0.78, b: 0.45, a: 1.0 };
-const GREY: Color = Color { r: 0.55, g: 0.55, b: 0.58, a: 1.0 };
-const AMBER: Color = Color { r: 0.95, g: 0.70, b: 0.25, a: 1.0 };
-
 /// The window is always drawn in the dark theme.
 const DARK: bool = true;
 
-pub fn view(s: &State, _: &mut Cx<State>) -> El {
+pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let t = tok::theme(DARK);
-    let mut root = row().w_full().h_full().fill(t.bg).child(sidebar(s, t)).child(stage(s, t));
-    if s.showing_screen() {
-        root = root.child(match s.selected_info().map(|d| d.platform) {
-            Some(Platform::Android) => android_panel(s, t),
-            _ => crate::debug::panel(s, t),
-        });
-    }
-    root
+    // The mark's clock: none under the system's reduced motion, so every mark rests.
+    let clock = (!cx.system_reduced_motion()).then_some(s.mark_t);
+    let panel = s.showing_screen().then(|| match s.selected_info().map(|d| d.platform) {
+        Some(Platform::Android) => android_panel(s, t),
+        _ => crate::debug::panel(s, t),
+    });
+    // The panes' widths and visibility, and their drag handles.
+    crate::panes::layout(s, t, sidebar(s, t, clock), stage(s, t, clock), panel)
 }
 
 /// A toolbar button: an icon (labelled for accessibility), with visible text only for the primary
@@ -39,7 +35,7 @@ fn button(key: &str, glyph: &'static Icon, label: &str, action: Action, primary:
     if primary { b.fill(tok::accent(0, true)) } else { b }
 }
 
-fn sidebar(s: &State, t: Theme) -> El {
+fn sidebar(s: &State, t: Theme, clock: Option<f32>) -> El {
     let mut list = col().key("device-list").gap(2.0);
     if s.devices.is_empty() {
         list = list.child(text("No devices").key("devices-empty").font(type_::BODY).color(t.text_secondary).padding(8.0));
@@ -66,12 +62,15 @@ fn sidebar(s: &State, t: Theme) -> El {
         }
         let selected = s.selected.as_deref() == Some(d.udid.as_str());
         let highlight = selection(t, DARK);
-        let color = match d.state {
-            DeviceState::Booted => GREEN,
-            DeviceState::Booting | DeviceState::ShuttingDown | DeviceState::Creating => AMBER,
-            _ => GREY,
-        };
-        let udid = d.udid.clone();
+        let state_mark = crate::mark::toned(
+            crate::mark::for_device(d.state),
+            clock.filter(|_| crate::mark::moves(d.state)),
+            Some(crate::mark::tone(d.platform)),
+            16.0,
+        )
+        .key(format!("device-{i}-mark"));
+        let (udid, menu_udid) = (d.udid.clone(), d.udid.clone());
+        let popped = s.popouts.is_open(&d.udid).then(|| crate::popout::row_mark(i, t));
         let mut badge = platform_badge(d, t).key(format!("device-{i}-platform"));
         if selected {
             // The secondary colour is too faint on the tint.
@@ -90,6 +89,7 @@ fn sidebar(s: &State, t: Theme) -> El {
             .center_y()
             .radius(radius::SM)
             .on_press(move |s: &mut State| s.actions.push(Action::Select(udid.clone())))
+            .on_secondary_press(move |s: &mut State, press, tx: &mut Tx| crate::popout::row_menu(s, menu_udid.clone(), press, tx))
             .child(bar)
             .child(
                 row()
@@ -100,8 +100,9 @@ fn sidebar(s: &State, t: Theme) -> El {
                     .pr(8.0)
                     .gap(8.0)
                     .center_y()
-                    .child(el().size(8.0, 8.0).radius(4.0).fill(color))
+                    .child(state_mark)
                     .child(text(d.name.clone()).font(type_::BODY).color(t.text).grow(1.0).truncate())
+                    .children(popped)
                     .child(badge),
             );
         if selected {
@@ -164,22 +165,29 @@ pub fn runtime_label(id: &str) -> String {
     }
 }
 
-fn stage(s: &State, t: Theme) -> El {
+fn stage(s: &State, t: Theme, clock: Option<f32>) -> El {
     let mut controls = row().key("controls").w_full().gap(8.0).center_y();
     let title =
         s.selected_info().map_or_else(|| "Select a device".to_string(), |d| format!("{} · {} · {}", d.name, d.label(), d.state.as_str()));
     controls = controls.child(text(title).key("device-title").font(type_::SECTION).color(t.text).grow(1.0).truncate());
     let booted = s.selected_info().is_some_and(|d| d.state == DeviceState::Booted);
+    let popped = s.selected.as_deref().filter(|u| s.popouts.is_open(u));
     if let Some(busy) = s.busy {
-        controls = controls.child(text(busy).key("busy").font(type_::BODY).color(t.text_secondary));
+        controls = controls
+            .child(crate::mark::mark(crate::mark::for_busy(busy), clock, 20.0).key("busy-mark"))
+            .child(text(busy).key("busy").font(type_::BODY).color(t.text_secondary));
     } else if s.selected.is_some() && !booted {
         controls = controls.child(button("boot-button", &icons::PLAY, "Boot", Action::Boot, true, t));
     }
     if s.showing_screen()
+        && popped.is_none()
         && let Some(d) = s.selected_info()
     {
         for c in crate::controls::for_device(d) {
             controls = controls.child(button(c.key, c.icon, c.label, c.action, false, t));
+        }
+        if booted {
+            controls = controls.child(crate::popout::stage_button(&d.udid, t));
         }
     }
     // The 3D view's own: face on (⌘0) and flip (⌘F); orbit, pan and zoom are on the pointer.
@@ -189,7 +197,11 @@ fn stage(s: &State, t: Theme) -> El {
             .child(button("face-on-button", &icons::FACE_ON, "Face on (⌘0)", Action::View3d(Command::FaceOn), false, t))
             .child(button("flip-button", &icons::FLIP, "Flip (⌘F)", Action::View3d(Command::Flip), false, t));
     }
-    let body = if s.showing_screen() { screen(s) } else { placeholder(s, t) };
+    let body = match popped {
+        Some(udid) => crate::popout::placeholder(udid, t),
+        None if s.showing_screen() => screen(s),
+        None => placeholder(s, t, clock),
+    };
     let mut stage = col().w_full().h_full().grow(1.0).min_w(0.0).padding(16.0).gap(12.0).child(controls).child(body);
     let footer = match (&s.status, &s.socket) {
         (Some(msg), _) => Some(msg.clone()),
@@ -202,9 +214,18 @@ fn stage(s: &State, t: Theme) -> El {
     stage
 }
 
-fn placeholder(s: &State, t: Theme) -> El {
-    let msg = if s.busy == Some("Booting…") { "Waiting for the device to finish booting…" } else { "Boot a device to see its screen" };
-    col().key("placeholder").w_full().grow(1.0).center().child(text(msg).font(type_::BODY).color(t.text_secondary))
+fn placeholder(s: &State, t: Theme, clock: Option<f32>) -> El {
+    let booting = s.busy == Some("Booting…");
+    let msg = if booting { "Waiting for the device to finish booting…" } else { "Boot a device to see its screen" };
+    let motion = if booting { sim_core::mark::Motion::Boot } else { sim_core::mark::Motion::Idle };
+    col()
+        .key("placeholder")
+        .w_full()
+        .grow(1.0)
+        .center()
+        .gap(18.0)
+        .child(crate::mark::mark(motion, clock.filter(|_| booting), 96.0).key("placeholder-mark"))
+        .child(text(msg).font(type_::BODY).color(t.text_secondary))
 }
 
 /// Keys on the focused screen (or the 3D slot over it): the keystroke or shortcut goes to the
@@ -294,7 +315,7 @@ fn screen(s: &State) -> El {
 /// the box (sideways, its width is the box's height and its height the box's width), centred,
 /// so it fills the box from the first frame and follows it as the window resizes. It takes no
 /// input: `device` keeps its upright box, so pointer positions in it are the upright screen's.
-fn turned(device: El, pixels: &rune::Pixels, turn: Rotation, ratio: f32, corners: f32) -> El {
+pub fn turned(device: El, pixels: &rune::Pixels, turn: Rotation, ratio: f32, corners: f32) -> El {
     let (w, h) = if turn.is_sideways() { (1.0 / ratio.max(f32::EPSILON), ratio) } else { (1.0, 1.0) };
     let picture = el()
         .key("device-pixels")

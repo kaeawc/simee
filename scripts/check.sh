@@ -5,6 +5,8 @@
 #   scripts/check.sh --quick    # linters, fmt, host clippy and tests only
 #   scripts/check.sh --all      # every step, whatever changed
 #
+# On Windows, where there is no bash, `cargo xtask check` (xtask/) runs the same steps.
+#
 # Steps: the script and docs linters (scripts/lint.sh: each one installed here, else a skip
 # line); rustfmt; clippy for this host; clippy for the other platform's target when its std is
 # installed (macOS code from Linux: `rustup target add aarch64-apple-darwin`, and the reverse),
@@ -96,7 +98,11 @@ fi
 if cargo nextest --version >/dev/null 2>&1; then
   step tests cargo nextest run --workspace --no-fail-fast --status-level fail --final-status-level fail --hide-progress-bar
 else
-  step tests cargo test --workspace --quiet
+  step tests cargo test --workspace --no-fail-fast --quiet
+fi
+# A strong import newer than macOS 11.0 stops dyld from loading emu or simee on older macOS.
+if [[ $(uname -s) == Darwin ]]; then
+  step "release imports" bash -c 'cargo build --release --quiet -p simee-emu -p simee && scripts/check-imports.sh'
 fi
 # The desktop is its own workspace with a large dependency (Rune): only when it changed. CI builds
 # it on every pull request, which catches a shared crate's change breaking it.

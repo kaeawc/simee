@@ -1,17 +1,18 @@
 //! The SDK emulator's command line: single-dash long flags, some taking a value.
 use anyhow::{Result, bail};
+use emu_vmm::pipe::camera::{Facing, SourceSpec};
 
 pub const USAGE: &str = "\
 usage: emu -avd NAME [options]
        emu @NAME [options]
        emu -avd NAME -dry-run   (print the boot plan without booting; any host)
        emu -list-avds | -version | -accel-check
-       emu -create-avd NAME -sysdir system-images/android-36/google_apis/arm64-v8a [-lcd 720x1280@320] [-cores N] [-memory MB]
+       emu -create-avd NAME -sysdir system-images/android-36/google_apis/arm64-v8a [-lcd 720x1280@320] [-cores N] [-memory MB] [-profile software-lite]
                   (-create-avd boots the first AVD of an image once and keeps its settled user data to
                    start the image's later AVDs from; -no-golden skips that for a pristine first boot)
        emu -clone-avd NAME -from GOLDEN   (copy-on-write clone of a stopped AVD's settled simee disks)
        emu -delete-avd NAME               (refused while any emulator, simee or stock, runs it)
-       emu -provision API [-tag google_apis] [-abi arm64-v8a] [-no-renderer] [-dry-run] [-create-avd NAME [-lcd WxH@DPI] [-cores N] [-memory MB]]
+       emu -provision API [-tag google_apis] [-abi arm64-v8a] [-no-renderer] [-dry-run] [-create-avd NAME [-lcd WxH@DPI] [-cores N] [-memory MB] [-profile software-lite]]
        emu -provision-renderer [-dry-run]
        emu -list-images [-tag TAG] [-abi arm64-v8a]
 
@@ -23,6 +24,9 @@ provisioning (no Java or sdkmanager; SDK at $ANDROID_HOME, default ~/Library/And
                     $ANDROID_HOME/simee/renderer/<revision>; both then initialize the renderer
                     once, so its Metal shaders are cached before the first boot
   -no-renderer      with -provision: skip the renderer (emu then boots without graphics)
+  -profile NAME     with -create-avd: software-lite makes a phone for software mode (x86_64 Linux
+                    without KVM): 540x960 at 240 dpi and a 30 Hz display (hw.lcd.vsync=30), for a
+                    quieter host (docs/android.md, Software mode); an explicit -lcd wins
   -no-golden        with -create-avd: don't boot the image once to keep a settled golden user data
                     (the new AVD first-boots fresh, as stock's does)
   -tag TAG          default, google_apis (default), google_apis_playstore, android-wear, ...
@@ -45,6 +49,8 @@ options:
                     at 4 MiB)
   -verbose          diagnostics, including vCPU exit counts at shutdown
   -no-boot-anim     skip the boot animation
+  -accel MODE       software mode (x86_64 Linux): auto (default: KVM when /dev/kvm is usable,
+                    else QEMU's TCG), on (KVM or fail), off (TCG); -no-accel is -accel off
   -disk-cache MODE  unsafe (default: guest flushes stay in the host page cache) or fsync
   -gpu MODE         rendering mode, default auto (host GPU through MoltenVK):
                       auto, host     host GPU through MoltenVK, software if that fails
@@ -56,6 +62,8 @@ options:
                                      lavapipe, with stock's notice: SDK images have no
                                      in-guest renderer, so guest rendering isn't possible
                       off, none      no renderer, no graphics
+                      metal          host, and posted frames also go to simee as IOSurfaces
+                                     copied on the GPU (experimental, macOS; issue #356)
                     An AVD's hw.gpu.mode (guest, software, lavapipe, ...) applies when -gpu
                     isn't given; the flag wins.
   -no-audio         the sound card stays silent and no host audio device is opened (-audio none)
@@ -65,15 +73,21 @@ options:
                     isn't shaped yet
   -netdelay D       initial network latency: gsm, gprs, edge, umts, ..., none (default), <ms> or
                     <min>:<max>; reported the same way
+  -camera-back S    the back camera's source: emulated (the test card), webcam0 (the host's first
+                    camera; webcam1, ...), none, or a simee source id (pattern:testcard, qr:TEXT,
+                    text:TEXT, image:PATH, solid:COLOUR, webcam:NAME); default hw.camera.back
+  -camera-front S   the same for the front camera (default hw.camera.front)
 Other SDK emulator flags are accepted.
 ";
+
+/// Whether this build boots in software mode, the only one `-accel` chooses for: on a Mac the
+/// hypervisor is the only accelerator, so there `-accel` is listed as not implemented.
+const SOFTWARE_MODE: bool = cfg!(all(target_os = "linux", target_arch = "x86_64"));
 
 /// Flags that take a value and that we don't act on (yet).
 const IGNORED_WITH_VALUE: &[&str] = &[
     "ports",
     "grpc",
-    "camera-back",
-    "camera-front",
     "packet-streamer-endpoint",
     "feature",
     "virtualscene-poster",
@@ -89,7 +103,6 @@ const IGNORED_WITH_VALUE: &[&str] = &[
     "partition-size",
     "snapshot",
     "id",
-    "accel",
     "selinux",
     "screen",
     "grpc-use-token",
@@ -116,6 +129,9 @@ pub struct Opts {
     pub version: bool,
     pub help: bool,
     pub accel_check: bool,
+    /// `-accel on|off|auto`, `-no-accel`: None is auto. Software mode only (Linux): on a Mac the
+    /// hypervisor is the only accelerator.
+    pub accel: Option<bool>,
     pub cores: Option<u32>,
     pub memory_mb: Option<u64>,
     pub port: Option<u16>,
@@ -135,11 +151,15 @@ pub struct Opts {
     pub allow_host_audio: bool,
     /// `-gpu MODE`: `off`/`none` disables host rendering; anything else uses gfxstream.
     pub gpu: Option<String>,
+    /// `-gpu metal`: the host renderer (`gpu` is `host`), with the Metal present path on.
+    pub metal_present: bool,
     /// `-netspeed`, `-netdelay` (`-netfast`: both unlimited, the default).
     pub network: sim_core::network::Conditions,
     /// `-disk-cache unsafe|fsync`: whether guest disk flushes fsync on the host.
     pub disk_fsync: bool,
     pub create_avd: Option<String>,
+    /// `-profile NAME` (one of `emu_avd::PROFILES`): what `-create-avd` makes.
+    pub profile: Option<String>,
     /// `-clone-avd NAME -from GOLDEN`.
     pub clone_avd: Option<String>,
     pub from: Option<String>,
@@ -159,6 +179,9 @@ pub struct Opts {
     pub tag: Option<String>,
     pub abi: Option<String>,
     pub dry_run: bool,
+    /// `-camera-back`, `-camera-front`: the stock camera value or a simee source id, checked.
+    pub camera_back: Option<String>,
+    pub camera_front: Option<String>,
     /// Flags accepted for compatibility but not implemented.
     pub ignored: Vec<String>,
 }
@@ -181,6 +204,24 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Opts> {
             "version" => o.version = true,
             "help" | "h" => o.help = true,
             "accel-check" => o.accel_check = true,
+            "accel" => {
+                let v = value(flag)?;
+                o.accel = match v.as_str() {
+                    "auto" => None,
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    v => bail!("-accel {v}: expected on, off or auto"),
+                };
+                if !SOFTWARE_MODE {
+                    o.ignored.push(format!("-accel {v}"));
+                }
+            }
+            "no-accel" => {
+                o.accel = Some(false);
+                if !SOFTWARE_MODE {
+                    o.ignored.push("-no-accel".into());
+                }
+            }
             "cores" => o.cores = Some(value(flag)?.parse()?),
             "memory" => o.memory_mb = Some(value(flag)?.parse()?),
             "port" => o.port = Some(value(flag)?.parse()?),
@@ -198,6 +239,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Opts> {
             "audio" => o.no_audio |= value(flag)? == "none",
             "gpu" => {
                 let mode = value(flag)?;
+                // Not a stock mode: the host renderer, plus the present path.
+                o.metal_present = mode == "metal";
+                let mode = if o.metal_present { "host".to_owned() } else { mode };
                 emu_avd::gpu::parse_flag(&mode).map_err(|e| anyhow::anyhow!(e))?;
                 o.gpu = Some(mode);
             }
@@ -222,6 +266,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Opts> {
                 }
             }
             "create-avd" => o.create_avd = Some(value(flag)?),
+            "profile" => {
+                let name = value(flag)?;
+                if !emu_avd::PROFILES.contains(&name.as_str()) {
+                    bail!("-profile takes {}, not '{name}'", emu_avd::PROFILES.join(" or "));
+                }
+                o.profile = Some(name);
+            }
             "clone-avd" => o.clone_avd = Some(value(flag)?),
             "from" => o.from = Some(value(flag)?),
             "delete-avd" => o.delete_avd = Some(value(flag)?),
@@ -235,6 +286,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Opts> {
             "tag" => o.tag = Some(value(flag)?),
             "abi" => o.abi = Some(value(flag)?),
             "dry-run" => o.dry_run = true,
+            "camera-back" | "camera-front" => {
+                let v = value(flag)?;
+                if let Err(e) = emu_vmm::pipe::camera::parse_link(&v) {
+                    bail!("invalid -{flag} value '{v}': {e}");
+                }
+                *if flag == "camera-back" { &mut o.camera_back } else { &mut o.camera_front } = Some(v);
+            }
             // Everything after -qemu belongs to QEMU, which we aren't.
             "qemu" => {
                 let rest: Vec<String> = it.by_ref().collect();
@@ -247,7 +305,59 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Opts> {
             f => o.ignored.push(format!("-{f}")),
         }
     }
+    if o.profile.is_some() && o.create_avd.is_none() {
+        bail!("-profile goes with -create-avd (it shapes the AVD that makes)");
+    }
     Ok(o)
+}
+
+impl Opts {
+    /// What each camera links to at start: its flag, else `hw.camera.back` / `hw.camera.front`
+    /// from config.ini (`config`), else none. A config value that isn't a source is reported and
+    /// skipped; flags were checked when parsed.
+    #[cfg_attr(
+        not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))),
+        allow(dead_code)
+    )]
+    pub fn camera_links(&self, config: impl Fn(&str) -> Option<String>) -> Vec<(Facing, Option<SourceSpec>)> {
+        [(Facing::Back, &self.camera_back), (Facing::Front, &self.camera_front)]
+            .into_iter()
+            .map(|(facing, flag)| {
+                let key = format!("hw.camera.{}", facing.dir());
+                let parsed = match flag {
+                    Some(value) => (value.clone(), emu_vmm::pipe::camera::parse_link(value)),
+                    None => {
+                        let value = config(&key).unwrap_or_default();
+                        let link = config_link(&key, &value);
+                        (value, link)
+                    }
+                };
+                let (value, link) = parsed;
+                let link = link.unwrap_or_else(|e| {
+                    eprintln!("emu: {key}={value} isn't a camera source ({e}); the {} camera is off", facing.dir());
+                    None
+                });
+                (facing, link)
+            })
+            .collect()
+    }
+}
+
+/// A `hw.camera.*` value from an AVD's config.ini as a link. A real host camera is never opened
+/// implicitly from a config file (that triggers the camera permission and light): `emulated`,
+/// `virtualscene`, `videoplayback`, `webcam0`, `webcamN` and any other bare word are the test
+/// card, and only an explicit choice (a `-camera-*` flag, the console's `camera link`, or a simee
+/// source id such as `webcam:obs` in the file) links a host camera.
+#[cfg_attr(not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))), allow(dead_code))]
+fn config_link(key: &str, value: &str) -> Result<Option<SourceSpec>, String> {
+    let v = value.trim();
+    if matches!(v, "" | "none" | "emulated" | "virtualscene") || v.contains(':') {
+        return emu_vmm::pipe::camera::parse_link(v);
+    }
+    eprintln!(
+        "emu: {key}={v} in config.ini isn't opened implicitly; using the test card (use -camera-back/-camera-front {v} or `camera link` for a host camera)"
+    );
+    emu_vmm::pipe::camera::parse_link("pattern:testcard")
 }
 
 fn parse_lcd(v: &str) -> Result<(u32, u32, u32)> {
@@ -271,6 +381,26 @@ mod tests {
         }
         assert!(parse("-gpu bogus".split_whitespace().map(String::from)).is_err());
         assert_eq!(p("-avd x").gpu, None);
+        // `metal` is the host renderer with the present path; nothing else turns that on.
+        let metal = p("-gpu metal");
+        assert_eq!((metal.gpu.as_deref(), metal.metal_present), (Some("host"), true));
+        assert!(!p("-gpu host").metal_present && !p("-avd x").metal_present);
+        assert!(!p("-gpu metal -gpu host").metal_present, "the last -gpu wins");
+    }
+
+    #[test]
+    fn accel_modes_are_stocks() {
+        assert_eq!(p("-avd x").accel, None);
+        assert_eq!(p("-avd x -accel auto").accel, None);
+        assert_eq!(p("-avd x -accel on").accel, Some(true));
+        assert_eq!(p("-avd x -accel off").accel, Some(false));
+        assert_eq!(p("-avd x -no-accel -port 5570").accel, Some(false));
+        assert_eq!(p("-avd x -no-accel -port 5570").port, Some(5570), "-no-accel takes no value");
+        // Acted on in software mode; elsewhere `-verbose` lists it as not implemented.
+        let ignored = if SOFTWARE_MODE { vec![] } else { vec!["-accel on".to_string()] };
+        assert_eq!(p("-avd x -accel on").ignored, ignored);
+        assert_eq!(p("-avd x -no-accel").ignored.is_empty(), SOFTWARE_MODE);
+        assert!(parse("-avd x -accel hvf".split_whitespace().map(String::from)).is_err());
     }
 
     #[test]
@@ -315,6 +445,17 @@ mod tests {
     }
 
     #[test]
+    fn profile_flag() {
+        assert_eq!(p("-create-avd lite -sysdir x -profile software-lite").profile.as_deref(), Some("software-lite"));
+        assert_eq!(p("-provision 36 -create-avd lite -profile software-lite").profile.as_deref(), Some("software-lite"));
+        assert_eq!(p("-create-avd plain -sysdir x").profile, None);
+        let err = parse("-avd pixel -profile software-lite".split(' ').map(String::from)).expect_err("no -create-avd").to_string();
+        assert!(err.contains("-create-avd"), "{err}");
+        let err = parse("-create-avd lite -profile fast".split(' ').map(String::from)).expect_err("unknown profile").to_string();
+        assert!(err.contains("software-lite") && err.contains("fast"), "{err}");
+    }
+
+    #[test]
     fn provision_flags() {
         let o =
             p("-provision 36 -tag google_apis_playstore -abi arm64-v8a -create-avd play36 -lcd 480x800@240 -cores 2 -memory 1536 -dry-run");
@@ -348,6 +489,43 @@ mod tests {
         assert!(!p("-avd pixel").network.is_shaped());
         assert!(parse(["-netspeed".to_string(), "warp".to_string()]).is_err());
         assert!(parse(["-netdelay".to_string(), "slow".to_string()]).is_err());
+    }
+
+    #[test]
+    fn camera_flags_link_sources() {
+        let o = p("-avd pixel -camera-back emulated -camera-front qr:hello -port 5570");
+        assert_eq!((o.camera_back.as_deref(), o.camera_front.as_deref()), (Some("emulated"), Some("qr:hello")));
+        assert!(o.ignored.is_empty() && o.port == Some(5570));
+        let config = |k: &str| (k == "hw.camera.front").then(|| "none".to_string());
+        let links = o.camera_links(config);
+        assert_eq!(links[0], (Facing::Back, Some(SourceSpec::parse("pattern:testcard").expect("card"))));
+        assert_eq!(links[1], (Facing::Front, Some(SourceSpec::Qr("hello".into()))), "the flag wins over config.ini");
+
+        // No flags: config.ini's stock values; one that isn't a source is off.
+        let config = |k: &str| Some(if k == "hw.camera.back" { "virtualscene" } else { "bogus:x" }.to_string());
+        let links = p("-avd pixel").camera_links(config);
+        assert!(links[0].1.is_some() && links[1].1.is_none());
+        assert_eq!(p("-avd pixel").camera_links(|_| None), vec![(Facing::Back, None), (Facing::Front, None)]);
+        assert!(p("-camera-back webcam0").camera_back.is_some(), "a host camera, resolved when the guest opens it");
+        assert!(parse(["-camera-back".to_string(), "bogus:x".to_string()]).is_err());
+    }
+
+    #[test]
+    fn config_ini_never_opens_a_host_camera() {
+        let card = Some(SourceSpec::parse("pattern:testcard").expect("card"));
+        let cfg = |v: &'static str| move |_: &str| Some(v.to_string());
+        for v in ["emulated", "virtualscene", "webcam0", "webcam3", "videoplayback", "somename"] {
+            let links = p("-avd pixel").camera_links(cfg(v));
+            assert_eq!((links[0].1.clone(), links[1].1.clone()), (card.clone(), card.clone()), "{v}");
+        }
+        assert_eq!(p("-avd pixel").camera_links(cfg("none")), vec![(Facing::Back, None), (Facing::Front, None)]);
+        // A simee source id in config.ini is explicit.
+        let links = p("-avd pixel").camera_links(cfg("webcam:obs"));
+        assert_eq!(links[0].1, Some(SourceSpec::Webcam("obs".into())));
+        // So is a flag, for its own camera only.
+        let links = p("-avd pixel -camera-back webcam0").camera_links(cfg("webcam1"));
+        assert_eq!(links[0].1, Some(SourceSpec::Webcam("webcam0".into())));
+        assert_eq!(links[1].1, card, "the front camera's config.ini value stays the test card");
     }
 
     #[test]

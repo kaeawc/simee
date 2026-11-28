@@ -14,86 +14,32 @@ mod display_server;
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
 mod fold;
 mod golden;
+#[cfg(windows)]
+mod host_windows;
 mod instance;
+mod on_signal;
 mod provision;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod software;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vkprobe;
 
+#[cfg(windows)]
+use host_windows::raise_nofile;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 
-/// Blocks SIGINT/SIGTERM/SIGHUP in this thread (and so in every thread created after it,
-/// including native libraries' threads) and returns a receiver that fires once any of them
-/// arrives. A dedicated thread `sigwait`s for them, so a library that installs its own handlers
-/// (the GPU renderer does) can't swallow the shutdown signal.
-#[allow(unsafe_code)]
-fn shutdown_signals() -> std::sync::mpsc::Receiver<i32> {
-    // SAFETY: plain libc signal-mask calls on a stack-allocated, initialized sigset.
-    let set = unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-            libc::sigaddset(&mut set, sig);
-        }
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
-        set
-    };
-    // Native libraries may set these signals to SIG_IGN (the GPU renderer does), and ignored
-    // signals are discarded even while blocked. Keep their disposition at SIG_DFL: blocked
-    // everywhere, the default action never runs, and sigwait receives them.
-    let started = std::time::Instant::now();
-    let _ = std::thread::Builder::new().name("signal-guard".into()).spawn(move || {
-        emu_hvf::host::set_qos(emu_hvf::host::Qos::Utility);
-        loop {
-            for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-                // SAFETY: querying and restoring a disposition with zero-initialized sigactions.
-                unsafe {
-                    let mut cur: libc::sigaction = std::mem::zeroed();
-                    if libc::sigaction(sig, std::ptr::null(), &mut cur) == 0 && cur.sa_sigaction != libc::SIG_DFL {
-                        let mut dfl: libc::sigaction = std::mem::zeroed();
-                        dfl.sa_sigaction = libc::SIG_DFL;
-                        libc::sigaction(sig, &dfl, std::ptr::null_mut());
-                    }
-                }
-            }
-            std::thread::sleep(signal_guard_interval(started.elapsed()));
-        }
-    });
-    let (tx, rx) = std::sync::mpsc::channel();
-    let _ = std::thread::Builder::new().name("signals".into()).spawn(move || {
-        emu_hvf::host::set_qos(emu_hvf::host::Qos::Utility);
-        let mut sig = 0;
-        // SAFETY: `set` is a valid sigset; sigwait writes the delivered signal number.
-        if unsafe { libc::sigwait(&set, &mut sig) } == 0 {
-            let _ = tx.send(sig);
-        }
-    });
-    rx
-}
-
-/// While native libraries may still be installing handlers, the signal guard checks often.
-/// The renderer, which does, initializes in the first seconds (beside kernel load, hundreds of
-/// ms) and once per process (guest resets reuse it); the window leaves room for a cold disk and
-/// the first boot's GPU device setup.
-const SIGNAL_GUARD_FAST: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// How long the signal guard sleeps between checks, `since_start` after it started: 200 ms in
-/// [`SIGNAL_GUARD_FAST`], then 5 s (an idle emulator's guard wakes 0.2 times a second, not 5).
-fn signal_guard_interval(since_start: std::time::Duration) -> std::time::Duration {
-    if since_start < SIGNAL_GUARD_FAST { std::time::Duration::from_millis(200) } else { std::time::Duration::from_secs(5) }
-}
-
 /// macOS's `OPEN_MAX`: the most open files `setrlimit` grants a process there whatever its hard
 /// limit says, and room for the NAT's flow caps and the rest of emu.
+#[cfg_attr(not(unix), allow(dead_code))]
 const NOFILE_WANT: u64 = 10240;
 
 /// Raises the soft open-file limit (256 by default on macOS) toward the hard one, up to
 /// [`NOFILE_WANT`]: each of the guest's network flows is a host socket of this process, and
 /// running out also fails the console's and the adb bridge's `accept`. Never lowers it. Returns
 /// the soft limit in force.
+#[cfg(unix)]
 fn raise_nofile() -> u64 {
     use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
     let cur = getrlimit(Resource::Nofile);
@@ -162,6 +108,10 @@ fn main() -> ExitCode {
 /// image's golden user data (`golden.rs`) unless `-no-golden`.
 fn create_avd(env: &emu_avd::Env, name: &str, sysdir: &str, opts: &args::Opts) -> Result<()> {
     let mut spec = emu_avd::NewAvd::for_image(name, sysdir);
+    // The profile first, so an explicit -lcd, -cores or -memory still wins over it.
+    if let Some(profile) = &opts.profile {
+        spec = spec.with_profile(profile)?;
+    }
     if let Some(lcd) = opts.lcd {
         spec.lcd = lcd;
     }
@@ -186,21 +136,24 @@ fn create_avd(env: &emu_avd::Env, name: &str, sysdir: &str, opts: &args::Opts) -
 fn real_main() -> Result<ExitCode> {
     let launched = std::time::Instant::now();
     // First, before any thread exists.
-    let signals = shutdown_signals();
+    let signals = on_signal::shutdown_signals();
     // Before the NAT sizes its flow caps from it.
     raise_nofile();
-    // Internal: `emu -probe-vulkan <lib64>` and `emu -warm-renderer <lib64>` (see vkprobe.rs).
+    // Internal: `emu -probe-vulkan <lib64>`, `emu -probe-kosmickrisp <lib64>` and
+    // `emu -warm-renderer <lib64>` (see vkprobe.rs).
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         let raw: Vec<String> = std::env::args().collect();
         let child: Option<fn(&std::path::Path) -> bool> = match raw.get(1).map(String::as_str) {
             Some("-probe-vulkan") => Some(vkprobe::probe),
+            Some("-probe-kosmickrisp") => Some(vkprobe::probe_kosmickrisp),
             Some("-warm-renderer") => Some(vkprobe::warm_child),
             _ => None,
         };
         if let Some(run) = child {
             let ok = raw.get(2).is_some_and(|p| run(std::path::Path::new(p)));
-            return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+            // A clean "no" has a status of its own: a crash, a panic or a signal isn't a verdict.
+            return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::from(vkprobe::PROBE_FAILED) });
         }
     }
     let opts = args::parse(std::env::args().skip(1))?;
@@ -264,11 +217,37 @@ fn real_main() -> Result<ExitCode> {
 /// prints the same `accel:` block).
 fn accel_check() -> (bool, String) {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    return (true, "Hypervisor.framework (arm64) is usable".into());
+    return match android_support(host_macos()) {
+        Ok(off) => {
+            let mut what = String::from("Hypervisor.framework (arm64) is usable");
+            for why in off {
+                what.push('\n');
+                what.push_str(&why);
+            }
+            (true, what)
+        }
+        Err(why) => (false, why),
+    };
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     return software::accel_check();
     #[cfg(not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))))]
     (false, "simee needs Hypervisor.framework on an Apple silicon Mac, or software mode on x86_64 Linux".into())
+}
+
+/// This host's macOS release (`SystemVersion.plist`), `None` off macOS.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn host_macos() -> Option<sim_core::support::Version> {
+    let text = std::fs::read_to_string(sim_core::support::SYSTEM_VERSION_PLIST).ok()?;
+    sim_core::support::Version::from_system_version(&text).map(|(v, _)| v)
+}
+
+/// The support matrix's Android rows (`sim_core::support`, `simee doctor`) on macOS `macos`: an
+/// error when no guest can boot here (below the floor), else why each optional feature is off.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn android_support(macos: Option<sim_core::support::Version>) -> std::result::Result<Vec<String>, String> {
+    use sim_core::support::{FLOORS, check};
+    check("android", macos)?;
+    Ok(FLOORS.iter().filter(|f| f.requires == Some("android")).filter_map(|f| check(f.id, macos).err()).collect())
 }
 
 /// `-avd NAME -dry-run`: prints the boot plan without booting (on any host), and fails if the
@@ -339,6 +318,9 @@ fn boot(
 
     // Before anything is created or started: refusing takes milliseconds, and the error is the
     // last line front ends show (`emu exited … before booting: <line>`).
+    for off in android_support(host_macos()).map_err(anyhow::Error::msg)? {
+        eprintln!("emu: {off}");
+    }
     if !instance::allow_old_images()
         && let Some(why) = instance::unsupported(&env.load(name)?)
     {
@@ -357,30 +339,38 @@ fn boot(
         // Without it a SIGINT/SIGTERM would never stop the machine: fail the launch instead.
         let verbose = opts.verbose;
         std::thread::Builder::new().name("stop-watch".into()).spawn(move || {
-            if signals.recv().is_ok() {
+            // As the console's `kill` stops it. Device threads blocked in native code (e.g. a
+            // wedged renderer) can stall an orderly teardown; a second signal, or the limit,
+            // doesn't let that keep the process alive.
+            let stopping = || {
                 if let Some(f) = foldable.get() {
                     f.release();
                 }
                 emu_vmm::request_stop(&stop);
-                // Device threads blocked in native code (e.g. a wedged renderer) can stall an
-                // orderly teardown; don't let that keep the process alive.
-                std::thread::sleep(SHUTDOWN_LIMIT);
-                let step = emu_vmm::teardown_status();
-                // The orderly path prints the counts once the machine is down; it didn't get there.
-                let counts = verbose && step.as_ref().is_none_or(|(s, _)| s != EXITING);
-                eprintln!("emu: {}", overrun_line(step));
-                if let Some(exits) = emu_vmm::exit_counts().filter(|_| counts) {
-                    for line in exit_lines(&exits) {
-                        eprintln!("emu: {line}");
-                    }
-                }
-                std::process::exit(0);
+            };
+            let Some((sig, forced)) = on_signal::watch(&signals, SHUTDOWN_LIMIT, stopping) else { return };
+            if forced != on_signal::Forced::Overrun {
+                eprintln!("emu: a second signal: exiting without finishing the shutdown");
+                std::process::exit(on_signal::exit_code(sig));
             }
+            let step = emu_vmm::teardown_status();
+            // The orderly path prints the counts once the machine is down; it didn't get there.
+            let counts = verbose && step.as_ref().is_none_or(|(s, _)| s != EXITING);
+            eprintln!("emu: {}", overrun_line(step));
+            if let Some(exits) = emu_vmm::exit_counts().filter(|_| counts) {
+                for line in exit_lines(&exits) {
+                    eprintln!("emu: {line}");
+                }
+            }
+            std::process::exit(on_signal::exit_code(sig));
         })?;
     }
 
     let avd = env.load(name)?;
     let inst = instance::Instance::prepare(&avd, opts)?;
+    opts.camera_links(|k| avd.get(k).map(str::to_string))
+        .into_iter()
+        .for_each(|(f, s)| emu_vmm::pipe::camera::Cameras::global().link(f, s));
     {
         // An adb server finds emulators by scanning adb ports 5555..5585 (16 instances, unless
         // started with ADB_LOCAL_TRANSPORT_MAX_PORT), or by being told (`host:emulator:<port>`,
@@ -464,7 +454,8 @@ fn boot(
                 eprintln!("emu: guest fault: {msg}");
                 return Ok(ExitCode::FAILURE);
             }
-            _ => return Ok(ExitCode::SUCCESS),
+            // 130 or 143 when a signal stopped it.
+            _ => return Ok(on_signal::stopped()),
         }
     }
 }
@@ -475,18 +466,22 @@ mod tests {
 
     use super::*;
 
-    /// Checks the guard makes in `[from, to)` of its life, following its own schedule.
-    fn guard_checks(from: Duration, to: Duration) -> usize {
-        let (mut t, mut n) = (Duration::ZERO, 0);
-        while t < to {
-            if t >= from {
-                n += 1;
-            }
-            t += signal_guard_interval(t);
+    #[test]
+    fn startup_refuses_below_the_android_floor_and_names_what_is_off() {
+        use sim_core::support::Version;
+        let e = android_support(Some(Version::new(14, 6, 1))).expect_err("below 15");
+        assert!(e.contains("needs macOS 15") && e.contains("hv_gic_create") && e.contains("runs macOS 14.6.1"), "{e}");
+        let off = android_support(Some(Version::new(15, 4, 0))).expect("15 boots");
+        assert_eq!(off.len(), 1, "{off:?}");
+        assert!(off[0].starts_with("4 KiB guest memory granule needs macOS 26"), "{}", off[0]);
+        assert_eq!(android_support(Some(Version::new(26, 0, 0))), Ok(vec![]));
+        assert_eq!(android_support(None), Ok(vec![]), "unknown: the hypervisor itself says");
+        if cfg!(target_os = "macos") {
+            assert!(host_macos().is_some_and(|v| v.major >= 11));
         }
-        n
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_open_file_limit_is_raised_toward_the_hard_limit_and_never_lowered() {
         use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
@@ -515,18 +510,5 @@ mod tests {
         assert!(overrun_line(None).contains("had not started tearing down"));
         let exits = vec![vec![("mmio_read", 3), ("wfi", 0), ("canceled", 1)], vec![("mmio_read", 0)]];
         assert_eq!(exit_lines(&exits), ["  vcpu0: mmio_read=3 canceled=1", "  vcpu1: "]);
-    }
-
-    #[test]
-    fn the_signal_guard_checks_often_at_startup_then_rarely() {
-        // A handler a library installs during startup is undone within 200 ms.
-        assert_eq!(signal_guard_interval(Duration::ZERO), Duration::from_millis(200));
-        assert_eq!(signal_guard_interval(SIGNAL_GUARD_FAST - Duration::from_millis(1)), Duration::from_millis(200));
-        assert_eq!(guard_checks(Duration::from_secs(1), Duration::from_secs(2)), 5);
-        // Idle afterwards: at most one wakeup in any second (it was 5), and it never stops.
-        for start in [SIGNAL_GUARD_FAST, SIGNAL_GUARD_FAST * 2, SIGNAL_GUARD_FAST * 10] {
-            assert!(guard_checks(start, start + Duration::from_secs(1)) <= 1, "{start:?}");
-            assert!(guard_checks(start, start + Duration::from_secs(10)) >= 1, "{start:?}");
-        }
     }
 }

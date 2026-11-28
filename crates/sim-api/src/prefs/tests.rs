@@ -346,7 +346,11 @@ fn the_watch_feed_reports_changes_in_order_with_old_and_new() {
 
     // The device stopping closes the feed: what was sent is still read, then `ended`; a call
     // without a cursor starts a new feed.
-    let before = ok(&mut s, "prefs_watch", all.clone())["cursor"].as_str().expect("cursor").to_owned();
+    // The feed's thread takes changes as the backend sends them, so a fresh cursor can sit before
+    // writes already made: follow to the head (the `launches` and `x` writes above) first.
+    let (caught_up, head) = follow(&mut s, &all, &next, 2);
+    assert_eq!(caught_up.len(), 2, "the writes since `next`");
+    let before = head["cursor"].as_str().expect("cursor").to_owned();
     set(&mut s, &store_id, "launches", "int", json!(6));
     fake.close_feeds();
     let (late, ended) = follow(&mut s, &all, &before, 2);
@@ -529,10 +533,11 @@ fn devices_without_a_backend_yet_say_so_after_checking_parameters() {
 #[test]
 fn defaults_read_and_write_are_unchanged() {
     let row = |m: &str| METHODS.iter().find(|(name, ..)| *name == m).copied().unwrap_or_else(|| panic!("{m}"));
-    assert_eq!(row("defaults_read"), ("defaults_read", "device, domain", "Read a preferences domain"));
+    // Unchanged but for the device set every iOS method takes (#409).
+    assert_eq!(row("defaults_read"), ("defaults_read", "device, domain, set?", "Read a preferences domain"));
     assert_eq!(
         row("defaults_write"),
-        ("defaults_write", "device, domain, key, value, type?", "Write a preference (type: string|int|float|bool)")
+        ("defaults_write", "device, domain, key, value, type?, set?", "Write a preference (type: string|int|float|bool)")
     );
     for m in ["defaults_read", "defaults_write"] {
         assert_eq!(methods::platforms(m), [Platform::Ios], "{m}");
@@ -675,4 +680,18 @@ fn android_devices_still_answer_not_yet_available_and_ios_has_a_backend() {
     assert!(err.ends_with(&format!("doesn't exist: is `{udid}` a simulator of the default device set?")), "{err}");
     #[cfg(not(target_os = "macos"))]
     assert_eq!(err, "app preferences (`prefs_*`) are not yet available on iOS devices");
+}
+
+/// #409: a long-lived server keeps the preference backends of the few device sets it was asked
+/// about last, not one per set any client ever named.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_session_keeps_the_backends_of_a_bounded_number_of_device_sets() {
+    let mut prefs = Session::default();
+    let mut ios = crate::ios::Session::default();
+    for n in 0..40 {
+        ios.use_set(Ok(Some(format!("/nonexistent/simee-409/set-{n}"))));
+        prefs.backend_on(Platform::Ios, &ios).expect("a backend");
+    }
+    assert!(prefs.sets.len() <= crate::ios::MAX_SETS, "{} backends kept", prefs.sets.len());
 }

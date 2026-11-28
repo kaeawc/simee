@@ -76,7 +76,7 @@ impl Device {
 impl Adb {
     /// Runs adb on the device with `args` after `-s <serial>`, for at most `limit`: its success
     /// and its stdout and stderr, in that order, as text.
-    fn run(&self, args: &[&str], limit: Duration) -> Result<(bool, String), String> {
+    pub(crate) fn run(&self, args: &[&str], limit: Duration) -> Result<(bool, String), String> {
         let what = format!("adb -s {} {}", self.serial, args.join(" "));
         let (ok, mut text, stderr) = output_within(Command::new(&self.adb).args(["-s", &self.serial]).args(args), limit, &what)?;
         text.push_str(&stderr);
@@ -84,7 +84,7 @@ impl Adb {
     }
 
     /// `adb shell <command>`, for at most `limit`: what it printed, or why it failed.
-    fn shell(&self, command: &str, limit: Duration) -> Result<String, String> {
+    pub(crate) fn shell(&self, command: &str, limit: Duration) -> Result<String, String> {
         match self.run(&["shell", command], limit)? {
             (true, text) => Ok(text),
             (false, text) => Err(failure(command, &text)),
@@ -211,15 +211,43 @@ impl Adb {
 /// never one reusing its PID) and the error names `what`. Output is read as it comes, so the
 /// call returns once the command exits even when a process it started still holds its pipes.
 fn output_within(command: &mut Command, limit: Duration, what: &str) -> Result<(bool, String, String), String> {
+    let ran = capture(command, limit, [usize::MAX; 2], what)?;
+    if ran.timed_out {
+        return Err(format!("`{what}` timed out after {limit:?}; stopped it"));
+    }
+    let [stdout, stderr] = [ran.stdout, ran.stderr].map(|b| String::from_utf8_lossy(&b).into_owned());
+    Ok((ran.code == Some(0), stdout, stderr))
+}
+
+/// What [`capture`] collected.
+#[derive(Debug, Default)]
+pub(crate) struct Captured {
+    /// The exit status; `None` when it was stopped (past its time or its cap) or died of a signal.
+    pub code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    /// A stream reached its cap and was cut there.
+    pub truncated: bool,
+    /// It ran past its time.
+    pub timed_out: bool,
+    /// It was stopped, at a cap or past its time, while it still ran: it never exited by itself.
+    pub stopped: bool,
+}
+
+/// [`output_within`]'s run, keeping at most `caps` bytes of stdout and of stderr: a stream that
+/// reaches its cap while the command runs stops it (`truncated`, `stopped`), as running past `limit`
+/// does (`timed_out`, `stopped`). One that reaches it in what is read after the command exited is
+/// only cut (`truncated`), the command's status kept.
+pub(crate) fn capture(command: &mut Command, limit: Duration, caps: [usize; 2], what: &str) -> Result<Captured, String> {
     /// How often a quiet command is checked for having exited.
     const TICK: Duration = Duration::from_millis(20);
+    let deadline = Instant::now().checked_add(limit).ok_or_else(|| format!("`{what}`: a time limit of {limit:?} is too long"))?;
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("couldn't run {}: {e}", Path::new(command.get_program()).display()))?;
-    let deadline = Instant::now() + limit;
     let (tx, rx) = mpsc::channel::<(usize, Option<Vec<u8>>)>();
     let pipes: [Option<Box<dyn Read + Send>>; 2] = [
         child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>),
@@ -244,13 +272,23 @@ fn output_within(command: &mut Command, limit: Duration, what: &str) -> Result<(
         });
     }
     drop(tx);
+    let mut ran = Captured::default();
     let mut out = [Vec::new(), Vec::new()];
+    // Keeps what fits of `bytes` under stream `i`'s cap; whether any didn't fit.
+    let keep = |out: &mut [Vec<u8>; 2], i: usize, bytes: &[u8]| {
+        let room = caps[i].saturating_sub(out[i].len());
+        out[i].extend_from_slice(&bytes[..bytes.len().min(room)]);
+        bytes.len() > room
+    };
     let status = loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if open > 0 && !left.is_zero() {
             match rx.recv_timeout(left.min(TICK)) {
                 Ok((i, Some(bytes))) => {
-                    out[i].extend(bytes);
+                    if keep(&mut out, i, &bytes) {
+                        ran.truncated = true;
+                        break None;
+                    }
                     continue;
                 }
                 Ok((_, None)) => {
@@ -265,26 +303,31 @@ fn output_within(command: &mut Command, limit: Duration, what: &str) -> Result<(
             sleep(left.min(Duration::from_millis(1)));
         }
         if let Some(status) = child.try_wait().map_err(|e| format!("`{what}`: {e}"))? {
-            break status;
+            break Some(status);
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("`{what}` timed out after {limit:?}; stopped it"));
+            ran.timed_out = true;
+            break None;
         }
     };
-    // It exited: what it wrote last may still be on its way from the readers. A process it left
-    // holding the pipes gets a moment, not the deadline.
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        ran.stopped = true;
+    }
+    // What it wrote last, or before it was stopped, may still be on its way from the readers. A
+    // process it left holding the pipes gets a moment, not the deadline.
     let grace = Instant::now() + Duration::from_millis(100);
     while open > 0 {
         match rx.recv_timeout(grace.saturating_duration_since(Instant::now())) {
-            Ok((i, Some(bytes))) => out[i].extend(bytes),
+            Ok((i, Some(bytes))) => ran.truncated |= keep(&mut out, i, &bytes),
             Ok((_, None)) => open -= 1,
             Err(_) => break,
         }
     }
-    let [stdout, stderr] = out.map(|b| String::from_utf8_lossy(&b).into_owned());
-    Ok((status.success(), stdout, stderr))
+    ran.code = status.and_then(|s| s.code());
+    [ran.stdout, ran.stderr] = out;
+    Ok(ran)
 }
 
 /// `name` if it is a package name: dot-separated segments of letters, digits and underscores,
@@ -327,7 +370,7 @@ fn install_result(ok: bool, text: &str) -> Result<(), String> {
 }
 
 /// An error from a command's output, its last line if it printed any.
-fn failure(what: &str, text: &str) -> String {
+pub(crate) fn failure(what: &str, text: &str) -> String {
     let text = text.trim();
     let line = text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no output");
     format!("{what} failed: {}", line.trim())
@@ -354,7 +397,7 @@ fn parse_pid(out: &str) -> Option<u32> {
 }
 
 /// The names in `pm list packages`'s `package:<name>` lines, sorted.
-fn parse_packages(out: &str) -> Vec<String> {
+pub(crate) fn parse_packages(out: &str) -> Vec<String> {
     let mut names: Vec<String> = out.lines().filter_map(|l| l.trim().strip_prefix("package:")).map(str::to_owned).collect();
     names.sort();
     names.dedup();
@@ -366,7 +409,8 @@ fn on_path(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(name)).find(|p| p.is_file())
 }
 
-#[cfg(test)]
+/// Run against `testing`'s fake adb and emulator, which are unix only.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::testing::{fake_adb, fake_emulator};

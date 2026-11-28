@@ -1,0 +1,55 @@
+[package]
+name = "simee-encode"
+description = "Real-time H.264 from simee's frame sources: VideoToolbox straight from an iOS device's IOSurface or an Android emulator's frame ring (OpenH264 on Linux), paced by the device's own frame callbacks, as Annex B access units with capture timestamps."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["h264", "videotoolbox", "encoder", "streaming", "simulator"]
+categories = ["multimedia::video", "multimedia::encoding"]
+include = ["/Cargo.toml", "/LICENSE", "/build.rs", "/examples", "/src"]
+
+[lib]
+doctest = false
+
+[features]
+# The Linux encoder: OpenH264 compiled from its C++ source (needs a C++ compiler; `nasm` makes it
+# several times faster on x86_64). Off by default so the workspace still lints the Linux target
+# from macOS with no C++ cross toolchain; without it `simee-encode` has no encoder on Linux.
+openh264 = ["dep:openh264", "dep:openh264-sys2"]
+
+[dependencies]
+sim-core.workspace = true
+
+# The encoder is VideoToolbox's; the frame sources hand it IOSurface-backed pixel buffers.
+[target.'cfg(target_os = "macos")'.dependencies]
+sim-android.workspace = true
+sim-coresim = { workspace = true, features = ["videotoolbox"] }
+
+# The Linux encoder and its frame source (emu's display socket): `source` and `linux` only build
+# with `--features openh264`, and nothing here builds off Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+sim-android.workspace = true
+openh264 = { workspace = true, optional = true }
+openh264-sys2 = { workspace = true, optional = true }
+
+# The tests read SPSes with the publisher's parser; `examples/publish_device.rs` publishes over
+# WHIP; the examples find an AVD's directory by name.
+[dev-dependencies]
+emu-avd.workspace = true
+sim-rtc.workspace = true
+
+# The workspace's lints, but `unsafe` is denied rather than forbidden: `linux.rs` has one `unsafe`
+# call (the runtime bitrate change OpenH264's safe crate lacks), allowed on that function alone.
+[lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "warn"
+unwrap_used = "warn"
+undocumented_unsafe_blocks = "deny"

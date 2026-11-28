@@ -289,7 +289,8 @@ address space and pipe over vfio-user, and the host-side state behind them (the 
 contexts and resources, open pipe connections, adb sessions) lives in emu, not in QEMU. So a booted
 snapshot does not restore, and making one restore is work in emu, not a flag. Its payoff would be
 the largest of anything in this document: the 172 s boot would become the time to map and
-restore 1.5 GB.
+restore 1.5 GB. Section 7 takes it further: the blockers removed, what a restore costs and what it
+breaks.
 
 ## 5. Ranked bottlenecks
 
@@ -299,10 +300,10 @@ profile, not measured; nothing here is a number for `docs/benchmarks.md`.
 | # | Bottleneck | What it costs the user | Evidence | Controlled in | Experiment and estimated gain |
 | --- | --- | --- | --- | --- | --- |
 | 1 | The first boot of a fresh AVD: `apexd` decompresses 24 `.capex` files serially, then `system_server` does its first-boot work | 360 s to `sys.boot_completed` and 386 s to the launcher, against 156 to 179 s warm: 190 to 200 s of every new AVD's first start | Section 4: init's wait for `apexd.status=activated` is 118.4 s of the 125 s extra before zygote; `ams_ready` is 67 s after `pms_ready` against 20 s; 4 first boots 360.1 to 366.7 s | `crates/emu-avd/src/lib.rs` creates the AVD, `apps/emu/src/main.rs:161` (`create_avd`) and `apps/emu/src/provision.rs:91` (`-provision ... -create-avd`) never boot it; `-clone-avd` is `apps/emu/src/main.rs:235` | Done: a clone of a settled AVD booted in 161.1 s / 190.4 s (one boot). To ship it: `-create-avd` (or `-provision`) boots the image once and keeps a settled userdata to clone for later AVDs of that image. Gain about 200 s per new AVD after the first; no QEMU or guest change |
-| 2 | Guest code runs at a fraction of its speed because every guest context switch flushes QEMU's soft TLB and jump cache (no PCID in TCG) | Everything the guest does: the 156 to 179 s warm boot, about 7 frames a second in the launcher, 95% janky frames | Section 3: 30% of vCPU time is guest code, 25 to 30% finding the next block, 18 to 26% soft MMU. Section 4: 564 context switches a second idle = 570 TLB flushes a second; 2,111 a second swiping; `-cpu max,+pcid` is refused by TCG; a 16× larger jump cache is slower (`tcg_flush_jmp_cache` 0.13 to 0.17 cores) | `crates/emu-vmm/src/soft.rs:25` (`CPU`) and `:96` (`-accel tcg,thread=multi`): QEMU exposes no option for it | Not config-only. Keep the soft TLB and jump cache across a CR3 write by tagging entries with the guest's PCID in QEMU's x86 target (the structure the profile points at), or measure the bound first: a guest pipe ping-pong between two processes (a context switch per message) against the same work in one process. Estimate: removing half of the lookup and soft-MMU share is 25% of vCPU time, so the guest runs about 1.3× faster: boot 170 s to about 130 s |
-| 3 | The warm boot is one serial guest job at about half a core per vCPU: kernel and init 52 to 55 s, preload 14 to 22 s, PackageManager 18 s, ActivityManager 19 s, screen and boot animation 36 s | 156 to 179 s to `sys.boot_completed` | Section 3: host CPU never above 2.83 of 4 cores in boot; vCPUs 54 to 65% busy; guest uptime milestones. Section 4: 3 vCPUs cost 16%, 2 cost 150%, 6 cost 12% (4 is right on 4 host cores) | `crates/emu-avd/src/lib.rs:218` (`cpus`, default 2 when the AVD sets no `hw.cpu.ncore`; `emu -create-avd` writes 4) and `crates/emu-vmm/src/soft.rs:99` | A booted snapshot is the only thing that skips it, and QEMU's `savevm` is refused (below): the vsock, console, net, input and GPU devices are emu's vhost-user and vfio-user backends and none is migratable, and the renderer's state is in emu. Estimate if it worked: restore of 1.5 GB plus a cold translation cache, tens of seconds against 170 s. A spike: serialize one device (vsock) through vhost-user's device-state protocol and see how many others block |
-| 4 | SwiftShader draws every frame on the same 4 cores as the vCPUs | The launcher's 7 frames a second: its four rasterizer threads take 0.35 to 0.55 cores while swiping (24% of host CPU over adb) and 0.56 in boot | Section 3: `Thread<0n>` rows; the SwiftShader JIT is the second symbol in boot and in the adb swipes. Section 4: 540×960 at 240 dpi gave 194 frames against 173 to 183 and p90 200 ms against 300 (one boot) | `apps/emu/src/instance.rs:390` (SwiftShader unless `-gpu lavapipe`, which crashed emu 66 s and 138 s in) | Run `lcd540` three times and an AVD with `hw.lcd.vsync=30` together (they were measured separately): if the gains add, a documented software-mode AVD profile (smaller screen, 30 Hz) is a config change. Estimate: 10 to 20% fewer janky frames, not a change in frame rate |
-| 5 | An idle guest costs 0.58 host cores | A device left running takes a core's worth of a 4-core host | Section 3: vCPUs 0.50 of it, QEMU's main loop 0.06, emu 0.01; the guest does 564 context switches a second (each a flush, rank 2) and takes 60 composer callbacks a second | `apps/emu/src/instance.rs:883` (`androidboot.qemu.vsync` from the AVD's `hw.lcd.vsync`), the AVD's sensor rate | `hw.lcd.vsync=30`: 0.55 against 0.59 here, 0.12 lower in docs/benchmarks.md. Lowering the sensors HAL's 15 Hz poll is a guest change; estimate 0.05 to 0.1 more. Fixing rank 2 lowers this too |
+| 2 | Guest code runs at a fraction of its speed because every guest context switch flushes QEMU's soft TLB and jump cache (no PCID in TCG) | Everything the guest does: the 156 to 179 s warm boot, about 7 frames a second in the launcher, 95% janky frames | Section 3: 30% of vCPU time is guest code, 25 to 30% finding the next block, 18 to 26% soft MMU. Section 4: 564 context switches a second idle = 570 TLB flushes a second; 2,111 a second swiping; `-cpu max,+pcid` is refused by TCG; a 16× larger jump cache is slower (`tcg_flush_jmp_cache` 0.13 to 0.17 cores) | `crates/emu-vmm/src/soft.rs:25` (`CPU`) and `:96` (`-accel tcg,thread=multi`): QEMU exposes no option for it | Not config-only. Keep the soft TLB and jump cache across a CR3 write by tagging entries with the guest's PCID in QEMU's x86 target (the structure the profile points at), or measure the bound first: a guest pipe ping-pong between two processes (a context switch per message) against the same work in one process. Estimate: removing half of the lookup and soft-MMU share is 25% of vCPU time, so the guest runs about 1.3× faster: boot 170 s to about 130 s. **Measured since (tcg-context-switch.md, #227): withdrawn.** A CR3 write costs 100 to 150 µs, the guest writes CR3 about 125 times a second idle and 150,000 times in a boot, which is a 3 to 4% ceiling; a prototype that keeps 8 PCIDs left boot unchanged (idle host CPU 10% lower). The lookup share is 36% in a loop with no context switches, so it is not mostly the flush |
+| 3 | The warm boot is one serial guest job at about half a core per vCPU: kernel and init 52 to 55 s, preload 14 to 22 s, PackageManager 18 s, ActivityManager 19 s, screen and boot animation 36 s | 156 to 179 s to `sys.boot_completed` | Section 3: host CPU never above 2.83 of 4 cores in boot; vCPUs 54 to 65% busy; guest uptime milestones. Section 4: 3 vCPUs cost 16%, 2 cost 150%, 6 cost 12% (4 is right on 4 host cores) | `crates/emu-avd/src/lib.rs:218` (`cpus`, default 2 when the AVD sets no `hw.cpu.ncore`; `emu -create-avd` writes 4) and `crates/emu-vmm/src/soft.rs:99` | A booted snapshot is the only thing that skips it, and QEMU's `savevm` is refused (below): the vsock, console, net, input and GPU devices are emu's vhost-user and vfio-user backends and none is migratable, and the renderer's state is in emu. Estimate if it worked: restore of 1.5 GB plus a cold translation cache, tens of seconds against 170 s. A spike: serialize one device (vsock) through vhost-user's device-state protocol and see how many others block. **Spiked since (section 7, #214): the save and the load work and take 8.5 s; the restored guest's graphics crash because the goldfish address space and the renderer start empty** |
+| 4 | SwiftShader draws every frame on the same 4 cores as the vCPUs | The launcher's 7 frames a second: its four rasterizer threads take 0.35 to 0.55 cores while swiping (24% of host CPU over adb) and 0.56 in boot | Section 3: `Thread<0n>` rows; the SwiftShader JIT is the second symbol in boot and in the adb swipes. Section 4: 540×960 at 240 dpi gave 194 frames against 173 to 183 and p90 200 ms against 300 (one boot) | `apps/emu/src/instance.rs:390` (SwiftShader unless `-gpu lavapipe`, which crashed emu 66 s and 138 s in) | Run `lcd540` three times and an AVD with `hw.lcd.vsync=30` together (they were measured separately): if the gains add, a documented software-mode AVD profile (smaller screen, 30 Hz) is a config change. Estimate: 10 to 20% fewer janky frames, not a change in frame rate. **Measured since (section 8, #228):** the gains do not add: the screen lowers the swiping cost (2.43 cores against 2.11 with both, 2.01 as shipped) and the p90 frame time (300 against 250 and 200 ms), with no more frames together, and shipped as `emu -create-avd -profile software-lite` |
+| 5 | An idle guest costs 0.58 host cores | A device left running takes a core's worth of a 4-core host | Section 3: vCPUs 0.50 of it, QEMU's main loop 0.06, emu 0.01; the guest does 564 context switches a second (each a flush, rank 2) and takes 60 composer callbacks a second | `apps/emu/src/instance.rs:883` (`androidboot.qemu.vsync` from the AVD's `hw.lcd.vsync`), the AVD's sensor rate | `hw.lcd.vsync=30`: 0.55 against 0.59 here, 0.12 lower in docs/benchmarks.md. Lowering the sensors HAL's 15 Hz poll is a guest change; estimate 0.05 to 0.1 more. Fixing rank 2 lowers this too. **Measured since (section 8):** 30 Hz alone settles at 0.49 cores against 0.59, and with the 540x960 screen at 0.53: the screen adds nothing to the idle cost |
 
 Checked and not bottlenecks (so no work belongs there): emu's own threads (vsock, vhost-user kicks,
 GPU decoder, console, display) are at most 0.03 cores, 0.01 idle, and `vhost_user.rs:587` blocks in
@@ -339,3 +340,203 @@ here, and no container runtime was installed or tried. Anything that wants one n
 with `CONFIG_ANDROID_BINDER_IPC` and `CONFIG_ANDROID_BINDERFS` (the Firecracker guest kernel here
 is the host's to change, not simee's), and the result would be an x86_64 Android on the host's
 kernel, so it says nothing about arm64 images.
+
+## 7. Can a booted guest be saved and restored? (#214)
+
+Research for [#214](https://github.com/kaeawc/simee/issues/214): CI's `boot (tcg)` job spends most
+of its ~300 s in "Boot, screenshot, tap, stop" (227 s). If a booted guest could be saved once per
+image and restored in a pull request, the check would take seconds. Run on 2026-11-28 with the
+setup of `.github/workflows/software-mode.yml`, so the numbers are what that job would see on a
+host of this size.
+
+**Result: not yet.** QEMU refuses the save as emu runs it today (four blockers, all in how
+emu's devices attach to it). With the blockers removed in a patched QEMU and a patched emu, the guest is
+saved in 15 s, loaded in 7.5 s and answers on adb 20 s after it resumes, against 163 s for a
+warm boot and 374 s for a first boot. But its graphics are dead: the first renderer calls
+divide by zero in the guest, the composer HAL, SurfaceFlinger and zygote restart in a loop, and
+no screenshot ever comes back. The screenshot and tap check can't pass on this restore, so phase 2
+(a CI path that restores one) isn't built.
+
+### Setup
+
+| | |
+| --- | --- |
+| Host | Firecracker VM, Ubuntu 22.04, kernel 6.1.189, no `/dev/kvm`, 4 vCPUs of an Intel Xeon at 2.2 GHz, 8 GiB RAM, 9.8 GB disk (about 1 GB free during the runs) |
+| QEMU | 11.1.3 from the pinned tarball (sha256 5a8289c7…84b22), CI's `configure` line plus `--disable-tools --disable-guest-agent` (disk) |
+| emu | this branch's `main` (1c5704e), release build; QEMU through `EMU_QEMU` pointing at a wrapper script that adds `-qmp unix:...` (and `-incoming defer` for the restore) |
+| Image | `emu -provision 36 -tag default -abi x86_64` (system image r2, renderer 37.3.10; checksums verified by emu), AVD from `emu -create-avd ci -sysdir ... -no-golden`: 4 vCPUs, 2048 MB RAM, 720×1280, 4 GB data, `-accel off` |
+
+### Why QEMU refuses today
+
+`migrate` and `savevm` through QMP on the unmodified setup, guest booting:
+
+```
+State blocked by non-migratable device '0000:00:02.0/vhost-user-vsock'
+```
+
+That is the first blocker QEMU names; QEMU 11.1.3's source and the patched runs show the rest.
+Each fix hides the next:
+
+| # | Blocker | Where | What fixing it takes |
+| --- | --- | --- | --- |
+| 1 | `.unmigratable = 1` on `vhost-user-vsock` and on `vhost-user-test-device` (the generic frontend of console, net, touch, keyboard, rotary and GPU) | QEMU `hw/virtio/vhost-user-vsock.c`, `vhost-user-test-device.c` | one line each: save the virtio state (`VMSTATE_VIRTIO_DEVICE`, as `vhost-user-rng` does). Not upstream: needs a QEMU patch, or emu stops using the test device |
+| 2 | The GPU's shared memory regions ("devices with VIRTIO Shared Memory Regions do not support migration yet") | `hw/virtio/vhost-user-base.c` | a QEMU patch (the check is a blocker, not a missing feature of the guest's state) |
+| 3 | `vhost-user backend lacks VHOST_USER_PROTOCOL_F_LOG_SHMFD`, then `vhost lacks VHOST_F_LOG_ALL` | emu's vhost-user backend (`crates/emu-vmm/src/vhost_user.rs`) | advertise both and accept `SET_LOG_BASE`/`SET_LOG_FD`. Saving a stopped VM needs no dirty log, so emu can accept and ignore it; a live save would need real dirty logging for the guest memory the devices write |
+| 4 | `SET_VRING_BASE` with a non-zero index is an error ("only fresh rings are supported") | `vhost_user.rs`, `virtio/queue.rs` | the queue starts at the available and used indices of the restored ring (`Queue::new` always starts at 0); the in-flight descriptors (taken from the available ring, not yet in the used ring) have to be resumed by each device |
+
+`vfio-user` (the goldfish address space and pipe) adds no blocker in QEMU 11.1.3; it adds no state
+either, which is the problem below.
+
+### The spike
+
+QEMU patched to drop 1 and 2 (`.fields = {VMSTATE_VIRTIO_DEVICE, VMSTATE_END_OF_LIST()}` in place
+of `.unmigratable`, the shared memory blocker removed; QEMU 11.1.3 rebuilt incrementally; QEMU's
+own tests not run), and emu patched for 3 and 4 (+20 −12 lines in `vhost_user.rs`,
+`virtio/queue.rs`, `virtio/mmio.rs`: `QueueConfig::start`, `SET_LOG_BASE` echoing its payload,
+`SET_LOG_FD` ignored, `VHOST_F_LOG_ALL` advertised and masked from the features given to the
+device). Nothing else in emu changed, so every device and the renderer start empty on the load.
+
+Save: boot to the launcher (warm boot, 162.8 s), wait 60 s, screenshot (`pre.png`: 222 kB, the
+launcher), `stop`, `migrate` to `exec:zstd -T0 -3`, `quit`. Load: a fresh `emu -avd ci` (new
+QEMU with `-incoming defer`, the same disks), `migrate-incoming` from `exec:zstd -d -c`, `cont`.
+
+| | Measured |
+| --- | --- |
+| Guest RAM / what QEMU sent | 2,148,016,128 B / 1,898,493,428 B (88% of the 2 GiB: zero pages aren't sent) |
+| Save (`stop` to `completed`) | 14.3 s of QEMU's `total-time`, 15.1 s as seen from the script |
+| State file | 517 MB with `zstd -3` (493 MiB) |
+| Load (`migrate-incoming` to the VM paused with everything loaded) | 7.5 s; guest running 8.5 s after emu started |
+| User data to go with it | `userdata.img` 4 GiB sparse, 545 MB allocated, 570 MB with `zstd -3`; cache and encryption key partitions 0.1 MB. The state is only valid with the disk it was saved with |
+| Actions cache cost per key | about 1.09 GB (517 MB + 570 MB); the cache is over its 10 GB limit already, so each key would evict older entries |
+| Full boot, same host | 163 s warm, 374 s first boot (a fresh AVD); the CI step takes 227 s per #214 |
+
+### What the restored guest does
+
+| Check | Result |
+| --- | --- |
+| `adb devices`, 20 s after `cont` | `emulator-5554 device` (the adb transport came back without help) |
+| `getprop sys.boot_completed` | `1` (the property was in the saved RAM; not evidence of anything) |
+| Screenshot over `display.sock`, 3 tries then 1 more 80 s later | `no frame presented yet`, then `the scanout frame couldn't be read`, every time: **no frame, ever** |
+| `simee tap` | exit 0 (the display socket took it; with no screen, nothing shows it reached the guest) |
+| Logcat | the guest's clock goes on from the save (01:18:15); 2 s later, `SIGFPE (FPE_INTDIV)` in `AddressSpaceStream::type1Write` in `vulkan.ranchu.so` (SystemUI's RenderThread, then system_server's and the launcher's), then in `rcCompose_enc` inside `android.hardware.graphics.composer3-service.ranchu`; init restarts SurfaceFlinger and zygote (01:18:25); the composer HAL aborts again at 01:18:29 and SurfaceFlinger at 01:18:31. Graphics stays dead |
+| emu | `gpu: first command 0x0203 8450 ms after activation`, `gpu reset: 2 mappings removed, 2 contexts and 3 resources left`: a renderer with 2 contexts and 3 resources at the end, where the saved guest's run ended with 14 and 31 |
+
+The divide by zero is most likely the guest reading a size of 0 from the address-space device
+it had configured before the save (the crash is in the address-space graphics stream; this spike
+didn't confirm what value was zero): the goldfish address space (`GoldfishAs`) and the goldfish pipe
+carrier are `vfio-user` devices served by emu, and their state (the claimed address-space blocks,
+the pipe command buffers, every open pipe connection) isn't in QEMU's stream. Beyond that the
+renderer starts without the guest's contexts, color buffers, blobs and Vulkan objects.
+
+### What a correct restore needs
+
+Each is emu's work; the first two are also QEMU's.
+
+1. **A QEMU that migrates the vhost-user devices**: patches 1 and 2 above carried in the build
+   (the workflow already builds QEMU from a pinned tarball and caches it), or serving these
+   devices without the generic test device.
+2. **emu saves its own state next to QEMU's**, with the VM stopped, and loads it before `cont`:
+   the ring positions and in-flight descriptors of every queue; vsock's connection table; the
+   console ports' buffers; the net backend's NAT and DHCP state; the input devices' pending events;
+   `GoldfishAs`'s blocks; the goldfish pipe's registers and every open pipe, with each service's
+   state (adb, qemud services, `refcount`, `GLProcessPipe`, sensors, camera...). Today none of
+   these has a serialize function.
+3. **The renderer's state.** The SDK's `libgfxstream_backend.so` exports `stream_renderer_suspend`,
+   `stream_renderer_snapshot`, `stream_renderer_restore` and `stream_renderer_resume` (nothing in
+   `emu-gfxstream` calls them yet, and this spike didn't), next to the whole of the stock
+   emulator's snapshot machinery (`androidSnapshot_*`). Whether they save a SwiftShader
+   Vulkan device's state (pipelines, memory contents, color buffers) correctly is the
+   open question, and the one that decides whether this is a week or months.
+4. **A device-set and version contract.** A saved state is only valid for the emu build that wrote
+   it: any change to a device's state or to the board (`layout.rs`, the ACPI table, the device
+   list) invalidates it.
+
+That last point also limits the CI use. The `boot (tcg)` job runs on a pull request only when the
+change reaches `apps/emu` or the crates it builds. Those are the changes the boot is there to
+test, and a state saved by `main`'s emu and loaded into the pull request's is a different
+emulator reading another one's state. Keying the cache by the emu build (as issue #214 proposes)
+means every pull request that triggers the job misses it and does the full boot, and a restored
+snapshot would skip exactly the boot code under test (device init, the board, the pipe handshake).
+A restore-only path would have to be limited to pull requests that don't change the board or a
+device's state, and that is hard to decide mechanically.
+
+### What was not tried
+
+- `mapped-ram` migration (needs multifd and a seekable file; the stream through `zstd` was used),
+  a live save with dirty logging, and a different compression level. The save and load times
+  above are with the guest stopped, on 4 vCPUs that were otherwise idle.
+- The renderer's snapshot calls, the address-space and pipe state, and so a correct restore.
+  So there's no figure for what a correct restore costs; the 7.5 s load is a lower bound that
+  leaves out the renderer's own load.
+- Restoring more than once or on another host: the SIGFPE sequence was seen once, in the one
+  restore whose guest ran (an earlier attempt that never sent `cont` is not a result).
+- CRIU on emu and QEMU together (checkpointing the process tree, the renderer included): the host
+  kernel has no `CONFIG_CHECKPOINT_RESTORE` and no `UNIX_DIAG`, so it couldn't be tried here. It
+  would need root and a kernel with both on the CI runner, and the same disk and cache cost.
+- The cheaper cut that needs none of the above, from section 4: a CI cache of the *golden user
+  data* (`emu-avd`'s `golden`), which skips the first-boot work (a warm boot was 156 to 179 s
+  against 360 s on the first host; section 4). That halves the boot, not "well under a minute",
+  and its cache cost is the 570 MB of user data. It wasn't measured on CI.
+
+### Reproducing
+
+QEMU as in the workflow; `emu -provision 36 -tag default -abi x86_64`;
+`emu -create-avd ci -sysdir system-images/android-36/default/x86_64 -no-golden`; an `EMU_QEMU`
+wrapper that is `exec "$QEMU_REAL" "$@" -qmp "unix:$QMP_SOCK,server=on,wait=off" $QEMU_EXTRA`;
+QMP `stop`, then `migrate` with `{"uri": "exec:zstd -T0 -3 -q -o state.zst"}`, polling
+`query-migrate`, then `quit`; a new emu with `QEMU_EXTRA="-incoming defer"`, `migrate-incoming`
+with `{"uri": "exec:zstd -d -c state.zst"}`, `cont`. The unmodified QEMU stops at the first
+`migrate` with the vsock error above.
+
+## 8. A smaller screen and 30 Hz together
+
+Ranks 4 and 5 of section 5 each measured one config change once: 540x960 at 240 dpi
+(section 4: 8% more frames, p90 200 ms against 300) and `hw.lcd.vsync=30` (idle 0.04 to 0.12 cores
+lower). [#228](https://github.com/kaeawc/simee/issues/228) measured them together and each alone, against the default,
+on one 4-vCPU host: three rounds of five warm boots in turn (15 boots), 2026-11-28. The fifth arm
+is an AVD made by the shipped `-create-avd -profile software-lite`. The method, host and every
+run are in [benchmarks.md](../benchmarks.md#software-mode-a-smaller-screen-and-30-hz);
+`scripts/bench/software-profile.sh --arms "default lcd540 vsync30 lite shipped"` reproduces it. Medians:
+
+| | default | 540x960 only | 30 Hz only | both (`config.ini`) | both (shipped) |
+| --- | --- | --- | --- | --- | --- |
+| Idle host CPU, 240 to 300 s after `sys.boot_completed` | 0.59 cores | 0.59 | 0.49 | 0.53 | 0.53 |
+| Host CPU while swiping, warm launcher | 2.43 cores | 2.15 | 2.46 | 2.11 | 2.01 |
+| Frames in 20 swipes, warm / cold launcher | 185 / 121 | 198 / 128 | 174 / 112 | 182 / 118 | 185 / 118 |
+| p90 frame time, warm launcher | 300 ms | 250 ms | 350 ms | 250 ms | 200 ms |
+| Warm boot to `sys.boot_completed` | 169.8 s | 156.9 s | 165.7 s | 156.4 s | 181.9 s |
+| Process tree PSS | 2868 MB | 2824 | 2846 | 2804 | 2828 |
+
+What it says:
+
+- **The gains do not add.** 30 Hz removes callbacks the composer takes while nothing draws
+  (section 5, rank 5), and is the only arm that clearly lowers the idle cost (0.59 to 0.49); the
+  profile's 0.53 is between that and the default's, and the screen alone is the default's 0.59. The
+  smaller screen has SwiftShader draw 44% fewer pixels (rank 4), which fits it lowering the swiping
+  cost (2.43 to 2.15 cores) and the frame times; 30 Hz alone does neither (2.46 cores, p90 350 ms).
+- **Frames: no gain together.** The screen alone draws 7% more frames on a warm launcher and 30 Hz
+  alone 6% fewer, so the profile draws the default's count (182 and 185 against 185). Software
+  mode still draws 2 to 4 frames a second under adb-driven swipes.
+- **Janky frames fall from 97% to 85% and 81%, mostly because a 30 Hz deadline is 33 ms**: 30 Hz
+  alone is 93%, the screen alone 96%. Read the frame times, not that percentage.
+- **No boot or memory win.** The warm boots overlap (the default's 169.8 to 182.5 s, the profile's
+  154.9 to 194.8 s), and PSS is within 2% in every arm: a 1.5 GB guest and QEMU's translation
+  cache are the memory, not the framebuffer.
+- **Noise.** The default's idle cost was 0.68, 0.59 and 0.58 on three boots of one AVD, so the
+  profile's 0.51 to 0.55 is under two of them and not clearly under the third, and the 30 Hz arm's
+  0.45 to 0.52 is the only one under all three.
+
+An earlier 12-boot run of the same script (2026-11-27) found the profile at 0.46 idle against 0.68
+and read as if the halves added. Its idle window was anchored to the launcher, not to
+`sys.boot_completed`, so the arms did not all start at the same offset; the script was fixed and
+the run repeated, and these numbers replace it. The host reported 3.8 GiB when the re-run
+started and 7.8 GiB when it ended, at an unrecorded time in between, and the guests' PSS is higher
+than in the first run, so do not compare memory across the runs (details in benchmarks.md).
+
+The decision: the profile ships, opt-in (`-profile software-lite`), with the default AVD unchanged.
+It buys about a tenth less idle CPU and about 17% less swiping CPU on a shared host, and it costs
+a 540x960, 30 Hz display for the apps; it is not faster to boot or lighter. Default, owner may
+override. What this doesn't cover: one host, one image (API 36 `default` x86_64), a 1.5 GB guest,
+animations on, 3 boots per arm; launcher swipes over adb, not a real app; the stock emulator (it
+has no software mode that boots, docs/android.md); and the sensors HAL's poll rate, which the
+profile doesn't touch.

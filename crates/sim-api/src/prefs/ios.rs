@@ -15,13 +15,20 @@
 //! - **Writes** go through cfprefsd with `native/prefstool.m`, one spawn per batch, so a running
 //!   app's `UserDefaults` sees them at once (its KVO observers fire; `didChangeNotification` does
 //!   not, as for any change made by another process).
-//! - **The feed** watches the store files and their directories with kqueue
-//!   ([`sim_coresim::FileWatch`]) and reports each key whose decoded value changed, so a change
-//!   shows when cfprefsd writes the file.
+//! - **The feed** runs an in-device observer (`ios/prefswatch.m`, built on first use like the
+//!   helper) that opens each store's domain in its container, observes it so cfprefsd sends it
+//!   every process's changes, and prints the store's values each time one comes; the feed reports
+//!   each key whose value changed as it is made. It also watches the store files and their
+//!   directories with kqueue ([`sim_coresim::FileWatch`]): a store the observer doesn't follow (it
+//!   can't be built or started, its runtime lacks the SPI, it exited, a store too large for it to
+//!   send, or a domain that appeared after the feed started) shows when cfprefsd writes its file.
+//!   The observer waits with no timer and is stopped when the feed ends or its output can't be
+//!   followed (and exits by itself with this process).
 
+use sim_core::hostfs::MetadataExt;
 use std::collections::HashMap;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use sim_core::platform::Platform;
 
@@ -232,20 +239,26 @@ pub struct Tracker {
 
 struct Tracked {
     store: Store,
+    /// The container cfprefsd keeps the store in (where the observer opens its domain).
+    container: PathBuf,
     file: PathBuf,
     stamp: Option<Stamp>,
     entries: Entries,
+    /// The in-device observer follows it: its file is behind cfprefsd, so it isn't read.
+    live: bool,
 }
 
 impl Tracker {
-    /// Follows `stores` of `app` (whose own defaults are in `app_prefs`), reading each now.
+    /// Follows `stores` of `app` (each with its container; the app's own defaults are in
+    /// `app_prefs`), reading each now.
     fn new(app: &str, app_prefs: PathBuf, all: bool, stores: Vec<(Store, PathBuf)>) -> Tracker {
         let stores = stores
             .into_iter()
-            .map(|(store, file)| {
+            .map(|(store, container)| {
+                let file = store_file(&container, &store);
                 let stamp = stamp(&file);
                 let entries = read_file(&file).unwrap_or_default();
-                Tracked { store, file, stamp, entries }
+                Tracked { store, container, file, stamp, entries, live: false }
             })
             .collect();
         Tracker { all, app: app.to_owned(), app_prefs, stores }
@@ -264,7 +277,8 @@ impl Tracker {
     }
 
     /// The changes since the last look, `at` now: each store whose file changed is read again and
-    /// compared by key (a file being replaced as it is read is read on the next look); a domain
+    /// compared by key (a file being replaced as it is read is read on the next look), except one
+    /// the observer follows ([`Tracker::observe`]); a domain
     /// whose file appeared in the app's container is followed from empty. Whether it follows
     /// more stores than before (more paths to watch).
     pub fn poll(&mut self, at: Date) -> (Vec<Change>, bool) {
@@ -274,7 +288,8 @@ impl Tracker {
                 let Ok(store) = Store::parse(Platform::Ios, &self.app, &name) else { continue };
                 let file = self.app_prefs.join(format!("{name}.plist"));
                 if !self.stores.iter().any(|t| t.store == store || t.file == file) {
-                    self.stores.push(Tracked { store, file, stamp: None, entries: Entries::new() });
+                    let container = self.app_prefs.parent().and_then(Path::parent).unwrap_or(&self.app_prefs).to_path_buf();
+                    self.stores.push(Tracked { store, container, file, stamp: None, entries: Entries::new(), live: false });
                     grew = true;
                 }
             }
@@ -285,6 +300,11 @@ impl Tracker {
             if now == tracked.stamp {
                 continue;
             }
+            if tracked.live {
+                // The observer has had these values from cfprefsd already (or newer ones).
+                tracked.stamp = now;
+                continue;
+            }
             let Ok(entries) = read_file(&tracked.file) else { continue };
             changes.extend(super::changes(&tracked.store, &tracked.entries, &entries, at));
             tracked.entries = entries;
@@ -292,6 +312,291 @@ impl Tracker {
         }
         (changes, grew)
     }
+
+    /// The in-device observer's arguments after the host's pid: each store's domain and the
+    /// container cfprefsd keeps it in, in order (its `snap <i>` lines name stores by that order).
+    pub fn observer_args(&self) -> Vec<String> {
+        self.stores.iter().flat_map(|t| [t.store.name.clone(), t.container.to_string_lossy().into_owned()]).collect()
+    }
+
+    /// Store `i`'s values as cfprefsd has them now (an observer's `snap`), `at` now: the keys that
+    /// changed. From here the observer follows the store, and its file (behind cfprefsd's memory)
+    /// isn't read. A store the observer wasn't given (`i` past them) is ignored.
+    pub fn observe(&mut self, i: usize, entries: Entries, at: Date) -> Vec<Change> {
+        let Some(tracked) = self.stores.get_mut(i) else { return Vec::new() };
+        let changes = super::changes(&tracked.store, &tracked.entries, &entries, at);
+        tracked.entries = entries;
+        tracked.live = true;
+        changes
+    }
+
+    /// The observer ended: each store is followed by its file again, from the file as it is now.
+    /// A file older than what the observer reported (cfprefsd hadn't written it yet) is not read
+    /// as a change back; the next time cfprefsd writes it, it is.
+    pub fn unobserved(&mut self) {
+        self.stores.iter_mut().for_each(Tracked::unobserve);
+    }
+
+    /// Store `i` is past the observer's cap (its `large`): its file follows it, as when the
+    /// observer ends, until the observer sends it again. Its name, unless the observer wasn't
+    /// given it.
+    pub fn too_large(&mut self, i: usize) -> Option<String> {
+        let tracked = self.stores.get_mut(i)?;
+        tracked.unobserve();
+        Some(tracked.store.name.clone())
+    }
+}
+
+impl Tracked {
+    fn unobserve(&mut self) {
+        if self.live {
+            self.live = false;
+            self.stamp = stamp(&self.file);
+        }
+    }
+}
+
+/// A line the in-device observer (`ios/prefswatch.m`) prints.
+#[derive(Debug, PartialEq)]
+pub enum ObserverLine {
+    /// `snap <i> <base64 binary plist>`: store `i`'s values as cfprefsd has them.
+    Snap(usize, Entries),
+    /// `ready`: it follows every store it was given.
+    Ready,
+    /// `large <i>`: store `i`'s values are past the observer's cap, so it doesn't send them (until
+    /// its next `snap` of the store).
+    Large(usize),
+    /// `error <why>`: it can't follow them, and exits.
+    Error(String),
+}
+
+/// One line of the observer's output.
+pub fn observer_line(line: &str) -> Result<ObserverLine, String> {
+    use base64::Engine as _;
+    let line = line.trim_end();
+    if line == "ready" {
+        return Ok(ObserverLine::Ready);
+    }
+    if let Some(why) = line.strip_prefix("error ") {
+        return Ok(ObserverLine::Error(why.to_owned()));
+    }
+    let bad = || format!("the preferences observer printed {:?}", line.chars().take(80).collect::<String>());
+    if let Some(i) = line.strip_prefix("large ") {
+        return i.parse().map(ObserverLine::Large).map_err(|_| bad());
+    }
+    let (i, b64) = line.strip_prefix("snap ").and_then(|rest| rest.split_once(' ')).ok_or_else(bad)?;
+    let i = i.parse().map_err(|_| bad())?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).map_err(|_| bad())?;
+    Ok(ObserverLine::Snap(i, plist::entries(&bytes)?))
+}
+
+/// How a feed waits for its files to change: kqueue on a device, a fake in tests.
+pub trait Files: Send {
+    /// Waits for a change to a watched path, or a tick with none.
+    fn wait(&mut self);
+    /// Watches `paths` from now on.
+    fn set(&mut self, paths: &[PathBuf]);
+}
+
+/// A feed's in-device observer: its output, and how to stop it (called at most once, and only
+/// while its output is open, so the process is still the observer).
+pub struct Observer {
+    pub reader: Box<dyn std::io::Read + Send>,
+    pub stop: Box<dyn FnOnce() + Send>,
+}
+
+/// The longest line read from the observer: well past its largest `snap` (`kMaxSnap` in
+/// `ios/prefswatch.m`, 256 KiB of plist sent as base64). A longer line isn't read whole: it ends
+/// the observer.
+const MAX_LINE: usize = 1 << 20;
+
+/// How following the observer's output ended.
+#[derive(Debug, PartialEq)]
+enum Followed {
+    /// Its output closed (it exited, or was stopped), after it was `ready` or not.
+    Closed { ready: bool },
+    /// It said why it can't follow the stores (`error`), and its output then closed.
+    Refused(String),
+    /// The feed ended; the observer is still running.
+    FeedEnded,
+    /// Its output can't be followed (a line that isn't one of its lines, or too long to be); it
+    /// may still be running.
+    Unreadable(String),
+}
+
+/// Follows the observer's output into the tracker and `sink` until it ends. `say` gets a notice
+/// for a store too large for the observer to send.
+fn follow_observer(reader: impl std::io::Read, tracker: &Mutex<Tracker>, sink: &super::Sink, say: &dyn Fn(String)) -> Followed {
+    let mut reader = std::io::BufReader::new(reader);
+    let mut buf = Vec::new();
+    let mut ready = false;
+    loop {
+        let line = match next_line(&mut reader, &mut buf) {
+            Ok(Some(line)) => line,
+            Ok(None) => return Followed::Closed { ready },
+            Err(why) => return Followed::Unreadable(why),
+        };
+        match observer_line(&line) {
+            Err(why) => return Followed::Unreadable(why),
+            Ok(ObserverLine::Ready) => ready = true,
+            Ok(ObserverLine::Error(why)) => {
+                // It exits after saying so: once its output closes, it is known to have.
+                std::io::copy(&mut reader, &mut std::io::sink()).ok();
+                return Followed::Refused(why);
+            }
+            Ok(ObserverLine::Large(i)) => {
+                let mut tracker = lock(tracker);
+                if let Some(name) = tracker.too_large(i) {
+                    say(format!(
+                        "simee: {}'s {name} preferences are too large for the observer to send (over 256 KiB): the feed follows its file until they fit (cfprefsd writes it about every 10 s)",
+                        tracker.app
+                    ));
+                }
+            }
+            Ok(ObserverLine::Snap(i, entries)) => {
+                // Under the tracker's lock, so a file's changes and the observer's go out in order.
+                let mut tracker = lock(tracker);
+                if !tracker.observe(i, entries, Date::now()).into_iter().all(|change| sink.send(change)) {
+                    return Followed::FeedEnded;
+                }
+            }
+        }
+    }
+}
+
+/// The observer's next line, without its newline; `None` once its output has closed. A line past
+/// [`MAX_LINE`] is not read whole: an error.
+fn next_line(reader: &mut impl std::io::BufRead, buf: &mut Vec<u8>) -> Result<Option<String>, String> {
+    use std::io::{BufRead as _, Read as _};
+    buf.clear();
+    let limit = u64::try_from(MAX_LINE).unwrap_or(u64::MAX).saturating_add(1);
+    let n = reader.by_ref().take(limit).read_until(b'\n', buf).map_err(|e| format!("reading the preferences observer: {e}"))?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    } else if buf.len() > MAX_LINE {
+        return Err(format!("the preferences observer printed a line longer than {MAX_LINE} bytes"));
+    }
+    String::from_utf8(std::mem::take(buf)).map(Some).map_err(|_| "the preferences observer printed a line that isn't UTF-8".into())
+}
+
+/// The observer's stop, shared by the feed's two threads: whichever ends first stops it, once,
+/// and never after its output has closed (it exited, and its pid may be another process's).
+struct Stopper {
+    stop: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+impl Stopper {
+    /// Stops the observer, unless it was stopped or has exited.
+    fn stop(&self) {
+        let stop = {
+            let mut stop = self.stop.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let taken = stop.take();
+            if taken.is_some() {
+                self.stopped.store(true, std::sync::atomic::Ordering::Release);
+            }
+            taken
+        };
+        if let Some(stop) = stop {
+            stop();
+        }
+    }
+
+    /// Its output has closed: it isn't signalled from now on. Whether the feed stopped it.
+    fn closed(&self) -> bool {
+        self.stop.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        self.stopped.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+fn lock(tracker: &Mutex<Tracker>) -> std::sync::MutexGuard<'_, Tracker> {
+    tracker.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Runs a feed of `tracker`'s stores into `sink` on its own threads, until the feed ends or
+/// `alive` (the device is booted) turns false. The files are watched throughout (`files` already
+/// watches `tracker.paths()`); while `observer` follows a store, its changes come from cfprefsd
+/// as they are made and its file isn't read. An observer that can't follow the stores, or exits,
+/// leaves the feed on the files, and `say`s why in one line (stderr on a device). When the feed
+/// ends, or the observer's output can't be followed, the observer is stopped.
+pub fn run_feed(
+    tracker: Tracker,
+    sink: super::Sink,
+    mut files: impl Files + 'static,
+    alive: impl Fn() -> bool + Send + Sync + 'static,
+    observer: Option<Observer>,
+    say: impl Fn(String) + Send + 'static,
+) -> Result<(), String> {
+    use std::sync::Arc;
+    let app = tracker.app.clone();
+    let tracker = Arc::new(Mutex::new(tracker));
+    let sink = Arc::new(sink);
+    let alive = Arc::new(alive);
+    let mut stopper = None;
+    if let Some(Observer { reader, stop }) = observer {
+        let helper = Arc::new(Stopper { stop: Mutex::new(Some(stop)), stopped: false.into() });
+        let (t, s, a, h) = (tracker.clone(), sink.clone(), alive.clone(), helper.clone());
+        std::thread::Builder::new()
+            .name("simee-prefs-ios-observer".into())
+            .spawn(move || {
+                let why = match follow_observer(reader, &t, &s, &say) {
+                    // Closed by the feed's own stop: not a fallback.
+                    Followed::Closed { ready } => (!h.closed()).then(|| {
+                        let why = if ready { "exited" } else { "exited before it followed the stores" };
+                        format!("the preferences observer {why}")
+                    }),
+                    Followed::Refused(why) => {
+                        h.closed();
+                        Some(why)
+                    }
+                    Followed::FeedEnded => {
+                        h.stop();
+                        None
+                    }
+                    Followed::Unreadable(why) => {
+                        h.stop();
+                        Some(why)
+                    }
+                };
+                lock(&t).unobserved();
+                if let Some(why) = why
+                    && s.is_open()
+                    && a()
+                {
+                    say(format!(
+                        "simee: {app}'s preferences feed follows the files from now on (cfprefsd writes them about every 10 s): {why}"
+                    ));
+                }
+            })
+            .map_err(|e| format!("can't start the preferences observer's reader: {e}"))?;
+        stopper = Some(helper);
+    }
+    std::thread::Builder::new()
+        .name("simee-prefs-ios".into())
+        .spawn(move || {
+            while sink.is_open() && alive() {
+                // Watched again before looking: a replaced file is a new inode, and a change made
+                // from here on wakes the next wait.
+                files.wait();
+                let mut tracker = lock(&tracker);
+                files.set(&tracker.paths());
+                let (changes, grew) = tracker.poll(Date::now());
+                if !changes.into_iter().all(|change| sink.send(change)) {
+                    break;
+                }
+                if grew {
+                    files.set(&tracker.paths());
+                }
+            }
+            if let Some(helper) = stopper {
+                helper.stop();
+            }
+        })
+        .map_err(|e| format!("can't start the preferences watcher: {e}"))?;
+    Ok(())
 }
 
 /// Whether the device whose directory is `device_dir` is booted, from the `state` in its
@@ -362,6 +667,11 @@ pub struct Ios {
     /// Where devices' directories are (`<root>/<UDID>/data`).
     devices: PathBuf,
     by_device: HashMap<String, Device>,
+    /// The device set `devices` is, when it isn't the default set (#409).
+    set: Option<String>,
+    /// How to connect to the simulator service on that set (the calling session's way).
+    #[cfg(target_os = "macos")]
+    open: Option<crate::ios::Opener>,
     #[cfg(target_os = "macos")]
     ctx: Option<sim_coresim::Context>,
 }
@@ -378,9 +688,19 @@ impl Ios {
         Ios {
             devices,
             by_device: HashMap::new(),
+            set: None,
+            #[cfg(target_os = "macos")]
+            open: None,
             #[cfg(target_os = "macos")]
             ctx: None,
         }
+    }
+
+    /// The devices of the device set at `set` (#409), whose directory holds them as the default
+    /// set's does, connecting to the service through `open`.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn in_set(set: String, open: crate::ios::Opener) -> Ios {
+        Ios { set: Some(set.clone()), open: Some(open), ..Ios::with_root(PathBuf::from(set)) }
     }
 
     fn data(&self, udid: &str) -> Result<PathBuf, String> {
@@ -388,7 +708,8 @@ impl Ios {
         if data.is_dir() {
             Ok(data)
         } else {
-            Err(format!("{} doesn't exist: is `{udid}` a simulator of the default device set?", data.display()))
+            let set = self.set.as_deref().map_or_else(|| "the default device set".to_owned(), |set| format!("the device set {set}"));
+            Err(format!("{} doesn't exist: is `{udid}` a simulator of {set}?", data.display()))
         }
     }
 
@@ -425,8 +746,8 @@ impl Ios {
         };
         let mut located = Vec::with_capacity(stores.len());
         for store in stores {
-            let (_, file) = self.locate(udid, &store)?;
-            located.push((store, file));
+            let (container, _) = self.locate(udid, &store)?;
+            located.push((store, container));
         }
         Ok(Tracker::new(app, app_prefs, store.is_none(), located))
     }
@@ -437,18 +758,37 @@ mod device {
     use std::time::Duration;
 
     use super::super::{AppState, Backend, Entries, Op, Sink, Store, Visibility, WriteResult};
-    use super::{Date, Ios, parse_read_reply, write_request};
+    use super::{Files, Ios, Observer, Tracker, parse_read_reply, write_request};
 
     /// The in-device helper's source (`native/prefstool.m`).
     const SOURCE: &str = include_str!("../../native/prefstool.m");
+    /// The in-device observer's source: a feed's changes from cfprefsd as they are made.
+    const WATCH_SOURCE: &str = include_str!("ios/prefswatch.m");
     /// How often a feed's watcher wakes with nothing changed, to see whether its feed or device
     /// has ended (and to catch a store whose directory didn't exist to be watched).
     const TICK: Duration = Duration::from_millis(500);
 
+    /// A feed's files, watched with kqueue.
+    struct Kqueue(sim_coresim::FileWatch);
+
+    impl Files for Kqueue {
+        fn wait(&mut self) {
+            // A failed wait (it never has) falls back to looking every tick.
+            self.0.wait(TICK).ok();
+        }
+
+        fn set(&mut self, paths: &[std::path::PathBuf]) {
+            self.0.set(paths).ok();
+        }
+    }
+
     impl Ios {
         fn sim(&mut self, udid: &str) -> Result<sim_coresim::Device, String> {
             if self.ctx.is_none() {
-                self.ctx = Some(sim_coresim::Context::new().map_err(|e| e.to_string())?);
+                self.ctx = Some(match &self.open {
+                    Some(open) => open(self.set.as_deref())?,
+                    None => sim_coresim::Context::new().map_err(|e| e.to_string())?,
+                });
             }
             let ctx = self.ctx.as_ref().ok_or("no service connection")?;
             let device = ctx.device(udid).map_err(|e| e.to_string())?;
@@ -462,15 +802,37 @@ mod device {
             Ok(device)
         }
 
-        /// Runs the helper in the device; its stdout.
-        fn helper(&mut self, udid: &str, args: &[String]) -> Result<String, String> {
+        /// The booted device and the in-device program `name` built from `source` for its runtime
+        /// (built on first use and cached).
+        fn tool(&mut self, udid: &str, name: &str, source: &str) -> Result<(sim_coresim::Device, String), String> {
             let device = self.sim(udid)?;
             let sdk = sim_netshape::Sdk::for_runtime(&device.info().runtime_id).map_err(|_| {
                 format!("app preferences are written on iOS, iPadOS and tvOS devices; `{}` isn't one", device.info().runtime_id)
             })?;
-            let tool = sim_netshape::objc_tool(sdk, "prefstool", SOURCE, &["-framework", "Foundation"])?;
-            let out = device.exec(&tool.display().to_string(), args, &[]).map_err(|e| e.to_string())?;
+            let tool = sim_netshape::objc_tool(sdk, name, source, &["-framework", "Foundation"])?;
+            Ok((device, tool.display().to_string()))
+        }
+
+        /// Runs the helper in the device; its stdout.
+        fn helper(&mut self, udid: &str, args: &[String]) -> Result<String, String> {
+            let (device, tool) = self.tool(udid, "prefstool", SOURCE)?;
+            let out = device.exec(&tool, args, &[]).map_err(|e| e.to_string())?;
             Ok(out.stdout)
+        }
+
+        /// Starts the in-device observer of `tracker`'s stores (`ios/prefswatch.m`). It exits by
+        /// itself when this process does; `stop` signals it.
+        fn observer(&mut self, udid: &str, tracker: &Tracker) -> Result<Observer, String> {
+            let (device, tool) = self.tool(udid, "prefswatch", WATCH_SOURCE)?;
+            let mut args = vec![std::process::id().to_string()];
+            args.extend(tracker.observer_args());
+            let (pid, reader) = device.exec_stream(&tool, &args, &[]).map_err(|e| e.to_string())?;
+            // The device's programs are host processes; the feed signals it only while its output
+            // is open (it hasn't exited), so the pid is still its own.
+            let stop = move || {
+                let _ = std::process::Command::new("/bin/kill").arg(pid.to_string()).status();
+            };
+            Ok(Observer { reader: Box::new(reader), stop: Box::new(stop) })
         }
     }
 
@@ -508,30 +870,19 @@ mod device {
         }
 
         fn watch(&mut self, device: &str, app: &str, store: Option<&Store>, sink: Sink) -> Result<(), String> {
-            let mut tracker = self.tracker(device, app, store)?;
+            let tracker = self.tracker(device, app, store)?;
             let device_dir = self.devices.join(device);
             let mut watch = sim_coresim::FileWatch::new().map_err(|e| format!("kqueue: {e}"))?;
             watch.set(&tracker.paths()).map_err(|e| format!("kqueue: {e}"))?;
-            std::thread::Builder::new()
-                .name("simee-prefs-ios".into())
-                .spawn(move || {
-                    while sink.is_open() && super::booted(&device_dir) {
-                        // A failed wait (it never has) falls back to looking every tick.
-                        watch.wait(TICK).ok();
-                        // Watched again before looking: a replaced file is a new inode, and a
-                        // change made from here on wakes the next wait.
-                        watch.set(&tracker.paths()).ok();
-                        let (changes, grew) = tracker.poll(Date::now());
-                        if !changes.into_iter().all(|change| sink.send(change)) {
-                            return;
-                        }
-                        if grew {
-                            watch.set(&tracker.paths()).ok();
-                        }
-                    }
+            // The observer brings each change as it is made; without it (it can't be built or
+            // started here) the files bring it when cfprefsd writes them.
+            let observer = self
+                .observer(device, &tracker)
+                .inspect_err(|why| {
+                    eprintln!("simee: {app}'s preferences feed follows the files (cfprefsd writes them about every 10 s): {why}");
                 })
-                .map_err(|e| format!("can't start the preferences watcher: {e}"))?;
-            Ok(())
+                .ok();
+            super::run_feed(tracker, sink, Kqueue(watch), move || super::booted(&device_dir), observer, |line| eprintln!("{line}"))
         }
     }
 }

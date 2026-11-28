@@ -99,29 +99,62 @@ impl<T> Drop for Worker<T> {
     }
 }
 
-/// Where a screenshot taken now is saved: the Desktop, or the temp dir without a home.
-pub fn screenshot_path() -> PathBuf {
-    let dir = std::env::var("HOME").map(|h| PathBuf::from(h).join("Desktop")).unwrap_or_else(|_| std::env::temp_dir());
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    dir.join(format!("simee-{secs}.png"))
+/// Where a screenshot taken now is saved: in `folder` (the settings' screenshot folder) while it
+/// is a directory, else the Desktop, or the temp dir without a home.
+pub fn screenshot_path(folder: Option<&std::path::Path>) -> PathBuf {
+    let desktop = || std::env::var("HOME").map(|h| PathBuf::from(h).join("Desktop")).unwrap_or_else(|_| std::env::temp_dir());
+    let dir = folder.filter(|f| f.is_dir()).map_or_else(desktop, std::path::Path::to_path_buf);
+    let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    unique_path(&dir, &format!("simee-{millis}"))
 }
 
-/// Encodes a frame as PNG and writes it to `path` on its own thread; the result goes to `outbox`.
-pub fn save_png(frame: sim_core::frame::Frame, path: PathBuf, outbox: Outbox) {
+/// `<dir>/<stem>.png`, or `<stem>-2.png`, `-3`… when that name is taken: quick shots stack in the
+/// preview, so two in the same moment must not overwrite one file.
+fn unique_path(dir: &std::path::Path, stem: &str) -> PathBuf {
+    let first = dir.join(format!("{stem}.png"));
+    if !first.exists() {
+        return first;
+    }
+    (2..).map(|n| dir.join(format!("{stem}-{n}.png"))).find(|p| !p.exists()).expect("a free name")
+}
+
+#[cfg(test)]
+mod screenshot_name_tests {
+    #[test]
+    fn a_taken_name_gets_a_suffix_instead_of_being_overwritten() {
+        let dir = std::env::temp_dir().join(format!("simee-shot-name-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let a = super::unique_path(&dir, "simee-1");
+        std::fs::write(&a, b"x").expect("write");
+        let b = super::unique_path(&dir, "simee-1");
+        assert_ne!(a, b);
+        assert!(b.ends_with("simee-1-2.png"), "{}", b.display());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Encodes a frame as PNG and writes it to `path` on its own thread; the result goes to `outbox`,
+/// and the saved PNG to `saved` (for the screenshot preview).
+pub fn save_png(frame: sim_core::frame::Frame, path: PathBuf, outbox: Outbox, saved: impl FnOnce(PathBuf, Vec<u8>) + Send + 'static) {
     let spawned = std::thread::Builder::new().name("simee-screenshot".into()).spawn({
         let outbox = outbox.clone();
-        move || outbox.post(write_png(&frame, &path))
+        move || match write_png(&frame, &path) {
+            Ok(png) => {
+                outbox.post(format!("saved {}", path.display()));
+                saved(path, png);
+            }
+            Err(e) => outbox.post(format!("screenshot failed: {e}")),
+        }
     });
     if let Err(e) = spawned {
         outbox.post(format!("screenshot failed: {e}"));
     }
 }
 
-fn write_png(frame: &sim_core::frame::Frame, path: &std::path::Path) -> String {
-    match sim_core::frame::encode_png(frame).and_then(|png| std::fs::write(path, png).map_err(|e| e.to_string())) {
-        Ok(()) => format!("saved {}", path.display()),
-        Err(e) => format!("screenshot failed: {e}"),
-    }
+fn write_png(frame: &sim_core::frame::Frame, path: &std::path::Path) -> Result<Vec<u8>, String> {
+    let png = sim_core::frame::encode_png(frame)?;
+    std::fs::write(path, &png).map_err(|e| e.to_string())?;
+    Ok(png)
 }
 
 #[cfg(test)]
@@ -203,7 +236,7 @@ mod tests {
     fn screenshots_are_written_off_the_ui_thread() {
         let path = std::env::temp_dir().join(format!("rs-shot-{}.png", std::process::id()));
         let outbox = Outbox::default();
-        save_png(sim_core::frame::Frame { width: 2, height: 1, rgba: vec![255; 8] }, path.clone(), outbox.clone());
+        save_png(sim_core::frame::Frame { width: 2, height: 1, rgba: vec![255; 8] }, path.clone(), outbox.clone(), |_, _| {});
         let start = std::time::Instant::now();
         let line = loop {
             if let Some(l) = outbox.take().pop() {

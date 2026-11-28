@@ -43,9 +43,11 @@ recoverable from what was recorded, or they need something the repository doesn'
 | [Idle host CPU, the NAT](#idle-host-cpu) | 5.9% of a core | not measured | M3 Max, 2026-11-25 | `scripts/bench/android-net.sh --mode idle` |
 | [NAT throughput](#idle-host-cpu) | 610 MB/s up, 2.1 GB/s down | not measured | M3 Max, 2026-11-25 | `scripts/bench/android-net.sh --mode throughput` |
 | [Frame pacing](#frame-pacing) | 0% / 0.25% janky | SDK emulator 5.6% / 6.2% | M3 Max, 2026-11-25 | `scripts/bench/android-frames.sh --device tablet\|phone` |
+| [Software mode on KVM, API 36 x86_64](#android-software-mode-on-kvm-githubs-x86_64-runner) | 28.8 s cold, 16.6 s warm, 2.27 GB | SDK emulator 37.3.10 30.3 s, 19.2 s, 3.00 GB | GitHub `ubuntu-latest` VM (4-vCPU Xeon 8573C), 2026-11-27 | `scripts/bench/android-boot.sh --image system-images/android-36/default/x86_64 --lcd 720x1280@320` |
 | [Software mode, CPU model](#android-software-mode-linux-without-kvm) | zygote 49.4 s | | 4-vCPU Xeon VM, 2026-11-26 | `scripts/bench/software-mode.sh --arms "tcg:…"` |
 | [Software mode, boot](#boot-to-sysboot_completed-with-emus-devices) | 168 s, 0.75 cores idle | SDK emulator `-accel off` 2302 s, 1.09 cores | 4-vCPU Xeon VM, 2026-11-26 | `scripts/bench/software-mode.sh --arms "emu stock"` |
 | [Software mode, `emu -avd`](#software-mode-through-emu--avd) | 161 s, tap 60.8 ms, screenshot 36.9 ms | SDK emulator unusable | 4-vCPU Xeon VM, 2026-11-26 | `android-frames.sh`, `api-steps.sh --android` |
+| [Software mode, software-lite profile](#software-mode-a-smaller-screen-and-30-hz) | 0.53 cores idle, 2.01 cores swiping, p90 frame 200 ms | default profile 0.59, 2.43, 300 ms | 4-vCPU Xeon VM, 2026-11-28 | `scripts/bench/software-profile.sh --rounds 3 --arms "default lcd540 vsync30 lite shipped"` (the software-lite numbers are the `shipped` arm) |
 | [Android farm](#android-farm) | 8 settled in 266 s | not measured | not recorded, before 2026-11-24 | `scripts/bench/android-farm.sh` |
 | [Device bundles](#android-device-bundles) | 1225 MB, 7.2 s export, 6.7 s import | no stock tool | M3 Max, 2026-11-27 | `scripts/bench/android-bundle.sh` |
 | [iOS boot](#ios-simee-against-simctl) | 15.5 s first, 2.3 s later | `simctl` 18.9 s, 2.3 s | M3 Max, 2026-11-24 | `scripts/bench/ios-boot.sh` |
@@ -57,6 +59,7 @@ recoverable from what was recorded, or they need something the repository doesn'
 | [Emulator internals](#emulator-internals) | before/after rows | | various | see the section |
 | [`launch` with and without restart](#launch-with-and-without-restart) | 17–136 ms | | M3 Max, 2026-11-27 | `scripts/bench/ios-api.py --suite launch` |
 | [Per-call device lookup](#per-call-device-lookup-on-a-crowded-host) | 0.66 / 0.04 ms | simee before: 1.54 / 0.34 ms | M3 Max, 2026-11-26 | `ios-api.py --suite lookup` |
+| [Android device resolution](#android-device-resolution) | exact name 0.14 ms, `booted` 0.39 ms (kept); one-shot call 6.7 ms | simee before: 0.25, 2.02 ms; 21 ms | 4-vCPU Xeon VM (Linux), 2026-11-28 | `scripts/bench/android-resolve.py --baseline …` |
 | [Introspection](#introspection-processes-connections-kill-network_state) | 2.5–3.5 ms | `ps`/`lsof`/`kill`: 126–191 ms | M3 Max, 2026-11-27 | `ios-api.py --suite introspection` |
 | [iPad pointer click](#ipad-pointer-click) | 408 ms later click | simee before: 3641 ms | M3 Max, 2026-11-27 | `ios-api.py --suite pointer` (timings) |
 | [iOS input defaults](#ios-input-defaults) | tap 12.6 ms, type 20 chars 121 ms | simee before: 64.5, 749 ms | M3 Max, 2026-11-27 | `ios-api.py --suite input` (timings) |
@@ -64,6 +67,7 @@ recoverable from what was recorded, or they need something the repository doesn'
 | [iOS memory tools](#ios-memory-tools) | `mem_vmmap` 0.60 s … `mem_leaks` 2.30 s | | M3 Max, 2026-11-27 | `ios-api.py --suite mem` |
 | [Desktop: Metal against wgpu](#desktop-runes-native-metal-backend-against-wgpu) | | | M3 Max, 2026-11-27 | no script (below) |
 | [MCP server](#mcp-server) | 1 crate | `rmcp`: 75 crates, 41 s build | Linux VM, 2026-11-26 | `scripts/bench/mcp-build.sh` |
+| [MCP idle subscription](#mcp-idle-subscription) | 1 wake-up a second, 0 ms CPU in 10 s | simee before: 98.5 wake-ups a second, 40 ms | 4-vCPU Xeon VM, 2026-11-27 | `cargo test --release -p simee-mcp idle_subscription -- --ignored --nocapture` |
 | [Build times](#build-times-local) | 74–77 CPU s | simee before: 131–136 | Apple silicon, 2026-11-26 | `scripts/bench/build-times.sh` |
 
 ## Android: emu against the SDK emulator
@@ -270,6 +274,41 @@ need a build from before the Vulkan-only renderer (2026-11-25) as the emu arm.
 Both display at 60 Hz. The stock emulator's tablet rendered about 1350 frames over the swipes and
 emu's about 530; emu with the guest on stock's GLES driver (`EMU_GUEST_EGL=emulation`) rendered
 1254, so the count follows the guest's driver. On the phone both render about 790.
+
+## Android: software mode on KVM (GitHub's x86_64 runner)
+
+Software mode with QEMU on the host's KVM (`-accel kvm -cpu host`, chosen automatically when
+`/dev/kvm` is usable) against the SDK emulator 37.3.10 on the same KVM, on a GitHub-hosted
+`ubuntu-latest` runner: a VM with 4 vCPUs of a Xeon Platinum 8573C and 15.6 GB, Ubuntu 26.04
+(kernel 7.0, Azure), 2026-11-27, simee 4605415. API 36 `default` x86_64 image, 720x1280@320, 4
+vCPUs and 2 GB per AVD, a new AVD each round (`-no-golden`), the arms' order alternating, medians
+of 3 rounds ([run 46070750188](https://github.com/kaeawc/simee/actions/runs/46070750188), the
+`Software mode` workflow's kvm leg; a manual or main run repeats it):
+
+```bash
+scripts/bench/android-boot.sh --image system-images/android-36/default/x86_64 --lcd 720x1280@320
+```
+
+| Measure | emu | SDK emulator 37.3.10 |
+| --- | --- | --- |
+| cold: launch until sys.boot_completed, s | **28.8** (28.8, 29.3, 28.3) | 30.3 (30.7, 30.3, 28.9) |
+| cold: launch until adb lists the device, s | **16.7** (16.7, 17.1, 16.7) | 19.2 (19.9, 19.2, 18.7) |
+| cold: peak RSS of the process tree, MB | **2270** | 2999 |
+| warm: launch until sys.boot_completed, s | **16.6** (16.6, 16.4, 16.7) | 19.2 (19.5, 19.2, 19.1) |
+| warm: launch until adb lists the device, s | **6.8** (6.1, 6.8, 7.1) | 10.8 (10.8, 10.8, 10.7) |
+| warm: peak RSS of the process tree, MB | **1858** | 1954 |
+| warm: guest 4x md5 of 64 MiB, s | 0.35 | 0.52 |
+| warm: guest 100k shell loop, s | 0.74 | 0.77 |
+| warm: adb shell echo, s | 0.04 | 0.04 |
+
+Three of the twelve boots (emu cold in round 3, both warm boots in round 2) saw a 1-minute load
+just above the 4 CPUs at a sample (`starved=yes`); each is inside the other rounds' spread, and
+without them the medians are emu 29.1 s cold and 16.7 s warm, the SDK emulator 30.3 s and 19.3 s.
+Both use the renderer from the same emulator package. emu uses it on SwiftShader Vulkan. The SDK emulator's
+default for `-no-window` on a host with no GPU is lavapipe Vulkan with SwANGLE GLES (`emuglConfig_init:
+vulkan_mode_selected:lavapipe gles_mode_selected:swangle` in its log). `cold` includes each one
+formatting its own userdata. The runner is a shared cloud
+VM, so absolute times move between runs; the comparison is within one run.
 
 ## Android: software mode (Linux without KVM)
 
@@ -519,6 +558,84 @@ a fresh userdata reached `sys.boot_completed` in 243.9 s (one run). This host's 
 Where software mode spends its time, phase by phase, with its own reproduction steps:
 [research/software-mode-profile.md](research/software-mode-profile.md) (a profile on a
 Firecracker VM, 2026-11-27, not a comparison).
+
+### Software mode: a smaller screen and 30 Hz
+
+The `software-lite` profile (`emu -create-avd NAME -sysdir … -profile software-lite`: 540x960 at
+240 dpi and `hw.lcd.vsync=30`) against the default 720x1280 at 320 dpi and 60 Hz, and each half
+alone. Five arms on one 4-vCPU Intel Xeon 2.2 GHz Firecracker VM, no `/dev/kvm`, 2026-11-28 (the
+run started 00:33 UTC and took 2 h 45 min); QEMU 11.1.3, emu from `39359d6`, API 36 `default`
+x86_64 r2, 4 vCPUs and 1.5 GB for the guest. The first four arms are one AVD whose `config.ini` the
+script rewrites between boots (the same userdata, animations on); the fifth, `shipped`, is an AVD
+made with `emu -create-avd … -profile software-lite` and never rewritten, so it boots from the
+golden user data built for 540x960. Three rounds, each booting the five arms warm in turn (the
+order alternating between rounds), after one uncounted first boot per AVD: 15 boots, the median
+with the three runs in round order in parentheses. Idle is emu's and QEMU's CPU time over the 60 s
+that start 240 s after `sys.boot_completed` (the same offset for every arm); the swipes are
+`scripts/android-jank.sh` (10 up and 10 down launcher swipes over adb, about 46 s), twice per
+boot, the first run being the coldest; frames per second is the launcher's frames over the run's
+wall time; memory is the emu and QEMU processes' proportional set size after the swipes (shared
+guest RAM counted once) and the peak sum of their resident sizes sampled during the boot. Host load
+(1-minute average at the end of each idle window) was 0.4 to 1.9: the guest's own, with nothing
+else running.
+
+```bash
+scripts/bench/software-profile.sh --qemu <qemu-system-x86_64> --rounds 3 --arms "default lcd540 vsync30 lite shipped"
+```
+
+| Measure | default | 540x960 only | 30 Hz only | software-lite, `config.ini` rewritten | software-lite, made by `-create-avd` |
+| --- | --- | --- | --- | --- | --- |
+| Warm boot to `sys.boot_completed` | 169.8 s (182.5, 169.8, 169.8) | 156.9 s (156.4, 182.7, 156.9) | 165.7 s (166.6, 165.7, 163.5) | 156.4 s (194.8, 156.4, 154.9) | 181.9 s (175.2, 186.6, 181.9) |
+| Warm boot to the launcher | 225.7 s (240.5, 225.7, 216.0) | 201.2 s (201.2, 228.0, 195.2) | 206.4 s (206.4, 220.7, 203.7) | 188.4 s (241.1, 188.4, 188.2) | 219.5 s (219.5, 229.8, 214.6) |
+| Idle host CPU (cores) | 0.59 (0.68, 0.59, 0.58) | 0.59 (0.63, 0.59, 0.50) | 0.49 (0.49, 0.52, 0.45) | 0.53 (0.53, 0.55, 0.51) | 0.53 (0.53, 0.53, 0.54) |
+| Swipes, second run: frames in 20 swipes | 185 (177, 194, 185) | 198 (204, 193, 198) | 174 (165, 174, 176) | 182 (168, 184, 182) | 185 (180, 185, 192) |
+| Swipes, second run: frames per second | 4.07 (3.82, 4.08, 4.07) | 4.49 (4.54, 4.27, 4.49) | 3.55 (3.31, 3.55, 3.79) | 3.92 (3.63, 4.03, 3.92) | 4.17 (3.81, 4.17, 4.37) |
+| Swipes, second run: frame time p50 / p90 | 200 / 300 ms | 150 / 250 ms | 200 / 350 ms | 150 / 250 ms | 129 / 200 ms |
+| Swipes, second run: janky frames | 97.2% (97.2, 97.4, 96.8) | 96.5% (95.6, 97.4, 96.5) | 93.1% (94.5, 93.1, 86.4) | 85.1% (85.1, 83.7, 87.4) | 80.7% (87.2, 79.5, 80.7) |
+| Swipes, second run: host CPU (cores) | 2.43 (2.43, 2.52, 2.35) | 2.15 (2.22, 2.14, 2.15) | 2.46 (2.46, 2.48, 2.18) | 2.11 (2.11, 2.08, 2.15) | 2.01 (2.13, 2.01, 1.93) |
+| Swipes, first run: frames in 20 swipes | 121 (112, 129, 121) | 128 (127, 128, 130) | 112 (80, 112, 118) | 118 (110, 125, 118) | 118 (110, 138, 118) |
+| Swipes, first run: frames per second | 2.70 (2.40, 2.86, 2.70) | 2.85 (2.82, 2.85, 2.94) | 2.39 (1.56, 2.39, 2.57) | 2.63 (2.49, 2.80, 2.63) | 2.68 (2.36, 3.16, 2.68) |
+| Swipes, first run: frame time p50 / p90 | 150 / 350 ms | 150 / 250 ms | 150 / 350 ms | 150 / 250 ms | 133 / 250 ms |
+| Swipes, first run: janky frames | 95.5% (95.5, 95.3, 96.7) | 94.5% (96.8, 94.5, 90.8) | 84.8% (90.0, 84.8, 83.9) | 78.4% (76.4, 78.4, 81.4) | 74.6% (83.6, 71.7, 74.6) |
+| Swipes, first run: host CPU (cores) | 3.21 (3.24, 3.21, 2.96) | 2.95 (2.94, 2.95, 3.02) | 3.23 (3.44, 3.23, 2.96) | 2.91 (3.00, 2.89, 2.91) | 2.78 (3.13, 2.78, 2.73) |
+| Memory, PSS after the swipes (MB) | 2868 (2868, 2834, 2868) | 2824 (2845, 2824, 2810) | 2846 (2846, 2827, 2856) | 2804 (2804, 2843, 2795) | 2828 (2847, 2820, 2828) |
+| Memory, peak resident sum in the boot (MB) | 2634 (2658, 2630, 2634) | 2632 (2622, 2661, 2632) | 2630 (2630, 2562, 2643) | 2620 (2655, 2620, 2617) | 2650 (2632, 2650, 2652) |
+
+What it says, comparing arms within this one run:
+
+- **Idle: 30 Hz is the part that helps, and the two halves do not add.** The default settles at
+  0.59 cores (0.58 to 0.68 over three boots), the screen alone at 0.59, 30 Hz alone at 0.49 and the
+  profile at 0.53 both ways it was made (0.51 to 0.55). That is 0.06 lower than the default, 10%,
+  and 0.04 higher than 30 Hz alone; with three boots per arm and the default's own 0.10 spread, the
+  profile's idle saving is a small one, and the 30 Hz arm's is the clearest.
+- **Swiping: the screen is the part that helps.** Host CPU in the second run is 2.43 cores for the
+  default, 2.15 for the screen alone, 2.46 for 30 Hz alone, 2.11 for the profile with `config.ini`
+  rewritten and 2.01 as shipped: 13% and 17% lower. The p90 frame time falls from 300 ms to 250
+  and 200 ms (350 ms for 30 Hz alone).
+- **Frames: no gain together.** A warm launcher drew 185 frames in 20 swipes by default, 198 with
+  the screen alone (+7%), 174 with 30 Hz alone (-6%), 182 and 185 with the profile: the same as
+  the default. The janky-frame share falls from 97% to 85% and 81%, mostly because a 30 Hz
+  deadline is 33 ms (30 Hz alone: 93%; the screen alone: 96%), so read the frame times.
+- **Boot and memory are not results.** The default's three warm boots ran 169.8 to 182.5 s, the
+  profile's 154.9 to 194.8 s, and the shipped AVD's 175.2 to 186.6 s: the spreads overlap. PSS and
+  peak resident size are within 2% in every arm; the guest's 1.5 GB and QEMU's translation cache
+  dominate them.
+- **`shipped` against `lite`:** the AVD made by `-create-avd` was 0.10 cores lower while swiping
+  (2.01 against 2.11) and 4 points less janky, with the same idle cost; both are inside this run's
+  spread, so it shows the shipped path boots and behaves like the rewritten one, not that it is
+  faster.
+
+An earlier run of this script on 2026-11-27 (12 boots, four arms) measured the profile's idle cost
+at 0.46 against 0.68 and its swipes at 1.99 against 2.41 cores, with an idle window that started
+relative to the launcher and not to `sys.boot_completed`. It is superseded by this table, which
+uses the script that ships; its numbers are not used anywhere. The host also reported 3.8 GiB of RAM
+when the run started (00:33 UTC) and 7.8 GiB when it ended (03:18 UTC); its 4 CPUs did not change.
+The script records RAM only at those two points, so when it changed is not known and neither is
+which boots ran on each side. Across the 15 boots PSS stays between 2795 and 2868 MB and peak
+resident size between 2562 and 2661 MB in every round, with no step, but that does not show the RAM
+was constant. The PSS here (about 2.8 GB) is higher than the first run's (2.3 GB), so do not compare
+memory across the two runs, and read the arms' differences as the ones within each round, where all
+five arms booted back to back.
 
 ## Android farm
 
@@ -785,6 +902,68 @@ until a rotation or fold. Reproduce: `python3 -I scripts/bench/ios-api.py --suit
 What `location` has left is the service's own round trip (`host_support_mig_set_location_lat_lon`,
 ~95% of its samples).
 
+### Android device resolution
+
+How long a call spends finding its device (#256), with 44 AVDs (phones, tablets, watches, TVs and
+cars, each with the `config.ini` avdmanager writes) and, in the second half of the table, two
+stand-ins for the stock emulator running (a process with a qemu's command line, `-port` from 5900,
+holding the AVD's `hardware-qemu.ini.lock`). Linux, 4-vCPU Xeon @ 2.20 GHz VM, 7.8 GB, Ubuntu
+22.04, 1-minute load under 3 (2026-11-28). **Not measured on macOS or with a real emulator.**
+Medians over 5 rounds of the p50 and p95 of 100 calls, the build before and after alternating.
+"Kept" is one connection to a `simee serve` that has been up a second; "one-shot" is a fresh
+`simee` process with no server on the socket, so it includes the process's start (`--version` is
+the floor: 4.7 ms). The calls fail, and the failure is what is timed, at different points:
+`tap` of an exact name fails after the device is resolved and before any network I/O (a stopped
+AVD isn't running, and a stand-in is a stock emulator, which refuses input over the display
+socket); `booted` fails inside resolution, with no running device ("no device matches `booted`")
+or, with 2 running, because it "matches several devices", so no device is picked and nothing
+after the lookup runs (`info booted` and `tap booted` in the 2-running column). Reproduce:
+`python3 -I scripts/bench/android-resolve.py --baseline <before build>`.
+
+| Call | none running, before → after (ms) | 2 running, before → after (ms) |
+| --- | --- | --- |
+| kept: `info` of an exact AVD name, p50 / p95 | 0.33 → 0.13 / 0.37 → 0.17 | 0.25 → 0.14 / 0.31 → 0.19 |
+| kept: `info` of `booted`, p50 / p95 | 2.10 → 0.36 / 2.39 → 0.40 | 2.02 → 0.39 / 2.23 → 0.52 |
+| kept: `devices` with `booted`, p50 / p95 | 2.20 → 0.80 / 2.36 → 1.90 | 2.07 → 0.85 / 2.30 → 1.49 |
+| kept: `devices`, p50 / p95 | 3.25 → 2.40 / 5.87 → 2.83 | 3.30 → 2.43 / 5.90 → 2.78 |
+| one-shot: `tap` of an exact name, p50 / p95 | 6.89 → 6.54 / 7.42 → 6.71 | 21.2 → 6.7 / 22.3 → 6.9 |
+| one-shot: `tap booted`, p50 / p95 | 11.7 → 7.9 / 12.0 → 8.4 | 32.7 → 8.2 / 36.4 → 8.7 |
+| one-shot: `list --booted`, p50 / p95 | 11.6 → 11.0 / 12.7 → 11.2 | 32.3 → 11.2 / 34.9 → 11.8 |
+| one-shot: `list`, p50 / p95 | 12.1 → 11.5 / 13.3 → 11.7 | 33.1 → 11.7 / 35.8 → 12.3 |
+
+What changed: the stock emulator's process facts (command line, listening ports) are read for the
+one PID a lock names, from `/proc/<pid>` on Linux and libproc on macOS, instead of a host-wide
+`ps -axo` and `lsof` (~60 ms each on a macOS host with ~1300 processes; `ps` here, with a few
+hundred processes, is ~20 ms). A kept server remembers them by (PID, start time). Each AVD's pointer
+and `config.ini` are parsed once and then validated by one `stat` (path, mtime, ctime, size, inode); an
+exact name is one `stat` of its pointer instead of listing the home; `booted` loads only the
+running AVDs' configs.
+
+What is left, measured. Kept `devices` is still about 2 ms (p50 2.01 ms with nothing running and
+1.93 with 2 running, p95 2.4 and 2.6; 2.01 and 2.20 on the build before the listing work below,
+which is no difference at this sample size: the per-round p50s of the same build range over
+0.5–2.3 ms, so none of the kept-connection rows moved by more than noise). Where the time goes in
+the server process on the same VM, p50 over 1000 calls, from the `listing_cost` test
+(`python3 -I scripts/bench/android-resolve.py --make-home DIR`, wait 3 s, then
+`SIMEE_BENCH_SDK=DIR/sdk SIMEE_BENCH_AVD_HOME=DIR/avd cargo test --release -p simee-android
+listing_cost -- --ignored --nocapture`): listing the home 0.005 ms, resolving each of the 44 AVDs'
+pointer and directory 0.11 ms, each one's lock 0.07 ms, describing each (config `stat`, image
+`stat`, the profile and the `DeviceInfo`) 0.23 ms, the whole `devices` 0.44 ms. The same test cut
+to `list_avds` and `devices` on the build before (`main` at #383, a copy of the test) gives 0.05–0.10
+and 0.59–0.62 ms, so the listing work is worth about 0.15 ms in the server. The rest of the 2 ms
+is the 10.7 KB reply: a call that does the same work and returns `[]` (`devices` with `booted`)
+takes 0.6–0.7 ms over the socket, and `help`, which computes in 0.1 ms, takes ~0.9 ms to arrive on
+this VM. So the listing is under 1 ms of server work and the call is not; getting the call under
+1 ms here is a matter of the connection's reply path (`crates/sim-api/src/lib.rs`), which was not
+changed. The listing's floor with exact validation is 5 system calls per AVD (pointer, directory,
+config, image, lock). The remembered listing of the home is not used when a pointer is a link or
+any read failed. `devices` with `booted` is 0.63 / 0.74 ms (none / 2 running) and `info` of
+`booted` 0.44 / 0.35 ms, also within noise of the build before.
+A cold one-shot `list` or fuzzy name
+reads every AVD's two files (about 700 system calls for 44 AVDs, ~5 ms over the floor); an on-disk
+cache would still `stat` each file, and wasn't built. With nothing running, the one-shot exact-name
+`tap` is within 1.7 ms of `--version`.
+
 ### Introspection: `processes`, `connections`, `kill`, `network_state`
 
 iPhone 17 Pro, iOS 27.2 (24B8117), freshly booted (~205 device processes, ~1200 on the host),
@@ -943,6 +1122,48 @@ No script: the runs open the desktop window on the host's display with a device 
 with a Rune `--window-script` file and read Rune's per-frame log and `ioreg`; the script files and
 the log parser used weren't checked in. The setup above is what to rebuild.
 
+## Video encode (H.264, VideoToolbox)
+
+`simee-encode` turning a device's frames into H.264 for the WebRTC publisher: 10 s per run with a
+swipe every 0.7 s, medians of 3 rounds, defaults (Constrained Baseline, 4 Mbit/s average, IDR every
+2 s), 2026-11-27, Apple M3 Max (Mac15,9), macOS 26.6.2, hardware encoder. Reproduce:
+`scripts/bench/encode.sh --udid <booted iPhone>` or `--avd <running AVD>`. The method, the full
+tables (latency p95, picture step, output rate, IDR sizes) and what the numbers say are in
+[streaming.md](streaming.md#encode-cost); the tablet and iPad rows are not measured yet.
+
+| Device, size, fps cap | Encoded, fps | Encode latency p50, ms | Encoding process CPU, % of a core |
+| --- | --- | --- | --- |
+| iPhone 17 Pro, 1206x2622, 30 | 26.8 | 17.28 | 2.7 |
+| iPhone 17 Pro, 1206x2622, 60 | 46.4 | 17.20 | 4.0 |
+| iPhone 17 Pro, 588x1280, 30 | 26.9 | 6.07 | 2.8 |
+| iPhone 17 Pro, 588x1280, 60 | 46.8 | 6.06 | 4.2 |
+| Android API 36, 1080x2400, 30 | 26.9 | 14.51 | 8.5 |
+| Android API 36, 1080x2400, 60 | 45.7 | 14.45 | 9.8 |
+| Android API 36, 576x1280, 30 | 22.1 | 5.80 | 6.9 |
+| Android API 36, 576x1280, 60 | 37.3 | 5.77 | 8.1 |
+
+## Video encode (H.264, OpenH264 on Linux)
+
+`simee-encode`'s Linux encoder (OpenH264 built from source, `--features openh264`) on synthetic
+phone screens, no device: an app drawer scrolling on a 1080x2400 screen presented at 60 fps,
+encoded through the real loop, 10 s per run, medians of 3 rounds, defaults (Constrained Baseline,
+4 Mbit/s average, IDR every 2 s), OpenH264 built with `nasm`, 2026-11-27. Host: a Linux VM,
+Intel Xeon @ 2.20 GHz, 4 vCPUs, 3.8 GB, Ubuntu 22.04, kernel 6.1.189. Reproduce:
+`scripts/bench/encode-linux.sh` (`OPENH264_NO_ASM=1` for the no-`nasm` row). Latency includes the
+colour conversion and scaling. The method, PSNR, bitrate and IDR sizes, and what the numbers say
+are in [streaming.md](streaming.md#encode-cost-on-linux). Synthetic screens, so a real device's
+bitrate will differ; this VM's numbers are not comparable with the Apple M3 Max rows above, and
+aarch64 speed is not measured.
+
+| Screen, size, fps cap | Encoded, fps | Encode latency p50, ms | Process CPU, % of a core |
+| --- | --- | --- | --- |
+| 1080x2400, 30 | 28.8 | 26.12 | 82 |
+| 1080x2400, 60 | 28.4 | 36.54 | 99 |
+| 1080x2400 capped at 1280 (576x1280), 30 | 29.8 | 22.39 | 68 |
+| 1080x2400 capped at 1280 (576x1280), 60 | 58.7 | 14.17 | 86 |
+| 1080x2400, 30, built without `nasm` | 13.6 | 61.82 | 100 |
+| 1080x2400 capped at 1280, 30, built without `nasm` | 24.6 | 35.00 | 98 |
+
 ## MCP server
 
 What the MCP server's protocol layer costs to build, against the official Rust SDK. Linux VM,
@@ -959,6 +1180,27 @@ count is `cargo tree --prefix none -e normal | sort -u | wc -l` in it (145 with 
 dependencies). `Cargo.lock` has 140 packages in all. Reproduce: `scripts/bench/mcp-build.sh`
 (it downloads `rmcp` into cargo's cache; nothing is added to this repository). Why this decides the protocol layer:
 [mcp.md](mcp.md#why-the-protocol-layer-is-hand-written).
+
+## MCP idle subscription
+
+What a subscribed resource costs while nothing changes: the watch thread's own wake-ups and CPU
+(`/proc/self/task/<tid>`), over 10 s after a 0.5 s settle, against a fake backend that answers at
+once, so it is the watcher and not the device. Linux VM, 4 vCPUs (Xeon @ 2.2 GHz, Linux 6.1),
+2026-11-27, release build, one run each (the numbers are counts, not timings). "Before" is
+`main` at 6ad2666, whose watcher slept in 10 ms steps and compared the clock, with the same test
+body copied in (the old `spawn` took one interval, 1 s).
+
+| Subscribed to | Wake-ups a second, before | after | CPU in 10 s, before | after | Reads in 10 s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| one screen | 98.5 | 1.0 | 40 ms | 0 ms (under the 10 ms tick) | 11 |
+| the resource list | 98.2 | 1.0 | 40 ms | 0 ms | 11 |
+| one screen and the list | 98.5 | 1.0 | 40 ms | 0 ms | 22 |
+
+The reads are the real cost on a device: a subscribed screen is one `screenshot` a second at the
+default pace (`SIMEE_MCP_SCREEN_FPS` raises or lowers it), and each is the call timed in
+[Time per automation step](#ios-simee-against-simctl). The host CPU of a subscribed screen on a
+device is [not yet measured](#not-yet-measured). A resource nobody subscribed to costs nothing:
+the server has no thread and makes no read (a test counts the backend's calls).
 
 ## Build times (local)
 
@@ -1114,6 +1356,9 @@ Claims that would belong in the README once someone runs them:
   device's directory (6,562 files), so the host's `mds_stores` indexes what devices write. What
   excluding `~/Library/Developer/CoreSimulator` from Spotlight saves a farm needs a change to the
   host's Spotlight privacy settings to measure.
+- Host CPU of an MCP client subscribed to a booted device's `screen`, `logs` and `processes`
+  resources, on iOS and Android, at the default pace and at `SIMEE_MCP_SCREEN_FPS=10`, against the
+  same device read by polling `screenshot` from the client.
 - Time per automation step through `simee mcp` (a `tools/call` of `tap`, then `screenshot`) against
   the socket API and the CLI on the same device.
 - A 10 ms `button` hold for the iPhone's side, Siri, Apple Pay, Action and volume buttons and on

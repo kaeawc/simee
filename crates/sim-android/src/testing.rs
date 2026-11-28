@@ -20,6 +20,11 @@ pub struct FakeEmulator {
     pub fold_status: Arc<Mutex<Option<String>>>,
     /// What simee's `rotation` answers: degrees the guest rotated its display (0 at first).
     pub rotation: Arc<Mutex<u32>>,
+    /// What each camera is linked to (`camera list`): `camera link` sets it, and a test can seed
+    /// it. Empty: `camera list` answers a bare `OK`.
+    pub cameras: Arc<Mutex<Vec<(String, String)>>>,
+    /// A facing (`back`, `front`) whose `camera link` fails with `KO`; None: none does.
+    pub camera_link_fails: Arc<Mutex<Option<String>>>,
 }
 
 /// Starts a fake emulator for AVD `avd` and advertises it in `android`'s running dir, so the AVD
@@ -41,48 +46,93 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
     let status = fold_status.clone();
     let rotation = Arc::new(Mutex::new(0));
     let turned = rotation.clone();
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("console");
+    let cameras: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let camera_link_fails: Arc<Mutex<Option<String>>> = Arc::default();
+    let (links, fails) = (cameras.clone(), camera_link_fails.clone());
+    // The advertised adb port is the console's plus one, so the console must not be on 65535 (an
+    // ephemeral port the OS hands out now and then): bind again, keeping the unusable one held so
+    // the next bind gets another.
+    let mut skipped = Vec::new();
+    let listener = loop {
+        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("console");
+        if l.local_addr().expect("addr").port() < u16::MAX {
+            break l;
+        }
+        skipped.push(l);
+    };
+    drop(skipped);
     let port = listener.local_addr().expect("addr").port();
     let log = console.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let mut out = stream.try_clone().expect("clone");
-            let _ = out.write_all(b"Android Console: type 'help' for a list of commands\r\nOK\r\n");
-            for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                let line = line.trim().to_owned();
-                if line == "quit" {
-                    break;
-                }
-                let reply = match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-                    // Authentication is the session's, not a command: answered, never recorded
-                    // (clients send it whenever `~/.emulator_console_auth_token` exists).
-                    ["auth", ..] => {
-                        let _ = out.write_all(b"Android Console: type 'help' for a list of commands\r\nOK\r\n");
-                        continue;
+            // A thread per connection, so concurrent clients are served concurrently.
+            let (log, status, turned) = (log.clone(), status.clone(), turned.clone());
+            let (links, fails) = (links.clone(), fails.clone());
+            std::thread::spawn(move || {
+                let mut out = stream.try_clone().expect("clone");
+                let _ = out.write_all(b"Android Console: type 'help' for a list of commands\r\nOK\r\n");
+                for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                    let line = line.trim().to_owned();
+                    if line == "quit" {
+                        break;
                     }
-                    ["ping"] => "I am alive!\r\nOK".to_owned(),
-                    ["frames"] => "3\r\nOK".to_owned(),
-                    ["rotation"] if stock => "KO: unknown command, try 'help'".to_owned(),
-                    ["rotation"] => format!("rotation: {}\r\nOK", turned.lock().expect("rotation")),
-                    ["fold", "status"] if stock => "KO: Usage: \"fold\"".to_owned(),
-                    ["fold", "status"] => match status.lock().expect("status").as_deref() {
-                        Some(lines) => format!("{lines}\r\nOK"),
-                        None => "OK".to_owned(),
-                    },
-                    ["car", "get", ..] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\nOK".to_owned(),
-                    ["car", "list"] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\n\
+                    let reply = match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+                        // Authentication is the session's, not a command: answered, never recorded
+                        // (clients send it whenever `~/.emulator_console_auth_token` exists).
+                        ["auth", ..] => {
+                            let _ = out.write_all(b"Android Console: type 'help' for a list of commands\r\nOK\r\n");
+                            continue;
+                        }
+                        ["ping"] => "I am alive!\r\nOK".to_owned(),
+                        ["frames"] => "3\r\nOK".to_owned(),
+                        ["rotation"] if stock => "KO: unknown command, try 'help'".to_owned(),
+                        ["rotation"] => format!("rotation: {}\r\nOK", turned.lock().expect("rotation")),
+                        ["fold", "status"] if stock => "KO: Usage: \"fold\"".to_owned(),
+                        ["fold", "status"] => match status.lock().expect("status").as_deref() {
+                            Some(lines) => format!("{lines}\r\nOK"),
+                            None => "OK".to_owned(),
+                        },
+                        ["car", "get", ..] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\nOK".to_owned(),
+                        ["car", "list"] => "property=GEAR_SELECTION id=0x11400400 area=0 status=available value=8\r\n\
                                         property=INFO_MAKE id=0x11100101 area=0 status=available value=Toy Car\r\nOK"
-                        .to_owned(),
-                    ["screenshot", path] => {
-                        let frame = Frame { width: 2, height: 1, rgba: vec![9, 9, 9, 255, 8, 8, 8, 255] };
-                        std::fs::write(path, sim_core::frame::encode_png(&frame).expect("png")).expect("write png");
-                        format!("{path} (2x1, frame 3)\r\nOK")
-                    }
-                    _ => "OK".to_owned(),
-                };
-                log.lock().expect("log").push(line);
-                let _ = out.write_all(format!("{reply}\r\n").as_bytes());
-            }
+                            .to_owned(),
+                        ["camera", "list"] => {
+                            let mut text = String::new();
+                            for (facing, source) in links.lock().expect("cameras").iter() {
+                                text.push_str(&format!("{facing}: {source}\r\n"));
+                            }
+                            format!("{text}OK")
+                        }
+                        // Like emu's console: the source is the rest of the line, its whitespace
+                        // collapsed to single spaces.
+                        ["camera", "link", facing, source @ ..] if !source.is_empty() => {
+                            if fails.lock().expect("fails").as_deref() == Some(*facing) {
+                                "KO: camera link failed".to_owned()
+                            } else {
+                                let mut links = links.lock().expect("cameras");
+                                links.retain(|(f, _)| f != facing);
+                                // The stock values are the test card, as emu reports them.
+                                let source = match source.join(" ").as_str() {
+                                    "emulated" | "virtualscene" => "pattern:testcard".to_owned(),
+                                    other => other.to_owned(),
+                                };
+                                links.push(((*facing).to_owned(), source));
+                                "OK".to_owned()
+                            }
+                        }
+                        ["screenshot", path] => {
+                            let frame = Frame { width: 2, height: 1, rgba: vec![9, 9, 9, 255, 8, 8, 8, 255] };
+                            std::fs::write(path, sim_core::frame::encode_png(&frame).expect("png")).expect("write png");
+                            // The emulator takes a moment to encode, so overlapping screenshots overlap here.
+                            sleep(Duration::from_millis(150));
+                            format!("{path} (2x1, frame 3)\r\nOK")
+                        }
+                        _ => "OK".to_owned(),
+                    };
+                    log.lock().expect("log").push(line);
+                    let _ = out.write_all(format!("{reply}\r\n").as_bytes());
+                }
+            });
         }
     });
     let display = Arc::new(Mutex::new(Vec::new()));
@@ -105,7 +155,7 @@ fn fake(android: &Android, avd: &str, stock: bool) -> FakeEmulator {
     let emulator = if stock { "" } else { "emulator=simee\n" };
     let ad = format!("port.serial={port}\nport.adb={}\navd.name={avd}\n{emulator}", port + 1);
     std::fs::write(running.join(format!("pid_{}.ini", std::process::id())), ad).expect("advertise");
-    FakeEmulator { console, display, fold_status, rotation }
+    FakeEmulator { console, display, fold_status, rotation, cameras, camera_link_fails }
 }
 
 /// `lines` once it holds `n` entries (or after 5 s, whatever it holds).
@@ -125,7 +175,10 @@ pub fn wait_for(lines: &Mutex<Vec<String>>, n: usize) -> Vec<String> {
 /// `pidof` exits 1, as toybox's does), `com.example.late`'s process shows up on the third
 /// `pidof`, `com.example.leaky` has two launcher activities (LeakCanary's alias second), and
 /// `am force-stop com.example.hang` never returns (it writes its PID to `hang.pid` beside the
-/// script first).
+/// script first). `ps` lists a guest's processes (init, zygote, system_server, the native daemons,
+/// apps); `kill` succeeds (logged only: no host process is signalled) except on pids 520
+/// (surfaceflinger) and 530 (cameraserver), which need `su 0` (present for `-9`, missing for 530's
+/// `-15`); and an `exec` line, and its stop, run on the host's `sh`.
 pub fn fake_adb(android: &Android) -> FakeAdb {
     let dir = android.env.sdk_root.as_ref().expect("sdk root").join("platform-tools");
     std::fs::create_dir_all(&dir).expect("platform-tools");
@@ -173,6 +226,34 @@ impl FakeAdb {
 
 const FAKE_ADB: &str = r#"echo "$*" >> "$(dirname "$0")/adb.log"
 [ "$1" = "-s" ] && shift 2
+# What an API 36 guest's toybox `ps -A -o PID,PPID,%CPU,RSS,ETIME,NAME,CMDLINE` prints (trimmed).
+ps_rows() {
+  printf '%s\n' \
+'  PID  PPID %CPU    RSS ELAPSED NAME                    CMDLINE' \
+'    1     0  0.0  11304   15:02 init                    /system/bin/init second_stage' \
+'    2     0  0.0      0   15:02 [kthreadd]              [kthreadd]' \
+'  310     1  0.1   2620   14:58 zygote64                zygote64' \
+'  311     1  0.0   2100   14:58 zygote                  zygote' \
+'  612   310  3.2 301520   14:50 system_server           system_server' \
+'  520     1  0.4  20480   14:58 surfaceflinger          /system/bin/surfaceflinger --flag' \
+'  200     1  0.0   4012   15:00 servicemanager          /system/bin/servicemanager' \
+'  201     1  0.0   4400   15:00 hwservicemanager        /system/system_ext/bin/hwservicemanager' \
+'  202     1  0.0   3300   15:00 vndservicemanager       /vendor/bin/vndservicemanager /dev/vndbinder' \
+'  203     1  0.0   9120   15:00 vold                    /system/bin/vold --blkid_context=u:r:blkid:s0' \
+'  204     1  0.0   3010   15:00 lmkd                    /system/bin/lmkd' \
+'  205     1  0.1   8200   15:00 logd                    /system/bin/logd' \
+'  206     1  0.2   7300   15:00 adbd                    /apex/com.android.adbd/bin/adbd --root_seclabel=u:r:su:s0' \
+'  207     1  0.0   9300   15:00 netd                    /system/bin/netd' \
+'  208     1  0.0   9400   15:00 installd                /system/bin/installd' \
+'  209     1  0.0   2200   15:01 ueventd                 /system/bin/ueventd' \
+'  210     1  0.0   9500   15:00 keystore2               /system/bin/keystore2 /data/misc/keystore' \
+'  211     1  0.0   9600   15:00 statsd                  /apex/com.android.os.statsd/bin/statsd' \
+'  530     1  0.0  12000   14:58 cameraserver            /system/bin/cameraserver' \
+'  900   310  1.5 180224   14:40 com.android.systemui    com.android.systemui' \
+' 4321   310  7.9 120332   00:42 com.example.app         com.example.app' \
+' 4400   310  7.9  60112   00:40 com.example.app:remote  com.example.app:remote' \
+' 4500   310  0.0  50000   00:30 com.google.android.gms.persistent com.google.android.gms.persistent'
+}
 case "$1" in
 install)
   case "$*" in
@@ -207,6 +288,22 @@ shell)
     "pidof -s "*) exit 1;;
     "am force-stop com.example.hang") echo $$ > "$(dirname "$0")/hang.pid"; exec sleep 10;;
     "am force-stop "*) ;;
+    "ps -A -o PID,PPID,%CPU,RSS,ETIME,NAME,CMDLINE") ps_rows;;
+    "ps -A -o PID,PPID,%CPU,RSS,ETIME,NAME,CMDLINE; echo @packages; pm list packages")
+      ps_rows; echo @packages; printf 'package:android\npackage:com.android.systemui\npackage:com.example.app\n';;
+    "kill -"*" 520"|"kill -"*" 530") echo "/system/bin/sh: kill: ${2##* }: Operation not permitted" >&2; exit 1;;
+    "su 0 kill -9 520"|"su 0 kill -9 530") ;;
+    "su 0 kill -15 530") echo "/system/bin/sh: su: inaccessible or not found" >&2; exit 127;;
+    # Every other signal succeeds, and is only logged: the fake never signals a host process.
+    "kill -"*) ;;
+    # exec's argv line runs on the host's sh, as the guest's would run it, in a child that outlives
+    # this adb (as adbd's shell outlives an adb client that is stopped). With `exec.slow` beside the
+    # script, adb takes a second to reach the device first.
+    "r='simee_start() "*)
+      [ -e "$(dirname "$0")/exec.slow" ] && sleep 1
+      /bin/sh -c "$2" & wait $!; exit $?;;
+    # exec's stop runs on the host's sh too: it signals only the group of the process exec started.
+    "simee_start() "*) exec /bin/sh -c "$2";;
     *) echo "fake adb: unhandled: $2" >&2; exit 2;;
   esac;;
 *) echo "fake adb: unhandled: $*" >&2; exit 2;;

@@ -25,7 +25,48 @@ pub struct Usage {
     /// spawned-and-reaped child adds to it, however short its life, so it tells whether a stretch
     /// of code spawned anything.
     pub reaped_children_ns: u64,
+    /// The CPU time (user and system) the children it has reaped used, their own reaped
+    /// descendants included.
+    pub reaped_children_cpu_ns: u64,
+    /// When it started, on the [`now_ns`] clock: with the pid, it names one process (a reused pid
+    /// starts later).
+    pub start_ns: u64,
+    /// Resident memory, bytes.
+    pub resident_bytes: u64,
+    /// Its physical footprint (what Activity Monitor's Memory column shows): dirty memory,
+    /// compressed or swapped pages included.
+    pub footprint_bytes: u64,
+    /// Bytes read from and written to disk, accumulated.
+    pub disk_read_bytes: u64,
+    pub disk_written_bytes: u64,
+    /// Energy the kernel attributes to it, nanojoules, accumulated (`ri_energy_nj`, macOS 12+);
+    /// `None` where the kernel doesn't offer the V6 record.
+    pub energy_nj: Option<u64>,
 }
+
+/// `rusage_info_v6` (`sys/resource.h`): V4, then `ri_flags` and the V5/V6 fields. libc stops at
+/// V4; the layout is checked against the SDK's header below.
+#[repr(C)]
+struct RusageV6 {
+    v4: libc::rusage_info_v4,
+    flags: u64,
+    user_ptime: u64,
+    system_ptime: u64,
+    pinstructions: u64,
+    pcycles: u64,
+    energy_nj: u64,
+    penergy_nj: u64,
+    rest: [u64; 14],
+}
+
+const RUSAGE_INFO_V6: i32 = 6;
+
+// What the SDK's header compiles to: sizeof(rusage_info_v6) 464, offsetof(ri_energy_nj) 336.
+const _: () = {
+    assert!(size_of::<libc::rusage_info_v4>() == 296);
+    assert!(std::mem::offset_of!(RusageV6, energy_nj) == 336);
+    assert!(size_of::<RusageV6>() == 464);
+};
 
 #[repr(C)]
 struct Timebase {
@@ -34,8 +75,16 @@ struct Timebase {
 }
 
 unsafe extern "C" {
-    // libc's binding is deprecated in favour of the mach2 crate; this one call isn't worth it.
+    // libc's bindings are deprecated in favour of the mach2 crate; these two calls aren't worth it.
     fn mach_timebase_info(info: *mut Timebase) -> i32;
+    fn mach_absolute_time() -> u64;
+}
+
+/// The host's monotonic clock (`mach_absolute_time`, which stops while the host sleeps), in
+/// nanoseconds: the clock [`Usage::start_ns`] is on.
+pub fn now_ns() -> u64 {
+    // SAFETY: mach_absolute_time takes nothing and reads a clock.
+    to_ns(unsafe { mach_absolute_time() })
 }
 
 /// Mach absolute time units to nanoseconds (1:1 on Intel, 125:3 on Apple silicon).
@@ -55,22 +104,41 @@ fn to_ns(ticks: u64) -> u64 {
     (u128::from(ticks) * u128::from(numer) / u128::from(denom)) as u64
 }
 
-/// The accumulated CPU time of `pid`, `None` when it can't be read (exited, or not ours).
+/// The accumulated usage of `pid` (CPU time, memory, disk I/O, energy), `None` when it can't be
+/// read (exited, or not ours). One `proc_pid_rusage` call: the V6 record, else V4 (no energy).
 pub fn usage(pid: i32) -> Option<Usage> {
+    let mut v6 = std::mem::MaybeUninit::<RusageV6>::zeroed();
+    // SAFETY: `v6` is a writable rusage_info_v6 (layout checked above), the size the V6 flavor
+    // fills; the kernel writes at most that many bytes. libc types the buffer as
+    // `*mut rusage_info_t` (itself a pointer).
+    if unsafe { libc::proc_pid_rusage(pid, RUSAGE_INFO_V6, v6.as_mut_ptr().cast()) } == 0 {
+        // SAFETY: zero-initialised and filled by a successful call; every field is a plain integer.
+        let v6 = unsafe { v6.assume_init() };
+        return Some(Usage { energy_nj: Some(v6.energy_nj), ..from_v4(&v6.v4) });
+    }
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
-    // SAFETY: `info` is a writable rusage_info_v4, the size the V4 flavor fills; the kernel writes
-    // at most that many bytes. libc types the buffer as `*mut rusage_info_t` (itself a pointer).
+    // SAFETY: `info` is a writable rusage_info_v4, the size the V4 flavor fills; as above.
     let rc = unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, info.as_mut_ptr().cast()) };
     if rc != 0 {
         return None;
     }
     // SAFETY: zero-initialised and filled by a successful call; every field is a plain integer.
-    let info = unsafe { info.assume_init() };
-    Some(Usage {
+    Some(from_v4(&unsafe { info.assume_init() }))
+}
+
+fn from_v4(info: &libc::rusage_info_v4) -> Usage {
+    Usage {
         cpu_ns: to_ns(info.ri_user_time.saturating_add(info.ri_system_time)),
         background_ns: to_ns(info.ri_cpu_time_qos_maintenance.saturating_add(info.ri_cpu_time_qos_background)),
         reaped_children_ns: to_ns(info.ri_child_elapsed_abstime),
-    })
+        reaped_children_cpu_ns: to_ns(info.ri_child_user_time.saturating_add(info.ri_child_system_time)),
+        start_ns: to_ns(info.ri_proc_start_abstime),
+        resident_bytes: info.ri_resident_size,
+        footprint_bytes: info.ri_phys_footprint,
+        disk_read_bytes: info.ri_diskio_bytesread,
+        disk_written_bytes: info.ri_diskio_byteswritten,
+        energy_nj: None,
+    }
 }
 
 /// Every pid on the host.
@@ -570,6 +638,31 @@ mod tests {
         // Both count the same CPU in different units: within 20 % (other test threads run too).
         assert!((ours - rusage_s).abs() <= 0.2 * rusage_s.max(0.2), "libproc {ours} s, getrusage {rusage_s} s");
         assert!(u.background_ns <= u.cpu_ns);
+    }
+
+    #[test]
+    fn usage_has_start_memory_disk_and_energy_on_the_now_clock() {
+        let me = usage(std::process::id() as i32).expect("own usage");
+        let before = now_ns();
+        assert!(me.start_ns > 0 && me.start_ns < before, "{} !< {before}", me.start_ns);
+        assert!(me.resident_bytes > 1 << 20 && me.footprint_bytes > 0, "{me:?}");
+        assert!(me.energy_nj.is_some(), "macOS 12+ has the V6 record");
+        busy_cpu(0.3);
+        let after = usage(std::process::id() as i32).expect("own usage");
+        let (joules, cpu_s) =
+            ((after.energy_nj.unwrap_or(0) - me.energy_nj.unwrap_or(0)) as f64 / 1e9, (after.cpu_ns - me.cpu_ns) as f64 / 1e9);
+        println!("{joules:.3} J for {cpu_s:.3} CPU-s: {:.2} W per busy core", joules / cpu_s);
+        // A macOS VM (GitHub's runners) reports no energy: the counters stay at zero there.
+        let in_vm = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "kern.hv_vmm_present"])
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "1");
+        assert!(joules > 0.0 || in_vm, "busy CPU costs energy");
+        let mut child = std::process::Command::new("/bin/sleep").arg("5").spawn().expect("sleep");
+        let kid = usage(child.id() as i32).expect("child usage");
+        child.kill().ok();
+        child.wait().ok();
+        assert!(kid.start_ns >= before && kid.start_ns <= now_ns(), "a child started after `before` is stamped after it");
     }
 
     #[test]

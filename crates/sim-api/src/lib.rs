@@ -18,6 +18,10 @@
 //! macOS hosts; elsewhere they fail with a clear reason.
 
 mod android;
+mod camera;
+#[cfg_attr(not(unix), allow(dead_code))]
+mod camera_device;
+pub mod catalog;
 mod contrast;
 #[cfg(target_os = "macos")]
 mod duo;
@@ -30,13 +34,19 @@ mod ios;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod memtools;
 mod methods;
+mod outputs;
 mod params;
 pub mod prefs;
+mod progress;
 mod schema;
 pub mod settle;
+mod shrink;
+pub mod shutdown;
+mod stream;
+mod usage;
 
+use sim_core::net::{UnixListener, UnixStream};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
@@ -49,7 +59,10 @@ use serde_json::Value;
 pub use forward::{HANDSHAKE_TIMEOUT, IN_CALLER, forwards, identity};
 pub use ios::{flush_input, track_input};
 pub use methods::{METHODS, Session, call as call_method, platforms};
+pub use outputs::output_schema;
+pub use progress::{CallHooks, Progress, call_cancelled, call_progress, call_step, with_call_hooks};
 pub use schema::input_schema;
+pub use shrink::{AGENT_MAX_SIDE, shrink_png_base64};
 pub use sim_core::frame::encode_png;
 
 /// The default socket path: `$SIMEE_SOCKET`, else `$TMPDIR/simee.sock`.
@@ -164,7 +177,13 @@ fn serve_stream(stream: UnixStream, mut call: impl FnMut(&str, &Value) -> Result
             continue;
         }
         out.clear();
-        let bytes = reply(&line, true, &mut out, &mut call);
+        // Counted while it runs and its reply goes out, so a shutdown waits for both.
+        let Some(_running) = shutdown::enter() else {
+            reply(&line, false, &mut out, |_, _| Err(shutdown::SHUTTING_DOWN.to_owned()));
+            let _ = writer.write_all(&out);
+            break;
+        };
+        let bytes = reply(&line, true, &mut out, |m, p| shutdown::outcome(call(m, p)));
         // The bytes go out from the result's own buffer, not copied after the line.
         if writer.write_all(&out).and_then(|()| bytes.map_or(Ok(()), |b| writer.write_all(&b))).is_err() {
             break;
@@ -259,14 +278,100 @@ impl Threads {
     }
 }
 
-/// Listens on `path` (replacing a stale socket) and serves connections until the process exits.
-pub fn serve(path: &Path) -> std::io::Result<()> {
+/// Stops every running stream, each sending its WHIP DELETE: call it before the process exits.
+pub fn stop_streams() {
+    stream::stop_all();
+}
+
+/// How long a shutdown gives the calls in flight to finish, or to stop at a safe point, before it
+/// stops the streams and exits anyway. On every host (callers outside this crate size their own
+/// drain by it), though only unix has the signals that start one.
+pub const DRAIN: Duration = Duration::from_secs(10);
+
+/// Listens on `path` (replacing a stale socket) and serves connections until SIGINT or SIGTERM
+/// (#388). Then it shuts down in order: calls in flight get up to 10 s (each stops at its next
+/// safe point, answering `cancelled: server shutting down`), and every call from then on, on a
+/// connection already open or one made during the shutdown, is answered so without running. It
+/// stops every stream with its WHIP DELETE, removes its socket (listening on it until then, so no
+/// other server takes the path meanwhile), and returns the exit code: 130 for SIGINT, 143 for
+/// SIGTERM. A second signal exits at once ([`shutdown::watch`]).
+///
+/// Once a signal arrives, [`call_cancelled`] is true for every call in this process, as a watched
+/// caller's cancel is for its own call.
+#[cfg(unix)]
+pub fn serve(path: &Path) -> std::io::Result<i32> {
+    serve_until_signal(path, Arc::new(methods::Session::default), DRAIN, || ())
+}
+
+/// The API socket is a Unix socket, and Windows has none here yet ([`sim_core::net`]).
+#[cfg(not(unix))]
+pub fn serve(_path: &Path) -> std::io::Result<i32> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "the API socket isn't implemented on Windows yet"))
+}
+
+/// [`serve`]'s loop and shutdown, with each connection's session made by `make` and `drain` for
+/// how long the calls in flight get; `ready` is called once the socket is bound and the signals
+/// are watched.
+#[cfg(unix)]
+fn serve_until_signal(path: &Path, make: MakeSession, drain: Duration, ready: impl FnOnce()) -> std::io::Result<i32> {
     let listener = bind(path)?;
-    let threads = Threads::new(Arc::new(methods::Session::default));
-    for stream in listener.incoming().flatten() {
-        threads.serve(stream)?;
+    // Held until the shutdown has removed the file: a socket still bound keeps its inode.
+    shutdown::remove_on_exit(path);
+    listener.set_nonblocking(true)?;
+    // The shutdown runs on a thread of its own while this one goes on accepting, and says it is
+    // done on a socket of the server's own: nothing depends on the socket file still being there.
+    let (done, says_done) = UnixStream::pair()?;
+    shutdown::watch(move |_| {
+        shut_down(drain);
+        let _ = (&says_done).write_all(&[1]);
+    })?;
+    let threads = Threads::new(make);
+    ready();
+    let served = accept_until_done(&listener, &done, &threads);
+    if served.is_err() {
+        shut_down(drain);
     }
-    Ok(())
+    drop(listener);
+    served.map(|()| shutdown::signal().map_or(0, shutdown::exit_code))
+}
+
+/// [`serve`]'s shutdown: the calls in flight get `drain`, then the streams stop and the sockets
+/// are removed.
+#[cfg(unix)]
+fn shut_down(drain: Duration) {
+    if !shutdown::drain(drain) {
+        shutdown::say!("simee: calls still running after {} s: stopping anyway", drain.as_secs());
+    }
+    stream::stop_all();
+    shutdown::remove_sockets();
+}
+
+/// Serves the connections `listener` (non-blocking) accepts until `done` is readable.
+#[cfg(unix)]
+fn accept_until_done(listener: &UnixListener, done: &UnixStream, threads: &Arc<Threads>) -> std::io::Result<()> {
+    use rustix::event::{PollFd, PollFlags, poll};
+    loop {
+        let mut fds = [PollFd::new(listener, PollFlags::IN), PollFd::new(done, PollFlags::IN)];
+        match poll(&mut fds, None) {
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(e.into()),
+        }
+        if !fds[1].revents().is_empty() {
+            return Ok(());
+        }
+        match listener.accept() {
+            // An accepted socket inherits the listener's O_NONBLOCK on macOS.
+            Ok((stream, _)) => {
+                if stream.set_nonblocking(false).is_ok() {
+                    threads.serve(stream)?;
+                }
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
+            // Out of descriptors, say: keep serving, as a blocking accept did, without spinning.
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
 }
 
 /// Serves on a background thread; returns once the socket is bound.
@@ -300,10 +405,8 @@ fn bind(path: &Path) -> std::io::Result<UnixListener> {
     // Fix this server's identity now, before its executable can be rebuilt under it.
     identity();
     SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
-    // Start the host sampler now, off this thread, so its history exists at the first `host` call.
-    let _ = std::thread::Builder::new().name("simee-host-start".into()).spawn(|| {
-        sim_host::global();
-    });
+    // The host sampler is not started here: it starts at the first read (`host`, `devices_usage`,
+    // an admission check) and parks again a minute after the last (`sim_host::LINGER`).
     if path.exists() && UnixStream::connect(path).is_err() {
         std::fs::remove_file(path)?;
     }
@@ -392,7 +495,7 @@ impl Client {
 
 /// A socket path for tests: under the temp dir when it fits a `sockaddr_un` (104 bytes on macOS),
 /// else under `/tmp`, since build wrappers point `TMPDIR` at long private directories.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn test_socket(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(name);
     let path = if path.as_os_str().len() < 100 { path } else { PathBuf::from("/tmp").join(name) };
@@ -400,7 +503,7 @@ pub(crate) fn test_socket(name: &str) -> PathBuf {
     path
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use serde_json::json;
 

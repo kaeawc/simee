@@ -656,7 +656,9 @@ def glob_re(pattern):
 
 
 def filter_runs(patterns, path):
-    """Whether a paths filter takes path: the last pattern that matches wins, `!` excludes."""
+    """Whether a paths filter takes path: the last pattern that matches wins, `!` excludes.
+    The patterns and git name files with `/`, so a path joined by Windows's `os.path` does too."""
+    path = path.replace(os.sep, "/")
     hit = False
     for pat in patterns:
         if glob_re(pat.lstrip("!")).match(path):
@@ -758,7 +760,7 @@ def software_inputs(crates, names):
                 if not p:
                     raise ValueError("%s:%d includes a path ci-scope can't read" % (f, ln))
                 out.add(p)
-    return out
+    return {f.replace(os.sep, "/") for f in out}
 
 
 def software_errors(crates):
@@ -809,9 +811,10 @@ def desktop_deps(crates):
 
 REFERENCED = re.compile(r'"(?:\.\./)*((?:docs|scripts)/[A-Za-z0-9_./-]+)"')
 
-# Paths no job here reads: docs, other workflows, local tooling, the script and docs linters'
-# configs, and scripts nothing below names.
-NONE = re.compile(r"^(docs/|\.github/workflows/(?:software-mode|release)\.yml$|\.githooks/|\.local/|LICENSE$|\.gitignore$"
+# Paths no job here reads: docs, other workflows, the website (its own workspace and workflow,
+# website.yml), local tooling, the script and docs linters' configs, and scripts nothing below
+# names.
+NONE = re.compile(r"^(docs/|website/|\.github/workflows/(?:software-mode|release|website)\.yml$|\.githooks/|\.local/|LICENSE$|\.gitignore$"
                   r"|Makefile$|bacon\.toml$|rustfmt\.toml$|\.editorconfig$|\.shellcheckrc$|\.yamllint\.yml$"
                   r"|lychee\.toml$|_typos\.toml$)|\.md$|^scripts/")
 # Scripts only the docs-scripts job runs: it runs on every change, so they reach no scoped job.

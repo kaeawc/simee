@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
-# Runs scripts/check.sh before every push (enable with scripts/install-hooks.sh; skip once with
-# `git push --no-verify`).
-exec "$(git rev-parse --show-toplevel)/scripts/check.sh"
+# Runs the checks before every push (enable with scripts/install-hooks.sh; skip once with
+# `git push --no-verify`): scripts/check.sh, or on Windows (Git for Windows runs hooks in its
+# bash) `cargo xtask check`, the same steps as a Rust program.
+root=$(git rev-parse --show-toplevel)
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*)
+    cd "$root" && exec cargo xtask check
+    ;;
+  *) exec "$root/scripts/check.sh" ;;
+esac

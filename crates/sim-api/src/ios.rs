@@ -242,7 +242,7 @@ fn mem_tool(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
     let tool = Tool::for_method(method).ok_or_else(|| format!("`{method}` isn't a memory tool"))?;
     let address = if tool == Tool::History { Some(memtools::address(need_str(p, "address")?)?) } else { None };
     let raw = opt_bool(p, "raw")?.unwrap_or(false);
-    let deadline = opt_u64(p, "timeout_s").map_or(memtools::DEFAULT_TIMEOUT, Duration::from_secs);
+    let deadline = mem_deadline(p);
     let pid = app_pid(&device_tree(&s.device(p)?.info().udid)?, p)?;
     let out = memtools::run(&tool.program(), &tool.args(pid, address.as_deref()), deadline)?;
     let mut result = memtools::finish(tool, pid, &out, raw)?;
@@ -275,7 +275,7 @@ fn boot_inject(device: &Device) -> Result<(), String> {
 /// afterwards, `launchctl` too, so injection couldn't be undone without a reboot.
 fn shaper_loads(device: &Device, env: &[(String, String)]) -> Result<(), String> {
     let out = device.exec("launchctl", &["getenv".to_owned(), "SIMEE_NETSHAPE".to_owned()], env).map_err(err)?;
-    match out.stderr.lines().find(|l| l.starts_with("dyld[") || l.contains("Library not loaded")) {
+    match crate::camera::dyld_failure(&out.stderr) {
         Some(line) => Err(format!("the network shaper doesn't load on this device's runtime: {}", line.trim())),
         None => Ok(()),
     }
@@ -340,18 +340,96 @@ fn with_captures<T>(f: impl FnOnce(&mut std::collections::HashMap<String, sim_au
     f(guard.get_or_insert_with(Default::default))
 }
 
+/// How many device sets a session keeps a connection (or a preferences backend) for (#409): the
+/// ones used last. A farm works in a few; a long-lived server asked about many more reconnects to
+/// one it let go of.
+pub(crate) const MAX_SETS: usize = 8;
+
+/// Something kept per device set (`None`: the default set) for the [`MAX_SETS`] sets used last.
+pub(crate) struct PerSet<T>(Vec<(Option<String>, T)>);
+
+impl<T> Default for PerSet<T> {
+    fn default() -> PerSet<T> {
+        PerSet(Vec::new())
+    }
+}
+
+impl<T> PerSet<T> {
+    /// `set`'s, made by `make` when it isn't kept; the set used longest ago is let go of first.
+    pub(crate) fn get_or_try(&mut self, set: &Option<String>, make: impl FnOnce() -> Result<T, String>) -> Result<&mut T, String> {
+        match self.0.iter().position(|(s, _)| s == set) {
+            // The most recently used set is last.
+            Some(i) => {
+                let entry = self.0.remove(i);
+                self.0.push(entry);
+            }
+            None => {
+                let made = make()?;
+                if self.0.len() >= MAX_SETS {
+                    self.0.remove(0);
+                }
+                self.0.push((set.clone(), made));
+            }
+        }
+        Ok(&mut self.0.last_mut().expect("just pushed").1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 /// One simulator service connection, created on first use.
-#[derive(Default)]
 pub struct Session {
-    ctx: Option<Context>,
+    /// A connection per device set used (`None`: the default set), each made on first use.
+    ctxs: PerSet<Context>,
+    /// The device set of the call in hand ([`Session::use_set`]), or why it can't be used.
+    set: Result<Option<String>, String>,
+    open: Opener,
+}
+
+/// Connects to the simulator service on a device set (`None`: the default set): [`service`], or a
+/// test's fake. Input workers and boot threads connect with their session's.
+pub(crate) type Opener = Arc<dyn Fn(Option<&str>) -> Result<Context, String> + Send + Sync>;
+
+/// The simulator service on `set`.
+fn service(set: Option<&str>) -> Result<Context, String> {
+    Context::open(set).map_err(|e| e.to_string())
+}
+
+impl Default for Session {
+    fn default() -> Session {
+        Session::with_opener(Arc::new(service))
+    }
 }
 
 impl Session {
+    /// A session that connects through `open`.
+    pub(crate) fn with_opener(open: Opener) -> Session {
+        Session { ctxs: PerSet::default(), set: Ok(None), open }
+    }
+
+    /// The device set the next calls use (#409): a path, `None` for the default set, or why the
+    /// call's set can't be used (each method that connects fails with it).
+    pub(crate) fn use_set(&mut self, set: Result<Option<String>, String>) {
+        self.set = set;
+    }
+
+    /// The device set of the call in hand.
+    pub(crate) fn set(&self) -> Result<Option<String>, String> {
+        self.set.clone()
+    }
+
+    /// How this session connects, for a thread of the call's own.
+    pub(crate) fn opener(&self) -> Opener {
+        self.open.clone()
+    }
+
     fn ctx(&mut self) -> Result<&Context, String> {
-        if self.ctx.is_none() {
-            self.ctx = Some(Context::new().map_err(|e| e.to_string())?);
-        }
-        self.ctx.as_ref().ok_or_else(|| "no service connection".to_owned())
+        let set = self.set.clone()?;
+        let open = &self.open;
+        self.ctxs.get_or_try(&set, || open(set.as_deref())).map(|ctx| &*ctx)
     }
 
     fn device(&mut self, p: &Value) -> Result<Device, String> {
@@ -422,6 +500,9 @@ static INPUT: Workers<String, Input> = Workers::new("simee-input", Duration::fro
 /// the HID client and main display, reused while the device stays in the same boot.
 #[derive(Default)]
 struct Input {
+    /// The device set the device is in (#409) and how to connect to it: the calling session's.
+    set: Option<String>,
+    open: Option<Opener>,
     ctx: Option<Context>,
     device: Option<Device>,
     /// State changes the watch has seen.
@@ -510,6 +591,15 @@ impl Screens {
 }
 
 impl Input {
+    /// Connects through `open` on `set` from now on: the calling session's. A worker that held a
+    /// device of another set (the same UDID asked for in the wrong set, say) lets go of everything.
+    fn on_set(&mut self, set: Option<String>, open: Opener) {
+        if self.set != set {
+            *self = Input { set, ..Input::default() };
+        }
+        self.open = Some(open);
+    }
+
     /// Runs `send` with the device's HID client and, when `screen` is set, its main screen's size.
     /// Both are reused until the device's state changes (a reboot) and dropped, with the device, on
     /// any failure; a device whose boots can't be told apart connects on every call, as before.
@@ -536,8 +626,8 @@ impl Input {
     /// The key of the device's current boot (none when its boots can't be told apart); the device
     /// is dropped on failure, as in [`Input::run`].
     fn boot(&mut self, udid: &str) -> Result<Option<BootKey>, String> {
-        let Self { ctx, device, changes, watch, .. } = self;
-        let result = connect(ctx, device, changes, watch, udid).map(|(_, key)| key);
+        let Self { set, open, ctx, device, changes, watch, .. } = self;
+        let result = connect(ctx, || connect_on(open.as_ref(), set.as_deref()), device, changes, watch, udid).map(|(_, key)| key);
         if result.is_err() {
             self.device = None;
             self.watch = None;
@@ -567,8 +657,8 @@ impl Input {
         which: duo::Display,
         with: impl FnOnce(&Screens, &Display) -> Result<R, String>,
     ) -> Result<R, String> {
-        let Self { ctx, device, changes, watch, screens, .. } = self;
-        let (device, key) = connect(ctx, device, changes, watch, udid)?;
+        let Self { set, open, ctx, device, changes, watch, screens, .. } = self;
+        let (device, key) = connect(ctx, || connect_on(open.as_ref(), set.as_deref()), device, changes, watch, udid)?;
         screens.with(key, || Screens::open(device), |s| with(s, s.pick(which)?.0))
     }
 
@@ -578,8 +668,8 @@ impl Input {
         screen: Option<duo::Display>,
         send: impl FnOnce(&Hid, Option<Touched>) -> Result<R, String>,
     ) -> Result<R, String> {
-        let Self { ctx, device, changes, watch, hid, screens, .. } = self;
-        let (device, key) = connect(ctx, device, changes, watch, udid)?;
+        let Self { set, open, ctx, device, changes, watch, hid, screens, .. } = self;
+        let (device, key) = connect(ctx, || connect_on(open.as_ref(), set.as_deref()), device, changes, watch, udid)?;
         let at = match screen {
             Some(which) => Some(screens.with(
                 key,
@@ -596,10 +686,19 @@ impl Input {
     }
 }
 
+/// A worker's connection: through its session's `open` on `set`, else to the service.
+fn connect_on(open: Option<&Opener>, set: Option<&str>) -> Result<Context, String> {
+    match open {
+        Some(open) => open(set),
+        None => service(set),
+    }
+}
+
 /// The worker's device (found and watched on first use) and the key its connections are reused
 /// under.
 fn connect<'a>(
     ctx: &'a mut Option<Context>,
+    open: impl FnOnce() -> Result<Context, String>,
     device: &'a mut Option<Device>,
     changes: &Arc<AtomicU64>,
     watch: &mut Option<StateWatch>,
@@ -607,7 +706,7 @@ fn connect<'a>(
 ) -> Result<(&'a Device, Option<BootKey>), String> {
     let ctx = match ctx {
         Some(ctx) => ctx,
-        None => ctx.insert(Context::new().map_err(err)?),
+        None => ctx.insert(open()?),
     };
     let device = match device {
         Some(device) => device,
@@ -635,8 +734,12 @@ fn on_display<R: Send + 'static>(
     which: duo::Display,
     with: impl FnOnce(&Screens, &Display) -> Result<R, String> + Send + 'static,
 ) -> Result<R, String> {
+    let (set, open) = (s.set()?, s.opener());
     let udid = s.udid(p)?;
-    let result = INPUT.run(&udid.clone(), move |input| sim_coresim::autoreleasepool(|| input.display(&udid, which, with)))?;
+    let result = INPUT.run(&udid.clone(), move |input| {
+        input.on_set(set, open);
+        sim_coresim::autoreleasepool(|| input.display(&udid, which, with))
+    })?;
     result.map_err(|e| as_typed(e, p))
 }
 
@@ -696,11 +799,42 @@ pub fn selection_infos(s: &mut Session) -> Result<Vec<sim_core::device::DeviceIn
     s.ctx()?.selection_infos().map_err(err)
 }
 
+/// A simulator as the camera links (`crate::camera`, #323) see it.
+fn camera_target(d: &Device) -> crate::camera::IosTarget {
+    let info = d.info();
+    crate::camera::IosTarget {
+        udid: info.udid,
+        name: info.name,
+        data_dir: std::path::PathBuf::from(d.data_path()),
+        booted: d.state() == DeviceState::Booted,
+    }
+}
+
+/// The simulator `query` names, for the camera links.
+pub(crate) fn camera_device(s: &mut Session, query: &str) -> Result<crate::camera::IosTarget, String> {
+    s.ctx()?.device(query).map(|d| camera_target(&d)).map_err(err)
+}
+
+/// Every simulator, for `camera_links` without a device.
+pub(crate) fn camera_devices(s: &mut Session) -> Result<Vec<crate::camera::IosTarget>, String> {
+    Ok(s.ctx()?.devices().map_err(err)?.iter().map(camera_target).collect())
+}
+
+/// Runs the device's own `launchctl` (the runtime's, see AGENTS.md): its stdout and stderr.
+pub(crate) fn camera_launchctl(s: &mut Session, udid: &str, args: &[String], env: &[(String, String)]) -> Result<(String, String), String> {
+    let out = s.ctx()?.device(udid).map_err(err)?.exec("launchctl", args, env).map_err(err)?;
+    Ok((out.stdout, out.stderr))
+}
+
 /// Runs an input method on its device's worker.
 fn input(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
+    let (set, open) = (s.set()?, s.opener());
     let udid = s.udid(p)?;
     let (method, params) = (method.to_owned(), p.clone());
-    let result = INPUT.run(&udid.clone(), move |input| sim_coresim::autoreleasepool(|| input_method(input, &udid, &method, &params)))?;
+    let result = INPUT.run(&udid.clone(), move |input| {
+        input.on_set(set, open);
+        sim_coresim::autoreleasepool(|| input_method(input, &udid, &method, &params))
+    })?;
     result.map_err(|e| as_typed(e, p))
 }
 
@@ -1136,6 +1270,62 @@ fn launch_restart(p: &Value) -> Result<bool, String> {
     Ok(opt_bool(p, "restart")?.unwrap_or(true))
 }
 
+/// How long a launch SpringBoard refused as being updated is answered from memory before one goes
+/// to the device again.
+const BEING_UPDATED_RECHECK: Duration = Duration::from_secs(60);
+
+/// Apps whose launch SpringBoard refused as being updated (`LaunchServicesDataMismatch`, #123), by
+/// (UDID, bundle id): the boot it happened in (the device's `launchd_sim` pid), when, and the
+/// error. SpringBoard retries for about 12.6 s before it refuses and only a reboot is known to clear
+/// the state, so a launch of one of them fails at once with that error until the device reboots or
+/// [`BEING_UPDATED_RECHECK`] passes.
+#[derive(Default)]
+struct BeingUpdated(std::collections::HashMap<(String, String), (i32, Instant, String)>);
+
+impl BeingUpdated {
+    /// The error to fail this launch with at once, if `bundle` on `udid` was refused in this boot
+    /// less than [`BEING_UPDATED_RECHECK`] ago. `boot` (the device's `launchd_sim` pid now) is asked
+    /// only for an app listed here, so other launches pay nothing.
+    fn refusal(&mut self, udid: &str, bundle: &str, now: Instant, boot: impl FnOnce() -> Option<i32>) -> Option<String> {
+        let key = (udid.to_owned(), bundle.to_owned());
+        let (seen_boot, at, message) = self.0.get(&key)?;
+        let age = now.saturating_duration_since(*at);
+        if age < BEING_UPDATED_RECHECK && boot() == Some(*seen_boot) {
+            return Some(format!(
+                "{message} (simee answered from memory: SpringBoard refused this launch {} s ago in this boot; it asks the \
+                 device again after a reboot or {} s)",
+                age.as_secs(),
+                BEING_UPDATED_RECHECK.as_secs()
+            ));
+        }
+        self.0.remove(&key);
+        None
+    }
+
+    /// Remembers `error` for `bundle` on `udid` when it is SpringBoard's being-updated refusal and
+    /// the device's boot is known.
+    fn note(&mut self, udid: &str, bundle: &str, error: &sim_coresim::Error, now: Instant, boot: impl FnOnce() -> Option<i32>) {
+        if is_being_updated(error)
+            && let Some(boot) = boot()
+        {
+            self.0.insert((udid.to_owned(), bundle.to_owned()), (boot, now, error.to_string()));
+        }
+    }
+}
+
+/// Whether a launch failed because SpringBoard holds the app as being updated (sim-coresim names
+/// `LaunchServicesDataMismatch` in that error alone).
+fn is_being_updated(error: &sim_coresim::Error) -> bool {
+    matches!(error, sim_coresim::Error::Service { op: "launch", message } if message.contains("LaunchServicesDataMismatch"))
+}
+
+static BEING_UPDATED: std::sync::Mutex<Option<BeingUpdated>> = std::sync::Mutex::new(None);
+
+fn with_being_updated<T>(f: impl FnOnce(&mut BeingUpdated) -> T) -> T {
+    let mut guard = BEING_UPDATED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    f(guard.get_or_insert_with(Default::default))
+}
+
 /// The plan for `p`, booting `concurrent` devices at once (1 for `boot`); `settle_default` when
 /// `settle` isn't given. `shapers` resolves the network shapers the devices need (built on first
 /// use), called at most once, here on the caller's thread.
@@ -1162,10 +1352,35 @@ fn boot_plan(
     })
 }
 
+/// What `boot` (settle off unless asked) or `boot_many` (`many`: settle on unless asked) plans for
+/// `p`, as text: what the schema's defaults are checked against.
+#[cfg(test)]
+pub(crate) fn boot_plan_text(p: &Value, many: bool) -> Result<String, String> {
+    boot_plan(p, 1, many, || Ok(Vec::new())).map(|plan| format!("{plan:?}"))
+}
+
+/// `settle`'s rule and how long it waits (`timeout_s`, default 600 s).
+pub(crate) fn settle_options(p: &Value) -> Result<(crate::settle::Rule, Duration), String> {
+    let rule = settle_rule(p, "")?;
+    Ok((rule, opt_u64(p, "timeout_s").map_or_else(|| crate::settle::default_settle_timeout(1), Duration::from_secs)))
+}
+
+/// `logs`' window, predicate and whether it answers from the device's stream (`stream`, default false).
+pub(crate) fn log_options(p: &Value) -> Result<(&str, Option<&str>, bool), String> {
+    Ok((str_param(p, "last").unwrap_or("1m"), str_param(p, "predicate"), opt_bool(p, "stream")?.unwrap_or(false)))
+}
+
+/// How long a memory tool may run (`timeout_s`, default [`crate::memtools::DEFAULT_TIMEOUT`]).
+pub(crate) fn mem_deadline(p: &Value) -> Duration {
+    opt_u64(p, "timeout_s").map_or(crate::memtools::DEFAULT_TIMEOUT, Duration::from_secs)
+}
+
 /// Boots `device` by `plan`: the boot, then the profile, then the settle wait, each timed. Only
 /// a failed boot is an error: a profile or settle wait that fails after it is reported in the
 /// timings (`profile.error`; `settled: false` with `settle_error`), the device left booted.
-fn boot_device(device: &Device, plan: &BootPlan) -> Result<Value, String> {
+/// `launching` is asked just before the boot is issued for a device that is off at that instant
+/// (not booted or booting): `Err` boots it not, and only a device it said yes to is this call's.
+fn boot_device(device: &Device, plan: &BootPlan, launching: &dyn Fn() -> Result<(), String>) -> Result<Value, String> {
     let start = std::time::Instant::now();
     let info = device.info();
     let udid = info.udid;
@@ -1180,6 +1395,10 @@ fn boot_device(device: &Device, plan: &BootPlan) -> Result<Value, String> {
     let preset = plan.profile.filter(|_| !was_booted).map(|profile| preset_profile(&udid, profile));
     let jobs = plan.profile.filter(|_| !was_booted).map(|profile| boot_jobs(&udid, profile)).unwrap_or_default();
     let boot_started = std::time::SystemTime::now();
+    // Read again now: another caller may have booted it since, and then this call only waits.
+    if !matches!(device.state(), DeviceState::Booted | DeviceState::Booting) {
+        launching()?;
+    }
     if !was_booted && (!env.is_empty() || !jobs.is_empty()) {
         device.boot_with(&sim_coresim::BootOptions { env: &env, jobs: &jobs }).map_err(err)?;
     }
@@ -1532,9 +1751,13 @@ fn wait_settled(udid: &str, rule: crate::settle::Rule, timeout: Duration, since_
     }
 }
 
+/// A device set and how to connect to it, for threads of a call's own.
+type SetOpener = (Option<String>, Opener);
+
 /// Boots `udids` with at most `concurrency` boots (and settle waits) in flight; one result per
-/// device, in order: the `boot_device` timings, or `{device, error}`.
-fn boot_many(udids: &[String], concurrency: usize, plan: &BootPlan) -> Vec<Value> {
+/// device, in order: the `boot_device` timings, or `{device, error}`. `hook` is asked before each
+/// device starts (one it stops gets its reason as the error) and told as each finishes.
+fn boot_many(udids: &[String], concurrency: usize, plan: &BootPlan, hook: &dyn crate::progress::BootHook, on: &SetOpener) -> Vec<Value> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results = std::sync::Mutex::new(vec![Value::Null; udids.len()]);
     let start = std::time::Instant::now();
@@ -1543,24 +1766,55 @@ fn boot_many(udids: &[String], concurrency: usize, plan: &BootPlan) -> Vec<Value
             scope.spawn(|| {
                 // Each thread has its own service connection: the service's objects stay on the
                 // thread that made them.
-                let ctx = Context::new().map_err(err);
+                let ctx = (on.1)(on.0.as_deref());
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(udid) = udids.get(i) else { break };
+                    if let Err(why) = hook.start(i) {
+                        results.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[i] = json!({"device": udid, "error": why});
+                        continue;
+                    }
                     let queued_s = start.elapsed().as_secs_f64();
                     let result = sim_coresim::autoreleasepool(|| {
                         let device = ctx.as_ref().map_err(Clone::clone)?.device(udid).map_err(err)?;
-                        boot_device(&device, plan)
+                        boot_device(&device, plan, &|| hook.launching(i))
                     });
                     let mut value = result.unwrap_or_else(|e| json!({"device": udid, "error": e}));
                     value["started_s"] = json!(round(queued_s));
                     value["done_s"] = json!(round(start.elapsed().as_secs_f64()));
+                    hook.finished(i, &value);
                     results.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[i] = value;
                 }
             });
         }
     });
     results.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `boot_many` of `p`'s `devices`, with `hook` asked before each device starts and told as each
+/// finishes.
+pub(crate) fn boot_many_hooked(s: &mut Session, p: &Value, hook: &dyn crate::progress::BootHook) -> Result<Value, String> {
+    let udids = strings(p, "devices");
+    if udids.is_empty() {
+        return Err("give `devices`: a list of UDIDs or names".into());
+    }
+    let concurrency = crate::params::concurrency(p)?;
+    // Settles by default: the slot is held through the settle wait, so K bounds the boot
+    // storms in flight (what the K sweep measured), not just the service's boot calls.
+    let mut exact = Vec::with_capacity(udids.len());
+    let mut runtimes = Vec::with_capacity(udids.len());
+    for q in &udids {
+        let (_, info) = s.ctx()?.resolve(q).map_err(err)?;
+        exact.push(info.udid);
+        runtimes.push(info.runtime_id);
+    }
+    let plan = boot_plan(p, concurrency.min(udids.len()), true, || build_shapers(&runtimes))?;
+    let start = std::time::Instant::now();
+    let results = boot_many(&exact, concurrency, &plan, hook, &(s.set()?, s.opener()));
+    let failed = results.iter().filter(|r| r.get("error").is_some()).count();
+    let unsettled = results.iter().filter(|r| r["settled"] == json!(false)).count();
+    Ok(json!({"concurrency": concurrency, "all_s": round(start.elapsed().as_secs_f64()), "failed": failed,
+        "unsettled": unsettled, "devices": results}))
 }
 
 /// Rejects a `create` whose device type isn't the requested form factor. CarPlay (auto) is valid
@@ -1595,6 +1849,10 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "device_types" => serde_json::to_value(s.ctx()?.device_types().map_err(err)?).map_err(err),
         "create" => {
             let device_type = need_str(p, "device_type")?;
+            // The one method that makes a device set's directory (#409): opening a set makes none.
+            if let Some(set) = s.set()? {
+                std::fs::create_dir_all(&set).map_err(|e| format!("the device set {set}: {e}"))?;
+            }
             if let Some(form_factor) = opt_form_factor(p)? {
                 check_form_factor(s.ctx()?, device_type, form_factor)?;
             }
@@ -1605,6 +1863,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             let d = s.device(p)?;
             let udid = d.info().udid;
             s.ctx()?.delete(&d).map_err(err)?;
+            crate::camera::ios_stopped(&udid);
             // The service leaves launchd_sim's directory (its log, ~1-3 MB, and the disables)
             // behind, and the one it wrote a boot's `disabled_jobs` to (launchd's own on iOS
             // 18.0); both are keyed by the UDID, so nothing reads them again.
@@ -1620,40 +1879,19 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "boot" => {
             let d = s.device(p)?;
             let plan = boot_plan(p, 1, false, || build_shapers(&[d.info().runtime_id]))?;
-            let timed = boot_device(&d, &plan)?;
+            let timed = boot_device(&d, &plan, &crate::progress::launching)?;
+            // The device's saved camera links (#323): its feed and the device-wide injection.
+            crate::camera::ios_booted(s, &d.info().udid);
             // Without settle or a profile, `boot` answers as it always has.
             Ok(if plan.settle.is_some() || plan.profile.is_some() { timed } else { Value::Null })
         }
-        "boot_many" => {
-            let udids = strings(p, "devices");
-            if udids.is_empty() {
-                return Err("give `devices`: a list of UDIDs or names".into());
-            }
-            let concurrency = crate::params::concurrency(p)?;
-            // Settles by default: the slot is held through the settle wait, so K bounds the boot
-            // storms in flight (what the K sweep measured), not just the service's boot calls.
-            let mut exact = Vec::with_capacity(udids.len());
-            let mut runtimes = Vec::with_capacity(udids.len());
-            for q in &udids {
-                let (_, info) = s.ctx()?.resolve(q).map_err(err)?;
-                exact.push(info.udid);
-                runtimes.push(info.runtime_id);
-            }
-            let plan = boot_plan(p, concurrency.min(udids.len()), true, || build_shapers(&runtimes))?;
-            let start = std::time::Instant::now();
-            let results = boot_many(&exact, concurrency, &plan);
-            let failed = results.iter().filter(|r| r.get("error").is_some()).count();
-            let unsettled = results.iter().filter(|r| r["settled"] == json!(false)).count();
-            Ok(json!({"concurrency": concurrency, "all_s": round(start.elapsed().as_secs_f64()), "failed": failed,
-                "unsettled": unsettled, "devices": results}))
-        }
+        "boot_many" => boot_many_hooked(s, p, &crate::progress::Unwatched),
         "settle" => {
             let d = s.device(p)?;
             if d.state() != DeviceState::Booted {
                 return Err(format!("{} isn't booted", d.info().name));
             }
-            let rule = settle_rule(p, "")?;
-            let timeout = opt_u64(p, "timeout_s").map_or_else(|| crate::settle::default_settle_timeout(1), Duration::from_secs);
+            let (rule, timeout) = settle_options(p)?;
             let Settled { at, settler } = wait_settled(&d.info().udid, rule, timeout, false);
             let settle_s = at.ok_or_else(|| not_settled(&settler, rule, timeout))?;
             let mut result = json!({"settle_s": round(settle_s)});
@@ -1679,8 +1917,13 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             let d = s.ctx()?.clone_device(&template, need_str(p, "name")?).map_err(err)?;
             serde_json::to_value(d.info()).map_err(err)
         }
-        "shutdown" => ok(s.device(p)?.shutdown()),
-        "erase" => ok(s.device(p)?.erase()),
+        // A device that stops (or is erased, which removes its socket) takes its camera feed with it.
+        "shutdown" | "erase" => {
+            let d = s.device(p)?;
+            ok(if method == "shutdown" { d.shutdown() } else { d.erase() })?;
+            crate::camera::ios_stopped(&d.info().udid);
+            Ok(Value::Null)
+        }
         "screen" => {
             let (w, h) = screen_size(s, p)?;
             Ok(json!({"width": w, "height": h}))
@@ -1708,6 +1951,12 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
         "uninstall" => ok(s.device(p)?.uninstall(need_str(p, "bundle_id")?)),
         "launch" => {
             let d = s.device(p)?;
+            let bundle = need_str(p, "bundle_id")?;
+            let udid = d.udid();
+            let boot = || sim_coresim::procs::launchd_sim(&udid);
+            if let Some(refused) = with_being_updated(|b| b.refusal(&udid, bundle, Instant::now(), boot)) {
+                return Err(refused);
+            }
             let mut env = pairs(p, "env");
             if p.get("shaped").and_then(Value::as_bool).unwrap_or(false) {
                 env.extend(shaper_env(&d)?);
@@ -1715,7 +1964,10 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
             if opt_bool(p, "malloc_stack_logging")?.unwrap_or(false) {
                 env.push(("MallocStackLogging".into(), "1".into()));
             }
-            let pid = d.launch_with(need_str(p, "bundle_id")?, &strings(p, "args"), &env, launch_restart(p)?).map_err(err)?;
+            let pid = d
+                .launch_with(bundle, &strings(p, "args"), &env, launch_restart(p)?)
+                .inspect_err(|e| with_being_updated(|b| b.note(&udid, bundle, e, Instant::now(), boot)))
+                .map_err(err)?;
             Ok(json!({"pid": pid}))
         }
         "terminate" => ok(s.device(p)?.terminate(need_str(p, "bundle_id")?)),
@@ -2027,11 +2279,10 @@ pub fn call(s: &mut Session, method: &str, p: &Value) -> Result<Value, String> {
 /// lines (with launchd_sim's, 195 of 18,476 lines, 1%, in 12 s of a just-booted device); and its
 /// timestamps are often 1 ms later (within ±1 ms on 99% of lines).
 fn logs(s: &mut Session, p: &Value) -> Result<Value, String> {
-    let last = str_param(p, "last").unwrap_or("1m");
-    let predicate = str_param(p, "predicate");
+    let (last, predicate, stream) = log_options(p)?;
     let device = s.device(p)?;
     let source = DeviceLog(&device);
-    let streamed = if opt_bool(p, "stream")?.unwrap_or(false) {
+    let streamed = if stream {
         let key = BootKey::of(device.state() == DeviceState::Booted, None, device.last_booted_at());
         let udid = device.udid();
         with_log_streams(|streams| streams.window(&udid, key, last, predicate, &source))
@@ -2351,6 +2602,335 @@ mod tests {
     }
 
     use super::*;
+
+    /// A fake simulator service: it records the device set each connection asks for and refuses
+    /// it, so every method stops at its first connection and nothing reaches the real service.
+    fn fake_service() -> (Opener, Arc<std::sync::Mutex<Vec<Option<String>>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let open: Opener = Arc::new(move |set: Option<&str>| {
+            record.lock().expect("seen").push(set.map(str::to_owned));
+            Err("the fake simulator service refuses every connection".to_owned())
+        });
+        (open, seen)
+    }
+
+    /// Every iOS method on a session whose service is [`fake_service`]: the sets each one opened.
+    fn opened_by_every_method(p: &Value, env: Option<&str>) -> Vec<(&'static str, Vec<Option<String>>, String)> {
+        let mut opened = Vec::new();
+        for (method, ..) in crate::METHODS {
+            if !crate::platforms(method).contains(&sim_core::platform::Platform::Ios) {
+                continue;
+            }
+            let (open, seen) = fake_service();
+            let mut s = crate::methods::Session {
+                ios: Session::with_opener(open),
+                fake_env_set: Some(env.map(str::to_owned)),
+                ..Default::default()
+            };
+            let mut p = p.clone();
+            // Where a name means something else to one method.
+            match *method {
+                "stylus" => p["button"] = json!(false),
+                "pointer" => {
+                    p["action"] = json!("move");
+                    p["button"] = json!("primary");
+                    p.as_object_mut().map(|o| (o.remove("to_x"), o.remove("to_y")));
+                }
+                "contrast_check" => p["appearance"] = json!("both"),
+                "watch_gesture" => p["gesture"] = json!("double-tap"),
+                "privacy" => p["action"] = json!("grant"),
+                _ => {}
+            }
+            let result = crate::methods::call(&mut s, method, &p);
+            let seen = seen.lock().expect("seen").clone();
+            opened.push((*method, seen, result.err().unwrap_or_default()));
+        }
+        opened
+    }
+
+    /// Methods that never connect to the simulator service, so no device set reaches them: host
+    /// and catalogue methods, and streams and captures named by their id.
+    const NO_SERVICE: &[&str] = &[
+        "help",
+        "identity",
+        "host",
+        "form_factors",
+        "admission_check",
+        "stream_status",
+        "stream_stop",
+        "audio_capture_stop",
+        "camera_sources",
+    ];
+
+    /// Methods that connect only when the host runs a simulator (`devices_usage` names the running
+    /// ones): either way is right, as long as a connection is on the call's set.
+    const WHEN_SIMULATORS_RUN: &[&str] = &["devices_usage"];
+
+    /// The parameters every method needs to get as far as its device: a UDID nothing has, so even a
+    /// method that reached the real service would find no device.
+    fn every_param(set: Option<&str>) -> Value {
+        const UDID: &str = "409409A0-0000-4000-8000-000000000409";
+        let strings: &[(&str, &str)] = &[
+            ("device", UDID),
+            ("name", "simee-409"),
+            ("device_type", "iPhone 17"),
+            ("runtime", "iOS-27-2"),
+            ("url", "https://example.com"),
+            ("path", "/nonexistent/simee-409"),
+            ("bundle_id", "dev.simee.none"),
+            ("text", "a"),
+            ("key", "a"),
+            ("button", "home"),
+            ("whip_url", "http://127.0.0.1:9/whip"),
+            ("store", "dev.simee.none"),
+            ("program", "/usr/bin/true"),
+            ("service", "photos"),
+            ("orientation", "portrait"),
+            ("direction", "up"),
+            ("appearance", "light"),
+            ("mode", "light"),
+            ("language", "en"),
+            ("domain", "dev.simee.none"),
+            ("gesture", "swipe"),
+            ("phase", "down"),
+            ("action", "click"),
+            ("facing", "back"),
+            ("source", "test"),
+            ("preset", "wifi"),
+            ("inject", "launch"),
+            ("capture_id", "c"),
+            ("uid", "u"),
+            ("admission", "ignore"),
+            ("property", "p"),
+            ("pattern", "p"),
+            ("predicate", "1"),
+            ("last", "1s"),
+            ("command", "true"),
+            ("type", "string"),
+            ("scope", "output"),
+            ("address", "0x1"),
+            ("size", "large"),
+        ];
+        let numbers: &[(&str, i64)] = &[
+            ("x", 1),
+            ("x1", 1),
+            ("y1", 1),
+            ("x2", 2),
+            ("y2", 2),
+            ("usage", 4),
+            ("y", 1),
+            ("to_x", 2),
+            ("to_y", 2),
+            ("level", 1),
+            ("latitude", 1),
+            ("longitude", 1),
+            ("timeout_s", 1),
+            ("wait_ms", 0),
+            ("pid", 1),
+            ("signal", 0),
+            ("category", 1),
+            ("option", 1),
+            ("duration_ms", 1),
+            ("ticks", 1),
+            ("delta", 1),
+            ("latency_ms", 0),
+            ("value", 1),
+            ("state", 1),
+            ("scale", 1),
+            ("angle", 0),
+        ];
+        let flags: &[(&str, bool)] = &[("on", true), ("settle", false), ("granted", true), ("suppressed", true), ("folded", true)];
+        let mut p = serde_json::Map::new();
+        p.extend(strings.iter().map(|(k, v)| ((*k).to_owned(), json!(v))));
+        p.extend(numbers.iter().map(|(k, v)| ((*k).to_owned(), json!(v))));
+        p.extend(flags.iter().map(|(k, v)| ((*k).to_owned(), json!(v))));
+        p.insert("devices".into(), json!([UDID]));
+        p.insert("region".into(), json!({"x": 0, "y": 0, "width": 1, "height": 1}));
+        for empty in ["payload", "env"] {
+            p.insert(empty.into(), json!({}));
+        }
+        for empty in ["ops", "commands", "args"] {
+            p.insert(empty.into(), json!([]));
+        }
+        let mut p = Value::Object(p);
+        if let Some(set) = set {
+            p["set"] = json!(set);
+        }
+        p
+    }
+
+    /// #409: every iOS method connects on the device set the call names (`set`, over the
+    /// environment's), never on the default set, whatever thread it connects on (the session's,
+    /// a device's input worker, a boot thread).
+    #[test]
+    fn every_ios_method_connects_on_the_set_the_call_names() {
+        // A writable place: `create` makes the set's directory, and a path under a read-only root
+        // (CI's macOS runner) fails that before any connection.
+        // Resolved up front: set names are resolved (`/tmp` is `/private/tmp` on macOS) once the
+        // directory exists, so the expected name must already be the resolved one.
+        let tmp = std::fs::canonicalize("/tmp").expect("/tmp");
+        let root = tmp.join(format!("simee-409-{}", std::process::id()));
+        let set_path = root.join("set");
+        let set = set_path.to_str().expect("utf-8").to_owned();
+        let set = set.as_str();
+        let mut quiet = Vec::new();
+        for env in [None, Some("/nonexistent/simee-409/env-set")] {
+            for (method, seen, why) in opened_by_every_method(&every_param(Some(set)), env) {
+                assert!(seen.iter().all(|s| s.as_deref() == Some(set)), "`{method}` (environment {env:?}) connected on {seen:?}");
+                if seen.is_empty() && env.is_none() && !WHEN_SIMULATORS_RUN.contains(&method) {
+                    quiet.push((method, why));
+                }
+            }
+        }
+        let names: Vec<&str> = quiet.iter().map(|(m, _)| *m).collect();
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(names, NO_SERVICE, "these methods connected to no service; is one missing its device set? {quiet:#?}");
+    }
+
+    /// #409: with no `set`, a method connects on the environment's set, and with neither on the
+    /// default set, exactly as before device sets.
+    #[test]
+    fn without_a_set_param_methods_connect_on_the_environment_set_else_the_default() {
+        const ENV: &str = "/nonexistent/simee-409/env-set";
+        for (method, seen, _) in opened_by_every_method(&every_param(None), Some(ENV)) {
+            assert!(seen.iter().all(|s| s.as_deref() == Some(ENV)), "`{method}` connected on {seen:?}, not the environment's set");
+        }
+        for (method, seen, _) in opened_by_every_method(&every_param(None), None) {
+            assert!(seen.iter().all(Option::is_none), "`{method}` connected on {seen:?}, not the default set");
+            if !WHEN_SIMULATORS_RUN.contains(&method) {
+                assert_eq!(seen.is_empty(), NO_SERVICE.contains(&method), "`{method}` connected {seen:?}");
+            }
+        }
+        // An empty `set` is the default set, whatever the environment says.
+        for (method, seen, _) in opened_by_every_method(&every_param(Some("")), Some(ENV)) {
+            assert!(seen.iter().all(Option::is_none), "`{method}` connected on {seen:?}, not the default set");
+        }
+    }
+
+    /// #409: every iOS method that connects to the service says it takes `set`, so its MCP tool
+    /// schema and `help` offer it (a `delete` without it, after a `create` in a farm's set, would
+    /// delete a default-set device of that name). The ones that never connect don't.
+    #[test]
+    fn every_method_that_connects_declares_its_set() {
+        let mut missing = Vec::new();
+        for (method, params, _) in crate::METHODS {
+            if !crate::platforms(method).contains(&sim_core::platform::Platform::Ios) {
+                continue;
+            }
+            let schema = crate::input_schema(method).expect("schema");
+            let set = &schema["properties"]["set"];
+            if NO_SERVICE.contains(method) {
+                assert!(set.is_null(), "`{method}` never connects, so it takes no set: {params}");
+                continue;
+            }
+            if set.is_null() {
+                missing.push(*method);
+                continue;
+            }
+            assert_eq!(set["type"], "string", "{method}");
+            let ios_only = crate::platforms(method) == [sim_core::platform::Platform::Ios];
+            assert_eq!(set.get("description").is_some(), !ios_only, "`{method}`: `set` is iOS only where Android runs it too: {set}");
+        }
+        assert!(missing.is_empty(), "these iOS methods don't declare `set?`: {missing:?}");
+    }
+
+    /// A set the call can't use (a relative path) fails the methods that connect, with the reason,
+    /// and connects nowhere.
+    #[test]
+    fn a_relative_set_fails_and_connects_nowhere() {
+        let (open, seen) = fake_service();
+        let mut s = crate::methods::Session { ios: Session::with_opener(open), fake_env_set: Some(None), ..Default::default() };
+        let err = crate::methods::call(&mut s, "devices", &json!({"set": "sets/a", "platform": "ios"})).expect_err("relative");
+        assert!(err.contains("absolute"), "{err}");
+        let err = crate::methods::call(
+            &mut s,
+            "tap",
+            &json!({"set": "sets/a", "device": "409409A0-0000-4000-8000-000000000409", "x": 1, "y": 1}),
+        )
+        .expect_err("relative");
+        assert!(err.contains("absolute"), "{err}");
+        assert!(seen.lock().expect("seen").is_empty());
+    }
+
+    /// The default set is the one the service has always used: `Context::open(None)` is
+    /// `Context::new()`'s set, `~/Library/Developer/CoreSimulator/Devices`, and a set's path is
+    /// the one asked for. Opening a set starts nothing (it reads or makes the set's plist).
+    #[test]
+    fn the_default_set_is_unchanged_and_a_custom_set_is_the_path_asked_for() {
+        let Ok(default) = Context::new() else {
+            eprintln!("skipped: no simulator service on this host");
+            return;
+        };
+        let home = std::env::var("HOME").expect("HOME");
+        assert_eq!(default.set_path(), format!("{home}/Library/Developer/CoreSimulator/Devices"));
+        assert_eq!(Context::open(None).expect("default set").set_path(), default.set_path());
+        let dir = std::env::temp_dir().join(format!("simee-409-set-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the set's directory (`create` makes it)");
+        let custom = Context::open(Some(dir.to_str().expect("utf-8"))).expect("custom set");
+        // The service names the set by its resolved path (`/var` is `/private/var` on macOS).
+        assert_eq!(std::path::PathBuf::from(custom.set_path()), dir.canonicalize().expect("the set's directory, made"));
+        assert!(custom.devices().expect("devices").is_empty(), "a new set has no devices");
+        drop(custom);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #409: only `create` makes a device set's directory. Any other method (`devices`, read-only,
+    /// among them) refuses a set that doesn't exist, so a mistyped path fails instead of listing
+    /// nothing and leaving a directory behind.
+    #[test]
+    fn only_create_makes_a_device_set() {
+        let root = std::path::PathBuf::from("/tmp").join(format!("simee-409-missing-{}", std::process::id()));
+        let dir = root.join("set");
+        std::fs::remove_dir_all(&root).ok();
+        let set = dir.display().to_string();
+        let err = Context::open(Some(&set)).err().expect("a missing set is refused").to_string();
+        assert!(err.contains(&set) && err.contains("doesn't exist") && err.contains("create"), "{err}");
+        assert!(!root.exists(), "nothing made");
+        let (open, seen) = fake_service();
+        let mut s = crate::methods::Session { ios: Session::with_opener(open), fake_env_set: Some(None), ..Default::default() };
+        let p = json!({"name": "farm-1", "device_type": "iPhone 17", "runtime": "iOS-27-2", "platform": "ios", "set": set});
+        crate::methods::call(&mut s, "create", &p).expect_err("the fake service refuses");
+        assert!(dir.is_dir(), "create made the set");
+        let real = dir.canonicalize().expect("real").display().to_string();
+        assert_eq!(*seen.lock().expect("seen"), [Some(real)]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// #409: what a session keeps per device set is bounded: the sets used last stay, the one used
+    /// longest ago goes first and is made again when asked for; a failed make keeps nothing.
+    #[test]
+    fn per_set_keeps_the_sets_used_last() {
+        let mut kept = PerSet::default();
+        let made = std::cell::Cell::new(0);
+        let get = |kept: &mut PerSet<usize>, n: usize| {
+            let set = Some(format!("/s/{n}"));
+            *kept.get_or_try(&set, || Ok(made.replace(made.get() + 1))).expect("made")
+        };
+        for n in 0..MAX_SETS {
+            get(&mut kept, n);
+        }
+        // `/s/0` used again: `/s/1` is now the one used longest ago.
+        assert_eq!(get(&mut kept, 0), 0, "kept, not made again");
+        get(&mut kept, MAX_SETS);
+        assert_eq!(kept.len(), MAX_SETS);
+        assert_eq!(get(&mut kept, 0), 0, "still kept");
+        assert_eq!(get(&mut kept, 1), MAX_SETS + 1, "let go of, so made again");
+        assert!(kept.get_or_try(&None, || Err("refused".into())).is_err());
+        assert_eq!(kept.len(), MAX_SETS);
+    }
+
+    /// A session connects on the set of the call in hand, not the one of the call before.
+    #[test]
+    fn a_session_connects_on_each_calls_set() {
+        let (open, seen) = fake_service();
+        let mut s = Session::with_opener(open);
+        s.use_set(Ok(Some("/a".into())));
+        assert!(s.ctx().is_err());
+        s.use_set(Ok(None));
+        assert!(s.ctx().is_err());
+        assert_eq!(*seen.lock().expect("seen"), [Some("/a".to_owned()), None]);
+    }
 
     /// A session that stays open (as `simee serve`'s does) finds a device by UDID and name, then
     /// misses it under its old name once another process renames it and under its UDID once that
@@ -2805,6 +3385,40 @@ mod tests {
             assert_eq!(source.shown.get(), 5);
         }
 
+        /// A subscription's reads: `seconds` of one read a second of `last`, with a line arriving
+        /// each second; how many of them `log show` answered. The stream's ring holds `keep` lines.
+        fn shown_by_a_subscription(last: &str, keep: usize, seconds: u64) -> (u32, usize) {
+            let (at, clock) = clock();
+            // Each line is 10 bytes, so the ring holds `keep` of them (the heavy-log case: a boot
+            // fills it in half a minute).
+            let (source, mut streams) = (FakeLog::default(), LogStreams::new(keep * 10, Duration::from_secs(300), clock));
+            logs(&mut streams, &source, key(1), last, None);
+            source.started.borrow()[0].write(HEADER);
+            for second in 1..=seconds {
+                advance(&at, Duration::from_secs(1));
+                let line = format!("line {second:04}");
+                source.started.borrow()[0].write(&line);
+                until(|| streams.kept.get("UDID").is_some_and(|(_, t)| lock(t).ring.lines.back().is_some_and(|(_, l)| *l == line)));
+                logs(&mut streams, &source, key(1), last, None);
+            }
+            (source.shown.get(), source.started.borrow().len())
+        }
+
+        #[test]
+        fn a_short_window_read_every_second_stops_spawning_log_show_once_the_stream_is_that_old() {
+            // The logs resource asks for a 5 s window (`sim-mcp`'s LOG_WINDOW) once a second. A ring
+            // that holds a boot's 10 s of lines answers every read after the first 5 s from the
+            // stream: `log show` ran for the first read, then for the 5 reads that reach back
+            // before the stream started, and never after.
+            let (shown, streams) = shown_by_a_subscription("5s", 10, 120);
+            assert_eq!(streams, 1, "one stream the whole time");
+            assert_eq!(shown, 1 + 4, "the first read and the four before the stream is 5 s old, then none for 115 more");
+            // A window the ring can't hold falls back on every read: the cost of a 30 s window on
+            // a just-booted device.
+            let (shown, _) = shown_by_a_subscription("30s", 10, 120);
+            assert_eq!(shown, 1 + 120);
+        }
+
         #[test]
         fn a_new_boot_or_a_closed_stream_starts_another() {
             let (at, clock) = clock();
@@ -2843,6 +3457,52 @@ mod tests {
         assert_eq!(launch_restart(&json!({"restart": false})), Ok(false));
         assert_eq!(launch_restart(&json!({"restart": "no"})), Err("`restart` must be true or false, not \"no\"".to_owned()));
         assert!(launch_restart(&json!({"restart": 0})).is_err());
+    }
+
+    fn being_updated_error() -> sim_coresim::Error {
+        sim_coresim::Error::Service {
+            op: "launch",
+            message: "SpringBoard holds dev.simee.tiny as being updated (LaunchServicesDataMismatch), ... Reboot the device".into(),
+        }
+    }
+
+    #[test]
+    fn a_launch_refused_as_being_updated_fails_at_once_until_the_device_reboots() {
+        let mut b = BeingUpdated::default();
+        let t0 = Instant::now();
+        b.note("U", "dev.simee.tiny", &being_updated_error(), t0, || Some(41));
+        let refused = b.refusal("U", "dev.simee.tiny", t0 + Duration::from_secs(5), || Some(41)).expect("remembered");
+        assert!(refused.starts_with("launch failed: SpringBoard holds dev.simee.tiny as being updated"), "{refused}");
+        assert!(refused.contains("refused this launch 5 s ago in this boot"), "{refused}");
+        assert!(b.refusal("U", "dev.simee.other", t0, || panic!("an app not listed never asks for the boot")).is_none());
+        assert!(b.refusal("V", "dev.simee.tiny", t0, || panic!("nor does another device")).is_none());
+        assert!(b.refusal("U", "dev.simee.tiny", t0 + Duration::from_secs(6), || Some(77)).is_none(), "rebooted: ask the device");
+        assert!(b.refusal("U", "dev.simee.tiny", t0 + Duration::from_secs(7), || Some(41)).is_none(), "and forgotten");
+    }
+
+    #[test]
+    fn a_remembered_refusal_is_asked_again_after_a_minute_or_when_the_device_is_down() {
+        let mut b = BeingUpdated::default();
+        let t0 = Instant::now();
+        b.note("U", "dev.simee.tiny", &being_updated_error(), t0, || Some(41));
+        assert!(b.refusal("U", "dev.simee.tiny", t0 + BEING_UPDATED_RECHECK, || Some(41)).is_none());
+        b.note("U", "dev.simee.tiny", &being_updated_error(), t0, || Some(41));
+        assert!(b.refusal("U", "dev.simee.tiny", t0, || None).is_none(), "shut down");
+        b.note("U", "dev.simee.tiny", &being_updated_error(), t0, || None);
+        assert!(b.0.is_empty(), "no boot to tie it to: nothing remembered");
+    }
+
+    #[test]
+    fn only_springboards_being_updated_refusal_is_remembered() {
+        let mut b = BeingUpdated::default();
+        let t0 = Instant::now();
+        let other = sim_coresim::Error::Service { op: "launch", message: "Simulator device failed to launch dev.simee.tiny.".into() };
+        b.note("U", "dev.simee.tiny", &other, t0, || panic!("not asked for another error"));
+        let install = sim_coresim::Error::Service { op: "install", message: "LaunchServicesDataMismatch".into() };
+        b.note("U", "dev.simee.tiny", &install, t0, || Some(41));
+        assert!(b.0.is_empty());
+        assert!(is_being_updated(&being_updated_error()));
+        assert!(!is_being_updated(&sim_coresim::Error::Invalid("LaunchServicesDataMismatch".into())));
     }
 
     #[test]

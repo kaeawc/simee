@@ -108,9 +108,10 @@ fn beside(path: &str, mode: Mode) -> String {
     p.with_file_name(name).to_string_lossy().into_owned()
 }
 
-/// `contrast_check`: the screen now, or with `appearance: both` the light and the dark UI (switch,
-/// wait `settle_ms`, check; then back to `restore`).
-pub fn run(t: &mut impl Target, p: &Value) -> Result<Value, String> {
+/// Whether to check both appearances (`appearance`: current, the default, or both), the one to
+/// leave the device in (`restore`, default light) and the wait after each switch (`settle_ms`,
+/// default [`SETTLE_MS`]).
+pub(crate) fn sweep_options(p: &Value) -> Result<(bool, Mode, Duration), String> {
     let both = match str_param(p, "appearance") {
         None | Some("current") => false,
         Some("both") => true,
@@ -121,7 +122,13 @@ pub fn run(t: &mut impl Target, p: &Value) -> Result<Value, String> {
     if settle_ms > MAX_SETTLE_MS {
         return Err(format!("`settle_ms` must be at most {MAX_SETTLE_MS}"));
     }
-    let settle = Duration::from_millis(settle_ms);
+    Ok((both, restore, Duration::from_millis(settle_ms)))
+}
+
+/// `contrast_check`: the screen now, or with `appearance: both` the light and the dark UI (switch,
+/// wait `settle_ms`, check; then back to `restore`).
+pub fn run(t: &mut impl Target, p: &Value) -> Result<Value, String> {
+    let (both, restore, settle) = sweep_options(p)?;
     let (scale, scale_source) = match p.get("scale").and_then(Value::as_f64) {
         Some(s) if s.is_finite() && s > 0.0 && s <= MAX_SCALE => (s, "param"),
         Some(s) if s.is_finite() && s > MAX_SCALE => return Err(format!("`scale` must be at most {MAX_SCALE} (pixels per point)")),
@@ -340,7 +347,8 @@ mod tests {
             assert!(file.exists());
         }
         std::fs::remove_dir_all(dir).ok();
-        assert_eq!(beside("/a/b/c", Mode::Dark), "/a/b/c-dark");
+        // The host's own separator joins the new name (a `\` on Windows).
+        assert_eq!(beside("/a/b/c", Mode::Dark), std::path::Path::new("/a/b").join("c-dark").to_string_lossy());
     }
 
     #[test]

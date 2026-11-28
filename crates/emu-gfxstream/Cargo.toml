@@ -21,6 +21,11 @@ libc.workspace = true
 sim-core.workspace = true
 thiserror.workspace = true
 
+# The Metal present path's tests hand a surface to simee's own receiver (the wire format is
+# shared, not the code).
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+sim-coresim = { workspace = true, features = ["videotoolbox"] }
+
 # FFI crate: unsafe is allowed here (every block carries a SAFETY comment), denied elsewhere.
 [lints.rust]
 unused_must_use = "deny"

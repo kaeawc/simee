@@ -102,6 +102,8 @@ pub enum Era {
 #[derive(Clone, Debug)]
 pub struct Ctx {
     pub era: Era,
+    /// The revision: [`MODERN`], or the one `initialize` agreed on.
+    pub version: &'static str,
     pub caps: Value,
     pub progress_token: Option<Value>,
 }
@@ -114,6 +116,11 @@ impl Ctx {
 
     pub fn modern(&self) -> bool {
         self.era == Era::Modern
+    }
+
+    /// Whether the revision has tool output schemas (2025-06-18 on; 2025-03-26 has none).
+    pub fn output_schemas(&self) -> bool {
+        self.version != "2025-03-26"
     }
 }
 
@@ -181,7 +188,7 @@ mod tests {
         let params = json!({"_meta": {META_VERSION: MODERN, META_CLIENT_CAPS: {"extensions": {EXT_TASKS: {}}}}});
         assert_eq!(requested_version(&params), Some(MODERN));
         assert_eq!(requested_version(&json!({})), None);
-        let ctx = Ctx { era: Era::Modern, caps: meta(&params)[META_CLIENT_CAPS].clone(), progress_token: None };
+        let ctx = Ctx { era: Era::Modern, version: MODERN, caps: meta(&params)[META_CLIENT_CAPS].clone(), progress_token: None };
         assert!(ctx.has_extension(EXT_TASKS) && !ctx.has_extension(EXT_UI) && ctx.modern());
     }
 

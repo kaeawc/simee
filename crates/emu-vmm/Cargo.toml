@@ -23,6 +23,7 @@ emu-hvf.workspace = true
 flate2.workspace = true
 libc.workspace = true
 rustix.workspace = true
+sim-camera.workspace = true
 sim-core.workspace = true
 smoltcp.workspace = true
 thiserror.workspace = true

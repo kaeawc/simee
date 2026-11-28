@@ -69,80 +69,8 @@ pub const SHAPE_KEYS: [&str; 10] = [
 pub const DUPLICATED_IDENTITY: &str = "every AVD made from a golden is the same device to its guest: android_id and per-app SSAIDs \
      live in the copied, encrypted user data";
 
-/// How a file was copied.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CloneKind {
-    /// A reflink (`FICLONE` on Linux): no data copied, blocks shared until either side writes.
-    Reflink,
-    /// Only the data extents copied: the file stays as sparse as the original.
-    Sparse,
-    /// `std::fs::copy`, which clones the file on APFS and copies it elsewhere.
-    Copy,
-}
-
-impl CloneKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            CloneKind::Reflink => "reflink",
-            CloneKind::Sparse => "sparse copy",
-            CloneKind::Copy => "copy (copy-on-write on APFS)",
-        }
-    }
-}
-
-/// Copies `from` to the new file `to`: a reflink where the file system has them, else a copy
-/// that keeps the file's holes (a user data image is mostly one), else `std::fs::copy`.
-///
-/// `to` must not exist (on any platform: `std::fs::copy` would replace it), and a failed clone
-/// leaves no half-written file behind.
-pub fn clone_file(from: &Path, to: &Path) -> Result<CloneKind> {
-    if to.symlink_metadata().is_ok() {
-        return Err(Error::Io(to.to_path_buf(), std::io::ErrorKind::AlreadyExists.into()));
-    }
-    clone_new_file(from, to).inspect_err(|_| {
-        let _ = std::fs::remove_file(to);
-    })
-}
-
-fn clone_new_file(from: &Path, to: &Path) -> Result<CloneKind> {
-    let io = |p: &Path, e| Error::Io(p.to_path_buf(), e);
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::FileExt;
-        let src = File::open(from).map_err(|e| io(from, e))?;
-        let dst = File::options().write(true).create_new(true).open(to).map_err(|e| io(to, e))?;
-        if rustix::fs::ioctl_ficlone(&dst, &src).is_ok() {
-            return Ok(CloneKind::Reflink);
-        }
-        let len = src.metadata().map_err(|e| io(from, e))?.len();
-        dst.set_len(len).map_err(|e| io(to, e))?;
-        let mut buf = vec![0u8; 1 << 20];
-        let mut pos = 0u64;
-        while pos < len {
-            let data = match rustix::fs::seek(&src, rustix::fs::SeekFrom::Data(pos)) {
-                Ok(d) => d,
-                // No data from `pos` on: the rest is a hole.
-                Err(rustix::io::Errno::NXIO) => break,
-                Err(e) => return Err(io(from, e.into())),
-            };
-            let end = rustix::fs::seek(&src, rustix::fs::SeekFrom::Hole(data)).map_err(|e| io(from, e.into()))?.min(len);
-            let mut at = data;
-            while at < end {
-                let n = ((end - at) as usize).min(buf.len());
-                src.read_exact_at(&mut buf[..n], at).map_err(|e| io(from, e))?;
-                dst.write_all_at(&buf[..n], at).map_err(|e| io(to, e))?;
-                at += n as u64;
-            }
-            pos = end;
-        }
-        Ok(CloneKind::Sparse)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        std::fs::copy(from, to).map_err(|e| io(from, e))?;
-        Ok(CloneKind::Copy)
-    }
-}
+/// How a disk was copied, and the one function that copies them (`clone.rs`).
+pub use crate::clone::{CloneKind, clone_file, clone_file_atomic};
 
 /// What a golden is keyed by.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -208,6 +136,24 @@ fn shape_of(avd: &Avd) -> String {
     s
 }
 
+/// What a remembered image hash is keyed by besides the path: size, inode and the modification
+/// and change times.
+#[cfg(unix)]
+fn file_stamp(meta: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!("{}|{}|{}.{}|{}.{}", meta.len(), meta.ino(), meta.mtime(), meta.mtime_nsec(), meta.ctime(), meta.ctime_nsec())
+}
+
+/// Windows has no inode or change time in std: size, modification and creation times. An edit in
+/// place that keeps the length and puts the modification time back isn't seen there.
+#[cfg(not(unix))]
+fn file_stamp(meta: &std::fs::Metadata) -> String {
+    let nanos = |t: std::io::Result<std::time::SystemTime>| {
+        t.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos())
+    };
+    format!("{}|{}|{}", meta.len(), nanos(meta.modified()), nanos(meta.created()))
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -240,20 +186,10 @@ impl Env {
     /// golden). Any write to the file changes its change time, which a program can't set back, so
     /// an edited file is hashed again; a remembered hash that doesn't look like one is ignored.
     fn image_file_hash(&self, path: &Path) -> Result<String> {
-        use std::os::unix::fs::MetadataExt;
         let io = |p: &Path, e| Error::Io(p.to_path_buf(), e);
         let meta = std::fs::metadata(path).map_err(|e| io(path, e))?;
         let real = std::fs::canonicalize(path).map_err(|e| io(path, e))?;
-        let stamp = format!(
-            "{}|{}|{}|{}.{}|{}.{}",
-            real.display(),
-            meta.len(),
-            meta.ino(),
-            meta.mtime(),
-            meta.mtime_nsec(),
-            meta.ctime(),
-            meta.ctime_nsec()
-        );
+        let stamp = format!("{}|{}", real.display(), file_stamp(&meta));
         let dir = self.golden_root().join(HASH_CACHE);
         let entry = dir.join(&sim_bundle::hash(stamp.as_bytes())[..32]);
         if let Ok(h) = std::fs::read_to_string(&entry)
@@ -428,11 +364,13 @@ fn publish(env: &Env, key: &GoldenKey, avd: &Avd) -> Result<CloneKind> {
     }
 }
 
+/// The slower of two ways a disk was copied: a reflink beats a sparse copy, which beats a full
+/// copy (it writes the holes out).
 fn worst(a: CloneKind, b: CloneKind) -> CloneKind {
     let rank = |k| match k {
         CloneKind::Reflink => 0,
-        CloneKind::Copy => 1,
-        CloneKind::Sparse => 2,
+        CloneKind::Sparse => 1,
+        CloneKind::Copy => 2,
     };
     if rank(b) > rank(a) { b } else { a }
 }
@@ -505,7 +443,9 @@ fn read_golden(dir: &Path) -> Option<Golden> {
     })
 }
 
-#[cfg(test)]
+/// The tests write at offsets and count allocated blocks (`FileExt`, `st_blocks`) and rely on the
+/// change time, so they run where those exist.
+#[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -770,6 +710,23 @@ mod tests {
         File::options().write(true).open(&system).expect("open").set_modified(mtime).expect("mtime back");
         assert_ne!(env.golden_key(&a).expect("edited").image, first.image);
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn the_worst_copy_is_the_slowest_one() {
+        use CloneKind::{Copy, Reflink, Sparse};
+        for (a, b, want) in [
+            (Reflink, Reflink, Reflink),
+            (Reflink, Sparse, Sparse),
+            (Sparse, Reflink, Sparse),
+            (Sparse, Copy, Copy),
+            (Copy, Sparse, Copy),
+            (Reflink, Copy, Copy),
+            (Copy, Reflink, Copy),
+            (Copy, Copy, Copy),
+        ] {
+            assert_eq!(worst(a, b), want, "{a:?} then {b:?}");
+        }
     }
 
     #[test]

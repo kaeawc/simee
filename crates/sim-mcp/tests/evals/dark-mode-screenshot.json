@@ -1,0 +1,20 @@
+{
+  "name": "dark-mode-screenshot",
+  "goal": "Switch the booted iPhone to dark mode and confirm it from a screenshot.",
+  "toolsets": "core",
+  "world": {
+    "devices": [
+      {"udid": "iphone-17", "name": "iPhone 17", "platform": "ios", "form_factor": "phone", "state": "Booted",
+       "foreground": "com.apple.Preferences"}
+    ]
+  },
+  "plan": [
+    {"tool": "devices", "args": {"booted": true}, "expect": {"contains": ["iphone-17"]}},
+    {"tool": "appearance", "args": {"device": "iphone-17", "mode": "dark"}},
+    {"tool": "screenshot", "args": {"device": "iphone-17"}}
+  ],
+  "end": {
+    "appearance": {"iphone-17": "dark"},
+    "screenshot_shows": {"iphone-17": ["appearance=dark"]}
+  }
+}

@@ -41,8 +41,9 @@ impl Live {
         let device = ctx.device(udid).map_err(|e| e.to_string())?;
         let hid = device.hid().map_err(|e| e.to_string())?;
         let shared = Arc::new(Shared::default());
+        shared.set_waker(waker);
         let kicked = Arc::new(AtomicBool::new(false));
-        let capture = spawn_capture(udid.to_owned(), native, shared.clone(), kicked.clone(), waker)?;
+        let capture = spawn_capture(udid.to_owned(), native, shared.clone(), kicked.clone())?;
         Ok(Self {
             udid: udid.to_owned(),
             device,
@@ -174,15 +175,10 @@ impl Drop for Live {
 /// device announces each frame (the display's frame callback wakes this thread), so a still screen
 /// costs a safety look every 100 ms; without announcements (or once they stop matching the seed)
 /// it polls, fast while the screen changes and backing off to 32 ms when still, and input from
-/// the window wakes it at once. The thread opens its own service connection: service objects stay
-/// on the thread that made them.
-fn spawn_capture(
-    udid: String,
-    native: NativeSurface,
-    shared: Arc<Shared>,
-    kicked: Arc<AtomicBool>,
-    waker: rune::Waker,
-) -> Result<JoinHandle<()>, String> {
+/// the window wakes it at once. A size change wakes the window the device is in now
+/// ([`Shared::wake`]). The thread opens its own service connection: service objects stay on the
+/// thread that made them.
+fn spawn_capture(udid: String, native: NativeSurface, shared: Arc<Shared>, kicked: Arc<AtomicBool>) -> Result<JoinHandle<()>, String> {
     std::thread::Builder::new()
         .name("simee-capture".into())
         .spawn(move || {
@@ -238,7 +234,7 @@ fn spawn_capture(
                                     let (w, h) = surface.size();
                                     let packed = (w << 16) | (h & 0xffff);
                                     if shared.size.swap(packed, Ordering::Relaxed) != packed {
-                                        waker();
+                                        shared.wake();
                                     }
                                     current = Some((surface, buffer));
                                     last_seed = None;

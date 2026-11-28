@@ -10,10 +10,12 @@ for both is to match the stock tools exactly and then exceed them.
 
 - New dependencies go in root `[workspace.dependencies]` with `default-features = false` and only
   the features used; crates reference them with `{ workspace = true }`.
-- `unsafe` lives only in `crates/sim-coresim` (the Objective-C / IOSurface boundary),
+- `unsafe` lives only in `crates/sim-coresim` (the Objective-C / IOSurface / VideoToolbox boundary),
   `crates/emu-hvf` (Hypervisor.framework and guest RAM), `crates/emu-kvm` (Linux KVM), `crates/emu-gfxstream` (the renderer),
-  `apps/emu`'s `shutdown_signals` (signal masks) and `desktop/src/surface.rs` (the zero-copy
-  bridge). Every `unsafe` block carries a `// SAFETY:` comment
+  `apps/emu`'s `shutdown_signals` (signal masks) and `host_windows.rs` (the console control handler), `crates/sim-encode`'s `src/linux.rs` (one OpenH264
+  `SetOption` call: a runtime bitrate change), `desktop/src/surface.rs` (the zero-copy
+  bridge) and `crates/sim-camera`'s `avf.rs` (AVFoundation capture) and `v4l2.rs` (Linux V4L2
+  ioctls). Every `unsafe` block carries a `// SAFETY:` comment
   (`clippy::undocumented_unsafe_blocks` is denied or warned there). Everything else forbids it.
 - Private service APIs are reached by selector/symbol lookup at runtime and checked with
   `respondsToSelector:` / `dlsym` first, so a missing API is an `Error::Unavailable`, never a crash.
@@ -53,9 +55,16 @@ for both is to match the stock tools exactly and then exceed them.
 - Every device, API method and UI element says which platform it belongs to: devices carry
   `platform`, `form_factor` and `sub_platform`; `help` lists each method's platforms. Validate a
   (platform, form factor) pair with `Kind::new`, which explains unsupported combinations.
+- The workspace builds for `x86_64-pc-windows-msvc` (Android devices only; docs/development.md
+  "Windows"). Code that must compile there names `sim_core::hostfs` (positional file I/O, `stat`
+  fields, modes, process groups) and `sim_core::net` (Unix sockets) instead of `std::os::unix`:
+  std's own types on unix, documented stand-ins on Windows. What can't work there yet answers
+  `ErrorKind::Unsupported` and says what is missing, and a test that needs a Unix socket,
+  `/bin/sh` or a hypervisor is gated `#[cfg(unix)]`, never dropped. Check a change from any host
+  with `cargo xwin clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings`.
 - Doctests are disabled; don't rely on them for coverage.
-- `desktop/` is a separate workspace (Rune is a large git dependency). Bump the Rune `rev` and every
-  `[patch.crates-io]` entry together, and commit `desktop/Cargo.lock`.
+- `desktop/` and `website/` are separate workspaces (Rune is a large git dependency). Bump the Rune
+  `rev` and every `[patch.crates-io]` entry together in both, and commit both `Cargo.lock` files.
 
 ## Benchmarks and public docs
 
@@ -68,6 +77,11 @@ argue with measured numbers against the stock tools, so keep the numbers current
   it doesn't have.
 - A change that moves a published number updates its row in the same PR. A performance PR with
   no row to update adds one, or says in its description why the win isn't user-visible.
+- Publish only a result the quiet-host protocol calls publishable: every `scripts/bench/` script
+  waits for a quiet host (`scripts/bench/quiet.sh`) and writes a host record beside its results;
+  `python3 -I scripts/bench/summarize.py check <result.json>` says whether a run may enter a table
+  (gate passed, 3 or more rounds, no measure over its noise budget). `--no-quiet-gate` is for
+  smoke runs. See `docs/research/bench-protocol.md`.
 - Compare like with like: the same AVD or device type, host and day, both tools cold or both
   warm, median of at least 3 runs. Say what was run (`scripts/android-bench.sh`, `hyperfine`, a
   `--ignored` bench). A number measured on a different machine (a Linux VM bench) is labelled so.
@@ -89,6 +103,7 @@ cargo c                      # check --all-targets
 cargo t                      # nextest run (or: cargo test)
 cargo lint                   # clippy --all-targets -D warnings
 cargo fmt --all
+cargo xtask check            # scripts/check.sh's steps, on any host (the Windows way; --quick, --all)
 cd desktop && cargo test     # Rune headless view tests
 ```
 
@@ -131,7 +146,11 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   `EmulatorMessage` codec, property names and values), `network.rs` (the stock console's
   `network speed|delay` presets, parsing and `network status` report), `framebuffer.rs` (which
   framebuffer port is an Apple device's main display), BGRA→RGBA conversion,
-  `Frame` and PNG encoding. No FFI.
+  `Frame` and PNG encoding, `mark/` (the simee mark: the cut, its light, colours and motion
+  states, a seam-free rasterizer and every file in `assets/brand/`; `docs/design/brand.md`),
+  `hostfs.rs` and `net.rs` (the unix-only std calls and Unix sockets, by one name on every host:
+  std's on unix, stand-ins on Windows), `entropy.rs` (OS random bytes: tokens, ids, the guest's
+  rng; Windows has no `/dev/urandom`). No FFI.
 - `crates/sim-coresim` — the service boundary: `Context` (service + device set), `Device`
   (lifecycle, apps, settings, orientation, CarPlay), `Display` (framebuffer surface, capture; main
   or external), `Hid` (touch, buttons, keyboard, the Digital Crown, watch gestures, the Siri
@@ -147,6 +166,23 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   proxy), `Profile`/`Rule` (the live profile file format).
 - `crates/sim-audio` — driverless per-device audio: `native/simaudio.swift` (process-tap helper,
   built on demand), capture/mute sessions, route and volume via the device's `audiosettings.plist`.
+- `crates/sim-rtc` — the WHIP publisher (no async runtime): `whip.rs` (RFC 9725 client),
+  `http.rs`/`url.rs` (blocking HTTP/1.1 on `std::net`), `h264.rs` (Annex B, access units, SPS
+  `profile-level-id`, SPS/PPS before IDRs), `rtp.rs` (RFC 6184, FU-A), `publisher.rs` (str0m in
+  RTP mode, one thread per publisher, the encoder callback). Docs: `docs/streaming.md`.
+- `crates/sim-encode` — the H.264 encoder (safe; its FFI is `sim-coresim`'s `videotoolbox.rs`
+  behind the `videotoolbox` feature, and `linux.rs`'s one call): `annexb.rs` (length-prefixed to Annex B, SPS/PPS before
+  every IDR), `pacing.rs` (fps cap, idle heartbeat, strictly increasing PTS), `stream.rs` (the
+  loop: `Source`, `Encoder`, `Controls`), `vt.rs` (`VtEncoder`, `Decoder`; macOS), `source.rs`
+  (`IosSource` wraps the framebuffer IOSurface, `AndroidSource` copies emu's ring frames into an
+  IOSurface pool; macOS); `examples/encode_bench.rs` (scripts/bench/encode.sh),
+  `examples/publish_device.rs` (a device to WHIP). Linux: `linux.rs` (`OpenH264Encoder`, OpenH264
+  built from source, behind the off-by-default `openh264` feature so the Linux cross-clippy from
+  macOS needs no C++ toolchain), `i420.rs` (BGRA/RGBA to BT.709 I420 and the `max_size` downscale,
+  on reused buffers), `android_frames.rs` (the display-socket reader both platforms' `AndroidSource`
+  use), `linux_source.rs`, `build.rs` (a cargo warning when the feature builds OpenH264 on x86 without
+  `nasm`, 2.4x slower); `examples/linux_bench.rs` (scripts/bench/encode-linux.sh). CI's `linux` job
+  lints and tests the crate with `--features openh264`; `scripts/check.sh` doesn't.
 - `crates/sim-android` — the Android backend's client: AVDs as labelled devices, system images as
   runtimes, AVD creation shaped by form factor, starting `emu` and waiting for boot, the console
   client (`console.rs`) and the display socket client (`display.rs`). No FFI.
@@ -170,6 +206,14 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   `examples/soft_devices.rs`
   serves the whole software-mode device set. Everything but `machine.rs`, `vcpu.rs` and
   `virtio/gpu.rs` builds and tests on Linux: put device logic there, not behind the hypervisor.
+- `crates/emu-container` — the container backend's host side, safe Rust (Android's userspace in a
+  container on the host's kernel, #210): `probe.rs` (binderfs, memfd, cgroups v2, user namespaces,
+  overlayfs, each missing piece with its fix, over an injectable `/proc` and `/sys` view),
+  `select.rs` (KVM, then container, then TCG; `-backend` overrides; `choose` is the one call
+  `apps/emu` makes), `image.rs` (the official Redroid image pinned by SHA-256; a download only on
+  request), `launch.rs` (the namespaces, id maps, mounts and `/init` arguments as data, run
+  through `unshare(1)`), `helper.rs` (`pivot_root` and parent-death, via rustix's safe wrappers).
+  Tests use fake trees; `SIMEE_E2E_CONTAINER=1` runs the launcher against the host's kernel.
 - `crates/emu-avd` — `Env` (SDK/AVD paths), `Avd` (config, `profile()`), `NewAvd`
   (`for_profile`), running-instance advertisements (`Running`), `BootConfig`, ini parsing.
 - `crates/emu-sdk` — Java-free provisioning: repository manifests, verified downloads, the
@@ -183,7 +227,10 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   non-macOS hosts `ios_unavailable.rs`), the Android backend's methods (`android.rs`), server
   and client (`lib.rs`). The CLI, the socket and the
   desktop panel all go through it; add a capability here once and every surface gets it.
-- `crates/sim-mcp` — the MCP server behind `simee mcp` (stdio only; no FFI, no new dependencies):
+- `crates/sim-mcp` — the MCP server behind `simee mcp` (stdio, and Streamable HTTP in `http.rs`; no
+  FFI; its one optional dependency set is the off-by-default `tls` feature: rustls on the ring
+  provider, rcgen, ring; `http/conn.rs` is what a connection reads and writes through, plain or
+  TLS, with reads bounded by one deadline, and `http/tls.rs` the certificates and handshake):
   `rpc.rs` (messages, versions, error codes), `server.rs` (which request does what; the current
   revision statelessly, `initialize` for older clients), `tools.rs` (one tool per `METHODS` entry,
   annotations, results, which methods are tasks), `resources.rs` (`simee://` URIs), `tasks.rs` (the
@@ -205,7 +252,8 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
 - `desktop/` — Rune app, one window for both platforms: `device.rs` (the live iOS device facade; a
   stub where there's no simulator service, so the window builds and tests on Linux), `ios.rs`
   (live iOS device, capture thread; macOS), `surface.rs` (zero-copy IOSurface bridge; macOS),
-  `android.rs` (live Android device: frames and input over `display.sock`), `controls.rs` (the
+  `android.rs` (live Android device: frames and input over `display.sock`), `mark.rs` (the mark
+  drawn live: the activity indicator and each device's state), `controls.rs` (the
   toolbar each platform and form factor gets), `debug.rs` (debug panel: tabs, API worker thread, views), `icons.rs` (SVG
   icons), `keys.rs` (host keys → HID), `view.rs`, `main.rs` (state, actions, poll, tests).
   Headless `--snap` works in debug builds, and in release with the `tooling` feature (Rune's
@@ -213,7 +261,17 @@ scripts/automobile-farm.sh <udid> emulator-5554 emulator-5556
   `cargo run --release --features tooling -- --snap /tmp/x.png --scene demo`. Scenes: demo,
   android, foldable, watch, tv, apple-watch, apple-tv, empty. On Linux it renders with Mesa's
   lavapipe.
-- `scripts/` — `parity.sh`, `ios-matrix.sh` (every iOS feature on one device: the
+- `website/` — the public site, a Rune app in web document mode and its own workspace (like
+  `desktop/`): `content.rs` (the README sections and `docs/*.md` it publishes, link and anchor
+  rewriting), `home.rs`, `docs.rs`, `devices.rs` (drawn from `sim-core`'s form factor matrix),
+  `demos.rs` (live streams via `public/live.js`); `scripts/build.sh` writes `website/dist` (wasm
+  plus each page's static HTML); deployed to Fly by `.github/workflows/website.yml`. `media/` is
+  the live demo's MediaMTX relay on Fly (`website-media.yml`), fed by `scripts/live-demo.sh`. Its copy carries no number of its own:
+  measured claims come from the README and docs. Docs: `website/README.md`.
+- `xtask/` — `cargo xtask check [--quick|--all]`: `scripts/check.sh`'s steps as a Rust program that
+  runs on every host, Windows included (no bash). `.github/workflows/windows.yml` runs it.
+- `scripts/` — `brand.sh` (redraws `assets/brand/` from `sim_core::mark`), `desktop-app.sh` (the
+  desktop as `simee.app` with its icon), `mediamtx.sh` (MediaMTX on free ports by hand), `mediamtx-fetch.sh` (the pinned, SHA-256-checked MediaMTX release: version and hashes live there; CI's `mediamtx` and macOS `lint-test` jobs run `simee-rtc`'s tests against it), `parity.sh`, `ios-matrix.sh` (every iOS feature on one device: the
   `docs/ios-versions.md` table), `automobile-harness.sh`, `automobile-farm.sh` (every device through
   one private AutoMobile daemon; `automobile-daemon.sh` starts, joins and stops it, and the
   harnesses join it through `AM_DAEMON_ENV`), `pf-shape.sh` (pf/dummynet, needs sudo);

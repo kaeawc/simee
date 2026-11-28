@@ -1,0 +1,34 @@
+{
+  "name": "prompt-audit-contrast",
+  "goal": "Follow the audit-contrast prompt for the Notes app's screen on iphone-17, starting from the home screen.",
+  "toolsets": "core,observe",
+  "prompt": {"name": "audit-contrast", "arguments": {"device": "iphone-17", "screen_description": "the Notes app's note list"}},
+  "world": {
+    "devices": [
+      {"udid": "iphone-17", "name": "iPhone 17", "platform": "ios", "form_factor": "phone", "state": "Booted",
+       "apps": ["com.example.notes"]}
+    ],
+    "icons": [{"bundle_id": "com.example.notes", "region": [100, 500, 180, 180]}],
+    "contrast": {
+      "com.example.notes": {
+        "light": [{"x": 48, "y": 300, "width": 420, "height": 40, "kind": "text", "foreground": "#9a9a9a", "background": "#ffffff",
+                   "ratio": 2.8, "required": 4.5}],
+        "dark": []
+      }
+    }
+  },
+  "plan": [
+    {"tool": "screenshot", "args": {"device": "iphone-17"}},
+    {"tool": "button", "args": {"device": "iphone-17", "button": "home"}},
+    {"tool": "swipe", "args": {"device": "iphone-17", "x1": 1000, "y1": 1300, "x2": 200, "y2": 1300}},
+    {"tool": "tap", "args": {"device": "iphone-17", "x": 190, "y": 590}},
+    {"tool": "screenshot", "args": {"device": "iphone-17"}},
+    {"tool": "contrast_check", "args": {"device": "iphone-17", "appearance": "both"}, "expect": {"contains": ["\"ratio\":2.8"]}}
+  ],
+  "end": {
+    "foreground": {"iphone-17": "com.example.notes"},
+    "appearance": {"iphone-17": "light"},
+    "screenshot_shows": {"iphone-17": ["app=com.example.notes"]},
+    "seen": ["2.8"]
+  }
+}

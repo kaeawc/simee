@@ -1,0 +1,592 @@
+Keep the soft TLB and the jump cache of up to 8 x86 PCIDs across CR3 writes in QEMU's TCG.
+
+Research prototype for kaeawc/simee#227, not for upstream as it stands (see
+docs/research/tcg-context-switch.md): no INVPCID, no CR4.PCIDE checks beyond what TCG did,
+x86 only, and the measured gain on a whole guest boot is within noise.
+
+Applies to the QEMU 11.1.3 release tarball (sha256 5a8289c7940dc77d... as in
+docs/research/software-mode-profile.md):
+
+    tar xf qemu-11.1.3.tar.xz && cd qemu-11.1.3 && patch -p1 < tcg-pcid.patch
+
+Run emu with EMU_QEMU pointing at the qemu-system-x86_64 built from the patched tree. The guest then
+sees CPUID.PCID and its kernel sets CR4.PCIDE; `info jit` in the monitor gains "TLB PCID
+switches" and "TLB PCID bank hits".
+
+---
+--- a/accel/tcg/cputlb.c
++++ b/accel/tcg/cputlb.c
+@@ -42,6 +42,7 @@
+ #include "exec/tlb-flags.h"
+ #include "qemu/atomic.h"
+ #include "qemu/atomic128.h"
++#include "qemu/rcu.h"
+ #include "tb-internal.h"
+ #include "trace.h"
+ #include "tb-hash.h"
+@@ -147,6 +148,65 @@
+     desc->window_max_entries = max_entries;
+ }
+ 
++/*
++ * PCID banks.
++ *
++ * A guest that tags its address spaces with PCIDs (x86 CR4.PCIDE) may switch
++ * back to one whose translations are still valid. QEMU's soft TLB and jump
++ * cache hold the translations of one address space, so each change of page
++ * table root used to drop both, and everything the next few hundred guest
++ * instructions touched had to be walked and looked up again.
++ *
++ * Here the translations of the PCID being left are kept in a bank (the dirty
++ * MMU indexes' tables, victim entries and the jump cache, which move by
++ * swapping) and those of the PCID being entered come back if they are in a
++ * bank. Any flush that is not a PCID-aware change of root (tlb_flush*, a CR4
++ * change, a memory map update, ...) drops every bank, and a page flush
++ * (INVLPG, which also drops global entries of every PCID) reaches them all.
++ * A write-protect range (tlb_reset_dirty: code was translated from those
++ * pages) is remembered and applied when the PCID comes back, and a bank that
++ * would have to apply too much is dropped.
++ */
++#define TLB_NBANKS 8
++
++typedef struct TLBBank {
++    bool init;
++    bool valid;
++    uint16_t pcid;
++    uint64_t last_used;
++    MMUIdxMap dirty;
++    /* Host range whose writable entries still have to lose their write permission (tlb_reset_dirty) */
++    uintptr_t pend_lo, pend_hi;
++    CPUTLBDesc d[NB_MMU_MODES];
++    CPUTLBDescFast f[NB_MMU_MODES];
++    CPUJumpCache *jc;
++} TLBBank;
++
++static void tlb_reset_dirty_one_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
++                                       uintptr_t start, uintptr_t length);
++
++/* A kept PCID that would need more than this much of a write-protect range applied is dropped instead. */
++#define TLB_BANK_PEND_MAX (1 << 20)
++
++struct TLBBanks {
++    uint64_t clock;
++    TLBBank bank[TLB_NBANKS];
++};
++
++static void tb_jmp_cache_clear_page_in(CPUJumpCache *jc, vaddr page_addr)
++{
++    int i, i0;
++
++    if (unlikely(!jc)) {
++        return;
++    }
++
++    i0 = tb_jmp_cache_hash_page(page_addr);
++    for (i = 0; i < TB_JMP_PAGE_SIZE; i++) {
++        qatomic_set(&jc->array[i0 + i].tb, NULL);
++    }
++}
++
+ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
+ {
+     CPUJumpCache *jc = cpu->tb_jmp_cache;
+@@ -338,6 +398,24 @@
+ {
+     int i;
+ 
++    if (cpu->tlb_banks) {
++        for (int b = 0; b < TLB_NBANKS; b++) {
++            TLBBank *bank = &cpu->tlb_banks->bank[b];
++
++            if (!bank->init) {
++                continue;
++            }
++            for (i = 0; i < NB_MMU_MODES; i++) {
++                g_free(bank->f[mmuidx_to_fast_index(i)].table);
++                g_free(bank->d[i].fulltlb);
++            }
++            if (bank->jc) {
++                g_free_rcu(bank->jc, rcu);
++            }
++        }
++        g_free(cpu->tlb_banks);
++        cpu->tlb_banks = NULL;
++    }
+     qemu_spin_destroy(&cpu->neg.tlb.c.lock);
+     for (i = 0; i < NB_MMU_MODES; i++) {
+         CPUTLBDesc *desc = &cpu->neg.tlb.d[i];
+@@ -367,7 +445,23 @@
+     }
+ }
+ 
+-static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
++/* Every kept PCID is gone: someone changed the address space under it. */
++static void tlb_banks_drop(CPUState *cpu)
++{
++    struct TLBBanks *bs = qatomic_read(&cpu->tlb_banks);
++
++    if (!bs) {
++        return;
++    }
++    qemu_spin_lock(&cpu->neg.tlb.c.lock);
++    for (int i = 0; i < TLB_NBANKS; i++) {
++        bs->bank[i].valid = false;
++    }
++    qemu_spin_unlock(&cpu->neg.tlb.c.lock);
++}
++
++/* Flush the live tables only; the kept PCIDs stay. */
++static void tlb_flush_live_work(CPUState *cpu, run_on_cpu_data data)
+ {
+     MMUIdxMap asked = data.host_int;
+     MMUIdxMap all_dirty, work, to_clean;
+@@ -407,6 +501,147 @@
+     }
+ }
+ 
++static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
++{
++    tlb_flush_live_work(cpu, data);
++    tlb_banks_drop(cpu);
++}
++
++static void tlb_bank_init(TLBBank *b)
++{
++    int64_t now = get_clock_realtime();
++
++    for (int i = 0; i < NB_MMU_MODES; i++) {
++        tlb_mmu_init(&b->d[i], &b->f[mmuidx_to_fast_index(i)], now);
++    }
++    b->dirty = 0;
++    b->init = true;
++    b->jc = g_new0(CPUJumpCache, 1);
++}
++
++/* Exchange the live tables with those of @b. Called with the lock held. */
++static void tlb_bank_swap_locked(CPUState *cpu, TLBBank *b)
++{
++    MMUIdxMap work = cpu->neg.tlb.c.dirty | b->dirty;
++    CPUJumpCache *jc;
++
++    /* A table that is clean on both sides is empty on both: nothing to move. */
++    for (; work != 0; work &= work - 1) {
++        int mmu_idx = ctz32(work);
++        CPUTLBDesc d = cpu->neg.tlb.d[mmu_idx];
++        CPUTLBDescFast *lf = cpu_tlb_fast(cpu, mmu_idx);
++        CPUTLBDescFast *bf = &b->f[mmuidx_to_fast_index(mmu_idx)];
++        CPUTLBDescFast f = *lf;
++
++        cpu->neg.tlb.d[mmu_idx] = b->d[mmu_idx];
++        b->d[mmu_idx] = d;
++        *lf = *bf;
++        *bf = f;
++    }
++    work = cpu->neg.tlb.c.dirty;
++    cpu->neg.tlb.c.dirty = b->dirty;
++    b->dirty = work;
++
++    jc = cpu->tb_jmp_cache;
++    qatomic_set(&cpu->tb_jmp_cache, b->jc);
++    b->jc = jc;
++}
++
++void tlb_switch_pcid(CPUState *cpu, uint16_t pcid, bool flush)
++{
++    struct TLBBanks *bs = cpu->tlb_banks;
++    TLBBank *hit = NULL, *b = NULL;
++    uint16_t left = cpu->tlb_pcid;
++
++    assert_cpu_is_self(cpu);
++
++    if (pcid == left) {
++        if (flush) {
++            tlb_flush_live_work(cpu, RUN_ON_CPU_HOST_INT(ALL_MMUIDX_BITS));
++        }
++        return;
++    }
++    if (!bs) {
++        bs = g_new0(struct TLBBanks, 1);
++        qemu_spin_lock(&cpu->neg.tlb.c.lock);
++        qatomic_set(&cpu->tlb_banks, bs);
++        qemu_spin_unlock(&cpu->neg.tlb.c.lock);
++    }
++
++    for (int i = 0; i < TLB_NBANKS; i++) {
++        if (bs->bank[i].valid && bs->bank[i].pcid == pcid) {
++            hit = &bs->bank[i];
++            break;
++        }
++    }
++    if (hit) {
++        b = hit;
++    } else {
++        /* Reuse a bank that was dropped, else make one, else the oldest. */
++        for (int i = 0; i < TLB_NBANKS; i++) {
++            TLBBank *c = &bs->bank[i];
++
++            if (!c->valid) {
++                if (!b || b->valid || (!b->init && c->init)) {
++                    b = c;
++                }
++            } else if (!b || (b->valid && c->last_used < b->last_used)) {
++                b = c;
++            }
++        }
++        if (!b->init) {
++            tlb_bank_init(b);
++        }
++    }
++
++    qemu_spin_lock(&cpu->neg.tlb.c.lock);
++    tlb_bank_swap_locked(cpu, b);
++    if (hit && b->pend_hi) {
++        /* the entering PCID's entries missed write protection meanwhile */
++        for (MMUIdxMap w = cpu->neg.tlb.c.dirty; w != 0; w &= w - 1) {
++            int idx = ctz32(w);
++
++            tlb_reset_dirty_one_locked(&cpu->neg.tlb.d[idx], cpu_tlb_fast(cpu, idx),
++                                       b->pend_lo, b->pend_hi - b->pend_lo);
++        }
++    }
++    b->pend_lo = b->pend_hi = 0;
++    b->pcid = left;
++    b->valid = true;
++    b->last_used = ++bs->clock;
++    cpu->tlb_pcid = pcid;
++    qemu_spin_unlock(&cpu->neg.tlb.c.lock);
++
++    qatomic_set(&cpu->neg.tlb.c.pcid_switch_count,
++                cpu->neg.tlb.c.pcid_switch_count + 1);
++    if (hit) {
++        qatomic_set(&cpu->neg.tlb.c.pcid_hit_count,
++                    cpu->neg.tlb.c.pcid_hit_count + 1);
++    }
++    if (!hit || flush) {
++        tlb_flush_live_work(cpu, RUN_ON_CPU_HOST_INT(ALL_MMUIDX_BITS));
++    }
++}
++
++/* tb_flush() reset the code buffer: no jump cache may point into it. */
++void tlb_banks_flush_jmp_caches(CPUState *cpu)
++{
++    struct TLBBanks *bs = qatomic_read(&cpu->tlb_banks);
++
++    if (!bs) {
++        return;
++    }
++    for (int i = 0; i < TLB_NBANKS; i++) {
++        CPUJumpCache *jc = bs->bank[i].jc;
++
++        if (jc) {
++            for (int j = 0; j < TB_JMP_CACHE_SIZE; j++) {
++                qatomic_set(&jc->array[j].tb, NULL);
++            }
++        }
++    }
++}
++
+ void tlb_flush_by_mmuidx(CPUState *cpu, MMUIdxMap idxmap)
+ {
+     tlb_debug("mmu_idx: 0x%" PRIx16 "\n", idxmap);
+@@ -519,6 +754,27 @@
+     }
+ }
+ 
++/* One page out of a kept PCID's tables. Called with tlb_c.lock held. */
++static void tlb_bank_flush_page_locked(CPUTLBDesc *d, CPUTLBDescFast *f,
++                                       vaddr page)
++{
++    CPUTLBEntry *e;
++
++    if ((page & d->large_page_mask) == d->large_page_addr) {
++        tlb_mmu_flush_locked(d, f);
++        return;
++    }
++    e = &f->table[(page >> TARGET_PAGE_BITS) & (f->mask >> CPU_TLB_ENTRY_BITS)];
++    if (tlb_flush_entry_locked(e, page)) {
++        d->n_used_entries--;
++    }
++    for (int k = 0; k < CPU_VTLB_SIZE; k++) {
++        if (tlb_flush_entry_locked(&d->vtable[k], page)) {
++            d->n_used_entries--;
++        }
++    }
++}
++
+ /**
+  * tlb_flush_page_by_mmuidx_async_0:
+  * @cpu: cpu on which to flush
+@@ -544,6 +800,24 @@
+             tlb_flush_page_locked(cpu, mmu_idx, addr);
+         }
+     }
++    /* INVLPG drops global entries of every PCID: reach the kept ones too. */
++    if (cpu->tlb_banks) {
++        for (int i = 0; i < TLB_NBANKS; i++) {
++            TLBBank *b = &cpu->tlb_banks->bank[i];
++
++            if (!b->valid) {
++                continue;
++            }
++            for (MMUIdxMap w = idxmap & b->dirty; w != 0; w &= w - 1) {
++                int idx = ctz32(w);
++
++                tlb_bank_flush_page_locked(&b->d[idx],
++                                           &b->f[mmuidx_to_fast_index(idx)], addr);
++            }
++            tb_jmp_cache_clear_page_in(b->jc, addr - TARGET_PAGE_SIZE);
++            tb_jmp_cache_clear_page_in(b->jc, addr);
++        }
++    }
+     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+ 
+     /*
+@@ -735,6 +1009,7 @@
+         }
+     }
+     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
++    tlb_banks_drop(cpu);
+ 
+     /*
+      * If the length is larger than the jump cache size, then it will take
+@@ -916,25 +1191,54 @@
+  * We must take tlb_c.lock to avoid racing with another vCPU update. The only
+  * thing actually updated is the target TLB entry ->addr_write flags.
+  */
++static void tlb_reset_dirty_one_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
++                                       uintptr_t start, uintptr_t length)
++{
++    unsigned int n = tlb_n_entries(fast);
++    unsigned int i;
++
++    for (i = 0; i < n; i++) {
++        tlb_reset_dirty_range_locked(&desc->fulltlb[i], &fast->table[i],
++                                     start, length);
++    }
++
++    for (i = 0; i < CPU_VTLB_SIZE; i++) {
++        tlb_reset_dirty_range_locked(&desc->vfulltlb[i], &desc->vtable[i],
++                                     start, length);
++    }
++}
++
+ void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length)
+ {
+     int mmu_idx;
+ 
+     qemu_spin_lock(&cpu->neg.tlb.c.lock);
+     for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
+-        CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
+-        CPUTLBDescFast *fast = cpu_tlb_fast(cpu, mmu_idx);
+-        unsigned int n = tlb_n_entries(fast);
+-        unsigned int i;
+-
+-        for (i = 0; i < n; i++) {
+-            tlb_reset_dirty_range_locked(&desc->fulltlb[i], &fast->table[i],
+-                                         start, length);
+-        }
++        tlb_reset_dirty_one_locked(&cpu->neg.tlb.d[mmu_idx],
++                                   cpu_tlb_fast(cpu, mmu_idx), start, length);
++    }
++    /*
++     * Kept PCIDs hold writable entries to the same pages. Scanning their tables
++     * here costs every other vCPU cache misses on each translated page, so the
++     * range is remembered and applied when the PCID comes back; one that would
++     * have to apply too much is dropped.
++     */
++    if (cpu->tlb_banks) {
++        for (int i = 0; i < TLB_NBANKS; i++) {
++            TLBBank *b = &cpu->tlb_banks->bank[i];
++            uintptr_t lo, hi;
+ 
+-        for (i = 0; i < CPU_VTLB_SIZE; i++) {
+-            tlb_reset_dirty_range_locked(&desc->vfulltlb[i], &desc->vtable[i],
+-                                         start, length);
++            if (!b->valid || !b->dirty) {
++                continue;
++            }
++            lo = b->pend_hi ? MIN(b->pend_lo, start) : start;
++            hi = b->pend_hi ? MAX(b->pend_hi, start + length) : start + length;
++            if (hi - lo > TLB_BANK_PEND_MAX) {
++                b->valid = false;
++            } else {
++                b->pend_lo = lo;
++                b->pend_hi = hi;
++            }
+         }
+     }
+     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+--- a/accel/tcg/tb-maint.c
++++ b/accel/tcg/tb-maint.c
+@@ -780,6 +780,9 @@
+ 
+     CPU_FOREACH(cpu) {
+         tcg_flush_jmp_cache(cpu);
++#ifndef CONFIG_USER_ONLY
++        tlb_banks_flush_jmp_caches(cpu);
++#endif
+     }
+ 
+     qht_reset_size(&tb_ctx.htable, CODE_GEN_HTABLE_SIZE);
+--- a/accel/tcg/tcg-stats.c
++++ b/accel/tcg/tcg-stats.c
+@@ -132,6 +132,19 @@
+     return false;
+ }
+ 
++static void tlb_pcid_counts(size_t *pswitch, size_t *phit)
++{
++    CPUState *cpu;
++    size_t sw = 0, hit = 0;
++
++    CPU_FOREACH(cpu) {
++        sw += qatomic_read(&cpu->neg.tlb.c.pcid_switch_count);
++        hit += qatomic_read(&cpu->neg.tlb.c.pcid_hit_count);
++    }
++    *pswitch = sw;
++    *phit = hit;
++}
++
+ static void tlb_flush_counts(size_t *pfull, size_t *ppart, size_t *pelide)
+ {
+     CPUState *cpu;
+@@ -160,6 +173,12 @@
+     g_string_append_printf(buf, "TLB full flushes    %zu\n", flush_full);
+     g_string_append_printf(buf, "TLB partial flushes %zu\n", flush_part);
+     g_string_append_printf(buf, "TLB elided flushes  %zu\n", flush_elide);
++
++    size_t pcid_switch, pcid_hit;
++
++    tlb_pcid_counts(&pcid_switch, &pcid_hit);
++    g_string_append_printf(buf, "TLB PCID switches   %zu\n", pcid_switch);
++    g_string_append_printf(buf, "TLB PCID bank hits  %zu\n", pcid_hit);
+ }
+ 
+ static void dump_exec_info(GString *buf)
+--- a/include/exec/cputlb.h
++++ b/include/exec/cputlb.h
+@@ -127,6 +127,18 @@
+ void tlb_flush(CPUState *cpu);
+ 
+ /**
++ * tlb_switch_pcid:
++ * @cpu: CPU whose address space changes
++ * @pcid: the PCID (address-space tag) that becomes current
++ * @flush: drop the entries tagged @pcid instead of keeping them
++ *
++ * A guest changed its page table root. The soft TLB and the jump cache of the
++ * PCID being left are kept, and those of @pcid come back when it was used
++ * recently, unless @flush. A tlb_flush() drops every kept PCID as well.
++ */
++void tlb_switch_pcid(CPUState *cpu, uint16_t pcid, bool flush);
++
++/**
+  * tlb_flush_all_cpus_synced:
+  * @cpu: src CPU of the flush
+  *
+@@ -236,6 +248,9 @@
+ static inline void tlb_flush(CPUState *cpu)
+ {
+ }
++static inline void tlb_switch_pcid(CPUState *cpu, uint16_t pcid, bool flush)
++{
++}
+ static inline void tlb_flush_all_cpus_synced(CPUState *src_cpu)
+ {
+ }
+--- a/include/exec/tb-flush.h
++++ b/include/exec/tb-flush.h
+@@ -35,4 +35,7 @@
+ 
+ void tcg_flush_jmp_cache(CPUState *cs);
+ 
++/* The jump caches kept for other PCIDs (accel/tcg/cputlb.c). */
++void tlb_banks_flush_jmp_caches(CPUState *cs);
++
+ #endif /* _TB_FLUSH_H_ */
+--- a/include/hw/core/cpu.h
++++ b/include/hw/core/cpu.h
+@@ -316,6 +316,9 @@
+     size_t full_flush_count;
+     size_t part_flush_count;
+     size_t elide_flush_count;
++    /* PCID banks (tlb_switch_pcid): switches, switches that found the bank */
++    size_t pcid_switch_count;
++    size_t pcid_hit_count;
+ } CPUTLBCommon;
+ 
+ /*
+@@ -519,6 +522,9 @@
+     MemoryRegion *memory;
+ 
+     struct CPUJumpCache *tb_jmp_cache;
++    /* Soft TLBs and jump caches kept per PCID (accel/tcg/cputlb.c) */
++    struct TLBBanks *tlb_banks;
++    uint16_t tlb_pcid;
+ 
+     GArray *gdb_regs;
+     int gdb_num_regs;
+--- a/target/i386/cpu.c
++++ b/target/i386/cpu.c
+@@ -897,7 +897,7 @@
+ #define CPUID_EXT_KERNEL_FEATURES \
+           (CPUID_EXT_PCID | CPUID_EXT_TSC_DEADLINE_TIMER)
+ #else
+-#define CPUID_EXT_KERNEL_FEATURES 0
++#define CPUID_EXT_KERNEL_FEATURES CPUID_EXT_PCID
+ #endif
+ #define TCG_EXT_FEATURES (CPUID_EXT_SSE3 | CPUID_EXT_PCLMULQDQ | \
+           CPUID_EXT_MONITOR | CPUID_EXT_SSSE3 | CPUID_EXT_CX16 | \
+--- a/target/i386/helper.c
++++ b/target/i386/helper.c
+@@ -177,11 +177,22 @@
+    the PDPT */
+ void cpu_x86_update_cr3(CPUX86State *env, target_ulong new_cr3)
+ {
++    bool pcide = (env->cr[4] & CR4_PCIDE_MASK) && (env->efer & MSR_EFER_LMA);
++    bool noflush = pcide && (new_cr3 >> 63);
++
++    if (pcide) {
++        /* Bit 63 asks to keep the PCID's translations; it is not stored. */
++        new_cr3 &= ~(1ULL << 63);
++    }
+     env->cr[3] = new_cr3;
+     if (env->cr[0] & CR0_PG_MASK) {
+         qemu_log_mask(CPU_LOG_MMU,
+                         "CR3 update: CR3=" TARGET_FMT_lx "\n", new_cr3);
+-        tlb_flush(env_cpu(env));
++        if (pcide) {
++            tlb_switch_pcid(env_cpu(env), new_cr3 & 0xfff, !noflush);
++        } else {
++            tlb_flush(env_cpu(env));
++        }
+     }
+ }
+ 
+@@ -193,9 +204,13 @@
+     printf("CR4 update: %08x -> %08x\n", (uint32_t)env->cr[4], new_cr4);
+ #endif
+     if ((new_cr4 ^ env->cr[4]) &
+-        (CR4_PGE_MASK | CR4_PAE_MASK | CR4_PSE_MASK |
++        (CR4_PGE_MASK | CR4_PAE_MASK | CR4_PSE_MASK | CR4_PCIDE_MASK |
+          CR4_SMEP_MASK | CR4_SMAP_MASK | CR4_LA57_MASK)) {
+         tlb_flush(env_cpu(env));
++        if ((new_cr4 ^ env->cr[4]) & CR4_PCIDE_MASK) {
++            /* Enabling or disabling PCIDs makes the current PCID 0. */
++            env_cpu(env)->tlb_pcid = 0;
++        }
+     }
+ 
+     /* Clear bits we're going to recompute.  */
+--- a/target/i386/tcg/system/misc_helper.c
++++ b/target/i386/tcg/system/misc_helper.c
+@@ -91,7 +91,8 @@
+         break;
+     case 3:
+         if ((env->efer & MSR_EFER_LMA) &&
+-                (t0 & ((~0ULL) << env_archcpu(env)->phys_bits))) {
++                ((t0 & ~((env->cr[4] & CR4_PCIDE_MASK) ? 1ULL << 63 : 0)) &
++                 ((~0ULL) << env_archcpu(env)->phys_bits))) {
+             cpu_vmexit(env, SVM_EXIT_ERR, 0, GETPC());
+         }
+         if (!(env->efer & MSR_EFER_LMA)) {

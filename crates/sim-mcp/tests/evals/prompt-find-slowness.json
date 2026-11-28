@@ -1,0 +1,30 @@
+{
+  "name": "prompt-find-slowness",
+  "goal": "Follow the find-slowness prompt for iphone-17 and name the process making it slow.",
+  "toolsets": "core,host,debug",
+  "prompt": {"name": "find-slowness", "arguments": {"device": "iphone-17"}},
+  "world": {
+    "devices": [
+      {"udid": "iphone-17", "name": "iPhone 17", "platform": "ios", "form_factor": "phone", "state": "Booted",
+       "apps": ["com.example.heavy"], "foreground": "com.example.heavy"}
+    ],
+    "processes": {
+      "iphone-17": [
+        {"pid": 1, "ppid": 0, "cpu": 0.4, "rss_kb": 12000, "elapsed": "01:10:00", "name": "launchd_sim", "path": "/sbin/launchd_sim"},
+        {"pid": 310, "ppid": 1, "cpu": 2.1, "rss_kb": 180000, "elapsed": "01:09:58", "name": "SpringBoard", "path": "/System/Library/CoreServices/SpringBoard.app/SpringBoard"},
+        {"pid": 4242, "ppid": 1, "cpu": 97.5, "rss_kb": 2400000, "elapsed": "00:12:03", "name": "Heavy", "path": "/Applications/Heavy.app/Heavy"}
+      ]
+    }
+  },
+  "plan": [
+    {"tool": "host", "args": {}, "expect": {"contains": ["admit"]}},
+    {"tool": "devices_usage", "args": {}, "expect": {"contains": ["iphone-17"]}},
+    {"tool": "processes", "args": {"device": "iphone-17"}, "expect": {"contains": ["\"pid\":4242"]}},
+    {"tool": "mem_vmmap", "args": {"device": "iphone-17", "pid": 4242}},
+    {"tool": "mem_heap", "args": {"device": "iphone-17", "pid": 4242}},
+    {"tool": "mem_leaks", "args": {"device": "iphone-17", "pid": 4242}, "expect": {"contains": ["HeavyImageCache"]}}
+  ],
+  "end": {
+    "seen": ["Heavy", "4242", "97.5"]
+  }
+}

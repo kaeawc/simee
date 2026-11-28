@@ -15,6 +15,12 @@ include = ["/Cargo.toml", "/LICENSE", "/examples", "/src"]
 [lib]
 doctest = false
 
+[features]
+# VideoToolbox H.264 (`videotoolbox`: encode a framebuffer or pooled pixel buffers, decode to
+# check): links VideoToolbox, CoreMedia and CoreVideo, so only `simee-encode` turns it on and the
+# CLI doesn't load them.
+videotoolbox = []
+
 [dependencies]
 sim-core.workspace = true
 

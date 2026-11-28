@@ -3,7 +3,12 @@
 //! On current system images the guest's pipe library connects a vsock stream to the host
 //! (CID 2, port 5000) and sends `pipe:<name>\0`; everything after that belongs to the named
 //! service. `qemud:adb` is adbd's transport; others (boot properties, sensors, ...) follow.
+#[cfg(unix)]
 pub mod adb;
+#[cfg(not(unix))]
+#[path = "adb_unsupported.rs"]
+pub mod adb;
+pub mod camera;
 pub mod car;
 pub mod clipboard;
 pub mod fingerprint;

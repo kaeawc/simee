@@ -183,9 +183,62 @@ pub fn power_sources() -> PowerInfo {
     out
 }
 
+unsafe extern "C" {
+    // libc's binding is deprecated in favour of the mach2 crate; this one call isn't worth it.
+    fn mach_host_self() -> libc::mach_port_t;
+}
+
+/// The host's CPU ticks across every CPU since boot (`host_statistics(HOST_CPU_LOAD_INFO)`): user,
+/// system, idle and nice, as the kernel's 32-bit counters (they wrap: take deltas with
+/// `wrapping_sub`). `None` when the call fails.
+pub fn cpu_ticks() -> Option<[u32; 4]> {
+    // Each mach_host_self() adds a user reference to the host port; take one for the process.
+    static HOST: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
+    // SAFETY: mach_host_self takes nothing and returns a send right to the host port.
+    let host = *HOST.get_or_init(|| unsafe { mach_host_self() });
+    let mut info = std::mem::MaybeUninit::<libc::host_cpu_load_info>::zeroed();
+    let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
+    // SAFETY: `info` is a writable host_cpu_load_info, `count` its size in natural_t words, what
+    // this flavor fills; the kernel updates `count` to the words written.
+    let rc = unsafe { libc::host_statistics(host, libc::HOST_CPU_LOAD_INFO, info.as_mut_ptr().cast(), &mut count) };
+    if rc != libc::KERN_SUCCESS || count != libc::HOST_CPU_LOAD_INFO_COUNT {
+        return None;
+    }
+    // SAFETY: zeroed and filled by a successful call that wrote every word; plain integers.
+    let info = unsafe { info.assume_init() };
+    let t = info.cpu_ticks;
+    Some([
+        t[libc::CPU_STATE_USER as usize],
+        t[libc::CPU_STATE_SYSTEM as usize],
+        t[libc::CPU_STATE_IDLE as usize],
+        t[libc::CPU_STATE_NICE as usize],
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_ticks_advance() {
+        // Ticks are coarse (100 Hz) and a CI VM may not account a short burst to any CPU, so spin
+        // until they move, for up to two seconds, rather than sampling after a fixed 50 ms.
+        let total = |t: [u32; 4]| t.iter().map(|&v| u64::from(v)).sum::<u64>();
+        let a = cpu_ticks().expect("ticks");
+        let mut x = 0u64;
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut b = a;
+        while std::time::Instant::now() < until {
+            for _ in 0..100_000 {
+                x = std::hint::black_box(x.wrapping_add(1));
+            }
+            b = cpu_ticks().expect("ticks");
+            if total(b) != total(a) {
+                break;
+            }
+        }
+        assert!(total(b).wrapping_sub(total(a)) > 0, "{a:?} -> {b:?}");
+    }
 
     #[test]
     fn thermal_and_power_read_on_this_host() {

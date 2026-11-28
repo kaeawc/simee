@@ -133,7 +133,7 @@ pub fn bezel(d: &DeviceInfo) -> Option<crate::bezel::Mode> {
     let form_factor = d.form_factor.unwrap_or(FormFactor::Phone);
     let edges = matches!(form_factor, FormFactor::Phone | FormFactor::Tablet | FormFactor::Watch | FormFactor::Foldable);
     match d.platform {
-        Platform::Ios if edges && form_factor != FormFactor::Foldable => Some(crate::bezel::Mode::Ios),
+        Platform::Ios if edges => Some(crate::bezel::Mode::Ios),
         Platform::Android if edges => Some(crate::bezel::Mode::Android),
         _ => None,
     }
@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn the_iphone_duo_gets_its_hinge() {
-        let mut duo = device(Platform::Ios, FormFactor::Phone);
+        let mut duo = device(Platform::Ios, FormFactor::Foldable);
         duo.device_type_id = "com.apple.CoreSimulator.SimDeviceType.iPhone-Duo".into();
         let keys: Vec<&str> = for_device(&duo).iter().map(|c| c.key).collect();
         assert!(keys.ends_with(&["fold-closed", "fold-half", "fold-opened", "screenshot-button", "shutdown-button"]), "{keys:?}");

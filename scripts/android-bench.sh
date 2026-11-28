@@ -24,7 +24,8 @@ out="$repo/bench"; mkdir -p "$out"
 port=${PORT:-5600}; serial="emulator-$port"
 own=()
 case "$kind" in
-  emu) (cd "$repo" && cargo build -q --release -p simee-emu) && codesign -s - -f --entitlements "$repo/scripts/hypervisor.entitlements" "$repo/target/release/emu" 2>/dev/null
+  emu) (cd "$repo" && cargo build -q --release -p simee-emu) || exit 1
+       [ "$(uname -s)" = Darwin ] && codesign -s - -f --entitlements "$repo/scripts/hypervisor.entitlements" "$repo/target/release/emu" 2>/dev/null
        bin="$repo/target/release/emu"; own=(-verbose) ;;
   stock) bin="$sdk/emulator/emulator" ;;
   *) echo "kind must be emu or stock" >&2; exit 2 ;;
@@ -33,14 +34,15 @@ esac
 # and readings are taken only at events (start, adb up, boot), never once per poll.
 now() { perl -MTime::HiRes=time -e 'printf "%.3f\n", time'; }
 since() { awk -v a="$(now)" -v b="$1" -v d="${2:-1}" 'BEGIN { printf "%.*f\n", d, a - b }'; }
-load1() { sysctl -n vm.loadavg | awk '{print $2}'; }
-ncpu=$(sysctl -n hw.ncpu)
+load1() { if [ -r /proc/loadavg ]; then cut -d' ' -f1 /proc/loadavg; else sysctl -n vm.loadavg | awk '{print $2}'; fi; }
+ncpu=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
 l0=$(load1)
 t0=$(now)
 # emu's own switches (EMU_RENDERER_GL=1, EMU_GUEST_EGL=...) pass through, for A/B runs.
 emu_env=()
 while IFS= read -r kv; do emu_env+=("$kv"); done < <(env | grep '^EMU_' || true)
-env -i HOME="$HOME" USER="$USER" TMPDIR="$TMPDIR" PATH="/usr/bin:/bin:/usr/sbin:/sbin" ANDROID_HOME="$sdk" ANDROID_SDK_ROOT="$sdk" ${emu_env[@]+"${emu_env[@]}"} \
+env -i HOME="$HOME" USER="${USER:-$(id -un)}" TMPDIR="${TMPDIR:-/tmp}" PATH="/usr/bin:/bin:/usr/sbin:/sbin" ANDROID_HOME="$sdk" ANDROID_SDK_ROOT="$sdk" \
+  ${ANDROID_AVD_HOME:+ANDROID_AVD_HOME="$ANDROID_AVD_HOME"} ${emu_env[@]+"${emu_env[@]}"} \
   "$bin" -avd "$avd" -port "$port" -no-window -no-audio -no-boot-anim -no-snapshot-save ${own[@]+"${own[@]}"} "$@" > "$out/$label.log" 2>&1 &
 pid=$!
 # CPU-seconds of the emulator's process tree (the stock launcher execs a qemu child).

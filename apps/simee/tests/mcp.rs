@@ -1,6 +1,8 @@
 //! `simee mcp` end to end, on any host: the real binary as a subprocess speaking MCP on stdio,
 //! with its own SDK, AVD home and `$HOME`, and a fake simee (`sim_android::testing`) standing in
-//! for a running emulator.
+//! for a running emulator. Unix only until the API has a Windows transport: the fake's console and
+//! display are Unix sockets.
+#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -42,8 +44,32 @@ impl Env {
         a
     }
 
+    /// `simee mcp` serving every tool.
     fn mcp(&self) -> Mcp {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_simee"))
+        self.mcp_with(Some("all"))
+    }
+
+    /// `simee mcp` with `SIMEE_MCP_TOOLSETS` set to `toolsets` (unset: the default, `core`).
+    fn mcp_with(&self, toolsets: Option<&str>) -> Mcp {
+        self.spawn(toolsets, None)
+    }
+
+    /// `simee mcp` (every tool) with `SIMEE_MCP_SCREEN_FPS` set to `fps`.
+    fn mcp_fps(&self, fps: &str) -> Mcp {
+        self.spawn(Some("all"), Some(fps))
+    }
+
+    fn spawn(&self, toolsets: Option<&str>, screen_fps: Option<&str>) -> Mcp {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_simee"));
+        match toolsets {
+            Some(t) => command.env("SIMEE_MCP_TOOLSETS", t),
+            None => command.env_remove("SIMEE_MCP_TOOLSETS"),
+        };
+        match screen_fps {
+            Some(f) => command.env("SIMEE_MCP_SCREEN_FPS", f),
+            None => command.env_remove("SIMEE_MCP_SCREEN_FPS"),
+        };
+        let mut child = command
             .arg("mcp")
             .env("HOME", self.root.join("home"))
             .env("ANDROID_HOME", self.root.join("sdk"))
@@ -194,5 +220,51 @@ fn a_client_of_an_older_revision_opens_with_initialize() {
     let result = mcp.line();
     assert_eq!(result["id"], 2);
     assert!(result["result"]["content"][0]["text"].as_str().is_some_and(|t| t.contains("Wear OS")), "{result}");
+    assert!(mcp.close().success());
+}
+
+#[test]
+fn the_default_server_serves_core_and_says_where_the_rest_is() {
+    let e = Env::new("core");
+    let mut mcp = e.mcp_with(None);
+    let tools = mcp.request("tools/list", json!({}), false)["result"]["tools"].clone();
+    let names: Vec<&str> = tools.as_array().expect("tools").iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.len() <= 25 && names.contains(&"tap") && names.contains(&"device_view") && !names.contains(&"create"), "{names:?}");
+    let hidden = mcp.request("tools/call", json!({"name": "create", "arguments": {"name": "x"}}), false);
+    assert!(hidden["error"]["message"].as_str().is_some_and(|m| m.contains("SIMEE_MCP_TOOLSETS=core,lifecycle")), "{hidden}");
+    assert!(mcp.close().success());
+    // An unknown toolset stops the server before it serves anything.
+    assert!(!e.mcp_with(Some("core,nope")).close().success());
+}
+
+#[test]
+fn the_screen_subscription_rate_is_an_environment_setting_that_must_make_sense() {
+    let e = Env::new("fps");
+    let mut mcp = e.mcp_fps("5");
+    let templates = mcp.request("resources/templates/list", json!({}), false)["result"]["resourceTemplates"].clone();
+    let names: Vec<&str> = templates.as_array().expect("templates").iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.contains(&"screen") && names.contains(&"processes") && names.contains(&"prefs"), "{names:?}");
+    let discover = mcp.request("server/discover", json!({}), false);
+    assert_eq!(discover["result"]["capabilities"]["resources"], json!({"subscribe": true, "listChanged": true}));
+    assert!(mcp.close().success());
+    // Zero, too many and not a number stop the server before it serves anything.
+    for bad in ["0", "31", "fast"] {
+        assert!(!e.mcp_fps(bad).close().success(), "{bad}");
+    }
+}
+
+#[test]
+fn the_default_server_lists_prompts_and_says_which_toolsets_they_need() {
+    let e = Env::new("prompts");
+    let mut mcp = e.mcp_with(None);
+    let list = mcp.request("prompts/list", json!({}), false)["result"].clone();
+    let names: Vec<&str> = list["prompts"].as_array().expect("prompts").iter().filter_map(|p| p["name"].as_str()).collect();
+    assert!(names.contains(&"boot-and-install") && names.contains(&"find-slowness"), "{names:?}");
+    let arguments = json!({"platform": "android", "form_factor": "phone", "app_path": "/a.apk"});
+    let got = mcp.request("prompts/get", json!({"name": "boot-and-install", "arguments": arguments}), false);
+    let text = got["result"]["messages"][0]["content"]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("`install` {device, path: \"/a.apk\"}") && text.contains("SIMEE_MCP_TOOLSETS=core,lifecycle"), "{got}");
+    let missing = mcp.request("prompts/get", json!({"name": "boot-and-install", "arguments": {"platform": "ios"}}), false);
+    assert_eq!(missing["error"]["code"], -32602, "{missing}");
     assert!(mcp.close().success());
 }

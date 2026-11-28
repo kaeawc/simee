@@ -118,6 +118,75 @@ fn app(android: &Android, d: &sim_android::Device, method: &str, p: &Value) -> R
     }
 }
 
+/// The longest `exec` `timeout_s`: a day.
+const MAX_EXEC_TIMEOUT_S: u64 = 86_400;
+
+/// `processes`, `kill` and `exec`, over adb, in iOS's shapes: `processes` rows with each app
+/// process's `package` too, nothing for `kill` (a signal to `pid`, or with `bundle_id` an app stop:
+/// `am force-stop`), and `exec`'s `{pid, stdout, stderr}` with `exit_code` and `truncated`.
+fn debug(android: &Android, d: &sim_android::Device, method: &str, p: &Value) -> Result<Value, String> {
+    match method {
+        "processes" => Ok(d
+            .adb(android)?
+            .processes()?
+            .into_iter()
+            .map(|r| {
+                json!({"pid": r.pid, "ppid": r.ppid, "cpu": r.cpu, "rss_kb": r.rss_kb, "elapsed": r.elapsed, "name": r.name,
+                    "path": r.path, "package": r.package})
+            })
+            .collect()),
+        "kill" => {
+            let pid = match p.get("pid") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(v.as_i64().ok_or("pid must be an integer")?),
+            };
+            let force = opt_bool(p, "force")?.unwrap_or(false);
+            match (pid, str_param(p, "bundle_id")) {
+                (Some(_), Some(_)) => Err("give `pid` or `bundle_id`, not both".into()),
+                (None, Some(package)) => d.adb(android)?.terminate(package).map(|()| Value::Null),
+                (Some(pid), None) => {
+                    let signal = p.get("signal").and_then(Value::as_i64).unwrap_or(15);
+                    d.adb(android)?.kill(pid, signal, force).map(|()| Value::Null)
+                }
+                (None, None) => Err("give `pid` (a signal) or `bundle_id` (an app stop)".into()),
+            }
+        }
+        _ => {
+            let program = need_str(p, "program")?;
+            // Unlike iOS's, a value that isn't a string is refused: dropping it would change the argv.
+            let args = match p.get("args") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(v) => v
+                    .as_array()
+                    .and_then(|a| a.iter().map(|w| w.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>())
+                    .ok_or("`args` must be a list of strings")?,
+            };
+            let env = match p.get("env") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(v) => v
+                    .as_object()
+                    .and_then(|o| o.iter().map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned()))).collect::<Option<Vec<_>>>())
+                    .ok_or("`env` must be an object of strings (names to values)")?,
+            };
+            let defaults = sim_android::procs::ExecLimits::default();
+            let at_least_1 = |key: &str| match opt_u64(p, key) {
+                Some(0) => Err(format!("{key} must be at least 1")),
+                n => Ok(n),
+            };
+            let timeout = match at_least_1("timeout_s")? {
+                Some(s) if s > MAX_EXEC_TIMEOUT_S => return Err(format!("timeout_s must be at most {MAX_EXEC_TIMEOUT_S} (a day)")),
+                s => s,
+            };
+            let limits = sim_android::procs::ExecLimits {
+                timeout: timeout.map_or(defaults.timeout, Duration::from_secs),
+                max_bytes: at_least_1("max_bytes")?.map_or(defaults.max_bytes, |n| usize::try_from(n).unwrap_or(usize::MAX)),
+            };
+            let out = d.adb(android)?.exec(program, &args, &env, limits)?;
+            Ok(json!({"pid": out.pid, "stdout": out.stdout, "stderr": out.stderr, "exit_code": out.exit_code, "truncated": out.truncated}))
+        }
+    }
+}
+
 /// `fold`: `folded` (the console's `fold` or `unfold`), a hinge `angle`, or a `posture` (stock's
 /// names or ids: closed, half-opened, opened, flipped, tent); a `null` one is absent. Answers
 /// with the hinge as simee's emulator then has it (angle, posture, whether folded, the display
@@ -169,6 +238,23 @@ fn first_port(p: &Value) -> Result<u16, String> {
     }
 }
 
+/// How long a boot waits for `sys.boot_completed` (`timeout_s`, default 300 s), and whether the
+/// device plays on the host (`audio`, default false: a farm booting N devices would open N host
+/// streams).
+pub(crate) fn boot_options(p: &Value) -> Result<(Duration, bool), String> {
+    Ok((Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300)), opt_bool(p, "audio")?.unwrap_or(false)))
+}
+
+/// `boot_many`'s boot timeout and first console port.
+pub(crate) fn boot_many_options(p: &Value) -> Result<(Duration, u16), String> {
+    Ok((Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300)), first_port(p)?))
+}
+
+/// `import`'s `allow_mismatch` (default false: only the exported revision of the system image).
+pub(crate) fn import_allows_mismatch(p: &Value) -> Result<bool, String> {
+    Ok(opt_bool(p, "allow_mismatch")?.unwrap_or(false))
+}
+
 /// One device's [`sim_android::BootOutcome`] in `boot_many`'s result: the same shape as an iOS
 /// device's (`device`, `boot_s`, or `error`), with the console port and adb serial.
 fn outcome_json(o: &sim_android::BootOutcome) -> Value {
@@ -181,18 +267,35 @@ fn outcome_json(o: &sim_android::BootOutcome) -> Value {
     }
 }
 
-/// `boot_many` for AVDs (`udids`, already resolved): [`Android::boot_many`], at most
-/// `concurrency` emulators starting at once, each on its own console port.
-pub fn boot_many(s: &mut Session, p: &Value, udids: &[String]) -> Result<Value, String> {
+/// A [`crate::progress::BootHook`] as the Android window's hook: each outcome as its `devices` entry.
+struct Outcomes<'a>(&'a dyn crate::progress::BootHook);
+
+impl sim_android::BootHook for Outcomes<'_> {
+    fn start(&self, i: usize) -> Result<(), String> {
+        self.0.start(i)
+    }
+
+    fn launching(&self, i: usize) -> Result<(), String> {
+        self.0.launching(i)
+    }
+
+    fn finished(&self, i: usize, outcome: &sim_android::BootOutcome) {
+        self.0.finished(i, &outcome_json(outcome));
+    }
+}
+
+/// `boot_many` for AVDs (`udids`, already resolved): [`Android::boot_many_hooked`], at most
+/// `concurrency` emulators starting at once, each on its own console port, with `hook` asked and
+/// told about each.
+pub(crate) fn boot_many(s: &mut Session, p: &Value, udids: &[String], hook: &dyn crate::progress::BootHook) -> Result<Value, String> {
     reject_ios_boot_params("boot_many", p)?;
     if udids.is_empty() {
         return Err("give `devices`: a list of AVD names".into());
     }
     let concurrency = crate::params::concurrency(p)?;
-    let timeout = Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300));
-    let first = first_port(p)?;
+    let (timeout, first) = boot_many_options(p)?;
     let start = std::time::Instant::now();
-    let outcomes = s.backend().boot_many(udids, concurrency, timeout, first)?;
+    let outcomes = s.backend().boot_many_hooked(udids, concurrency, timeout, first, &Outcomes(hook))?;
     let devices: Vec<Value> = outcomes.iter().map(outcome_json).collect();
     let failed = outcomes.iter().filter(|o| o.result.is_err()).count();
     Ok(json!({"concurrency": concurrency, "all_s": (start.elapsed().as_secs_f64() * 10.0).round() / 10.0, "failed": failed,
@@ -204,7 +307,7 @@ pub fn boot_many(s: &mut Session, p: &Value, udids: &[String]) -> Result<Value, 
 /// device's guest identity, which `config.ini` keys it dropped, and any revision mismatch.
 pub fn import(s: &mut Session, p: &Value) -> Result<Value, String> {
     let (from, name) = (need_str(p, "from")?, need_str(p, "name")?);
-    let allow_mismatch = opt_bool(p, "allow_mismatch")?.unwrap_or(false);
+    let allow_mismatch = import_allows_mismatch(p)?;
     let (info, im) = s.backend().import_avd(std::path::Path::new(from), name, allow_mismatch)?;
     Ok(json!({
         "device": info,
@@ -258,9 +361,8 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
         "delete" => null(android.delete(&d)),
         "boot" => {
             reject_ios_boot_params(method, p)?;
-            // Silent unless asked: a tool or farm booting N devices would open N host streams.
-            let audio = opt_bool(p, "audio")?.unwrap_or(false);
-            null(d.boot(&android, Duration::from_secs(opt_u64(p, "timeout_s").unwrap_or(300)), audio))
+            let (timeout, audio) = boot_options(p)?;
+            null(d.boot_asking(&android, timeout, audio, &crate::progress::launching))
         }
         "clone" => {
             if d.running.is_some() {
@@ -314,6 +416,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
             null(d.key(usage, Direction::Up))
         }
         "install" | "uninstall" | "launch" | "terminate" | "apps" | "open_url" => app(&android, &d, method, p),
+        "processes" | "kill" | "exec" => debug(&android, &d, method, p),
         "location" => {
             let (lat, lon) = (crate::params::need_f64(p, "latitude")?, crate::params::need_f64(p, "longitude")?);
             null(d.set_location(lat, lon))
@@ -391,7 +494,7 @@ pub fn call(s: &mut Session, method: &str, p: &Value, udid: &str) -> Result<Valu
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use serde_json::{Value, json};
     use sim_android::testing::{FakeAdb, FakeEmulator, fake_adb, fake_emulator};
@@ -492,6 +595,95 @@ mod tests {
         // Asking for nothing is fine.
         run(&mut s, "launch", json!({"bundle_id": "com.example.app", "args": [], "env": {}, "shaped": false})).expect("empty");
         assert_eq!(adb.calls().len(), 3, "only the last call ran adb");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn processes_kill_and_exec_work_on_both_platforms() {
+        let help = call(&mut Session::default(), "help", &Value::Null).expect("help");
+        for method in ["processes", "kill", "exec"] {
+            let row = help.as_array().and_then(|a| a.iter().find(|x| x["method"] == method)).expect(method);
+            assert_eq!(row["platforms"], json!(["android", "ios"]), "{method}");
+        }
+    }
+
+    #[test]
+    fn processes_answers_with_ios_rows_and_each_apps_package() {
+        let (mut s, root, _adb, _emulator) = session("procs");
+        let rows = run(&mut s, "processes", json!({})).expect("processes");
+        let rows = rows.as_array().expect("rows");
+        assert_eq!(
+            rows[0],
+            json!({"pid": 4321, "ppid": 310, "cpu": 7.9, "rss_kb": 120_332, "elapsed": "00:42", "name": "com.example.app",
+                "path": "com.example.app", "package": "com.example.app"})
+        );
+        let sf = rows.iter().find(|r| r["pid"] == 520).expect("surfaceflinger");
+        assert_eq!((&sf["path"], &sf["package"]), (&json!("/system/bin/surfaceflinger"), &Value::Null));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn kill_signals_stops_an_app_and_guards_the_essential_processes() {
+        let (mut s, root, adb, _emulator) = session("kill");
+        assert_eq!(run(&mut s, "kill", json!({"pid": 4321})), Ok(Value::Null));
+        assert_eq!(run(&mut s, "kill", json!({"pid": 4400, "signal": 9})), Ok(Value::Null));
+        let err = run(&mut s, "kill", json!({"pid": 612})).expect_err("system_server");
+        assert!(err.contains("system_server") && err.contains("force"), "{err}");
+        assert_eq!(run(&mut s, "kill", json!({"pid": 612, "force": true})), Ok(Value::Null));
+        // An app stop rather than a signal.
+        assert_eq!(run(&mut s, "kill", json!({"bundle_id": "com.example.app"})), Ok(Value::Null));
+        let signals: Vec<String> = adb.calls().into_iter().filter(|c| !c.starts_with("shell ps ")).collect();
+        assert_eq!(signals, ["shell kill -15 4321", "shell kill -9 4400", "shell kill -15 612", "shell am force-stop com.example.app"]);
+        assert_eq!(
+            run(&mut s, "kill", json!({"pid": 4321, "bundle_id": "com.example.app"})),
+            Err("give `pid` or `bundle_id`, not both".into())
+        );
+        assert_eq!(run(&mut s, "kill", json!({})), Err("give `pid` (a signal) or `bundle_id` (an app stop)".into()));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn exec_runs_an_argv_with_a_timeout_and_a_cap() {
+        let (mut s, root, _adb, _emulator) = session("exec");
+        let out =
+            run(&mut s, "exec", json!({"program": "sh", "args": ["-c", "echo \"$1\"; echo e >&2; exit 4", "sh", "a 'b'"]})).expect("exec");
+        assert!(out["pid"].as_i64().is_some_and(|p| p > 0), "{out}");
+        assert_eq!(
+            (&out["stdout"], &out["stderr"], &out["exit_code"], &out["truncated"]),
+            (&json!("a 'b'\n"), &json!("e\n"), &json!(4), &json!(false))
+        );
+        let env = run(&mut s, "exec", json!({"program": "sh", "args": ["-c", "echo $SIMEE_Y"], "env": {"SIMEE_Y": "z"}})).expect("env");
+        assert_eq!(env["stdout"], "z\n");
+        let capped = run(&mut s, "exec", json!({"program": "yes", "max_bytes": 10})).expect("capped");
+        assert_eq!(
+            (&capped["stdout"], &capped["truncated"], &capped["exit_code"]),
+            (&json!("y\ny\ny\ny\ny\n"), &json!(true), &Value::Null)
+        );
+        let err = run(&mut s, "exec", json!({"program": "sleep", "args": ["5"], "timeout_s": 1})).expect_err("timeout");
+        assert!(err.starts_with("`sleep` timed out after 1s"), "{err}");
+        assert_eq!(run(&mut s, "exec", json!({})), Err("missing string parameter `program`".into()));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn exec_refuses_parameters_it_cant_pass_through() {
+        let (mut s, root, adb, _emulator) = session("execparams");
+        for args in [json!(["a", 1]), json!("a"), json!([null])] {
+            assert_eq!(run(&mut s, "exec", json!({"program": "echo", "args": args})), Err("`args` must be a list of strings".into()));
+        }
+        for env in [json!({"A": 1}), json!(["A=1"])] {
+            assert_eq!(
+                run(&mut s, "exec", json!({"program": "echo", "env": env})),
+                Err("`env` must be an object of strings (names to values)".into())
+            );
+        }
+        for timeout in [u64::MAX, 86_401] {
+            assert_eq!(
+                run(&mut s, "exec", json!({"program": "true", "timeout_s": timeout})),
+                Err("timeout_s must be at most 86400 (a day)".into())
+            );
+        }
+        assert!(adb.calls().is_empty(), "{:?}", adb.calls());
         std::fs::remove_dir_all(root).ok();
     }
 

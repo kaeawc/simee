@@ -5,6 +5,12 @@
 
 mod bootconfig;
 pub mod bundle;
+mod cache;
+#[cfg(unix)]
+pub mod clone;
+#[cfg(not(unix))]
+#[path = "clone_copy.rs"]
+pub mod clone;
 pub mod golden;
 pub mod gpu;
 mod ini;
@@ -12,6 +18,7 @@ pub mod sdk_device;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub use bootconfig::BootConfig;
 pub use ini::parse_ini;
@@ -65,18 +72,47 @@ impl Env {
 
     /// AVD names, sorted, as `emulator -list-avds` prints them.
     pub fn list_avds(&self) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(&self.avd_home)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().into_string().ok()?;
-                let stem = name.strip_suffix(".ini")?;
-                e.path().is_file().then(|| stem.to_string())
-            })
-            .collect();
+        cache::listing(&self.avd_home, || self.read_avds())
+    }
+
+    /// The names [`Env::list_avds`] lists, read from the home, and whether that answer can be
+    /// remembered: not when any read failed (running out of file handles must not become "no
+    /// AVDs" until the directory changes), nor when a pointer is a link, because the directory's
+    /// stamp doesn't change when a link's target comes or goes.
+    fn read_avds(&self) -> (Vec<String>, bool) {
+        let mut cacheable = true;
+        let mut names = Vec::new();
+        match std::fs::read_dir(&self.avd_home) {
+            Err(_) => cacheable = false,
+            Ok(entries) => {
+                for e in entries {
+                    let Ok(e) = e else {
+                        cacheable = false;
+                        continue;
+                    };
+                    let Ok(name) = e.file_name().into_string() else { continue };
+                    let Some(stem) = name.strip_suffix(".ini") else { continue };
+                    // The entry's own type (no stat); only a link needs following.
+                    let file = match e.file_type() {
+                        Ok(t) if t.is_file() => true,
+                        Ok(t) if t.is_dir() => false,
+                        Ok(_) => {
+                            cacheable = false;
+                            e.path().is_file()
+                        }
+                        Err(_) => {
+                            cacheable = false;
+                            e.path().is_file()
+                        }
+                    };
+                    if file {
+                        names.push(stem.to_string());
+                    }
+                }
+            }
+        }
         names.sort();
-        names
+        (names, cacheable)
     }
 
     /// Whether [`Env::list_avds`] lists `name`, from one stat of its pointer `<name>.ini` instead
@@ -101,16 +137,20 @@ impl Env {
     }
 
     pub fn load(&self, name: &str) -> Result<Avd> {
-        let content_dir = self.content_dir(name)?;
-        let config = parse_ini(&read(&content_dir.join("config.ini"))?);
+        self.load_in(name, self.content_dir(name)?)
+    }
+
+    /// [`Env::load`] for an AVD whose directory the caller resolved ([`Env::content_dir`]).
+    pub fn load_in(&self, name: &str, content_dir: PathBuf) -> Result<Avd> {
+        let path = content_dir.join("config.ini");
+        let config = cache::ini(&path)?.ok_or_else(|| Error::Io(path, std::io::ErrorKind::NotFound.into()))?;
         Avd::new(name, content_dir, config, self.sdk_root.as_deref())
     }
 
     /// AVD `name`'s directory: its pointer's `path=` (or `path.rel=`), else `<name>.avd`.
-    fn content_dir(&self, name: &str) -> Result<PathBuf> {
+    pub fn content_dir(&self, name: &str) -> Result<PathBuf> {
         let pointer = self.avd_home.join(format!("{name}.ini"));
-        Ok(if pointer.is_file() {
-            let p = parse_ini(&read(&pointer)?);
+        Ok(if let Some(p) = cache::ini(&pointer)? {
             p.get("path")
                 .map(PathBuf::from)
                 .filter(|p| p.is_dir())
@@ -163,13 +203,16 @@ fn held_lock(dir: &Path) -> Option<PathBuf> {
         if matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)) {
             return Some(path);
         }
+        // Held by us now if the lock was free: Windows' locks are mandatory, so reading the file
+        // below by another handle fails until it is let go (unix's are advisory).
+        let _ = f.unlock();
         // A PID lock (stock's filelock: the PID, then NUL) whose process is alive. A stale one
         // from a crash names a dead PID (or, rarely, a reused one: refusing then is safe).
         let pid = std::fs::read(&path).ok().and_then(|b| {
             let digits: String = b.iter().take_while(|c| c.is_ascii_digit()).map(|&c| c as char).collect();
             digits.parse::<i32>().ok()
         });
-        if pid.and_then(rustix::process::Pid::from_raw).is_some_and(|p| rustix::process::test_kill_process(p).is_ok()) {
+        if pid.is_some_and(pid_alive) {
             return Some(path);
         }
     }
@@ -181,7 +224,8 @@ fn held_lock(dir: &Path) -> Option<PathBuf> {
 pub struct Avd {
     pub name: String,
     pub dir: PathBuf,
-    pub config: BTreeMap<String, String>,
+    /// `config.ini`'s keys, shared with the remembered parse (`Arc::make_mut` to edit a copy).
+    pub config: Arc<BTreeMap<String, String>>,
     pub sysdir: PathBuf,
     /// The SDK the image came from (holds the gfxstream renderer in `emulator/lib64` or
     /// `simee/renderer/<revision>/lib64`).
@@ -189,7 +233,7 @@ pub struct Avd {
 }
 
 impl Avd {
-    fn new(name: &str, dir: PathBuf, config: BTreeMap<String, String>, sdk_root: Option<&Path>) -> Result<Avd> {
+    fn new(name: &str, dir: PathBuf, config: Arc<BTreeMap<String, String>>, sdk_root: Option<&Path>) -> Result<Avd> {
         let sysdir = (1..=3)
             .filter_map(|i| config.get(&format!("image.sysdir.{i}")))
             .map(|rel| match sdk_root {
@@ -396,6 +440,35 @@ impl Avd {
     }
 }
 
+/// The named AVD profiles `emu -create-avd -profile NAME` takes ([`NewAvd::with_profile`]).
+pub const PROFILES: [&str; 1] = ["software-lite"];
+
+/// The software-lite profile's screen: 540x960 at 240 dpi, 56% of the default 720x1280's pixels.
+pub const SOFTWARE_LITE_LCD: (u32, u32, u32) = (540, 960, 240);
+
+/// The software-lite profile's refresh rate, `hw.lcd.vsync`.
+pub const SOFTWARE_LITE_VSYNC_HZ: u32 = 30;
+
+/// Whether profile `name` ([`PROFILES`]) can shape an AVD of an image with tag `tag` (`default`,
+/// `google_apis`, `android-tv`, ...), with the reason when it can't. It needs no image, so
+/// `emu -provision` asks before it downloads one.
+pub fn check_profile(name: &str, tag: &str) -> Result<()> {
+    match name {
+        "software-lite" => {
+            let kind = android_profile(|k| (k == "tag.id").then(|| tag.to_owned())).kind;
+            if kind.form_factor == FormFactor::Phone {
+                Ok(())
+            } else {
+                Err(Error::Config(format!(
+                    "profile software-lite shrinks a phone's screen; '{tag}' images are a {:?} with a screen of their own",
+                    kind.form_factor
+                )))
+            }
+        }
+        other => Err(Error::Config(format!("unknown AVD profile '{other}' (profiles: {})", PROFILES.join(", ")))),
+    }
+}
+
 /// What `create_avd` writes. Defaults favour cheap, fast boots: a small screen boots markedly
 /// faster than a large one, and more than 2 GB of RAM makes cold boots slower, not faster.
 #[derive(Clone, Debug)]
@@ -423,7 +496,8 @@ impl NewAvd {
     pub fn new(name: &str, sysdir: &str) -> NewAvd {
         NewAvd {
             name: name.to_string(),
-            sysdir: sysdir.trim_end_matches('/').to_string() + "/",
+            // `image.sysdir.N` always has `/`, whatever joined the path (a `\` on Windows).
+            sysdir: sysdir.replace('\\', "/").trim_end_matches('/').to_string() + "/",
             lcd: (720, 1280, 320),
             ram_mb: 2048,
             cores: 4,
@@ -435,11 +509,32 @@ impl NewAvd {
         }
     }
 
+    /// The AVD with profile `name` applied ([`PROFILES`]).
+    ///
+    /// `software-lite` is for software mode (x86_64 Linux without KVM), where the guest's CPU and
+    /// the frames SwiftShader draws share the host's cores: a 540x960 screen at 240 dpi and a 30 Hz
+    /// display (`hw.lcd.vsync=30`). It takes the screen, so apps see a smaller, slower display;
+    /// RAM and vCPUs stay as they were (docs/android.md "Software mode" has what it saves). Only
+    /// phone images have a screen to shrink: the other form factors are refused.
+    pub fn with_profile(mut self, name: &str) -> Result<NewAvd> {
+        let tag = self.sysdir.trim_matches('/').split('/').nth(2).unwrap_or_default().to_owned();
+        check_profile(name, &tag)?;
+        match name {
+            "software-lite" => {
+                self.lcd = SOFTWARE_LITE_LCD;
+                self.extra.retain(|(k, _)| k != "hw.lcd.vsync");
+                self.extra.push(("hw.lcd.vsync".to_owned(), SOFTWARE_LITE_VSYNC_HZ.to_string()));
+                Ok(self)
+            }
+            other => unreachable!("check_profile accepts only PROFILES, not '{other}'"),
+        }
+    }
+
     /// An AVD shaped like its system image's own kind, from the tag in `sysdir`
     /// (`system-images/android-34/android-wear/arm64-v8a`): a round watch for Wear OS, a TV with a
     /// D-pad, a headset for Android XR, a phone for mobile images.
     pub fn for_image(name: &str, sysdir: &str) -> NewAvd {
-        let tag = sysdir.trim_matches('/').split('/').nth(2).unwrap_or_default().to_owned();
+        let tag = sysdir.replace('\\', "/").trim_matches('/').split('/').nth(2).unwrap_or_default().to_owned();
         let profile = sim_core::form_factor::android_profile(|k| (k == "tag.id").then(|| tag.clone()));
         NewAvd::for_profile(name, sysdir, &profile.kind.image_profile(&tag))
     }
@@ -553,7 +648,7 @@ impl Env {
     }
 
     /// Creates AVD `name` as a copy of `golden` whose simee disks (`<golden>/simee/`: userdata,
-    /// cache, metadata) are copy-on-write clones ([`golden::clone_file`]: APFS's `fclonefileat`, a
+    /// cache, metadata) are copy-on-write clones ([`clone::clone_file`]: `clonefile` on APFS, a `FICLONE`
     /// reflink on Linux file systems that have them, else a copy that keeps the image's holes), so a
     /// clone takes no space until either side writes, and it boots warm
     /// (no first-boot formatting, encryption or dexopt) from the state the golden was settled in.
@@ -598,14 +693,20 @@ impl Env {
             std::fs::write(&cfg, config).map_err(|e| io(&cfg, e))?;
             let boot = src.dir.join("boot.prop");
             if boot.is_file() {
-                std::fs::copy(&boot, dir.join("boot.prop")).map_err(|e| io(&boot, e))?;
+                clone::clone_file(&boot, &dir.join("boot.prop"))?;
             }
             let disks = state_dir(&dir);
             std::fs::create_dir_all(&disks).map_err(|e| io(&disks, e))?;
             for f in CLONED_DISKS {
                 let from = src_disks.join(f);
                 if from.is_file() {
-                    golden::clone_file(&from, &disks.join(f))?;
+                    let to = disks.join(f);
+                    // The key is what a guest boots with: it lands whole or not at all (#431).
+                    if f == "encryptionkey.img" {
+                        clone::clone_file_atomic(&from, &to)?;
+                    } else {
+                        clone::clone_file(&from, &to)?;
+                    }
                 }
             }
             Ok(())
@@ -684,7 +785,7 @@ pub struct Running {
     pub adb_port: u16,
     pub avd_dir: Option<PathBuf>,
     /// simee's `emu` runs it (it advertised itself with `emulator=simee`); `false` for the stock
-    /// emulator, found by [`Env::stock_instances`].
+    /// emulator, found by [`Env::stock_instances_among_with`].
     pub simee: bool,
 }
 
@@ -716,15 +817,27 @@ impl Running {
 
     /// Whether its process still exists.
     pub fn alive(&self) -> bool {
-        rustix::process::Pid::from_raw(self.pid).is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
+        pid_alive(self.pid)
     }
 }
 
-/// What the host says about a process, for [`Env::stock_instances_with`].
+/// Whether process `pid` exists (`kill(pid, 0)`; a process of another user counts).
+#[cfg(unix)]
+fn pid_alive(pid: i32) -> bool {
+    rustix::process::Pid::from_raw(pid).is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
+}
+
+/// Whether process `pid` exists and hasn't exited.
+#[cfg(windows)]
+fn pid_alive(pid: i32) -> bool {
+    u32::try_from(pid).is_ok_and(emu_hvf::host::process_alive)
+}
+
+/// What the host says about a process, for [`Env::stock_instances_among_with`].
 pub struct Probe<'a> {
-    /// The process's command line (`ps -o args=`); `None` when it has gone.
+    /// The process's command line; `None` when it has gone.
     pub args: &'a dyn Fn(i32) -> Option<String>,
-    /// The TCP ports the process listens on (`lsof`).
+    /// The TCP ports the process listens on.
     pub listening: &'a dyn Fn(i32) -> Vec<u16>,
 }
 
@@ -760,55 +873,10 @@ pub fn console_port_from_listening(ports: &[u16]) -> Option<u16> {
     ports.iter().copied().filter(|p| (5554..=5682).contains(p) && p % 2 == 0 && ports.contains(&(p + 1))).min()
 }
 
-/// The ports a process listens on, from `lsof -nP -a -iTCP -sTCP:LISTEN -p <pid>`: each line
-/// ends with `TCP 127.0.0.1:5750 (LISTEN)`.
-pub fn parse_lsof_listening(out: &str) -> Vec<u16> {
-    out.lines()
-        .filter(|l| l.contains("(LISTEN)"))
-        .filter_map(|l| l.split_whitespace().rev().nth(1)?.rsplit(':').next()?.parse().ok())
-        .collect()
-}
-
 fn host_probe_args(pid: i32) -> Option<String> {
     let out = std::process::Command::new("ps").args(["-o", "args=", "-p", &pid.to_string()]).output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     (out.status.success() && !text.is_empty()).then_some(text)
-}
-
-fn host_probe_listening(pid: i32) -> Vec<u16> {
-    std::process::Command::new("lsof")
-        .args(["-nP", "-a", "-iTCP", "-sTCP:LISTEN", "-p", &pid.to_string()])
-        .output()
-        .map(|o| parse_lsof_listening(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or_default()
-}
-
-/// Every process's command line from one `ps -axo pid=,args=`.
-pub fn parse_ps_all(out: &str) -> BTreeMap<i32, String> {
-    out.lines()
-        .filter_map(|l| {
-            let (pid, args) = l.trim_start().split_once(char::is_whitespace)?;
-            Some((pid.parse().ok()?, args.trim().to_owned()))
-        })
-        .collect()
-}
-
-/// Every process's listening TCP ports from one `lsof -nP -iTCP -sTCP:LISTEN -Fpn`: `p<pid>`
-/// lines, each followed by that process's `n<address>:<port>` lines.
-pub fn parse_lsof_by_pid(out: &str) -> BTreeMap<i32, Vec<u16>> {
-    let mut map: BTreeMap<i32, Vec<u16>> = BTreeMap::new();
-    let mut pid = None;
-    for l in out.lines() {
-        if let Some(p) = l.strip_prefix('p') {
-            pid = p.parse().ok();
-        } else if let (Some(n), Some(pid)) = (l.strip_prefix('n'), pid)
-            && !n.contains("->")
-            && let Some(port) = n.rsplit(':').next().and_then(|p| p.parse().ok())
-        {
-            map.entry(pid).or_default().push(port);
-        }
-    }
-    map
 }
 
 impl Env {
@@ -819,61 +887,34 @@ impl Env {
     /// `-port N`; without it the console port is the emulator-range port the process listens on.
     /// Instances in `skip` (by AVD name) are left out, so a simee `emu` is never listed twice.
     ///
-    /// The host is asked once per listing: one `ps` for every live lock's command line and, only
-    /// if some emulator lacks `-port`, one `lsof` for every listening socket.
-    pub fn stock_instances(&self, skip: &[Running]) -> Vec<Running> {
-        let names = self.list_avds();
-        self.stock_instances_among(&names, skip, true)
+    /// Only the AVDs `names` are looked at (each one's lock), and `probe` is asked only about a
+    /// process whose lock names a live PID.
+    pub fn stock_instances_among_with(&self, names: &[String], skip: &[Running], probe: &Probe) -> Vec<Running> {
+        let avds: Vec<(String, PathBuf)> = names.iter().filter_map(|name| Some((name.clone(), self.content_dir(name).ok()?))).collect();
+        Self::stock_instances_in_with(avds.iter().map(|(n, d)| (n.as_str(), d.as_path())), skip, probe)
     }
 
-    /// [`Env::stock_instances`] for the one AVD `name` alone: its lock only, one `ps` at most.
-    pub fn stock_instance(&self, name: &str, skip: &[Running]) -> Option<Running> {
-        self.stock_instances_among(&[name.to_owned()], skip, false).pop()
-    }
-
-    fn stock_instances_among(&self, names: &[String], skip: &[Running], batch: bool) -> Vec<Running> {
-        let ps = std::cell::OnceCell::new();
-        let lsof = std::cell::OnceCell::new();
-        let run = |argv: &[&str]| {
-            std::process::Command::new(argv[0])
-                .args(&argv[1..])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-                .unwrap_or_default()
-        };
-        let args = |pid: i32| {
-            if batch {
-                ps.get_or_init(|| parse_ps_all(&run(&["ps", "-axo", "pid=,args="]))).get(&pid).cloned()
-            } else {
-                host_probe_args(pid)
-            }
-        };
-        let listening = |pid: i32| {
-            if batch {
-                let all = lsof.get_or_init(|| parse_lsof_by_pid(&run(&["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"])));
-                all.get(&pid).cloned().unwrap_or_default()
-            } else {
-                host_probe_listening(pid)
-            }
-        };
-        self.stock_instances_among_with(names, skip, &Probe { args: &args, listening: &listening })
-    }
-
-    /// [`Env::stock_instances`] asking `probe` about processes.
-    pub fn stock_instances_with(&self, skip: &[Running], probe: &Probe) -> Vec<Running> {
-        self.stock_instances_among_with(&self.list_avds(), skip, probe)
-    }
-
-    fn stock_instances_among_with(&self, names: &[String], skip: &[Running], probe: &Probe) -> Vec<Running> {
-        names
-            .iter()
-            .filter(|name| !skip.iter().any(|r| r.avd_name == **name))
-            .filter_map(|name| {
-                let dir = self.content_dir(name).ok()?;
+    /// [`Env::stock_instances_among_with`] for AVDs whose directories the caller resolved
+    /// ([`Env::content_dir`]), so listing and looking at them resolves each once.
+    pub fn stock_instances_in_with<'a>(
+        avds: impl IntoIterator<Item = (&'a str, &'a Path)>,
+        skip: &[Running],
+        probe: &Probe,
+    ) -> Vec<Running> {
+        avds.into_iter()
+            .filter(|(name, _)| !skip.iter().any(|r| r.avd_name == *name))
+            .filter_map(|(name, dir)| {
                 let bytes = std::fs::read(dir.join("hardware-qemu.ini.lock")).ok()?;
                 let digits: String = bytes.iter().take_while(|c| c.is_ascii_digit()).map(|&c| c as char).collect();
                 let pid: i32 = digits.parse().ok()?;
-                let r = Running { pid, avd_name: name.clone(), console_port: 0, adb_port: 0, avd_dir: Some(dir), simee: false };
+                let r = Running {
+                    pid,
+                    avd_name: name.to_owned(),
+                    console_port: 0,
+                    adb_port: 0,
+                    avd_dir: Some(dir.to_path_buf()),
+                    simee: false,
+                };
                 if !r.alive() {
                     return None;
                 }
@@ -973,17 +1014,8 @@ mod tests {
         assert!(!qemu_args_run_avd("qemu -avd other -writable-system lane", "lane"));
         assert!(!qemu_args_run_avd("qemu -avd lane2 -no-window", "lane"));
         assert!(!qemu_args_run_avd("vim -avd lane", "lane"), "not a qemu");
-        let ps = "  1 /sbin/launchd\n 4242 /sdk/qemu-system-aarch64 -avd lane -ports 5600,5700\nnoise\n";
-        assert_eq!(parse_ps_all(ps).get(&4242).map(String::as_str), Some("/sdk/qemu-system-aarch64 -avd lane -ports 5600,5700"));
-        let by_pid = parse_lsof_by_pid("p10\nf3\nn127.0.0.1:5751\nn[::1]:5750\nn127.0.0.1:5751->127.0.0.1:9\np11\nn*:80\n");
-        assert_eq!((by_pid.get(&10), by_pid.get(&11)), (Some(&vec![5751, 5750]), Some(&vec![80])));
         assert_eq!(console_port_from_listening(&[51686, 5555, 5554, 5555, 8080]), Some(5554));
         assert_eq!(console_port_from_listening(&[5554]), None, "an adb port must listen too");
-        let lsof = "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n\
-            qemu-syst 44692 jason 35u IPv4 0xa 0t0 TCP 127.0.0.1:5751 (LISTEN)\n\
-            qemu-syst 44692 jason 36u IPv6 0xb 0t0 TCP [::1]:5750 (LISTEN)\n\
-            qemu-syst 44692 jason 67u IPv4 0xc 0t0 TCP 127.0.0.1:5751->127.0.0.1:51699 (ESTABLISHED)\n";
-        assert_eq!(parse_lsof_listening(lsof), [5751, 5750]);
     }
 
     #[test]
@@ -1011,7 +1043,7 @@ mod tests {
         let args = |_pid: i32| Some("/sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64-headless -avd X -port 5750".to_owned());
         let probe = Probe { args: &|pid| args(pid).map(|a| a.replace(" X ", " live ")), listening: &|_| vec![] };
         let skip = [Running { pid: 1, avd_name: "simee".into(), console_port: 5600, adb_port: 5601, avd_dir: None, simee: true }];
-        let found = env.stock_instances_with(&skip, &probe);
+        let found = env.stock_instances_among_with(&env.list_avds(), &skip, &probe);
         let names: Vec<&str> = found.iter().map(|r| r.avd_name.as_str()).collect();
         // `noport`/`reused` lack `-avd <their name>` in the fixture args; `dead` has no process;
         // `idle` has no lock; `simee` is already listed by its advertisement.
@@ -1024,12 +1056,12 @@ mod tests {
             args: &|_| Some("qemu-system-aarch64-headless -avd noport -no-window".to_owned()),
             listening: &|_| vec![5557, 5556, 51686],
         };
-        let found = env.stock_instances_with(&skip, &probe);
+        let found = env.stock_instances_among_with(&env.list_avds(), &skip, &probe);
         let noport = found.iter().find(|r| r.avd_name == "noport").expect("noport");
         assert_eq!(noport.console_port, 5556);
         // A PID that now belongs to another program is not an emulator.
         let probe = Probe { args: &|_| Some("/usr/bin/vim notes.txt".to_owned()), listening: &|_| vec![] };
-        assert!(env.stock_instances_with(&skip, &probe).is_empty());
+        assert!(env.stock_instances_among_with(&env.list_avds(), &skip, &probe).is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1102,6 +1134,8 @@ mod tests {
         assert!(me.alive());
     }
 
+    // Unix mode bits decide what can be listed or searched.
+    #[cfg(unix)]
     #[test]
     fn has_avd_stats_one_pointer_instead_of_listing_the_home() {
         use std::os::unix::fs::PermissionsExt;
@@ -1117,13 +1151,42 @@ mod tests {
         }
         // A home that can be searched but not read: a listing finds nothing, one stat still works.
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o300)).expect("chmod");
+        // Root (or a filesystem that ignores modes) can still list it: the permission isn't enforced.
+        let enforced = std::fs::read_dir(&home).is_err();
         let unlisted = env.list_avds();
         let (found, not) = (env.has_avd("pixel"), env.has_avd("pix"));
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).expect("chmod back");
+        if !enforced {
+            println!("SKIPPED: has_avd without listing: mode 0300 does not block listing here (running as root?)");
+            let _ = std::fs::remove_dir_all(&home);
+            return;
+        }
         assert!(unlisted.is_empty(), "the home can't be listed: {unlisted:?}");
         assert!(found, "found by its pointer alone");
         assert!(!not);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_listing_with_a_link_or_a_failed_read_is_not_cacheable() {
+        let tmp = std::env::temp_dir().join(format!("emu-avd-readavds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("home");
+        let env = Env { sdk_root: None, avd_home: tmp.clone() };
+        std::fs::write(tmp.join("a.ini"), "").expect("a");
+        std::fs::create_dir(tmp.join("d.ini")).expect("a directory named like a pointer");
+        assert_eq!(env.read_avds(), (vec!["a".to_owned()], true));
+        // A link: its target coming or going doesn't touch the home's stamp.
+        std::fs::write(tmp.join("target"), "").expect("target");
+        std::os::unix::fs::symlink(tmp.join("target"), tmp.join("b.ini")).expect("link");
+        assert_eq!(env.read_avds(), (vec!["a".to_owned(), "b".to_owned()], false));
+        std::fs::remove_file(tmp.join("target")).expect("dangling");
+        assert_eq!(env.read_avds(), (vec!["a".to_owned()], false), "a dangling link isn't an AVD");
+        // A home that can't be read is no AVDs this time, not for good.
+        let missing = Env { sdk_root: None, avd_home: tmp.join("missing") };
+        assert_eq!(missing.read_avds(), (Vec::new(), false));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1148,22 +1211,22 @@ mod tests {
         assert_eq!(avd.cpus(), 4);
         assert_eq!(avd.ram_bytes(), 2 << 30);
         let mut small = avd.clone();
-        small.config.insert("hw.ramSize".into(), "512".into());
+        Arc::make_mut(&mut small.config).insert("hw.ramSize".into(), "512".into());
         assert_eq!(small.ram_bytes(), 1 << 30, "stock pads small devices by 512 MB");
         assert_eq!(avd.api_level(), Some(36));
         assert!(!avd.is_x86_64());
         assert_eq!(avd.vsync_hz(), 60, "stock's default refresh rate");
         let mut slow = avd.clone();
-        slow.config.insert("hw.lcd.vsync".into(), "30".into());
+        Arc::make_mut(&mut slow.config).insert("hw.lcd.vsync".into(), "30".into());
         assert_eq!(slow.vsync_hz(), 30);
         for bad in ["0", "1000", "sixty"] {
-            slow.config.insert("hw.lcd.vsync".into(), bad.into());
+            Arc::make_mut(&mut slow.config).insert("hw.lcd.vsync".into(), bad.into());
             assert_eq!(slow.vsync_hz(), 60, "{bad} falls back to 60");
         }
         let mut x86 = avd.clone();
-        x86.config.insert("abi.type".into(), "x86_64".into());
+        Arc::make_mut(&mut x86.config).insert("abi.type".into(), "x86_64".into());
         assert!(x86.is_x86_64(), "abi.type says so");
-        x86.config.clear();
+        Arc::make_mut(&mut x86.config).clear();
         x86.sysdir = sdk.join("system-images/android-36/default/x86_64");
         assert!(x86.is_x86_64(), "an AVD with neither key takes its image's ABI");
         assert!(env.load("nope").is_err());
@@ -1247,6 +1310,65 @@ mod tests {
             [Some(true), Some(false), Some(false)]
         );
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn software_lite_is_a_smaller_screen_at_30_hz_and_nothing_else() {
+        let tmp = std::env::temp_dir().join(format!("emu-avd-lite-{}", std::process::id()));
+        let sdk = tmp.join("sdk");
+        let sys = "system-images/android-36/default/x86_64";
+        std::fs::create_dir_all(sdk.join(sys)).expect("mkdir");
+        std::fs::write(sdk.join(sys).join("kernel-ranchu"), b"k").expect("write");
+        let env = Env { sdk_root: Some(sdk), avd_home: tmp.join("avd") };
+        let plain = NewAvd::for_image("plain", sys);
+        env.create_avd(&plain).expect("create plain");
+        env.create_avd(&NewAvd::for_image("lite", sys).with_profile("software-lite").expect("phone image")).expect("create lite");
+        let (plain, lite) = (env.load("plain").expect("plain"), env.load("lite").expect("lite"));
+        assert_eq!((plain.lcd(), plain.vsync_hz()), ((720, 1280, 320), 60), "the default profile is unchanged");
+        assert_eq!((lite.lcd(), lite.vsync_hz()), ((540, 960, 240), 30));
+        let text = std::fs::read_to_string(lite.dir.join("config.ini")).expect("config");
+        assert_eq!(text.lines().filter(|l| l.starts_with("hw.lcd.vsync=")).count(), 1, "one vsync line: {text}");
+        assert!(text.contains("hw.lcd.vsync=30\n"));
+        // Nothing but the screen and the refresh rate differs from a plain phone AVD.
+        let keys = |a: &Avd| {
+            let mut kv: Vec<(String, String)> = a.config.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            kv.retain(|(k, _)| !k.starts_with("hw.lcd.") && !k.starts_with("AvdId") && !k.starts_with("avd.ini"));
+            kv
+        };
+        assert_eq!(keys(&plain), keys(&lite), "RAM, vCPUs and the rest stay as they were");
+        assert_eq!((lite.cpus(), lite.ram_bytes()), (4, 2 << 30));
+        // The settled user data depends on the screen, not the refresh rate: lite gets its own golden.
+        let shape = |a: &Avd| golden::SHAPE_KEYS.map(|k| a.get(k).map(str::to_owned));
+        assert_ne!(shape(&plain), shape(&lite));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn a_profile_is_checked_against_the_tag_alone() {
+        assert!(check_profile("software-lite", "default").is_ok());
+        assert!(check_profile("software-lite", "google_apis_playstore").is_ok());
+        let err = check_profile("software-lite", "android-tv").expect_err("tv").to_string();
+        assert!(err.contains("android-tv") && err.contains("software-lite"), "{err}");
+        assert!(check_profile("fast", "default").expect_err("unknown").to_string().contains("software-lite"));
+    }
+
+    #[test]
+    fn software_lite_replaces_a_vsync_and_refuses_other_form_factors() {
+        let mut spec = NewAvd::for_image("x", "system-images/android-36/google_apis/x86_64");
+        spec.extra.push(("hw.lcd.vsync".into(), "120".into()));
+        let spec = spec.with_profile("software-lite").expect("phone");
+        assert_eq!(
+            spec.extra.iter().filter(|(k, _)| k == "hw.lcd.vsync").collect::<Vec<_>>(),
+            [&("hw.lcd.vsync".to_string(), "30".to_string())]
+        );
+        assert_eq!(spec.lcd, SOFTWARE_LITE_LCD);
+        for tag in ["android-wear", "android-tv", "android-automotive"] {
+            let err =
+                NewAvd::for_image("x", &format!("system-images/android-34/{tag}/x86_64")).with_profile("software-lite").expect_err(tag);
+            assert!(err.to_string().contains(tag) && err.to_string().contains("software-lite"), "{err}");
+        }
+        let err = NewAvd::for_image("x", "system-images/android-36/default/x86_64").with_profile("fast").expect_err("unknown");
+        assert!(err.to_string().contains("software-lite"), "the error lists the profiles: {err}");
     }
 
     #[test]
@@ -1372,6 +1494,16 @@ mod tests {
     }
 
     #[test]
+    fn a_system_image_dir_joined_with_backslashes_is_written_with_slashes() {
+        let sysdir = "system-images/android-34/android-tv/arm64-v8a/";
+        assert_eq!(NewAvd::new("x", r"system-images\android-34\android-tv\arm64-v8a/").sysdir, sysdir);
+        assert_eq!(NewAvd::new("x", sysdir).sysdir, sysdir, "slashes are left alone");
+        let tv = NewAvd::for_image("x", r"system-images\android-34\android-tv\arm64-v8a/");
+        assert_eq!(tv.sysdir, sysdir);
+        assert_ne!(tv.lcd, NewAvd::new("x", sysdir).lcd, "the tag was read through the backslashes: a TV, not a phone");
+    }
+
+    #[test]
     fn new_avds_take_their_image_form_factor() {
         let shape = |sysdir: &str| {
             let s = NewAvd::for_image("x", sysdir);
@@ -1472,13 +1604,13 @@ mod tests {
 
         // An AVD without boot.prop falls back to the image's; `hw.mainKeys` defaults to yes.
         let mut bare = phone.clone();
-        bare.config.remove("hw.mainKeys");
+        Arc::make_mut(&mut bare.config).remove("hw.mainKeys");
         assert!(bare.main_keys(), "stock's default");
         std::fs::write(bare.sysdir.join("boot.prop"), "ro.emulator.circular=1\n").expect("write");
         assert!(bare.circular());
         std::fs::write(bare.dir.join("boot.prop"), "ro.emulator.circular=no\n").expect("write");
         assert!(!bare.circular(), "the AVD's boot.prop wins");
-        bare.config.insert("hw.lcd.circular".into(), "yes".into());
+        Arc::make_mut(&mut bare.config).insert("hw.lcd.circular".into(), "yes".into());
         assert!(bare.circular());
         let _ = std::fs::remove_dir_all(tmp);
     }

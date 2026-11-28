@@ -5,7 +5,8 @@
 //! from the emulator's display socket. Clicks and drags become touches, typing goes to the device
 //! keyboard, and the toolbar has the controls the device's form factor has (Back/Home/Recents, a
 //! foldable's hinge, a watch's rotary input, a TV's D-pad). ⌘⇧H is Home, ⌘L Lock, ⌘S saves a
-//! screenshot to the Desktop, ⌘3 switches the 3D device view on and off ([`scene`]).
+//! screenshot to the Desktop, ⌘3 switches the 3D device view on and off ([`scene`]),
+//! ⌘⇧O pops the device out into a window of its own and back ([`popout`]).
 //!
 //! Handlers only queue [`Action`]s and [`Input`]s; `poll` performs them. That keeps handlers pure,
 //! so the headless tests drive the real view without a device. Rune runs `poll` at the start of a
@@ -17,9 +18,11 @@
 //!
 //! `cargo run` opens the window (`SIMEE_DEVICE=<udid|name|booted>` preselects a device);
 //! `cargo run -- --snap shot.png --scene demo` renders headless (scenes: demo, android, foldable,
-//! folded, tablet, ipad, watch, tv, apple-watch, apple-tv, turned, turned-tablet, empty); a
-//! release build needs `--features tooling` for it.
+//! folded, tablet, ipad, watch, tv, apple-watch, apple-tv, turned, turned-tablet, empty,
+//! sidebar-hidden, inspector-hidden, panes-hidden, panes-wide, resources, resources-memory, admission,
+//! admission-many, popped); a release build needs `--features tooling` for it.
 
+mod admission;
 mod android;
 mod bezel;
 mod controls;
@@ -29,8 +32,14 @@ mod icons;
 #[cfg(target_os = "macos")]
 mod ios;
 mod keys;
+mod mark;
+mod panes;
+mod popout;
+mod resources;
 mod scan;
 mod scene;
+mod settings;
+mod shot_preview;
 mod stylus;
 #[cfg(target_os = "macos")]
 mod surface;
@@ -57,7 +66,10 @@ use keys::KeyAction;
 pub enum Action {
     Refresh,
     Select(String),
+    /// Boot the selected device, past [`admission`] first.
     Boot,
+    /// Boot these devices now: admitted, or the user chose to on the admission sheet.
+    BootNow(Vec<String>),
     Shutdown,
     Button(Button),
     ToggleAppearance,
@@ -77,6 +89,9 @@ pub enum Action {
     /// A change of the 3D view: face on, a saved view, flip, spin ([`scene::Command`]).
     View3d(scene::Command),
     Debug(debug::DebugAction),
+    /// The device moves to a window of its own, and back ([`popout`]).
+    PopOut(String),
+    PopIn(String),
 }
 
 /// Device input, in device pixels.
@@ -161,6 +176,21 @@ pub struct State {
     pub bezel: bezel::Bezel,
     /// The 3D device view's switch.
     pub view3d: scene::Toggle,
+    /// The screenshot previews in the window's bottom-right corner ([`shot_preview`]).
+    pub previews: shot_preview::Previews,
+    /// Seconds the mark has been moving (a job running, a device starting or stopping), and the
+    /// poll time it started at; `None` while it rests.
+    pub mark_t: f32,
+    mark_from: Option<f64>,
+    /// The saved settings ([`settings`]) and the panes' own state ([`panes`]).
+    pub prefs: settings::Store,
+    pub panes: panes::Panes,
+    /// The resource panel's samples and its line to the API ([`resources`]).
+    pub resources: resources::Resources,
+    /// Devices out in windows of their own ([`popout`]).
+    pub popouts: popout::Popouts,
+    /// The check before a boot and its warning sheet ([`admission`]).
+    pub admission: admission::Gate,
 }
 
 /// An Android screen switched away from, with what the window showed it with.
@@ -285,6 +315,10 @@ impl State {
     fn connect(&mut self) {
         self.connect_pending = false;
         let Some(info) = self.selected_info().cloned() else { return };
+        // Its own window has its connection.
+        if self.popouts.is_open(&info.udid) {
+            return;
+        }
         if self.screen.as_ref().is_some_and(|sc| sc.udid != info.udid) {
             self.pause_screen();
         }
@@ -393,6 +427,8 @@ fn init() -> State {
         shape: Shape::Rounded,
         held: None,
         busy: None,
+        mark_t: 0.0,
+        mark_from: None,
         status: view3d_status,
         debug: debug::Debug::default(),
         socket: None,
@@ -420,7 +456,21 @@ fn init() -> State {
         screen_view: (0.0, 0.0),
         bezel: bezel::Bezel::default(),
         view3d,
+        previews: shot_preview::Previews::default(),
+        prefs: settings::Store::default(),
+        panes: panes::Panes::default(),
+        resources: resources::Resources::default(),
+        popouts: popout::Popouts::default(),
+        admission: admission::Gate::default(),
     }
+}
+
+/// The window's state from its saved settings.
+#[cfg_attr(feature = "hot", allow(dead_code))]
+fn init_with(store: settings::Store) -> State {
+    let mut s = init();
+    panes::restore(&mut s, store);
+    s
 }
 
 fn info(udid: &str, name: &str, device_type: &str, runtime: &str, state: DeviceState) -> DeviceInfo {
@@ -613,6 +663,7 @@ fn headless() -> bool {
 
 fn setup(s: &mut State, waker: Waker) {
     s.native.set_waker(waker.clone());
+    s.previews.connect(waker.clone());
     s.outbox = work::Outbox::new(Some(waker.clone()));
     s.bezel.set_outbox(s.outbox.clone());
     s.waker = Some(waker);
@@ -632,7 +683,9 @@ fn setup(s: &mut State, waker: Waker) {
         }
     }
     if let Some(w) = s.waker.clone() {
-        s.debug.start(w);
+        s.debug.start(w.clone());
+        s.resources.connect(w.clone());
+        s.admission.connect(w);
     }
     // The window also serves the API, so scripts can drive the device it shows.
     let socket = std::env::var_os("SIMEE_SOCKET").map_or_else(|| std::env::temp_dir().join("simee-desktop.sock"), std::path::PathBuf::from);
@@ -714,7 +767,8 @@ fn coalesce_moves(inputs: Vec<Input>) -> Vec<Input> {
 }
 
 fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
-    let mut changed = false;
+    // A landed admission check queues its boot (or shows its sheet) before the actions run.
+    let mut changed = admission::poll(s);
     if let Some((button, due)) = s.held
         && t >= due
     {
@@ -730,6 +784,9 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
         if let Action::View3d(c) = action {
             s.view3d.view.back = scene::shows_back(s);
             s.view3d.view.command(c, t);
+            continue;
+        }
+        if popout::perform(s, &action, tx) {
             continue;
         }
         if s.offline {
@@ -758,20 +815,10 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             }
             Action::Boot => {
                 let Some(info) = s.selected_info().cloned() else { continue };
-                match info.platform {
-                    Platform::Ios => {
-                        let Some(waker) = s.waker.clone() else { continue };
-                        s.busy = Some("Booting…");
-                        s.work_done.store(false, Ordering::Relaxed);
-                        device::boot_async(info.udid, s.work_done.clone(), s.work_error.clone(), waker);
-                    }
-                    Platform::Android => {
-                        let Some(backend) = s.android_backend.clone() else { continue };
-                        // With audio: a person is watching this one (tools and farms boot silent).
-                        s.run_async("Booting…", move || backend.device(&info.udid)?.boot(&backend, Duration::from_secs(300), true));
-                    }
-                }
+                let admitted = admission::ask(s, &info);
+                boot(s, &admitted);
             }
+            Action::BootNow(udids) => boot(s, &udids),
             Action::Shutdown => {
                 if let Some(live) = s.live.take() {
                     if let Err(e) = live.shutdown() {
@@ -808,7 +855,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             }
             Action::Xr(command) => android_action(s, move |d| d.xr(&command).map(drop)),
             Action::ToggleStylus => toggle_stylus(s),
-            Action::ToggleView3d | Action::View3d(_) => {}
+            Action::ToggleView3d | Action::View3d(_) | Action::PopOut(_) | Action::PopIn(_) => {}
             Action::Debug(a) => {
                 if let Some(udid) = s.live.as_ref().map(|l| l.udid.clone())
                     && let Some(msg) = s.debug.perform(&udid, a)
@@ -867,7 +914,22 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
         s.sized_for = Some(size);
         let form_factor = s.selected_info().and_then(|i| i.form_factor);
         let bezel = s.selected_info().and_then(controls::bezel).is_some();
-        tx.resize_window(fit_window(size, form_factor, bezel));
+        // The window opened at its saved size for this device keeps it; resized or hidden panes
+        // widen or narrow the fit.
+        if s.panes.keep_window.take().is_none_or(|udid| s.selected.as_ref() != Some(&udid)) {
+            let (w, h) = fit_window(size, form_factor, bezel);
+            tx.resize_window((w + panes::chrome_delta(&s.prefs.current, true), h));
+        }
+        changed = true;
+    }
+    // The mark turns while a job runs or a device starts or stops: a frame every
+    // `mark::FRAME`, and none once everything rests.
+    if s.busy.is_some() || s.devices.iter().any(|d| mark::moves(d.state)) {
+        let from = *s.mark_from.get_or_insert(t);
+        s.mark_t = (t - from) as f32;
+        changed = true;
+        tx.wake_after(mark::FRAME);
+    } else if s.mark_from.take().is_some() {
         changed = true;
     }
     // The 3D view's camera and turn: a frame for every step of a running change and one to land
@@ -878,7 +940,35 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             tx.wake_after(Duration::ZERO);
         }
     }
+    // Screenshot previews: a frame for every step of a slide, a wake at the next expiry.
+    changed |= s.previews.step(t);
+    if let Some(secs) = s.previews.wake_in(t) {
+        tx.wake_after(Duration::from_secs_f64(secs));
+    }
+    changed |= resources::poll(s, t, tx);
+    changed |= panes::poll(s, t, tx);
+    changed |= popout::poll(s, t, tx);
     changed
+}
+
+/// Boots the listed devices, past admission already.
+fn boot(s: &mut State, udids: &[String]) {
+    for udid in udids {
+        let Some(info) = s.devices.iter().find(|d| &d.udid == udid).cloned() else { continue };
+        match info.platform {
+            Platform::Ios => {
+                let Some(waker) = s.waker.clone() else { continue };
+                s.busy = Some("Booting…");
+                s.work_done.store(false, Ordering::Relaxed);
+                device::boot_async(info.udid, s.work_done.clone(), s.work_error.clone(), waker);
+            }
+            Platform::Android => {
+                let Some(backend) = s.android_backend.clone() else { continue };
+                // With audio: a person is watching this one (tools and farms boot silent).
+                s.run_async("Booting…", move || backend.device(&info.udid)?.boot(&backend, Duration::from_secs(300), true));
+            }
+        }
+    }
 }
 
 /// ⌘3: the 3D view on or off, or the reason it can't be (a backend without depth buffers, a
@@ -893,10 +983,17 @@ fn toggle_view3d(s: &mut State) {
 }
 
 /// Window shortcuts the focused control left alone: ⌘3 toggles the 3D view; while it shows, ⌘0,
-/// ⌘1 ⌘2 ⌘4 ⌘5, ⌘F and ⌘[ ⌘] move it ([`scene::Command::for_key`]).
+/// ⌘1 ⌘2 ⌘4 ⌘5, ⌘F and ⌘[ ⌘] move it ([`scene::Command::for_key`]). ⌘S saves a screenshot
+/// wherever the focus is. ⌘⌥S and ⌘⌥I hide and show the sidebar and the inspector ([`panes`]),
+/// ⌘⌥R the resource panel ([`resources`]).
 fn on_key(s: &mut State, k: &rune::KeyEvent, tx: &mut Tx) -> bool {
+    if panes::on_key(s, k, tx) || popout::on_key(s, k, tx) {
+        return true;
+    }
     let action = if k.key == rune::Key::Command('3') && !k.mods.shift {
         Action::ToggleView3d
+    } else if keys::map(k) == KeyAction::Screenshot {
+        Action::Screenshot
     } else if let Some(c) = scene::Command::for_key(k)
         && scene::active(s).is_some()
     {
@@ -1021,10 +1118,14 @@ fn edge_touch(s: &State, x: f32, y: f32, phase: Phase, edge: sim_core::gesture::
 /// copied here and encoded on a thread. The result reaches the status line through the outbox;
 /// returns a status line only for what fails at once.
 fn screenshot(s: &State) -> Option<String> {
-    let path = work::screenshot_path();
+    let path = work::screenshot_path(s.prefs.current.screenshot_dir.as_deref());
+    let inbox = s.previews.inbox();
     if let Some(sc) = &s.screen {
         sc.console(move |d| match d.screenshot_png_to(&path) {
-            Ok(_) => Ok(Some(format!("saved {}", path.display()))),
+            Ok(_) => {
+                inbox.post_file(&path);
+                Ok(Some(format!("saved {}", path.display())))
+            }
             Err(e) => Err(format!("screenshot failed: {e}")),
         });
         return None;
@@ -1040,12 +1141,14 @@ fn screenshot(s: &State) -> Option<String> {
     if frame.width == 0 || frame.height == 0 {
         return Some("no frame to save".into());
     }
-    work::save_png(frame, path, s.outbox.clone());
+    shot_preview::save_png(frame, path, s.outbox.clone(), inbox);
     None
 }
 
 fn main() {
-    let spec = AppSpec::<State> {
+    // Live Rust editing runs the spec as it is: no saved window frame.
+    #[cfg_attr(feature = "hot", allow(unused_mut))]
+    let mut spec = AppSpec::<State> {
         scenes: &[
             ("demo", demo),
             ("android", android_scene),
@@ -1060,12 +1163,29 @@ fn main() {
             ("turned", turned_scene),
             ("turned-tablet", turned_tablet_scene),
             ("empty", empty),
+            ("screenshot", |s| {
+                demo(s);
+                shot_preview::demo_shots(s, 2);
+            }),
+            ("android-screenshot", |s| {
+                android_scene(s);
+                shot_preview::demo_shots(s, 1);
+            }),
+            ("sidebar-hidden", panes::sidebar_hidden_scene),
+            ("inspector-hidden", panes::inspector_hidden_scene),
+            ("panes-hidden", panes::panes_hidden_scene),
+            ("panes-wide", panes::panes_wide_scene),
+            ("resources", resources::scene),
+            ("resources-memory", resources::memory_scene),
+            ("popped", popout::scene),
+            ("admission", admission::scene),
+            ("admission-many", admission::many_scene),
         ],
         setup: Some(setup),
         poll: Some(poll),
         on_key: Some(on_key),
         min_size: Some((1000.0, 560.0)),
-        ..AppSpec::new("simee", (1240.0, 870.0), init, view::view)
+        ..AppSpec::new("simee", (1240.0, 870.0), init, admission::view)
     };
     // Live Rust editing runs the spec its own way, without the visibility hook.
     #[cfg(feature = "hot")]
@@ -1076,8 +1196,21 @@ fn main() {
         // Before the window's state is made: it reads whether the 3D view can draw. Both
         // backends draw it (Rune's native Metal one since anomalyco/rune#2563, #193).
         scene::set_supported(true);
+        // Headless runs and scenes never read or write the user's settings.
+        let store = if headless() { settings::Store::default() } else { settings::Store::open_default() };
+        let opened_at = panes::open_at(&mut spec, &store);
         // With the view off the compositor draws Rune's default frame.
-        let app = rune::App::new(spec).on_visibility(on_visibility).compositor(scene::Scene::default());
+        let app = rune::App::new(spec)
+            .on_visibility(on_visibility)
+            .on_window(panes::remember_window)
+            .on_close(popout::on_main_close)
+            .on_quit(popout::on_main_close)
+            .init(move || init_with(store))
+            .compositor(scene::Scene::default());
+        let app = match opened_at {
+            Some(options) => app.window_options(options),
+            None => app,
+        };
         let app = match gpu_backend(setting.as_deref()) {
             Ok(Some(backend)) => app.gpu_backend(backend),
             Ok(None) => app,
@@ -1818,7 +1951,7 @@ mod tests {
     }
 
     /// A display socket that takes one client and records its lines.
-    fn recording_display(name: &str) -> (std::path::PathBuf, Arc<Mutex<Vec<String>>>) {
+    pub(crate) fn recording_display(name: &str) -> (std::path::PathBuf, Arc<Mutex<Vec<String>>>) {
         use std::io::BufRead;
         let dir = std::path::PathBuf::from("/tmp").join(format!("rs-main-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

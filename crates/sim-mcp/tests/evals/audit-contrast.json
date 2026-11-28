@@ -1,0 +1,27 @@
+{
+  "name": "audit-contrast",
+  "goal": "Check the screen showing on the booted iPhone for WCAG contrast failures in light and dark, and report each one with its ratio.",
+  "toolsets": "core,observe",
+  "world": {
+    "devices": [
+      {"udid": "iphone-17", "name": "iPhone 17", "platform": "ios", "form_factor": "phone", "state": "Booted",
+       "apps": ["com.example.notes"], "foreground": "com.example.notes"}
+    ],
+    "contrast": {
+      "com.example.notes": {
+        "light": [{"x": 48, "y": 300, "width": 420, "height": 40, "kind": "text", "foreground": "#9a9a9a", "background": "#ffffff",
+                   "ratio": 2.8, "required": 4.5}],
+        "dark": [{"x": 48, "y": 300, "width": 420, "height": 40, "kind": "text", "foreground": "#3a3a3c", "background": "#000000",
+                  "ratio": 1.9, "required": 4.5}]
+      }
+    }
+  },
+  "plan": [
+    {"tool": "devices", "args": {"booted": true}, "expect": {"contains": ["iphone-17"]}},
+    {"tool": "contrast_check", "args": {"device": "iphone-17", "appearance": "both"}, "expect": {"contains": ["\"ratio\":1.9", "\"ratio\":2.8"]}}
+  ],
+  "end": {
+    "appearance": {"iphone-17": "light"},
+    "seen": ["1.9", "2.8"]
+  }
+}

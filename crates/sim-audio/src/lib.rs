@@ -46,6 +46,12 @@ pub fn helper() -> Result<PathBuf, String> {
     Ok(out)
 }
 
+/// This host's macOS release, `None` off macOS (or unreadable: the helper then says).
+fn host_macos() -> Option<sim_core::support::Version> {
+    let text = std::fs::read_to_string(sim_core::support::SYSTEM_VERSION_PLIST).ok()?;
+    sim_core::support::Version::from_system_version(&text).map(|(v, _)| v)
+}
+
 /// Host audio devices as the helper reports them.
 pub fn host_devices() -> Result<Value, String> {
     let out = Command::new(helper()?).arg("devices").output().map_err(|e| e.to_string())?;
@@ -133,6 +139,9 @@ impl Capture {
     /// silent on the host meanwhile. With `out`, samples are written there as WAV on stop. Waits
     /// until the device has an audio client (up to 30 s).
     pub fn start(launchd_pid: i32, out: Option<&Path>, mute: bool) -> Result<Self, String> {
+        // Below the floor the helper would answer the same, after a build that may not even
+        // compile against an older SDK.
+        sim_core::support::check("audio_capture", host_macos())?;
         let mut cmd = Command::new(helper()?);
         cmd.args(["tap", "--launchd", &launchd_pid.to_string()]);
         if let Some(p) = out {
@@ -216,6 +225,21 @@ mod tests {
         set_volume(&root, 40).expect("volume");
         assert_eq!(std::fs::read_to_string(&path).expect("read"), include_str!("../fixtures/audiosettings.plutil-replaced.plist"));
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The tap's floor is the support matrix's, and both the helper's guard and its fallback
+    /// message name it; this host (macOS 14.2+) passes the check.
+    #[test]
+    fn the_tap_is_guarded_at_its_macos_floor() {
+        let floor = sim_core::support::floor("audio_capture").and_then(|f| f.macos).expect("floor");
+        assert_eq!(floor.to_string(), "14.2");
+        assert!(HELPER_SOURCE.contains("@available(macOS 14.2, *)\nfunc tap("), "tap is annotated");
+        assert!(HELPER_SOURCE.contains("if #available(macOS 14.2, *) {\n        tap("), "its call is guarded");
+        assert!(HELPER_SOURCE.contains("audio capture needs macOS 14.2 or later"));
+        if cfg!(target_os = "macos") {
+            let v = host_macos().expect("SystemVersion.plist");
+            assert_eq!(sim_core::support::check("audio_capture", Some(v)).is_ok(), v >= floor);
+        }
     }
 
     #[test]

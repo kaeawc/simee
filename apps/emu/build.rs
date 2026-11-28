@@ -10,6 +10,11 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
+    // cpal's CoreAudio backend imports AudioHardwareCreateProcessTap and ...DestroyProcessTap
+    // (macOS 14.2). Linked strongly, dyld refuses to load emu on macOS 13 and 14.0 to 14.1 before
+    // `main` can name the floor. Weak, they resolve to null there; emu refuses below macOS 15
+    // first, so nothing calls them. scripts/check-imports.sh checks the result.
+    println!("cargo:rustc-link-arg-bins=-Wl,-weak_framework,CoreAudio");
     println!("cargo:rustc-link-arg-bins=-Wl,-rpath,@executable_path/lib64");
     // Host GLES is ANGLE on Metal; gfxstream dlopens libEGL/libGLESv2 by bare name.
     println!("cargo:rustc-link-arg-bins=-Wl,-rpath,@executable_path/lib64/gles_angle");

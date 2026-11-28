@@ -11,6 +11,16 @@ pub const REASON: &str = "iOS simulator devices need a macOS host with Xcode";
 #[derive(Default)]
 pub struct Session;
 
+impl Session {
+    /// No device set is opened on this host.
+    pub(crate) fn use_set(&mut self, _: Result<Option<String>, String>) {}
+
+    /// The default set: there is no other here.
+    pub(crate) fn set(&self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+}
+
 /// No HID input is sent on this host.
 pub fn track_input() {}
 
@@ -22,6 +32,11 @@ pub fn flush_input(_timeout: std::time::Duration) -> bool {
 /// No simulators to select from.
 pub fn selection_infos(_: &mut Session) -> Result<Vec<sim_core::device::DeviceInfo>, String> {
     Ok(Vec::new())
+}
+
+/// No iOS devices to boot.
+pub(crate) fn boot_many_hooked(s: &mut Session, p: &Value, _: &dyn crate::progress::BootHook) -> Result<Value, String> {
+    call(s, "boot_many", p)
 }
 
 /// Listings are empty; every other method names a device that can't exist here.

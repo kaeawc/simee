@@ -8,9 +8,14 @@ One window for iOS and Android devices.
 cd desktop
 cargo run --release                     # SIMEE_DEVICE=<udid|name|booted> preselects a device
 cargo run -- --snap shot.png --scene demo   # headless render; scenes: demo, android, foldable,
-                                            # folded, tablet, ipad, watch, tv, apple-watch, apple-tv, empty
+                                            # folded, tablet, ipad, watch, tv, apple-watch, apple-tv, empty, resources
 cargo run --release --features tooling -- --snap shot.png --scene demo   # the same, optimized
 ```
+
+`scripts/desktop-app.sh` builds the window as `simee.app`, a macOS bundle with simee's icon, so
+the Dock and Finder show the mark. The mark in the window ([brand.md](design/brand.md)) is the
+activity indicator: it turns beside a running job and on the empty stage while a device boots, and
+each device in the list shows its state with it.
 
 The window, the 3D device view included, draws with Rune's native Metal backend.
 `SIMEE_GPU_BACKEND=wgpu` switches it to wgpu's Metal backend, and `metal` chooses the default. The
@@ -145,4 +150,118 @@ iOS frames go to the GPU without copying (the framebuffer IOSurface is sampled d
 right-hand panel has five debug tabs (Device, Network, Storage, Processes, Logs). Android frames
 stream from the emulator's display socket, and the panel shows the device and its live guest
 console.
+
+## Panes and settings
+
+The device list (left) and the panel (right) each have a drag handle on their inner edge:
+drag it to resize (180–420 points for the list, 280–600 for the panel, always leaving the
+screen at least 420), double-click it for the default width. ⌘⌥S hides and shows the list,
+⌘⌥I the panel, ⌘⌥R the [resource panel](#resource-panel). The headless scenes `sidebar-hidden`, `inspector-hidden`, `panes-hidden` and
+`panes-wide` show them.
+
+The window keeps its layout in a small versioned JSON file (`desktop/src/settings.rs`):
+`~/Library/Application Support/simee/desktop.json` on macOS, `$XDG_CONFIG_HOME/simee/` (or
+`~/.config/simee/`) on Linux, `%APPDATA%\simee\` on Windows; `SIMEE_DESKTOP_SETTINGS` names
+another file. It holds the panes' widths and visibility, the last selected device and debug tab,
+the window's size and position, the screenshot folder (`screenshot_dir`; the Desktop when unset
+or missing), and the device list's collapsed groups, hidden devices and tools, order and
+favorites for the organization work that follows. It is read at start and written half a second
+after changes stop, and again as the window closes, through a temporary file renamed over it.
+A file that can't be read, isn't valid, or comes from a newer version falls back to the
+defaults with one line in the status bar. It is copied aside first
+(`desktop.json.<why>-<secs>.bak`) and never deleted; if even the copy fails, nothing is saved
+that session. Headless runs never read or write it.
+
+## Resource panel
+
+⌘⌥R, or the gauge button in the panel's top-right corner, swaps the panel for the resource panel
+(`desktop/src/resources.rs`, #276), and shows the panel first if it was hidden. It shows what the
+host has left and what each running device costs. Host gauges come from the API's `host`: busy
+CPU, load per core, memory pressure and free memory, swap, free disk, the thermal state and the
+admit / hold / backoff verdict. The device list comes from `devices_usage`: CPU, memory, disk I/O
+and (where the host reports it) energy per device, sorted by CPU or memory, with a sparkline of the
+last minute. Each device the window lists has quick actions: show it in the window, stop its
+stream (when one runs through the stream API in this window's process), and shut it down. The
+device on screen shuts down as the toolbar's button does; any other device goes through the API's
+`shutdown`, and the gauges and the device list follow at once. A device the window doesn't list
+(a stock emulator started without an AVD) has no actions.
+
+The panel samples at most once a second, on a thread of its own, and only while it shows: with
+the panel, the inspector or the window hidden it asks for nothing and schedules no wake. A sample
+that changes nothing shown draws no frame. Its visibility and sort persist in the settings file
+(`resources`). The headless scenes `resources` and `resources-memory` show it with fixed data.
+
+## Admission before a boot
+
+Before the window boots a device it asks the API's `admission_check` (the device's platform,
+form factor and count; see [Admission](api.md#admission)) whether the host can take it
+(`desktop/src/admission.rs`, #275), on a thread of its own so the window never waits. On admit
+the device boots with no UI. On hold or backoff a sheet drops from the top of the window with
+the numbers ("Booting pixel_tablet would take memory used from 78% to 89%") and every reason
+the API gave, and offers Boot anyway, Boot N (when the host admits some of the devices asked
+for but not all: the first N, from `predicted.admissible`) and Cancel (or Escape). Boot N is
+the default button when offered, otherwise Cancel. "Why? See the resource panel" shows the
+[resource panel](#resource-panel) beside the sheet, with the host's verdict now. "Don't ask
+again for Android phone devices this session" skips the check for that platform and form
+factor on the next boots, until the window quits; it is remembered only when the sheet boots,
+not when it is cancelled. A check never blocks silently: one that fails or can't start boots
+anyway and says so in the status bar. The window boots one device at a time (the toolbar's
+Boot), so Boot N shows only for a request of several devices; it creates and clones no devices
+yet. The headless scenes `admission` and `admission-many` show the sheet with fixed data.
+
+## Screenshot preview
+
+⌘S, or the toolbar's Screenshot button, saves the device's screen to the Desktop as a PNG, as
+before, on iOS and Android alike. ⌘S works wherever the focus is in the window. A thumbnail of
+the shot then slides up into the window's bottom-right corner, as the macOS screenshot preview
+does (`desktop/src/shot_preview.rs`):
+
+| Do | What happens |
+| --- | --- |
+| Nothing | It stays 5 s, then slides off to the right. The file stays saved |
+| Hover over it | It stays while the pointer is there, and for at least 1.5 s after |
+| Take more shots | They stack leftwards, newest in the corner, up to four. A fifth sends the oldest away |
+| Drag it into Finder, Mail, Slack, a browser upload… | It drops as the PNG file. The drag carries the file and the PNG data (Rune's `drag_out`). A drop the other app accepts dismisses the preview |
+| Click it | Opens the file in its default app (Preview) |
+| Right-click it | Open, Copy (the PNG to the pasteboard), Show in Finder, Delete (removes the file) |
+| Swipe right on it with two fingers | Dismisses it early |
+
+Under the system's reduced motion it appears and leaves without sliding. The window asks for
+frames only while a preview moves, plus one wake when the next one is due to leave. The
+`screenshot` and `android-screenshot` headless scenes show it settled.
+
+## Pop-out windows
+
+Any running device can leave the main window for a native window of its own, sized to its
+screen, and come back (`desktop/src/popout.rs`, #286). Pop it out from its row's context menu in
+the device list (Pop Out to Window), the stage toolbar's pop-out button, or ⌘⇧O; the main window
+then shows the next running device, and the list marks the one that's out. Several devices can
+be out at once. Pop back in from the pop-out's toolbar, ⌘⇧O in it, the row's menu (Pop Back In),
+or by closing the window: closing returns the device to the main window as its selected device,
+it never shuts the device down. Selecting a device that's out focuses its window. Closing the main
+window ends the app, pop-outs included.
+
+The device's connection moves with it rather than reconnecting: an iOS device's capture thread
+and HID session (the zero-copy surface keeps its latest frame and wakes the window now drawing
+it), an Android device's display stream and console worker. The pop-out's first frame is the one
+the main window last showed, and it keeps drawing while the main window is hidden. Each window
+owns the device it shows, so its touches and keys can only reach that device. A pop-out has the
+device's toolbar (the form factor's controls, without the tablet stylus) and ⌘S; its console
+results and errors show on its own status line. It is flat: the 3D device view stays in the main
+window.
+
+A popped device that stops, shut down from the resource panel, the CLI or a script, or an
+emulator that went away, lets go of its connection at once: the pop-out says the device stopped
+and keeps only Pop Back In, and the device comes back to the main window as one that isn't
+running, never with its last frame. A pop-out asked for on a device that isn't connected yet (a
+row's menu on a device that wasn't selected) waits up to 10 seconds for it, then gives up and
+says so, so a later scan never pops it out unasked.
+
+Each device's pop-out frame is kept in the settings file (`popouts`, by UDID or AVD name), so
+popping the same device out again, in this run or the next, opens it where it was. A frame saved
+on a display that's no longer connected opens on the nearest one that is, whole where it fits,
+as the main window's restore checks its own frame. Reopening the
+pop-outs that were open at quit is #288. The windows open at run time through Rune's
+`open_window`, which headless runs don't do: the `popped` scene shows the main window with its
+device out, and the pop-out's own view is checked in the tests.
 

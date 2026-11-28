@@ -125,20 +125,24 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --locked --all-targets --profile ci -- -D warnings
+      # The Linux H.264 encoder, `simee-encode`'s `openh264` feature: off by default because it
+      # builds OpenH264's C++ (g++ is on the runner) and `scripts/check.sh` lints the Linux target
+      # from macOS with no C++ cross toolchain, so nothing above compiles it (nor simee-api's and simee's
+      # Linux stream path behind the same feature). nasm gives it the
+      # x86_64 assembly (2.4x faster; the build warns without it).
+      - run: sudo apt-get install -y --no-install-recommends nasm || (sudo apt-get update && sudo apt-get install -y --no-install-recommends nasm)
+      - run: cargo clippy --locked -p simee-encode -p simee-api -p simee --all-targets --features openh264 --profile ci -- -D warnings
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-llvm-cov,cargo-nextest
+      - run: cargo nextest run --locked -p simee-encode -p simee-api -p simee --features openh264 --cargo-profile ci --hide-progress-bar
       # The tests run once, instrumented. Per-file coverage goes to the job summary, and the job
       # fails when line coverage drops under the floor: raise it as coverage grows, never lower it
       # to get green.
       - run: cargo llvm-cov nextest --locked --workspace --cargo-profile ci --no-report --hide-progress-bar
       # x86_64 runners expose /dev/kvm (root:kvm 0660): open it to the runner user, then run
       # emu-kvm's tests that drive real KVM guests (ignored where there is no KVM).
-      - name: Give the runner /dev/kvm
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
+      - uses: ./.github/actions/enable-kvm
       - run: cargo llvm-cov nextest --locked -p simee-emu-kvm --cargo-profile ci --no-report --hide-progress-bar --run-ignored only -E 'not test(notify_cost)'
       - run: |
           {
@@ -152,6 +156,38 @@ jobs:
         with:
           name: coverage-linux
           path: lcov.info
+
+  # The WebRTC publisher against a real MediaMTX (tests/mediamtx/mediamtx.yml), and the rest of
+  # `simee-rtc`'s end-to-end tests: the `linux` job builds without the `rust-crypto` DTLS backend,
+  # so those skip there. MediaMTX is the release pinned in scripts/mediamtx-fetch.sh, checked
+  # against its SHA-256 on every run (the download is about a second; an Actions cache entry would
+  # cost as much to restore and evict other entries from the full cache). `lint-test` runs the
+  # same tests on macOS (it tests simee-rtc already). Setting
+  # SIMEE_REQUIRE_MEDIAMTX makes a skipped MediaMTX test a failure, so a broken download or a
+  # missing DTLS backend can't go green by skipping.
+  mediamtx:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SIMEE_REQUIRE_MEDIAMTX: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+      # Restore-only, from the `linux` job's entry: the repository's Actions cache is over its
+      # limit, and a second Linux entry saved from main would evict older ones (macOS included).
+      # What `linux` didn't build (aws-lc, for `rust-crypto`) compiles each run.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: linux
+          save-if: false
+      - name: MediaMTX
+        run: |
+          bin=$(scripts/mediamtx-fetch.sh "$RUNNER_TEMP/mediamtx")
+          "$bin" --version
+          echo "MEDIAMTX_BIN=$bin" >> "$GITHUB_ENV"
+      - run: cargo test --locked --profile ci -p simee-rtc --features rust-crypto
 
   # What the KVM fast paths save, on real KVM (x86_64; GitHub's arm64 runners have no /dev/kvm,
   # see #54): a virtio-style doorbell store that exits to userspace against one completed in the
@@ -169,11 +205,7 @@ jobs:
           shared-key: kvm-x86
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Give the runner /dev/kvm
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
+      - uses: ./.github/actions/enable-kvm
       - run: |
           cargo test --locked --release -p simee-emu-kvm notify_cost -- --ignored --nocapture | tee bench.txt
           { echo '### KVM notify cost (x86_64 runner)'; echo '```text'; grep notify_cost: bench.txt; nproc; grep -m1 'model name' /proc/cpuinfo; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
@@ -208,7 +240,17 @@ jobs:
       - name: Wait for the simulator service
         timeout-minutes: 5
         run: time xcrun simctl list devices > /dev/null
+      # simee-rtc's MediaMTX tests (Apple's DTLS backend; the `mediamtx` job runs them on Linux):
+      # the pinned, SHA-256-checked release, about a second. SIMEE_REQUIRE_MEDIAMTX below makes a
+      # skipped MediaMTX test a failure.
+      - name: MediaMTX
+        run: |
+          bin=$(scripts/mediamtx-fetch.sh "$RUNNER_TEMP/mediamtx")
+          "$bin" --version
+          echo "MEDIAMTX_BIN=$bin" >> "$GITHUB_ENV"
       - name: Test the crates with macOS-specific code
+        env:
+          SIMEE_REQUIRE_MEDIAMTX: "1"
         run: |
           packages=()
           while read -r name; do packages+=(-p "$name"); done < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' -e '/^$/d' .config/macos-tests.txt)
@@ -284,7 +326,7 @@ jobs:
   # cancelled (a failed `changes` fails it too, though the jobs after it show as skipped).
   ci-ok:
     if: always()
-    needs: [changes, fmt, docs-scripts, linux, kvm-x86, lint-test, emu-desktop, desktop-linux]
+    needs: [changes, fmt, docs-scripts, linux, mediamtx, kvm-x86, lint-test, emu-desktop, desktop-linux]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

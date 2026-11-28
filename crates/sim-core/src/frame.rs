@@ -51,9 +51,74 @@ pub fn png_size(png: &[u8]) -> Option<(u32, u32)> {
     Some((be(16), be(20)))
 }
 
+/// Decodes an 8-bit RGB or RGBA PNG (what [`encode_png`] writes) into a [`Frame`], opaque where the
+/// PNG has no alpha.
+pub fn decode_png(png: &[u8]) -> Result<Frame, String> {
+    let mut reader = png::Decoder::new(std::io::Cursor::new(png)).read_info().map_err(|e| e.to_string())?;
+    let mut buf = vec![0; reader.output_buffer_size().ok_or("the PNG is too large to decode")?];
+    let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
+    if info.bit_depth != png::BitDepth::Eight {
+        return Err(format!("only 8-bit PNGs decode, not {:?}", info.bit_depth));
+    }
+    buf.truncate(info.buffer_size());
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => buf,
+        png::ColorType::Rgb => buf.as_chunks::<3>().0.iter().flat_map(|p| [p[0], p[1], p[2], 0xff]).collect(),
+        other => return Err(format!("only RGB and RGBA PNGs decode, not {other:?}")),
+    };
+    Ok(Frame { width: info.width, height: info.height, rgba })
+}
+
+/// A PNG sized for a reader that doesn't need every pixel (an agent's context): shrunk by the
+/// smallest whole factor that brings its longest side to at most `max_side`, each block averaged.
+/// A PNG already that small is returned as it is, undecoded.
+pub fn shrink_png(png: &[u8], max_side: u32) -> Result<Vec<u8>, String> {
+    let (width, height) = png_size(png).ok_or("not a PNG")?;
+    let factor = crate::pixels::downscale_factor(width.max(height), max_side);
+    if factor <= 1 {
+        return Ok(png.to_vec());
+    }
+    let frame = decode_png(png)?;
+    let (w, h, rgba) = crate::pixels::downscale(frame.width, frame.height, &frame.rgba, factor);
+    encode_rgba(w, h, &rgba)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shrinking_averages_blocks_down_to_the_longest_side_and_leaves_small_ones() {
+        // 8x4: the left half red, the right half blue; at most 4 on a side is a factor of 2.
+        let rgba: Vec<u8> = (0..32).flat_map(|i| if i % 8 < 4 { [255, 0, 0, 255] } else { [0, 0, 255, 255] }).collect();
+        let png = encode_png(&Frame { width: 8, height: 4, rgba }).expect("encode");
+        let small = shrink_png(&png, 4).expect("shrink");
+        let frame = decode_png(&small).expect("decode");
+        assert_eq!((frame.width, frame.height), (4, 2));
+        assert_eq!(&frame.rgba[..4], [255, 0, 0, 255]);
+        assert_eq!(&frame.rgba[12..16], [0, 0, 255, 255]);
+        // A factor is whole: 8 down to at most 5 is still 2; at most 2 is 4.
+        assert_eq!(png_size(&shrink_png(&png, 5).expect("shrink")), Some((4, 2)));
+        assert_eq!(png_size(&shrink_png(&png, 2).expect("shrink")), Some((2, 1)));
+        // Already small enough: the same bytes, not a re-encode.
+        assert_eq!(shrink_png(&png, 8).expect("fits"), png);
+        assert_eq!(shrink_png(&png, 100).expect("fits"), png);
+        assert!(shrink_png(b"nope", 4).is_err());
+        let truncated = &png[..png.len() - 20];
+        assert!(shrink_png(truncated, 4).is_err());
+    }
+
+    #[test]
+    fn decoding_gives_opaque_rgba_for_rgb_and_refuses_what_it_cannot_read() {
+        let frame = busy_frame(5, 3, |_| 0xff);
+        assert_eq!(decode_png(&encode_png(&frame).expect("encode")).expect("decode"), frame);
+        let mut gray = Vec::new();
+        let mut encoder = png::Encoder::new(&mut gray, 2, 2);
+        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header().and_then(|mut w| w.write_image_data(&[0; 4])).expect("write");
+        assert!(decode_png(&gray).expect_err("gray").contains("Grayscale"));
+    }
 
     #[test]
     fn encodes_a_decodable_png() {

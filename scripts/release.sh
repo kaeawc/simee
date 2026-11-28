@@ -29,8 +29,10 @@ old="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
 sed -i.bak -e "s/^version = \"$old\"$/version = \"$new\"/" -e "s/version = \"=$old\" }/version = \"=$new\" }/" Cargo.toml
 rm Cargo.toml.bak
 cargo update --workspace --offline
-# The desktop workspace depends on the crates by path: resolving it records their new version.
+# The desktop and website workspaces depend on the crates by path: resolving each records their
+# new version.
 (cd desktop && cargo metadata --offline --format-version 1 >/dev/null)
+(cd website && cargo metadata --offline --format-version 1 >/dev/null)
 
 # "## [Unreleased]" keeps its heading; its entries move under the new version.
 python3 - "$new" "$(date +%Y-%m-%d)" <<'EOF'

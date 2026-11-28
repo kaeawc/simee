@@ -1,0 +1,54 @@
+# MediaMTX for simee's WebRTC tests: WHIP ingest and WHEP egress on loopback, nothing else.
+# Needs MediaMTX v1.19.2 or newer (see docs/streaming.md for the pinned version).
+#
+# The ports below are the defaults for running it by hand. The harness (crates/sim-rtc/tests/
+# common) and scripts/mediamtx.sh start it on free ports instead, through MediaMTX's own MTX_*
+# environment overrides (MTX_WEBRTCADDRESS, MTX_APIADDRESS, MTX_WEBRTCLOCALUDPADDRESS,
+# MTX_WEBRTCLOCALTCPADDRESS), so this file stays a valid config on its own.
+
+logLevel: info
+# MediaMTX logs to stdout; the harness and the script redirect it to a file.
+logDestinations: [stdout]
+
+# The control API: the tests read /v3/paths/get/<name> to see a publisher arrive.
+api: true
+apiAddress: 127.0.0.1:9997
+
+# WebRTC: WHIP at /<name>/whip, WHEP at /<name>/whep. Plain HTTP; no TLS on loopback.
+webrtc: true
+webrtcAddress: 127.0.0.1:8889
+webrtcEncryption: false
+# Media over loopback UDP (and TCP as the fallback), with no STUN: only host candidates.
+webrtcLocalUDPAddress: 127.0.0.1:8189
+webrtcLocalTCPAddress: 127.0.0.1:8189
+webrtcIPsFromInterfaces: false
+webrtcAdditionalHosts: [127.0.0.1]
+webrtcICEServers2: []
+
+# AutoMobile measured first frames up to 15 s after WHIP connects on a device; the 2 s default
+# closes a valid publisher before its first SPS/PPS + IDR arrives. 30 s is twice that.
+webrtcTrackGatherTimeout: 30s
+
+# Everything else off.
+rtsp: false
+rtmp: false
+hls: false
+srt: false
+moq: false
+metrics: false
+pprof: false
+playback: false
+
+# No credentials: anonymous publish, read and API from loopback only.
+authMethod: internal
+authInternalUsers:
+  - user: any
+    ips: ["127.0.0.1", "::1"]
+    permissions:
+      - action: publish
+      - action: read
+      - action: api
+
+# Any path, created when a publisher arrives.
+paths:
+  all_others:

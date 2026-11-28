@@ -21,6 +21,11 @@
 //! turned once per frame into a buffer of their own that every such reader shares. An unturned
 //! display never touches that buffer.
 //!
+//! Under `-gpu metal` a posted frame can also be taken as a shared surface the renderer's GPU
+//! copied it into ([`FrameStore::latest_surface`], [`DisplaySink::set_surface_readback`]): once
+//! per frame however many streams ask, held while anyone holds it, and none for a presented
+//! frame or a view, which are read as pixels as before.
+//!
 //! A renderer without GL can't report its posts (gfxstream's post callback reads every post back
 //! through GL); [`PostTicker`] stands in, driven by the renderer's fences.
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,6 +38,19 @@ use sim_core::rotation::{Rotation, rotate_rgba_into};
 /// Reads the last posted frame back as tightly packed RGBA, top row first, `width` x `height`,
 /// into the buffer (exactly `width * height * 4` bytes). False when there's nothing to read.
 pub type Readback = Box<dyn Fn(u32, u32, &mut [u8]) -> bool + Send + Sync>;
+
+/// A posted frame the renderer's GPU copied into a shared surface (an IOSurface, `-gpu metal`):
+/// BGRA, the whole scanout as the panel lies. The surface isn't written again while any handle
+/// to it lives.
+pub trait SharedSurface: Send + Sync {
+    fn size(&self) -> (u32, u32);
+    /// A new Mach send right for the surface, owned by the caller; `None` if none could be made.
+    fn mach_port(&self) -> Option<u32>;
+}
+
+/// Copies the last posted frame (`width` x `height`) into a shared surface; `None` when it can't
+/// (no free surface, the path is off): readers then take its pixels from the [`Readback`].
+pub type SurfaceReadback = Box<dyn Fn(u32, u32) -> Option<Arc<dyn SharedSurface>> + Send + Sync>;
 
 /// Receives finished scanout frames (BGRA/RGBA rows, `stride` bytes apart).
 pub trait DisplaySink: Send + Sync {
@@ -64,6 +82,11 @@ pub trait DisplaySink: Send + Sync {
 
     /// How posted frames are read back (see [`DisplaySink::posted`]).
     fn set_readback(&self, readback: Readback) {
+        let _ = readback;
+    }
+
+    /// How posted frames are copied into shared surfaces (`-gpu metal`), besides being read back.
+    fn set_surface_readback(&self, readback: SurfaceReadback) {
         let _ = readback;
     }
 
@@ -107,6 +130,10 @@ pub struct FrameStore {
     /// The capture turned upright, for readers that don't turn frames themselves, and the turn
     /// it was made with; filled only while the display is turned.
     upright: Mutex<(Capture, Rotation)>,
+    surface_readback: OnceLock<SurfaceReadback>,
+    /// The frame number the last shared surface was taken for, and the surface (None: it couldn't
+    /// be had for that frame).
+    surface: Mutex<(u64, Option<Arc<dyn SharedSurface>>)>,
 }
 
 /// A rectangle of the scanout: x, y, width, height.
@@ -184,6 +211,8 @@ impl FrameStore {
             view: Mutex::new(None),
             rotation: Mutex::new(Rotation::Deg0),
             upright: Mutex::default(),
+            surface_readback: OnceLock::new(),
+            surface: Mutex::new((0, None)),
         }
     }
 
@@ -325,6 +354,36 @@ impl FrameStore {
             up.0.rgba = Vec::new();
             up.0.frame = 0;
         }
+        // The pool's surface goes back to it.
+        if let Ok(mut s) = self.surface.try_lock() {
+            *s = (0, None);
+        }
+    }
+
+    /// Whether posted frames can be taken as shared surfaces ([`FrameStore::latest_surface`]).
+    pub fn has_surfaces(&self) -> bool {
+        self.surface_readback.get().is_some()
+    }
+
+    /// The latest frame as a shared surface the renderer's GPU copied it into, with its number:
+    /// copied once per frame however many readers ask, and kept for that frame while anyone holds
+    /// it. `None` for a presented frame, a view (a folded foldable's outer screen), a store without
+    /// [`DisplaySink::set_surface_readback`], or when no surface could be had for this frame:
+    /// readers then take its pixels ([`FrameStore::latest`], [`FrameStore::read_into`]).
+    pub fn latest_surface(&self) -> Option<(u64, Arc<dyn SharedSurface>)> {
+        let copy = self.surface_readback.get()?;
+        self.mark_read();
+        let (width, height, frame, posted) = self.state();
+        if !posted || frame == 0 || width == 0 || height == 0 || clip_view(*lock(&self.view), width, height).is_some() {
+            return None;
+        }
+        let mut kept = lock(&self.surface);
+        if kept.0 != frame {
+            // The last frame's surface goes back first: a pool with one free surface still serves.
+            *kept = (frame, None);
+            kept.1 = copy(width, height).filter(|s| s.size() == (width, height));
+        }
+        kept.1.clone().map(|s| (frame, s))
     }
 
     /// Bytes of frame buffers the store holds (kept pixels, capture, spare), for tests and
@@ -550,6 +609,10 @@ impl DisplaySink for FrameStore {
         let _ = self.readback.set(readback);
     }
 
+    fn set_surface_readback(&self, readback: SurfaceReadback) {
+        let _ = self.surface_readback.set(readback);
+    }
+
     /// An opaque black frame of the current size, presented as pixels (nothing before the first
     /// frame).
     fn blank(&self) {
@@ -573,6 +636,14 @@ impl DisplaySink for FrameStore {
 /// ends the composer's commands, so the tail is what catches the last frame of an animation.
 /// A quiet guest costs nothing: the thread sleeps until the next fence. A notice with no new
 /// frame behind it costs a reader one readback of an unchanged frame, and only while one reads.
+///
+/// With a [`PostProbe`] ([`PostTicker::start_probed`]) the notices follow the posts instead:
+/// while pokes are recent the thread asks the probe every `poll` and gives a notice only when the
+/// last post changed. A fence comes before its frame is posted, so a fence-paced notice reads
+/// the old frame back and the new one waits out the interval; a probed one comes within `poll`
+/// of the post, once per post. While the probe can't answer, notices are fence-paced as above.
+/// Once a burst's first post is noticed it polls more coarsely, and when its tail runs out it
+/// gives one more notice for a post the probe couldn't tell apart ([`Pacer`]).
 pub struct PostTicker {
     state: Mutex<TickState>,
     wake: Condvar,
@@ -583,6 +654,11 @@ pub struct PostTicker {
 
 /// See [`PostTicker::hold_until`].
 pub type Hold = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// What tells a [`PostTicker`] a new post from none: an identity of the renderer's last post that
+/// changes with each post (the posted color buffer's handle), or `None` while it can't be read.
+/// Called on the ticker's thread, unlocked, every poll while fences come: it has to be cheap.
+pub type PostProbe = Arc<dyn Fn() -> Option<u32> + Send + Sync>;
 
 #[derive(Default)]
 struct TickState {
@@ -597,8 +673,21 @@ struct TickState {
 }
 
 impl PostTicker {
-    /// Starts the notice thread for a `width` x `height` display.
+    /// Starts the notice thread for a `width` x `height` display, its notices paced by fences.
     pub fn start(sink: Arc<dyn DisplaySink>, width: u32, height: u32, interval: Duration, tail: Duration) -> Arc<PostTicker> {
+        Self::start_probed(sink, width, height, interval, tail, None)
+    }
+
+    /// [`PostTicker::start`], its notices following the posts `probe` tells apart, asked every
+    /// `poll` while fences come (see [`PostTicker`]).
+    pub fn start_probed(
+        sink: Arc<dyn DisplaySink>,
+        width: u32,
+        height: u32,
+        interval: Duration,
+        tail: Duration,
+        probe: Option<(PostProbe, Duration)>,
+    ) -> Arc<PostTicker> {
         let ticker = Arc::new(PostTicker {
             state: Mutex::new(TickState::default()),
             wake: Condvar::new(),
@@ -606,7 +695,8 @@ impl PostTicker {
             thread: Mutex::new(None),
         });
         let t = ticker.clone();
-        let spawned = std::thread::Builder::new().name("post-ticker".into()).spawn(move || t.run(&*sink, width, height, interval, tail));
+        let pace = Pace { interval, tail, probe };
+        let spawned = std::thread::Builder::new().name("post-ticker".into()).spawn(move || t.run(&*sink, width, height, &pace));
         match spawned {
             Ok(h) => *ticker.thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(h),
             Err(e) => eprintln!("emu: post-ticker: {e}; host frames won't update"),
@@ -658,44 +748,48 @@ impl PostTicker {
         }
     }
 
-    fn run(&self, sink: &dyn DisplaySink, width: u32, height: u32, interval: Duration, tail: Duration) {
+    fn run(&self, sink: &dyn DisplaySink, width: u32, height: u32, pace: &Pace) {
+        let mut pacer = Pacer::new(pace.interval, pace.tail, pace.probe.as_ref().map(|(_, poll)| *poll));
         loop {
-            let hold = {
+            let (hold, last) = {
                 let mut s = self.lock();
                 loop {
                     if s.stop {
                         return;
                     }
-                    match s.last {
-                        Some(t) if t.elapsed() <= tail => break,
-                        _ => {
-                            s.last = None;
-                            s.idle = true;
-                            s = self.wake.wait(s).unwrap_or_else(std::sync::PoisonError::into_inner);
-                        }
+                    if let Some(t) = s.last {
+                        break (s.hold.clone(), t);
                     }
+                    s.idle = true;
+                    s = self.wake.wait(s).unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
-                s.hold.clone()
             };
-            // The hold is asked unlocked: it may call into the renderer, whose fences poke.
+            // The hold and the probe are asked unlocked: they call into the renderer, whose
+            // fences poke.
             let met = hold.as_ref().is_none_or(|h| h());
+            let post = pace.probe.as_ref().and_then(|(p, _)| p());
+            let now = Instant::now();
+            let step = pacer.step(now, last, post, hold.is_some());
             let notice = {
                 let mut s = self.lock();
                 // Checked again under the lock: a hold set since it was read holds this notice
                 // too, or the notice could land after the reset's black frame.
-                let notice = met
+                let notice = step.notice
+                    && met
                     && match (&s.hold, &hold) {
                         (None, _) => true,
                         (Some(cur), Some(h)) => Arc::ptr_eq(cur, h),
                         (Some(_), None) => false,
                     };
+                // A met hold ends with the notice it lets through.
                 if notice {
                     s.hold = None;
-                    s.noticing = true;
                 }
+                s.noticing = notice;
                 notice
             };
             if notice {
+                pacer.noticed(now, post);
                 // Ends the notice even if the sink panics, so a hold never waits for it forever.
                 struct Noticed<'a>(&'a PostTicker);
                 impl Drop for Noticed<'_> {
@@ -707,8 +801,99 @@ impl PostTicker {
                 let _end = Noticed(self);
                 sink.posted(width, height);
             }
-            std::thread::sleep(interval);
+            match step.next {
+                Some(d) => std::thread::sleep(d),
+                None => {
+                    // The burst is over, unless a fence came since it was read.
+                    let mut s = self.lock();
+                    if s.last == Some(last) {
+                        s.last = None;
+                        pacer.quiet();
+                    }
+                }
+            }
         }
+    }
+}
+
+/// How a [`PostTicker`] paces its notices (see [`PostTicker::start_probed`]).
+struct Pace {
+    interval: Duration,
+    tail: Duration,
+    probe: Option<(PostProbe, Duration)>,
+}
+
+/// How often a probed ticker asks for a new post once a burst's first post was noticed: the
+/// rest of an animation's posts come a display frame apart, so a coarser poll still notices each
+/// within it, for a quarter of the wakeups (see [`Pacer`]).
+const SETTLED_POLL: Duration = Duration::from_millis(4);
+
+/// A [`PostTicker`]'s decisions, apart from its thread, locks and clock, so tests can drive them
+/// on a fake clock. A burst is the ticker's time awake: from the fence that wakes it to a tail
+/// with none.
+///
+/// Probed, a burst polls every `poll` until its first new post is noticed (a tap's frame on a
+/// quiet screen comes within `poll`), then every [`SETTLED_POLL`] for the rest of it: a steady
+/// 60 Hz animation wakes the ticker about 250 times a second instead of 1000. The handle can't
+/// tell every post: a compositor with a single target keeps it, three posts between two polls
+/// cycle back to it, reallocated targets reuse it, and it may be set before its frame is
+/// composed. So when the tail runs out, one more notice is given if a fence came since the last
+/// one: at most one readback of an unchanged frame per burst, after the changed one.
+struct Pacer {
+    interval: Duration,
+    tail: Duration,
+    /// How often the probe is asked, with one.
+    poll: Option<Duration>,
+    /// The post the last notice was for (probed), so the same post isn't noticed twice.
+    seen: Option<u32>,
+    /// When the last notice was given.
+    noticed: Option<Instant>,
+    /// This burst's first new post was noticed: poll every [`SETTLED_POLL`].
+    settled: bool,
+}
+
+/// What the ticker does on one wakeup: give a notice (unless held), then sleep for `next`, or go
+/// idle when it's `None`.
+#[derive(Debug, PartialEq)]
+struct Step {
+    notice: bool,
+    next: Option<Duration>,
+}
+
+impl Pacer {
+    fn new(interval: Duration, tail: Duration, poll: Option<Duration>) -> Pacer {
+        Pacer { interval, tail, poll, seen: None, noticed: None, settled: false }
+    }
+
+    /// The step at `now`, the last fence having come at `last` and the probe reading `post`.
+    /// `held`: a hold is set (a met one notices whatever is posted, see
+    /// `machine::blank_until_next_post`: the next boot's first post may reuse the handle of the
+    /// last boot's last).
+    fn step(&self, now: Instant, last: Instant, post: Option<u32>, held: bool) -> Step {
+        if now.saturating_duration_since(last) > self.tail {
+            // The tail's notice: for a post the handle couldn't tell from the last.
+            let notice = self.noticed.is_none_or(|n| last > n);
+            return Step { notice, next: None };
+        }
+        let notice = post.is_none() || post != self.seen || held;
+        let next = match (self.poll, post) {
+            (Some(poll), Some(_)) if self.settled => poll.max(SETTLED_POLL),
+            (Some(poll), Some(_)) => poll,
+            _ => self.interval,
+        };
+        Step { notice, next: Some(next) }
+    }
+
+    /// A notice was given at `now` for `post`.
+    fn noticed(&mut self, now: Instant, post: Option<u32>) {
+        self.seen = post;
+        self.noticed = Some(now);
+        self.settled |= post.is_some();
+    }
+
+    /// The burst ended (the ticker went idle): the next one polls every `poll` again.
+    fn quiet(&mut self) {
+        self.settled = false;
     }
 }
 
@@ -784,6 +969,336 @@ mod tests {
         // One fence after a quiet spell wakes it again.
         ticker.poke();
         wait_for("a fence after a quiet spell to wake the ticker", || posts.0.load(Ordering::Relaxed) > after);
+        ticker.stop();
+    }
+
+    /// A renderer's last post as the probe sees it: host composition cycling through its targets.
+    struct FakeRenderer {
+        posts: AtomicUsize,
+        /// How many targets composition posts in turn (three on API 36, one for a compositor
+        /// with a single target buffer).
+        targets: usize,
+        /// The probe can't read the renderer (a missing or uninitialized `FrameBuffer`).
+        unreadable: std::sync::atomic::AtomicBool,
+    }
+
+    impl FakeRenderer {
+        fn new(targets: usize) -> Arc<FakeRenderer> {
+            Arc::new(FakeRenderer { posts: AtomicUsize::new(0), targets, unreadable: Default::default() })
+        }
+
+        fn post(&self) {
+            self.posts.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn probe(self: &Arc<Self>) -> PostProbe {
+            let r = self.clone();
+            Arc::new(move || (!r.unreadable.load(Ordering::SeqCst)).then(|| (r.posts.load(Ordering::SeqCst) % r.targets) as u32 + 1))
+        }
+    }
+
+    /// Counts notices, and the renderer's posts as each one saw them.
+    struct Seen {
+        renderer: Arc<FakeRenderer>,
+        notices: AtomicUsize,
+        /// The renderer's post count when the last notice was given.
+        posts: AtomicUsize,
+    }
+
+    impl Seen {
+        fn new(renderer: &Arc<FakeRenderer>) -> Arc<Seen> {
+            Arc::new(Seen { renderer: renderer.clone(), notices: AtomicUsize::new(0), posts: AtomicUsize::new(usize::MAX) })
+        }
+
+        fn notices(&self) -> usize {
+            self.notices.load(Ordering::SeqCst)
+        }
+    }
+
+    impl DisplaySink for Seen {
+        fn present(&self, _: u32, _: u32, _: u32, _: u32, _: &[u8]) {}
+        fn posted(&self, _: u32, _: u32) {
+            self.posts.store(self.renderer.posts.load(Ordering::SeqCst), Ordering::SeqCst);
+            self.notices.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A probed ticker as the machine starts one (a 50 ms tail, polled every 1 ms), but with an
+    /// interval of a minute: a fence-paced notice would take a minute.
+    fn probed(sink: Arc<dyn DisplaySink>, renderer: &Arc<FakeRenderer>) -> Arc<PostTicker> {
+        let probe = Some((renderer.probe(), Duration::from_millis(1)));
+        PostTicker::start_probed(sink, 2560, 1600, Duration::from_secs(60), Duration::from_millis(50), probe)
+    }
+
+    /// Waits until the ticker has given no notice for three tails, so its burst is over.
+    fn quiet(seen: &Seen) -> usize {
+        let start = Instant::now();
+        let (mut n, mut since) = (seen.notices(), Instant::now());
+        while since.elapsed() < Duration::from_millis(150) {
+            assert!(start.elapsed() < Duration::from_secs(10), "the notices never stopped");
+            std::thread::sleep(Duration::from_millis(5));
+            if seen.notices() != n {
+                (n, since) = (seen.notices(), Instant::now());
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn a_single_target_compositors_last_frame_is_noticed_when_its_fences_stop() {
+        // Every post lands on the one target: the handle never changes after the first.
+        let renderer = FakeRenderer::new(1);
+        let seen = Seen::new(&renderer);
+        let ticker = probed(seen.clone(), &renderer);
+        ticker.poke();
+        wait_for("the first post to be noticed", || seen.notices() >= 1);
+        let first = quiet(&seen);
+        for _ in 0..3 {
+            fences(&ticker, 5);
+            renderer.post();
+            fences(&ticker, 5);
+        }
+        wait_for("the tail's notice of the last post", || seen.notices() > first);
+        assert_eq!(seen.posts.load(Ordering::SeqCst), 3, "the last notice came after the last post");
+        // (Can only false-pass: a stalled ticker also gives none.)
+        let n = quiet(&seen);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(seen.notices(), n, "no fence, no notice");
+        ticker.stop();
+    }
+
+    #[test]
+    fn a_post_back_on_the_noticed_handle_is_noticed_when_its_fences_stop() {
+        // Three posts between two polls (a late ticker on a loaded host): the 1-2-3 cycle lands
+        // on the handle the last notice was for.
+        let renderer = FakeRenderer::new(3);
+        let seen = Seen::new(&renderer);
+        let ticker = probed(seen.clone(), &renderer);
+        ticker.poke();
+        wait_for("the first post to be noticed", || seen.notices() >= 1);
+        quiet(&seen);
+        fences(&ticker, 5);
+        for _ in 0..3 {
+            renderer.post();
+        }
+        fences(&ticker, 5);
+        wait_for("a notice after the last post", || seen.posts.load(Ordering::SeqCst) == 3);
+        ticker.stop();
+    }
+
+    #[test]
+    fn fences_with_no_post_behind_them_give_one_notice_when_they_stop() {
+        // The handle may be set before its frame is composed: a notice of it can read the old
+        // pixels, and the next post may keep the handle. The tail's notice covers both.
+        let renderer = FakeRenderer::new(3);
+        let seen = Seen::new(&renderer);
+        let ticker = probed(seen.clone(), &renderer);
+        ticker.poke();
+        wait_for("the first post to be noticed", || seen.notices() >= 1);
+        let first = quiet(&seen);
+        fences(&ticker, 20);
+        wait_for("the tail's notice", || seen.notices() > first);
+        let n = quiet(&seen);
+        // A ticker stalled for longer than the tail while the fences came ends the burst early
+        // and starts another, so the count is bounded by bursts, not exact (the fake clock tests
+        // below count exactly).
+        assert!(n - first <= 2, "{} notices for one burst of fences", n - first);
+        ticker.stop();
+    }
+
+    /// Drives a [`Pacer`] on a fake clock the way the ticker's thread does: idle until a fence,
+    /// then awake on the pacer's sleeps until it goes idle. `fences` are times from the start in
+    /// ms (sorted), `posts` the times the handle changes to a value (sorted), `start` the handle
+    /// before the first. Returns the wakeups and the notices' times.
+    fn simulate(pacer: &mut Pacer, fences: &[f64], posts: &[(f64, u32)], start: u32) -> (usize, Vec<f64>) {
+        let t0 = Instant::now();
+        let at = |ms: f64| t0 + Duration::from_secs_f64(ms / 1000.0);
+        let since = |t: Instant| t.duration_since(t0).as_secs_f64() * 1000.0;
+        let (mut now, mut awake, mut wakeups, mut notices) = (t0, false, 0, Vec::new());
+        loop {
+            if !awake {
+                match fences.iter().find(|&&f| at(f) > now || (wakeups == 0 && at(f) >= now)) {
+                    Some(&f) => (now, awake) = (at(f), true),
+                    None => return (wakeups, notices),
+                }
+            }
+            let last = fences.iter().rev().map(|&f| at(f)).find(|&f| f <= now).expect("woken by a fence");
+            let post = posts.iter().rev().find(|&&(t, _)| at(t) <= now).map_or(start, |&(_, h)| h);
+            wakeups += 1;
+            let step = pacer.step(now, last, Some(post), false);
+            if step.notice {
+                pacer.noticed(now, Some(post));
+                notices.push(since(now));
+            }
+            match step.next {
+                Some(d) => now += d,
+                None => {
+                    pacer.quiet();
+                    awake = false;
+                }
+            }
+        }
+    }
+
+    /// The machine's pacer (16 ms interval, 50 ms tail, 1 ms poll).
+    fn machine_pacer() -> Pacer {
+        Pacer::new(Duration::from_millis(16), Duration::from_millis(50), Some(Duration::from_millis(1)))
+    }
+
+    #[test]
+    fn a_tap_on_a_quiet_screen_is_noticed_within_a_poll_of_its_post() {
+        let mut pacer = machine_pacer();
+        // The current frame, noticed and gone quiet; then a tap: the app's and the composer's
+        // fences for 6 ms, its post at 5.5 ms, and the post's own fence at 7 ms.
+        let mut fences = vec![0.0];
+        fences.extend((0..=6).map(|i| 200.0 + i as f64));
+        fences.push(207.0);
+        let (_, notices) = simulate(&mut pacer, &fences, &[(205.5, 2)], 1);
+        let tap: Vec<f64> = notices.iter().copied().filter(|&t| t >= 200.0).collect();
+        assert!(tap[0] >= 205.5 && tap[0] <= 206.5, "the tap's frame noticed at {:.1} ms, posted at 205.5", tap[0]);
+        // Then at most the tail's notice, after it.
+        assert!(tap.len() <= 2, "notices of the tap: {tap:?}");
+    }
+
+    /// 60 Hz for `secs`: each frame's fences at 0, 1 and 2 ms into it, its post at 4 ms, on
+    /// `targets` targets in turn. Returns the fences and the posts.
+    fn animation(secs: f64, targets: u32) -> (Vec<f64>, Vec<(f64, u32)>) {
+        let frame = 1000.0 / 60.0;
+        let frames = (secs * 60.0) as u32;
+        let fences = (0..frames).flat_map(|k| [0.0, 1.0, 2.0].map(|d| k as f64 * frame + d)).collect();
+        let posts = (0..frames).map(|k| (k as f64 * frame + 4.0, (k + 1) % targets + 1)).collect();
+        (fences, posts)
+    }
+
+    #[test]
+    fn a_steady_animation_is_polled_coarsely_after_its_first_post() {
+        let mut pacer = machine_pacer();
+        let (fences, posts) = animation(1.0, 3);
+        let (wakeups, notices) = simulate(&mut pacer, &fences, &posts, 1);
+        // A 1 ms poll for the whole second would wake 1000 times (plus the tail).
+        assert!(wakeups <= 300, "{wakeups} wakeups for a second of 60 Hz");
+        // The frame on screen when it starts, every post once, and the tail's notice after the
+        // last.
+        assert!((61..=62).contains(&notices.len()), "{} notices of 60 posts", notices.len());
+        // The coarse poll still follows each post within a poll of its own.
+        let settled = SETTLED_POLL.as_secs_f64() * 1000.0 + 1e-6;
+        for (i, &(t, _)) in posts.iter().enumerate() {
+            let n = notices[i + 1];
+            assert!(n >= t && n - t <= settled, "post {i} at {t:.1} noticed at {n:.1}");
+        }
+    }
+
+    #[test]
+    fn the_next_burst_polls_finely_again() {
+        let mut pacer = machine_pacer();
+        // A second of animation, a quiet spell, then a tap: its frame within 1 ms of its post.
+        let (mut fences, posts) = animation(1.0, 3);
+        let mut posts = posts;
+        fences.extend((0..=6).map(|i| 2000.0 + i as f64));
+        let next = posts.last().map_or(1, |&(_, h)| h % 3 + 1);
+        posts.push((2005.5, next));
+        let (_, notices) = simulate(&mut pacer, &fences, &posts, 1);
+        let tap = notices.iter().copied().find(|&t| t >= 2000.0).expect("the tap noticed");
+        assert!(tap - 2005.5 <= 1.0, "the tap's frame noticed at {tap:.1} ms, posted at 2005.5");
+    }
+
+    #[test]
+    fn the_tail_notices_once_what_the_handle_cannot_tell() {
+        // A single target: the posts after the first never change the handle.
+        let mut pacer = machine_pacer();
+        let (fences, posts) = animation(0.2, 1);
+        let (_, notices) = simulate(&mut pacer, &fences, &posts, 1);
+        let last = *fences.last().expect("fences");
+        assert_eq!(notices.len(), 2, "the first post and the tail's notice: {notices:?}");
+        let end = last + 50.0 + SETTLED_POLL.as_secs_f64() * 1000.0;
+        assert!(notices[1] > last + 50.0 && notices[1] <= end, "the tail's notice at {:.1}, last fence {last:.1}", notices[1]);
+
+        // Three posts between two polls: the cycle lands on the noticed handle.
+        let mut pacer = machine_pacer();
+        let fences: Vec<f64> = (0..10).map(f64::from).collect();
+        let (_, notices) = simulate(&mut pacer, &fences, &[(5.1, 2), (5.2, 3), (5.3, 1)], 1);
+        assert_eq!(notices.len(), 2, "the first frame and the tail's notice: {notices:?}");
+
+        // Fences after the last notice, the handle never changing: one notice at the tail's end.
+        let mut pacer = machine_pacer();
+        let fences: Vec<f64> = (0..20).map(f64::from).collect();
+        let (_, notices) = simulate(&mut pacer, &fences, &[], 1);
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(notices[1] > 69.0, "the tail's notice at {:.1}", notices[1]);
+
+        // The pin: no fence after the last notice, no tail notice.
+        let mut pacer = machine_pacer();
+        let (_, notices) = simulate(&mut pacer, &[0.0], &[], 1);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+    }
+
+    /// Pokes for `ms` (fences with no post behind them).
+    fn fences(ticker: &PostTicker, ms: u64) {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(ms) {
+            ticker.poke();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_probed_ticker_notices_each_post_once_and_soon() {
+        let (posts, renderer) = (Arc::new(Posts::default()), FakeRenderer::new(3));
+        // An interval and a tail of a minute: a notice paced by fences after the first would take
+        // a minute, so any later notice within the waits' 5 s timeout came from the probe.
+        let minute = Duration::from_secs(60);
+        let probe = Some((renderer.probe(), Duration::from_millis(1)));
+        let ticker = PostTicker::start_probed(posts.clone(), 2560, 1600, minute, minute, probe);
+        ticker.poke();
+        wait_for("the current post to be noticed", || posts.0.load(Ordering::Relaxed) == 1);
+        for n in 2..=6 {
+            // Fences before the post (the composer's commands): no notice of an unchanged frame.
+            fences(&ticker, 5);
+            assert_eq!(posts.0.load(Ordering::Relaxed), n - 1, "a fence with no post behind it");
+            renderer.post();
+            wait_for("a post to be noticed within the poll, not the interval", || posts.0.load(Ordering::Relaxed) >= n);
+        }
+        // (Can only false-pass: a stalled ticker also reads 6.)
+        fences(&ticker, 20);
+        assert_eq!(posts.0.load(Ordering::Relaxed), 6, "one notice per post");
+        ticker.stop();
+    }
+
+    #[test]
+    fn a_probed_ticker_sleeps_through_a_quiet_guest_and_follows_fences_while_it_cannot_probe() {
+        let (posts, renderer) = (Arc::new(Posts::default()), FakeRenderer::new(3));
+        let probe = Some((renderer.probe(), Duration::from_millis(1)));
+        let ticker = PostTicker::start_probed(posts.clone(), 2560, 1600, Duration::from_millis(5), Duration::from_millis(20), probe);
+        // No fence: a post isn't looked for (the probe is asked only while fences come).
+        renderer.post();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(posts.0.load(Ordering::Relaxed), 0, "no fence, no notice");
+        // The renderer can't be probed: notices come with the fences, as without a probe.
+        renderer.unreadable.store(true, Ordering::SeqCst);
+        fences(&ticker, 60);
+        wait_for("fence-paced notices", || posts.0.load(Ordering::Relaxed) >= 2);
+        ticker.stop();
+    }
+
+    #[test]
+    fn a_met_hold_notices_the_next_boots_post_even_on_the_last_boots_handle() {
+        let (posts, renderer) = (Arc::new(Posts::default()), FakeRenderer::new(3));
+        let minute = Duration::from_secs(60);
+        let probe = Some((renderer.probe(), Duration::from_millis(1)));
+        let ticker = PostTicker::start_probed(posts.clone(), 2560, 1600, minute, minute, probe);
+        ticker.poke();
+        wait_for("the last boot's post to be noticed", || posts.0.load(Ordering::Relaxed) == 1);
+        // A reset, and the next boot's first post on the same handle: the probe reads no change.
+        let posted_new = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        ticker.hold_until({
+            let posted_new = posted_new.clone();
+            Arc::new(move || posted_new.load(Ordering::SeqCst))
+        });
+        fences(&ticker, 10);
+        posted_new.store(true, Ordering::SeqCst);
+        wait_for("the next boot's post to be noticed", || posts.0.load(Ordering::Relaxed) == 2);
+        fences(&ticker, 20);
+        assert_eq!(posts.0.load(Ordering::Relaxed), 2, "noticed once");
         ticker.stop();
     }
 
@@ -1365,5 +1880,111 @@ mod tests {
         store.present(1, 1, 4, 67, &[1, 2, 3, 4]);
         assert!(store.read_into(1, 1, 3, &mut dst), "converted presented pixels");
         assert_eq!(dst, [1, 2, 3, 4]);
+    }
+
+    /// A shared surface from a pool of `free` (a count shared with the fake renderer).
+    struct FakeSurface {
+        size: (u32, u32),
+        free: Arc<AtomicUsize>,
+    }
+
+    impl SharedSurface for FakeSurface {
+        fn size(&self) -> (u32, u32) {
+            self.size
+        }
+        fn mach_port(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    impl Drop for FakeSurface {
+        fn drop(&mut self) {
+            self.free.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A store whose renderer copies posts into a pool of `pool` surfaces; the copies made, and
+    /// the pool's free count.
+    fn surface_store(pool: usize) -> (FrameStore, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let store = FrameStore::default();
+        let (copies, free) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(pool)));
+        let (c, f) = (copies.clone(), free.clone());
+        store.set_surface_readback(Box::new(move |w, h| {
+            // Take one from the pool, if one is free.
+            f.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)).ok()?;
+            c.fetch_add(1, Ordering::Relaxed);
+            Some(Arc::new(FakeSurface { size: (w, h), free: f.clone() }) as Arc<dyn SharedSurface>)
+        }));
+        store.set_readback(Box::new(|_, _, buf| {
+            buf.fill(0xAB);
+            true
+        }));
+        (store, copies, free)
+    }
+
+    #[test]
+    fn posted_frames_become_one_shared_surface_each_however_many_readers() {
+        let (store, copies, free) = surface_store(3);
+        assert!(store.has_surfaces() && store.latest_surface().is_none(), "nothing posted yet");
+        store.posted(4, 2);
+        let (n, a) = store.latest_surface().expect("a surface");
+        let (m, b) = store.latest_surface().expect("the same");
+        assert_eq!((n, m, copies.load(Ordering::Relaxed)), (1, 1, 1), "one copy for both readers");
+        assert!(Arc::ptr_eq(&a, &b) && a.size() == (4, 2));
+        // The next frame is copied again; the last one's surface stays with whoever holds it.
+        store.posted(4, 2);
+        let (n, c) = store.latest_surface().expect("a surface");
+        assert_eq!((n, copies.load(Ordering::Relaxed), free.load(Ordering::Relaxed)), (2, 2, 1));
+        drop((a, b));
+        assert_eq!(free.load(Ordering::Relaxed), 2, "released by its last holder");
+        drop(c);
+        assert_eq!(free.load(Ordering::Relaxed), 2, "the store keeps the latest frame's");
+    }
+
+    #[test]
+    fn frames_without_a_surface_are_read_as_pixels() {
+        let (store, copies, free) = surface_store(1);
+        store.posted(2, 2);
+        let held = store.latest_surface().expect("the only surface");
+        // The pool is empty while a client holds it: the next frame has no surface, once, and
+        // its pixels come from the readback as before.
+        store.posted(2, 2);
+        assert!(store.latest_surface().is_none());
+        assert!(store.latest_surface().is_none(), "tried once per frame");
+        assert_eq!(copies.load(Ordering::Relaxed), 1);
+        assert_eq!(store.latest(|c| c.rgba.clone()), Some(vec![0xAB; 16]));
+        drop(held);
+        store.posted(2, 2);
+        assert!(store.latest_surface().is_some(), "free again: the next frame is a surface");
+        // Presented pixels (guest composition, a blank screen) are never a surface.
+        store.present(2, 2, 8, 67, &[1; 16]);
+        assert!(store.latest_surface().is_none());
+        // Nor is a view of the scanout.
+        store.posted(2, 2);
+        store.set_view(Some((0, 0, 1, 2)));
+        assert!(store.latest_surface().is_none());
+        assert_eq!(store.latest(|c| (c.width, c.height)), Some((1, 2)));
+        // A store nobody gave a surface readback has none.
+        let plain = FrameStore::default();
+        plain.posted(2, 2);
+        assert!(!plain.has_surfaces() && plain.latest_surface().is_none());
+        assert_eq!(free.load(Ordering::Relaxed), 0, "the store holds the last surface it had");
+    }
+
+    #[test]
+    fn an_unread_stores_surface_goes_back_to_the_pool() {
+        let store = FrameStore::with_idle(Duration::from_millis(20));
+        let free = Arc::new(AtomicUsize::new(1));
+        let f = free.clone();
+        store.set_surface_readback(Box::new(move |w, h| {
+            f.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)).ok()?;
+            Some(Arc::new(FakeSurface { size: (w, h), free: f.clone() }) as Arc<dyn SharedSurface>)
+        }));
+        store.posted(2, 2);
+        drop(store.latest_surface().expect("a surface"));
+        assert_eq!(free.load(Ordering::Relaxed), 0, "kept for its frame");
+        std::thread::sleep(Duration::from_millis(40));
+        store.posted(2, 2);
+        assert_eq!(free.load(Ordering::Relaxed), 1, "unread past the idle period: released");
     }
 }

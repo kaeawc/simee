@@ -1,0 +1,42 @@
+{
+  "name": "prompt-reproduce-bug",
+  "goal": "Follow the reproduce-bug prompt for the Notes crash on iphone-17, capturing logs and screenshots.",
+  "toolsets": "core,debug",
+  "prompt": {"name": "reproduce-bug", "arguments": {"device": "iphone-17", "capture": "both",
+    "steps": "1. Tap the compose button. 2. Type hello. 3. Press Return. 4. Swipe up on the note. 5. Press volume-up. 6. Tap Save: the app quits."}},
+  "world": {
+    "devices": [
+      {"udid": "iphone-17", "name": "iPhone 17", "platform": "ios", "form_factor": "phone", "state": "Booted",
+       "apps": ["com.example.notes"], "foreground": "com.example.notes"}
+    ],
+    "crash": {
+      "bundle_id": "com.example.notes",
+      "region": [1000, 150, 200, 150],
+      "log": "Notes[4242:9b0] *** Terminating app due to uncaught exception 'NSInternalInconsistencyException', reason: 'save with no store'",
+      "report": "Notes-2026-11-27-101500.ips"
+    }
+  },
+  "plan": [
+    {"tool": "screen", "args": {"device": "iphone-17"}},
+    {"tool": "screenshot", "args": {"device": "iphone-17"}},
+    {"tool": "logs", "args": {"device": "iphone-17", "stream": true, "last": "1s"}},
+    {"tool": "tap", "args": {"device": "iphone-17", "x": 1100, "y": 2450}},
+    {"tool": "screenshot", "args": {"device": "iphone-17"}},
+    {"tool": "type", "args": {"device": "iphone-17", "text": "hello"}},
+    {"tool": "screenshot", "args": {"device": "iphone-17"}},
+    {"tool": "key", "args": {"device": "iphone-17", "usage": 40}},
+    {"tool": "screenshot", "args": {"device": "iphone-17"}},
+    {"tool": "swipe", "args": {"device": "iphone-17", "x1": 600, "y1": 1800, "x2": 600, "y2": 900}},
+    {"tool": "screenshot", "args": {"device": "iphone-17"}},
+    {"tool": "button", "args": {"device": "iphone-17", "button": "volume-up"}},
+    {"tool": "screenshot", "args": {"device": "iphone-17"}},
+    {"tool": "tap", "args": {"device": "iphone-17", "x": 1100, "y": 220}},
+    {"tool": "logs", "args": {"device": "iphone-17", "last": "60s"}, "expect": {"contains": ["Terminating app"]}},
+    {"tool": "screenshot", "args": {"device": "iphone-17"}},
+    {"tool": "crash_reports", "args": {"device": "iphone-17"}, "expect": {"contains": ["Notes-2026-11-27-101500.ips"]}}
+  ],
+  "end": {
+    "foreground": {"iphone-17": null},
+    "seen": ["Terminating app due to uncaught exception 'NSInternalInconsistencyException'", "Notes-2026-11-27-101500.ips"]
+  }
+}

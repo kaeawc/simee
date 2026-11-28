@@ -9,7 +9,7 @@ use objc2::runtime::{AnyObject, Sel};
 use objc2::{msg_send, sel};
 use objc2_foundation::{NSError, NSString};
 use sim_core::device::{DeviceInfo, DeviceState, DeviceTypeInfo, RuntimeInfo, Selection, select};
-use sim_core::form_factor::{apple_family_form_factor, apple_kind};
+use sim_core::form_factor::{apple_kind, apple_type_form_factor};
 use sim_core::hid::Orientation;
 use sim_core::platform::Platform;
 
@@ -285,7 +285,8 @@ pub enum Appearance {
     Dark,
 }
 
-/// A connection to the simulator service and its default device set.
+/// A connection to the simulator service and one device set: the default set, or another
+/// directory of devices ([`Context::open`]).
 pub struct Context {
     context: Obj,
     set: Obj,
@@ -293,8 +294,25 @@ pub struct Context {
 }
 
 impl Context {
-    /// Connects to the service for the active developer directory.
+    /// Connects to the service for the active developer directory, on the default device set.
     pub fn new() -> Result<Self> {
+        Self::open(None)
+    }
+
+    /// Connects to the service on the device set at `set` (an absolute directory that exists), or
+    /// on the default set (`~/Library/Developer/CoreSimulator/Devices`) for `None` (#409).
+    /// Simulator.app opens a window for each device of the default set that boots; a device of
+    /// another set (as `simctl --set` makes) boots with no window.
+    pub fn open(set: Option<&str>) -> Result<Self> {
+        if let Some(path) = set {
+            if !path.starts_with('/') {
+                return Err(Error::Invalid(format!("a device set is an absolute path, not `{path}`")));
+            }
+            // Opening a set makes nothing: a caller that creates devices makes its directory first.
+            if !std::path::Path::new(path).is_dir() {
+                return Err(Error::Invalid(format!("the device set {path} doesn't exist: `create` a device in it to make it")));
+            }
+        }
         let dir = developer_dir()?;
         Library::open(CORE_SIMULATOR)?;
         let kit = open_simulator_kit(&dir)?;
@@ -306,14 +324,29 @@ impl Context {
         let context: std::result::Result<Obj, Retained<NSError>> =
             unsafe { msg_send![cls, sharedServiceContextForDeveloperDir: &*rt::nsstring(&dir), error: _] };
         let context = context.map_err(|e| rt::service_error("connect", &e))?;
-        rt::require(&context, sel!(defaultDeviceSetWithError:))?;
-        // SAFETY: the method exists (checked) and takes NSError**, returning the device set.
-        let set: std::result::Result<Obj, Retained<NSError>> = unsafe { msg_send![&*context, defaultDeviceSetWithError: _] };
+        let set: std::result::Result<Obj, Retained<NSError>> = match set {
+            None => {
+                rt::require(&context, sel!(defaultDeviceSetWithError:))?;
+                // SAFETY: the method exists (checked) and takes NSError**, returning the device set.
+                unsafe { msg_send![&*context, defaultDeviceSetWithError: _] }
+            }
+            Some(path) => {
+                rt::require(&context, sel!(deviceSetWithPath:error:))?;
+                // SAFETY: the method exists (checked) and takes (NSString, NSError**), returning the
+                // device set at that path (nil with the error set on failure).
+                unsafe { msg_send![&*context, deviceSetWithPath: &*rt::nsstring(path), error: _] }
+            }
+        };
         let set = set.map_err(|e| rt::service_error("open device set", &e))?;
         Ok(Self { context, set, kit })
     }
 
-    /// All devices in the default set, sorted by runtime then name.
+    /// The directory of this connection's device set.
+    pub fn set_path(&self) -> String {
+        rt::string_prop(&self.set, sel!(setPath))
+    }
+
+    /// All devices in the set, sorted by runtime then name.
     pub fn devices(&self) -> Result<Vec<Device>> {
         let mut devices = self.unsorted_devices()?;
         devices.sort_by_cached_key(|d| {
@@ -481,8 +514,9 @@ fn device_type_info(t: &AnyObject) -> DeviceTypeInfo {
         0.0
     };
     let product_family = rt::string_prop(t, sel!(productFamily));
+    let identifier = rt::string_prop(t, sel!(identifier));
     DeviceTypeInfo {
-        identifier: rt::string_prop(t, sel!(identifier)),
+        identifier: identifier.clone(),
         name: rt::string_prop(t, sel!(name)),
         model: rt::string_prop(t, sel!(modelIdentifier)),
         product_family: product_family.clone(),
@@ -490,7 +524,7 @@ fn device_type_info(t: &AnyObject) -> DeviceTypeInfo {
         screen_height: size.height,
         screen_scale: f64::from(scale),
         platform: Platform::Ios,
-        form_factor: apple_family_form_factor(&product_family),
+        form_factor: apple_type_form_factor(&identifier, &product_family),
     }
 }
 
@@ -514,6 +548,148 @@ impl Drop for StateWatch {
         let done: std::result::Result<(), Retained<NSError>> =
             unsafe { msg_send![&*self.device, unregisterNotificationHandler: self.handle, error: _] };
         done.ok();
+    }
+}
+
+/// A failed launch's error. One that SpringBoard refused because it still holds the app as being
+/// updated (`LaunchServicesDataMismatch`, #123) says so and what clears it; any other is the
+/// service's own.
+fn launch_error(bundle_id: &str, error: *mut NSError) -> Error {
+    // SAFETY: the service wrote either nil or a valid autoreleased NSError into the out-parameter.
+    if let Some(e) = unsafe { error.as_ref() } {
+        let mut chain = Vec::new();
+        error_chain(e, &mut chain);
+        if being_updated(&chain) {
+            return Error::Service { op: "launch", message: being_updated_message(bundle_id) };
+        }
+    }
+    rt::raw_error("launch", error)
+}
+
+/// Each error's `BSErrorCodeDescription` (FrontBoard's name for its code) and
+/// `NSLocalizedFailureReason`, outermost first, following `NSUnderlyingError` at most 8 deep.
+/// SpringBoard's reason is the innermost error's: CoreSimulator wraps it twice.
+fn error_chain(error: &AnyObject, out: &mut Vec<(String, String)>) {
+    let Some(info) = rt::optional_prop(error, sel!(userInfo)) else { return };
+    if !rt::responds(&info, sel!(objectForKey:)) {
+        return;
+    }
+    let field = |key| rt::dict_string(&info, key).unwrap_or_default();
+    out.push((field("BSErrorCodeDescription"), field("NSLocalizedFailureReason")));
+    // SAFETY: `objectForKey:` takes a key object and returns nil or the value (checked to exist).
+    let underlying: Option<Obj> = unsafe { msg_send![&*info, objectForKey: &*rt::nsstring("NSUnderlyingError")] };
+    if let Some(underlying) = underlying.filter(|u| rt::responds(u, sel!(userInfo)))
+        && out.len() < 8
+    {
+        error_chain(&underlying, out);
+    }
+}
+
+/// Whether a launch error's chain (each error's code name and failure reason, see
+/// [`error_chain`]) is SpringBoard holding the app as being updated: its code
+/// `LaunchServicesDataMismatch`, or a reason that says the app "is being updated".
+fn being_updated(chain: &[(String, String)]) -> bool {
+    chain.iter().any(|(code, reason)| code == "LaunchServicesDataMismatch" || reason.to_lowercase().contains("is being updated"))
+}
+
+/// What a launch SpringBoard refused as being updated says: what happened and what clears it. It
+/// names `LaunchServicesDataMismatch`, which callers match to remember the state.
+fn being_updated_message(bundle_id: &str) -> String {
+    format!(
+        "SpringBoard holds {bundle_id} as being updated (LaunchServicesDataMismatch), which back-to-back installs can \
+         leave behind (#123). Reboot the device (`simee shutdown <udid>`, then `simee boot <udid>`): only a reboot is \
+         known to clear it"
+    )
+}
+
+#[cfg(test)]
+mod launch_error_tests {
+    use objc2::class;
+
+    use super::*;
+
+    /// An NSError in `domain` whose userInfo holds `fields` and, when given, `underlying`.
+    fn error(domain: &str, code: isize, fields: &[(&str, &str)], underlying: Option<&NSError>) -> Retained<NSError> {
+        let info = rt::mutable_dictionary();
+        for (k, v) in fields {
+            rt::dict_set(&info, k, &rt::nsstring(v));
+        }
+        if let Some(u) = underlying {
+            rt::dict_set(&info, "NSUnderlyingError", u);
+        }
+        // SAFETY: `+errorWithDomain:code:userInfo:` takes (NSString, NSInteger, NSDictionary) and
+        // returns an autoreleased NSError.
+        unsafe { msg_send![class!(NSError), errorWithDomain: &*rt::nsstring(domain), code: code, userInfo: &*info] }
+    }
+
+    /// What CoreSimulator returns when SpringBoard refuses a launch, as the service built it for a
+    /// missing app on iOS 27.2: two FBSOpenApplicationService errors around FrontBoard's own.
+    fn wrapped(code_name: &str, reason: &str) -> Retained<NSError> {
+        let inner =
+            error("FBSOpenApplicationErrorDomain", 4, &[("BSErrorCodeDescription", code_name), ("NSLocalizedFailureReason", reason)], None);
+        let request = error(
+            "FBSOpenApplicationServiceErrorDomain",
+            4,
+            &[("BSErrorCodeDescription", "InvalidRequest"), ("NSLocalizedDescription", "The request to open \"dev.simee.tiny\" failed.")],
+            Some(&inner),
+        );
+        error(
+            "FBSOpenApplicationServiceErrorDomain",
+            4,
+            &[
+                ("BSErrorCodeDescription", "InvalidRequest"),
+                ("NSLocalizedDescription", "Simulator device failed to launch dev.simee.tiny."),
+            ],
+            Some(&request),
+        )
+    }
+
+    fn message(e: &Retained<NSError>) -> String {
+        launch_error("dev.simee.tiny", Retained::as_ptr(e).cast_mut()).to_string()
+    }
+
+    #[test]
+    fn a_launch_springboard_holds_as_being_updated_says_to_reboot() {
+        let e = wrapped("LaunchServicesDataMismatch", "dev.simee.tiny is being updated");
+        let m = message(&e);
+        assert!(m.starts_with("launch failed: SpringBoard holds dev.simee.tiny as being updated (LaunchServicesDataMismatch)"), "{m}");
+        assert!(m.contains("simee shutdown <udid>") && m.contains("simee boot <udid>"), "{m}");
+    }
+
+    #[test]
+    fn the_reason_alone_or_the_code_alone_is_enough() {
+        assert!(message(&wrapped("Unspecified", "The application \"Tiny\" is being updated.")).contains("LaunchServicesDataMismatch"));
+        assert!(message(&wrapped("LaunchServicesDataMismatch", "")).contains("Reboot the device"));
+    }
+
+    #[test]
+    fn any_other_refusal_keeps_the_services_own_message() {
+        let e = wrapped("NotFound", "Application info provider (FBSApplicationLibrary) returned nil for \"dev.simee.tiny\"");
+        assert_eq!(
+            message(&e),
+            "launch failed: Simulator device failed to launch dev.simee.tiny. (The request to open \"dev.simee.tiny\" failed.)"
+        );
+        assert_eq!(
+            launch_error("dev.simee.tiny", ptr::null_mut()).to_string(),
+            "launch failed: the service reported failure without an error"
+        );
+    }
+
+    #[test]
+    fn the_chain_is_read_outermost_first_and_stops_at_8_deep() {
+        let mut chain = Vec::new();
+        error_chain(&wrapped("NotFound", "gone"), &mut chain);
+        let codes: Vec<&str> = chain.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(codes, ["InvalidRequest", "InvalidRequest", "NotFound"]);
+        assert_eq!(chain[2].1, "gone");
+        let mut deep = error("D", 0, &[("BSErrorCodeDescription", "0")], None);
+        for i in 1..20 {
+            deep = error("D", i, &[("BSErrorCodeDescription", &i.to_string())], Some(&deep));
+        }
+        let mut chain = Vec::new();
+        error_chain(&deep, &mut chain);
+        assert_eq!(chain.len(), 8);
+        assert!(!being_updated(&chain));
     }
 }
 
@@ -709,7 +885,7 @@ impl Device {
         let pid: i32 = unsafe {
             msg_send![&*self.obj, launchApplicationWithID: &*rt::nsstring(bundle_id), options: &*rt::empty_dictionary(), error: &mut error]
         };
-        if pid > 0 { Ok(pid) } else { Err(rt::raw_error("launch", error)) }
+        if pid > 0 { Ok(pid) } else { Err(launch_error(bundle_id, error)) }
     }
 
     /// Terminates an app by bundle identifier.
@@ -990,7 +1166,7 @@ impl Device {
         // SAFETY: the method exists (checked) and takes (NSString, NSDictionary, NSError**), returning int.
         let pid: i32 =
             unsafe { msg_send![&*self.obj, launchApplicationWithID: &*rt::nsstring(bundle_id), options: &*options, error: &mut error] };
-        if pid > 0 { Ok(pid) } else { Err(rt::raw_error("launch", error)) }
+        if pid > 0 { Ok(pid) } else { Err(launch_error(bundle_id, error)) }
     }
 
     /// The device's main display. The device must be booted.
@@ -1029,7 +1205,8 @@ impl Device {
     /// CarPlay HID service its touches go to. iOS 26 runtimes and earlier: iOS 27 renders it black.
     pub fn set_carplay(&self, on: bool) -> Result<()> {
         let info = self.info();
-        if info.form_factor != Some(sim_core::form_factor::FormFactor::Phone) {
+        use sim_core::form_factor::FormFactor;
+        if !matches!(info.form_factor, Some(FormFactor::Phone | FormFactor::Foldable)) {
             return Err(Error::Invalid(format!("CarPlay attaches to an iPhone; {} is {}", info.name, info.label())));
         }
         sim_core::carplay::runtime_supports(&info.runtime_id).map_err(Error::Invalid)?;
@@ -1051,7 +1228,7 @@ impl Device {
         use sim_core::form_factor::FormFactor;
         let info = self.info();
         // Only SpringBoard takes the message; elsewhere (Apple TV's PineBoard) it's silently dropped.
-        if !matches!(info.form_factor, Some(FormFactor::Phone | FormFactor::Tablet) | None) {
+        if !matches!(info.form_factor, Some(FormFactor::Phone | FormFactor::Tablet | FormFactor::Foldable) | None) {
             return Err(Error::Invalid(format!("only an iPhone or iPad rotates; {} is {}", info.name, info.label())));
         }
         let sel = sel!(lookup:error:);

@@ -9,6 +9,12 @@
 //! boundary (about 85° opening from closed). simee runs a small in-device program that asks it to.
 //! Each screen has its own digitizer, addressed by its screen ID with the screen bit set.
 
+/// The outer screen's pixels (`LCD`), the device type's main screen: what a folded Duo shows.
+pub const OUTER_PX: (u32, u32) = (1398, 2034);
+/// The inner screen's pixels as its framebuffer holds them (`LCD-1`): a landscape panel stored a
+/// quarter turn from upright, so it lies unfolded at (2853, 2007).
+pub const INNER_PX: (u32, u32) = (2007, 2853);
+
 /// One of a two-screen device's built-in screens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {

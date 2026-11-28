@@ -1,0 +1,63 @@
+name: Website media relay
+
+# The live demo's relay (website/media): MediaMTX on Fly, app simee-media. A pull request builds
+# the image and starts it to check the config loads; a push to main deploys it with the
+# FLY_MEDIA_API_TOKEN secret of the `website` environment, passing with a notice until that
+# secret exists (website/media/README.md).
+on:
+  push:
+    branches: [main]
+    paths: &media
+      - website/media/**
+      - .github/workflows/website-media.yml
+  pull_request:
+    paths: *media
+  workflow_dispatch:
+
+concurrency:
+  group: website-media-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: docker build -t simee-media website/media
+      # MediaMTX exits on a config it can't load; a started WebRTC server means it loaded.
+      - run: |
+          docker run -d --name media -e MTX_AUTHINTERNALUSERS_1_PASS=ci simee-media
+          for _ in $(seq 20); do
+            docker logs media 2>&1 | grep -q '\[WebRTC\] started' && exit 0
+            sleep 1
+          done
+          docker logs media
+          exit 1
+
+  deploy:
+    needs: check
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: website
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_MEDIA_API_TOKEN }}
+    steps:
+      - if: env.FLY_API_TOKEN == ''
+        run: echo "::notice::FLY_MEDIA_API_TOKEN isn't set in the website environment, so nothing was deployed (setup in website/media/README.md)."
+      - if: env.FLY_API_TOKEN != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: env.FLY_API_TOKEN != ''
+        uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # 1.5
+      - if: env.FLY_API_TOKEN != ''
+        run: flyctl deploy --remote-only --config fly.toml --wait-timeout 300
+        working-directory: website/media

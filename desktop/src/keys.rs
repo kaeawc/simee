@@ -25,6 +25,8 @@ fn plain(usage: u32) -> KeyAction {
 /// Maps one host key press.
 pub fn map(event: &KeyEvent) -> KeyAction {
     match &event.key {
+        // ⌘⌥ chords are the window's (⌘⌥S, ⌘⌥I: the panes), not the device's.
+        Key::Command(_) if event.mods.alt => KeyAction::Ignore,
         Key::Command(c) => match (c, event.mods.shift) {
             ('h', true) => KeyAction::Home,
             ('l', false) => KeyAction::Lock,
@@ -79,6 +81,9 @@ mod tests {
         assert_eq!(map(&ev(Key::Command('h'), false)), KeyAction::Ignore);
         assert_eq!(map(&ev(Key::Command('l'), false)), KeyAction::Lock);
         assert_eq!(map(&ev(Key::Command('s'), false)), KeyAction::Screenshot);
+        let mut cmd_alt_s = ev(Key::Command('s'), false);
+        cmd_alt_s.mods.alt = true;
+        assert_eq!(map(&cmd_alt_s), KeyAction::Ignore, "⌘⌥S is the window's");
         assert_eq!(map(&ev(Key::Text("é".into()), false)), KeyAction::Ignore);
     }
 }

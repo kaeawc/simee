@@ -1,0 +1,23 @@
+{
+  "name": "install-and-launch",
+  "goal": "Install the app at /fixtures/Notes.apk on the booted Android phone and launch it.",
+  "toolsets": "core",
+  "world": {
+    "devices": [
+      {"udid": "pixel-9", "name": "Pixel 9", "platform": "android", "form_factor": "phone", "state": "Booted"}
+    ],
+    "packages": {"/fixtures/Notes.apk": "com.example.notes"}
+  },
+  "plan": [
+    {"tool": "devices", "args": {"booted": true}, "expect": {"contains": ["pixel-9"]}},
+    {"tool": "install", "args": {"device": "pixel-9", "path": "/fixtures/Notes.apk"}},
+    {"tool": "apps", "args": {"device": "pixel-9"}, "expect": {"contains": ["com.example.notes"]}},
+    {"tool": "launch", "args": {"device": "pixel-9", "bundle_id": "com.example.notes"}},
+    {"tool": "screenshot", "args": {"device": "pixel-9"}}
+  ],
+  "end": {
+    "installed": {"pixel-9": ["com.example.notes"]},
+    "foreground": {"pixel-9": "com.example.notes"},
+    "screenshot_shows": {"pixel-9": ["app=com.example.notes"]}
+  }
+}

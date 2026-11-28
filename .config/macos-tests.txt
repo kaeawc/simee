@@ -9,13 +9,17 @@ simee
 simee-android
 simee-api
 simee-audio
+simee-camera
 simee-coresim
 simee-emu
 simee-emu-avd
+simee-emu-container
 simee-emu-gfxstream
 simee-emu-hvf
 simee-emu-sdk
 simee-emu-vmm
+simee-encode
 simee-host
 simee-mcp
 simee-netshape
+simee-rtc

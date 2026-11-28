@@ -45,7 +45,8 @@ device type of the iOS 27.1 and `iOS-27-2-iPhone19-4` runtimes), `simee boot`, w
 
 ## iPhone Duo
 
-The iPhone Duo (`iPhone19,4`) has two built-in screens: the outer one (`LCD`, 1398×2034, the
+The iPhone Duo (`iPhone19,4`) is iOS's foldable: simee lists it as `form_factor: foldable`,
+sub-platform `ios` ([form-factors.md](form-factors.md)). It has two built-in screens: the outer one (`LCD`, 1398×2034, the
 device type's main screen) and the inner one (`LCD-1`, 2007×2853, a landscape panel its
 framebuffer holds a quarter turn from upright). SpringBoard shows the device on one at a time and
 leaves the other black. Neither Xcode 26.6's Simulator.app nor Xcode 27.2 (whose DeviceHub replaces
@@ -94,6 +95,43 @@ screen.
 4. The tvOS runtime has no user interface style: `simctl ui appearance` fails the same way, and
    simee now says why ("Runtime does not support userInterfaceStyle").
 5. tvOS has no web browser to open the URL; `simctl openurl` fails the same way.
+
+## Back-to-back installs (#123)
+
+On 2026-11-26, on a heavily loaded host, about 100 back-to-back `install`s of the same app left an
+iOS 27.2 iPhone 17 Pro unable to launch it: SpringBoard held the app as being updated
+(`LaunchServicesDataMismatch`), each `launch` failed after 12.6 s of SpringBoard retries, and only a
+reboot cleared it. It did not happen again on 2026-11-27 (M3 Max, macOS 26.6, Xcode 26.6, a fresh
+iOS 27.2 iPhone 17 Pro, settled, host load 12 to 26) with the one-screen app `scripts/ios-matrix.sh`
+builds (108 KB), in any of these loops:
+
+| Loop | Installs | Install median / p90 / max | Launch afterwards |
+| --- | --- | --- | --- |
+| simee `install`, one kept API connection | 200 | 137 / 158 / 361 ms | ok, 37 ms |
+| `xcrun simctl install` | 200 | 386 / 504 / 827 ms | ok, 45 ms |
+| simee install, launch, terminate, repeated | 100 | 134 / 149 / 396 ms | all 100 ok |
+| simee installs over the running app | 100 | | ok, 41 ms |
+| simee installs while a second connection launches it (`restart: false`) without pause | 100 | | 100 overlapping launches ok (max 2.6 s); then ok, 0.56 s |
+
+So there is no count at which it starts on an unloaded host (510 simee installs and 200 `simctl`
+ones on one boot). SpringBoard's side of each install (`applicationsDidInstall`, then removing the
+install placeholder, in its `com.apple.frontboard.ApplicationLibrary` log) was done 10 to 16 ms
+before `install` returned, over 10 installs 0.5 s apart: there is nothing for `install` to wait
+for, so it doesn't. The state is SpringBoard falling behind the install notifications (each
+install registers the app with LaunchServices three times and wakes about 20 daemons), which a
+loaded host makes likely.
+
+What simee does about it: when SpringBoard refuses a launch as being updated (FrontBoard's code
+`LaunchServicesDataMismatch`, or a reason saying the app "is being updated", anywhere in the
+error's underlying errors), `launch` says so and that a reboot clears it, instead of passing on
+CoreSimulator's generic "failed to launch". The API server remembers it per device and app: for
+the next 60 s in the same boot (the device's `launchd_sim`), a launch of that app fails at once
+with the same error instead of spending another 12.6 s. A reboot, or the minute passing, sends
+the next launch to the device again. The first refusal still takes SpringBoard's 12.6 s.
+
+Reproduce: `simee serve --socket <s>`, then over one connection send `install` 200 times and
+`launch` once (`{"device": "<udid>", "path": "<Tiny.app>"}`, then `{"device": "<udid>",
+"bundle_id": "dev.simee.tiny"}`); for `simctl`, loop `xcrun simctl install <udid> <Tiny.app>`.
 
 ## What changed in simee for these runtimes
 
