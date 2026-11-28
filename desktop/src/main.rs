@@ -21,7 +21,7 @@
 //! folded, tablet, ipad, watch, tv, apple-watch, apple-tv, auto, carplay, vision-pro, android-xr,
 //! glasses, turned, turned-tablet, empty,
 //! sidebar-hidden, inspector-hidden, panes-hidden, panes-wide, resources, resources-memory, admission,
-//! admission-many, popped); a release build needs `--features tooling` for it.
+//! admission-many, popped, list-booted, list-search); a release build needs `--features tooling` for it.
 
 mod admission;
 mod android;
@@ -32,7 +32,9 @@ mod device;
 mod icons;
 #[cfg(target_os = "macos")]
 mod ios;
+mod jobs;
 mod keys;
+mod list;
 mod mark;
 mod panes;
 mod popout;
@@ -48,8 +50,8 @@ mod surface;
 mod view;
 mod work;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use std::time::Duration;
 
@@ -68,8 +70,10 @@ use keys::KeyAction;
 pub enum Action {
     Refresh,
     Select(String),
-    /// Boot the selected device, past [`admission`] first.
-    Boot,
+    /// Boot this device, past [`admission`] first: the Boot button's selected device, or the
+    /// row a click or Return was on. It names its device, so a selection that didn't take (a
+    /// device out in its own window) can't boot another.
+    Boot(String),
     /// Boot these devices now: admitted, or the user chose to on the admission sheet.
     BootNow(Vec<String>),
     Shutdown,
@@ -134,8 +138,21 @@ pub struct State {
     pub shape: Shape,
     /// A pressed hardware button and when to release it.
     held: Option<(Button, f64)>,
-    /// What's running in the background ("Booting…", "Shutting down…").
-    pub busy: Option<&'static str>,
+    /// Each device's long job ("Booting…", "Shutting down…"), keyed by UDID or AVD name
+    /// ([`jobs`]): the stage shows the selected device's only.
+    pub jobs: jobs::Jobs,
+    /// What boots a device: the live window's backends, or a test's stand-in; `None` in headless
+    /// scenes, which boot nothing.
+    pub booter: Option<jobs::Booter>,
+    /// The API calls the toolbar's device jobs make (an iPhone Duo's `fold`, `carplay`): the
+    /// method table in a live window, a test's stand-in.
+    pub api: admission::Call,
+    /// Work for the whole window ("Refreshing…"), shown in the sidebar, not on a device.
+    pub window_busy: Option<&'static str>,
+    /// The device list's search field and the match its arrow keys are on ([`list`]), by UDID or
+    /// AVD name: the highlight stays on that device when the list reorders. `None` is the first.
+    pub search: rune::TextEdit,
+    pub search_highlight: Option<String>,
     pub status: Option<String>,
     pub debug: debug::Debug,
     /// The unix socket this window serves the API on.
@@ -168,8 +185,6 @@ pub struct State {
     /// Status lines from background work.
     outbox: work::Outbox,
     waker: Option<Waker>,
-    work_done: Arc<AtomicBool>,
-    work_error: Arc<Mutex<Option<String>>>,
     sized_for: Option<(u32, u32)>,
     /// Whether the window shows (not minimised, hidden, or covered where the system says so).
     visible: bool,
@@ -257,6 +272,8 @@ impl State {
             self.status = Some(e);
         }
         if std::mem::take(&mut self.resolve_pending) {
+            // The refresh asked for this scan.
+            self.window_busy = None;
             if self.selected.as_deref() == Some("booted") {
                 self.selected = self.devices.iter().find(|d| d.state == DeviceState::Booted).map(|d| d.udid.clone());
             } else if let Some(q) = self.selected.clone()
@@ -408,22 +425,22 @@ impl State {
         }
     }
 
-    /// Runs `job` on a worker thread (booting and shutting down block for seconds); `poll`
-    /// refreshes the list when it's done.
-    fn run_async(&mut self, label: &'static str, job: impl FnOnce() -> Result<(), String> + Send + 'static) {
-        let Some(waker) = self.waker.clone() else { return };
-        self.busy = Some(label);
-        self.work_done.store(false, Ordering::Relaxed);
-        let (done, error) = (self.work_done.clone(), self.work_error.clone());
-        std::thread::spawn(move || {
-            if let Err(e) = job()
-                && let Ok(mut slot) = error.lock()
-            {
-                *slot = Some(e);
+    /// Runs `job` as `udid`'s job on a thread of its own (booting and shutting down block for
+    /// seconds); `poll` reports it and refreshes the list when it's done. One job per device: while
+    /// one runs, another for that device is refused (the status line says so) and returns false.
+    fn run_job(&mut self, udid: &str, label: &'static str, job: impl FnOnce() -> Result<(), String> + Send + 'static) -> bool {
+        match self.jobs.start(udid, label, Box::new(job), self.waker.clone()) {
+            Ok(()) => true,
+            Err(running) => {
+                self.status = Some(format!("Wait for {running} to finish"));
+                false
             }
-            done.store(true, Ordering::Relaxed);
-            waker();
-        });
+        }
+    }
+
+    /// A device's name for status lines (its UDID or AVD name when it's no longer listed).
+    fn device_name(&self, udid: &str) -> String {
+        self.devices.iter().find(|d| d.udid == udid).map_or_else(|| udid.to_owned(), |d| d.name.clone())
     }
 }
 
@@ -440,7 +457,12 @@ fn init() -> State {
         console_log: Vec::new(),
         shape: Shape::Rounded,
         held: None,
-        busy: None,
+        jobs: jobs::Jobs::default(),
+        booter: None,
+        api: sim_api::call_method,
+        window_busy: None,
+        search: rune::TextEdit::default(),
+        search_highlight: None,
         mark_t: 0.0,
         mark_from: None,
         status: view3d_status,
@@ -462,8 +484,6 @@ fn init() -> State {
         connect_pending: false,
         outbox: work::Outbox::default(),
         waker: None,
-        work_done: Arc::new(AtomicBool::new(false)),
-        work_error: Arc::new(Mutex::new(None)),
         sized_for: None,
         visible: true,
         stylus: false,
@@ -750,6 +770,7 @@ fn setup(s: &mut State, waker: Waker) {
         return;
     }
     s.android_backend = Some(sim_android::Android::from_env());
+    s.booter = Some(live_booter(s.android_backend.clone()));
     // Devices are listed on the scanner thread, so the window paints before the simulator
     // service has answered. Android devices start and stop outside this window (the CLI,
     // AutoMobile, a crash): it rescans every two seconds, following the selected device's
@@ -811,17 +832,13 @@ fn fold_to(d: &sim_android::Device, posture: Posture) -> Result<(), String> {
 }
 
 /// Folds an iPhone Duo through the API's `fold` (SpringBoard sweeps its hinge: a second or two),
-/// off the UI thread; the capture thread then shows the screen in use.
+/// off the UI thread; the capture thread then shows the screen in use. It is the device's job: a
+/// fold while that device's CarPlay attaches waits for the attach to finish.
 fn apple_fold(s: &mut State, udid: String, posture: Posture) {
-    // The busy slot stays with the job holding it until that returns: a fold sharing it would
-    // clear it with the first job's completion, letting a second attach start beside the fold.
-    if let Some(running) = s.busy {
-        s.status = Some(format!("Wait for {running} to finish"));
-        return;
-    }
-    s.run_async("Folding…", move || {
+    let call = s.api;
+    s.run_job(&udid.clone(), "Folding…", move || {
         let params = serde_json::json!({"device": udid, "posture": posture});
-        sim_api::call_method(&mut sim_api::Session::default(), "fold", &params).map(drop)
+        call(&mut sim_api::Session::default(), "fold", &params).map(drop)
     });
 }
 
@@ -878,8 +895,12 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             continue;
         }
         if s.offline {
-            if let Action::Select(udid) = action {
-                s.selected = Some(udid);
+            // Headless scenes and tests: a selection, and boots when they gave a booter.
+            match action {
+                Action::Select(udid) => s.selected = Some(udid),
+                Action::Boot(udid) if s.booter.is_some() => boot_device(s, &udid),
+                Action::BootNow(udids) if s.booter.is_some() => boot(s, &udids),
+                _ => {}
             }
             continue;
         }
@@ -887,6 +908,9 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
             Action::Refresh => {
                 s.resolve_pending = true;
                 s.connect_pending = true;
+                if s.scanner.is_some() {
+                    s.window_busy = Some("Refreshing…");
+                }
                 s.rescan();
             }
             Action::Select(udid) => {
@@ -901,11 +925,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
                 }
                 s.connect();
             }
-            Action::Boot => {
-                let Some(info) = s.selected_info().cloned() else { continue };
-                let admitted = admission::ask(s, &info);
-                boot(s, &admitted);
-            }
+            Action::Boot(udid) => boot_device(s, &udid),
             Action::BootNow(udids) => boot(s, &udids),
             Action::Shutdown => {
                 if let Some(live) = s.live.take() {
@@ -915,10 +935,21 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
                     drop(live);
                     s.rescan();
                 }
-                if let Some(sc) = s.screen.take()
+                // A device with a job running (its boot still waiting for the guest) keeps its
+                // screen: the shutdown is refused, so the screen isn't dropped for nothing.
+                let running = s.screen.as_ref().and_then(|sc| s.jobs.label(&sc.udid));
+                if let Some(running) = running {
+                    s.status = Some(format!("Wait for {running} to finish"));
+                } else if let Some(sc) = s.screen.take()
                     && let Some(backend) = s.android_backend.clone()
                 {
-                    s.run_async("Shutting down…", move || backend.device(&sc.udid)?.shutdown());
+                    // Through `Android::shutdown`, so a running Android Auto head unit
+                    // (`car_start`) stops too.
+                    let udid = sc.udid.clone();
+                    s.run_job(&udid, "Shutting down…", move || {
+                        let device = backend.device(&sc.udid)?;
+                        backend.shutdown(&device)
+                    });
                 }
                 s.sized_for = None;
             }
@@ -982,10 +1013,10 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
         s.status = Some(line);
         changed = true;
     }
-    if s.busy.is_some() && s.work_done.load(Ordering::Relaxed) {
-        s.busy = None;
-        if let Some(e) = s.work_error.lock().ok().and_then(|mut g| g.take()) {
-            s.status = Some(e);
+    // Each device's job reports on its own: a failure names its device.
+    for done in s.jobs.finished() {
+        if let Err(e) = done.result {
+            s.status = Some(format!("{}: {e}", s.device_name(&done.udid)));
         }
         s.connect_pending = true;
         s.rescan();
@@ -1012,7 +1043,7 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
     }
     // The mark turns while a job runs or a device starts or stops: a frame every
     // `mark::FRAME`, and none once everything rests.
-    if s.busy.is_some() || s.devices.iter().any(|d| mark::moves(d.state)) {
+    if s.jobs.any() || s.window_busy.is_some() || s.devices.iter().any(|d| mark::moves(d.state)) {
         let from = *s.mark_from.get_or_insert(t);
         s.mark_t = (t - from) as f32;
         changed = true;
@@ -1039,24 +1070,50 @@ fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
     changed
 }
 
-/// Boots the listed devices, past admission already.
+/// The Boot button, and a click on a shut-down device's row ([`list::activate`]): `udid`, past
+/// [`admission`] first. A device with a job running waits for it; one already running or
+/// booting isn't booted again.
+fn boot_device(s: &mut State, udid: &str) {
+    let Some(info) = s.devices.iter().find(|d| d.udid == udid).cloned() else { return };
+    if let Some(running) = s.jobs.label(&info.udid) {
+        s.status = Some(format!("Wait for {running} to finish"));
+        return;
+    }
+    if matches!(info.state, DeviceState::Booted | DeviceState::Booting) {
+        return;
+    }
+    // Its own window holds it, stopped: closing that brings it back here to boot.
+    if s.popouts.is_open(udid) {
+        s.status = Some(format!("{} is in its own window: close it to boot it here", info.name));
+        return;
+    }
+    let admitted = admission::ask(s, &info);
+    boot(s, &admitted);
+}
+
+/// Boots the listed devices, past admission already, each as its own job ([`jobs`]).
 fn boot(s: &mut State, udids: &[String]) {
+    let Some(booter) = s.booter.clone() else { return };
     for udid in udids {
         let Some(info) = s.devices.iter().find(|d| &d.udid == udid).cloned() else { continue };
+        let Some(work) = booter(&info) else { continue };
+        s.run_job(udid, jobs::BOOTING, work);
+    }
+}
+
+/// What boots a device in the live window: the simulator service for iOS, the emulator for an AVD.
+fn live_booter(android: Option<sim_android::Android>) -> jobs::Booter {
+    Arc::new(move |info: &DeviceInfo| -> Option<jobs::Work> {
+        let udid = info.udid.clone();
         match info.platform {
-            Platform::Ios => {
-                let Some(waker) = s.waker.clone() else { continue };
-                s.busy = Some("Booting…");
-                s.work_done.store(false, Ordering::Relaxed);
-                device::boot_async(info.udid, s.work_done.clone(), s.work_error.clone(), waker);
-            }
+            Platform::Ios => Some(Box::new(move || device::boot(&udid))),
             Platform::Android => {
-                let Some(backend) = s.android_backend.clone() else { continue };
+                let backend = android.clone()?;
                 // With audio: a person is watching this one (tools and farms boot silent).
-                s.run_async("Booting…", move || backend.device(&info.udid)?.boot(&backend, Duration::from_secs(300), true));
+                Some(Box::new(move || backend.device(&udid)?.boot(&backend, Duration::from_secs(300), true)))
             }
         }
-    }
+    })
 }
 
 /// ⌘3: the 3D view on or off, or the reason it can't be (a backend without depth buffers, a
@@ -1080,15 +1137,17 @@ fn toggle_carplay(s: &mut State) {
         show_offline_carplay(s, on);
         return;
     }
-    // One attach or detach at a time: a second press while one runs would race it.
-    let Some(live) = s.live.as_ref().filter(|_| s.busy.is_none()) else { return };
+    // One attach or detach at a time: a second press while one runs (or any job on the device)
+    // would race it.
+    let Some(live) = s.live.as_ref().filter(|l| s.jobs.label(&l.udid).is_none()) else { return };
     let (udid, shared) = (live.udid.clone(), live.shared.clone());
     if !on {
         shared.carplay.store(false, Ordering::Relaxed);
     }
-    s.run_async(if on { "Attaching CarPlay…" } else { "Detaching CarPlay…" }, move || {
+    let call = s.api;
+    s.run_job(&udid.clone(), if on { "Attaching CarPlay…" } else { "Detaching CarPlay…" }, move || {
         let params = serde_json::json!({"device": udid, "on": on});
-        sim_api::call_method(&mut sim_api::Session::default(), "carplay", &params)?;
+        call(&mut sim_api::Session::default(), "carplay", &params)?;
         shared.carplay.store(on, Ordering::Relaxed);
         Ok(())
     });
@@ -1099,7 +1158,7 @@ fn toggle_carplay(s: &mut State) {
 /// wherever the focus is. ⌘⌥S and ⌘⌥I hide and show the sidebar and the inspector ([`panes`]),
 /// ⌘⌥R the resource panel ([`resources`]).
 fn on_key(s: &mut State, k: &rune::KeyEvent, tx: &mut Tx) -> bool {
-    if panes::on_key(s, k, tx) || popout::on_key(s, k, tx) {
+    if panes::on_key(s, k, tx) || popout::on_key(s, k, tx) || list::on_key(s, k, tx) {
         return true;
     }
     let action = if k.key == rune::Key::Command('3') && !k.mods.shift {
@@ -1301,6 +1360,8 @@ fn main() {
             ("popped", popout::scene),
             ("admission", admission::scene),
             ("admission-many", admission::many_scene),
+            ("list-booted", list::booted_scene),
+            ("list-search", list::search_scene),
         ],
         setup: Some(setup),
         poll: Some(poll),
@@ -1370,6 +1431,7 @@ fn gpu_backend(setting: Option<&str>) -> Result<Option<rune::GpuBackend>, String
 mod tests {
     use super::*;
     use rune::{Env, Key, KeyEvent, Runtime};
+    use std::sync::Mutex;
 
     fn runtime(scene: fn(&mut State)) -> Runtime<State> {
         let mut s = init();
@@ -1397,7 +1459,7 @@ mod tests {
     #[test]
     fn demo_scene_shows_devices_screen_and_controls() {
         let rt = runtime(demo);
-        for key in ["device-list", "device-0", "device-1", "device-2", "device-screen", "home-button", "lock-button", "device-title"] {
+        for key in ["device-list", "device-A1", "device-B2", "device-D4", "device-screen", "home-button", "lock-button", "device-title"] {
             assert!(rt.find(key).is_some(), "{key} rendered");
         }
         assert!(rt.find("placeholder").is_none());
@@ -1432,8 +1494,9 @@ mod tests {
         rt.pointer_up(x + w / 2.0, y + h / 2.0);
         rt.frame(1.0 / 60.0);
         assert!(rt.state.inputs.is_empty(), "no touch through the 3D view: {:?}", rt.state.inputs);
-        press(&mut rt, "device-1");
-        assert_eq!(rt.state.actions, vec![Action::Select("B2".into())]);
+        press(&mut rt, "device-B2");
+        // B2 is shut down: one click selects and boots it.
+        assert_eq!(rt.state.actions, vec![Action::Select("B2".into()), Action::Boot("B2".into())]);
     }
 
     /// One click on the 3D view must not blur the device: keys still reach it.
@@ -1612,11 +1675,11 @@ mod tests {
     #[test]
     fn devices_and_title_carry_platform_labels() {
         let rt = runtime(demo);
-        assert_eq!(text_of(&rt, "device-0-platform"), "iOS");
-        assert_eq!(text_of(&rt, "device-2-platform"), "iPadOS");
-        assert_eq!(text_of(&rt, "device-4-platform"), "watchOS");
+        assert_eq!(text_of(&rt, "device-A1-platform"), "iOS");
+        assert_eq!(text_of(&rt, "device-D4-platform"), "iPadOS");
+        assert_eq!(text_of(&rt, "device-E5-platform"), "watchOS");
         assert_eq!(text_of(&rt, "device-title"), "iPhone 17 · iOS · Phone · Booted");
-        let row = rt.elements().into_iter().find(|e| e.key.as_deref() == Some("device-2")).and_then(|e| e.label);
+        let row = rt.elements().into_iter().find(|e| e.key.as_deref() == Some("device-D4")).and_then(|e| e.label);
         assert_eq!(row.as_deref(), Some("iPad Pro 11-inch (M4), iPadOS · Tablet"));
     }
 
@@ -1625,12 +1688,12 @@ mod tests {
         let rt = runtime(demo);
         assert_eq!(text_of(&rt, "platform-ios"), "iOS");
         assert_eq!(text_of(&rt, "platform-android"), "Android");
-        assert_eq!(text_of(&rt, "device-5-platform"), "tvOS");
-        assert_eq!(text_of(&rt, "device-6-platform"), "visionOS");
-        assert_eq!(text_of(&rt, "device-7-platform"), "Android");
-        assert_eq!(text_of(&rt, "device-10-platform"), "Wear OS");
-        assert_eq!(text_of(&rt, "device-11-platform"), "Android TV");
-        assert_eq!(text_of(&rt, "device-12-platform"), "Android Automotive");
+        assert_eq!(text_of(&rt, "device-F6-platform"), "tvOS");
+        assert_eq!(text_of(&rt, "device-G7-platform"), "visionOS");
+        assert_eq!(text_of(&rt, "device-pixel_9-platform"), "Android");
+        assert_eq!(text_of(&rt, "device-wear_round-platform"), "Wear OS");
+        assert_eq!(text_of(&rt, "device-google_tv-platform"), "Android TV");
+        assert_eq!(text_of(&rt, "device-automotive-platform"), "Android Automotive");
     }
 
     #[test]
@@ -1770,20 +1833,375 @@ mod tests {
         assert_eq!(rt.state.screen_size(), (800, 480));
     }
 
-    /// A Duo fold while CarPlay attaches (or any job runs) leaves the busy slot alone: the slot
-    /// stays held until the attach call returns, so a second attach can't start beside the fold.
+    /// What the fake API's calls asked for, in order: `(method, device)`.
+    static API_CALLS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+    /// An API that answers every call at once and records it: no device or service is reached.
+    fn fake_api(_: &mut sim_api::Session, method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let device = params["device"].as_str().unwrap_or_default().to_owned();
+        API_CALLS.lock().unwrap_or_else(|e| e.into_inner()).push((method.to_owned(), device));
+        Ok(serde_json::Value::Null)
+    }
+
+    /// A Duo fold while that device's CarPlay attaches waits: the attach holds the device's job
+    /// until its call returns, so a second job can't start beside it. Another device folds, by
+    /// the API's `fold` (a stand-in here, so no service is called).
     #[test]
-    fn a_fold_waits_for_the_job_holding_the_busy_slot() {
+    fn a_fold_waits_for_the_job_on_its_device() {
         let mut s = init();
-        s.waker = Some(Arc::new(|| {}));
-        s.busy = Some("Attaching CarPlay…");
-        s.work_done.store(false, Ordering::Relaxed);
-        apple_fold(&mut s, "no-such-device".into(), Posture::Closed);
-        assert_eq!(s.busy, Some("Attaching CarPlay…"));
-        assert!(!s.work_done.load(Ordering::Relaxed), "the attach's completion flag was not reset");
-        s.busy = None;
-        apple_fold(&mut s, "no-such-device".into(), Posture::Closed);
-        assert_eq!(s.busy, Some("Folding…"), "a free slot runs it");
+        s.api = fake_api;
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        assert!(s.run_job("duo", "Attaching CarPlay…", move || gate.recv().map_err(|e| e.to_string())));
+        apple_fold(&mut s, "duo".into(), Posture::Closed);
+        assert_eq!(s.jobs.label("duo"), Some("Attaching CarPlay…"), "the attach keeps the device");
+        assert_eq!(s.status.as_deref(), Some("Wait for Attaching CarPlay… to finish"));
+        apple_fold(&mut s, "other-duo".into(), Posture::Closed);
+        assert_eq!(s.jobs.label("other-duo"), Some("Folding…"), "another device's fold runs");
+        release.send(()).expect("release");
+        finish_jobs(&mut s);
+        let calls = API_CALLS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(calls, [("fold".to_string(), "other-duo".to_string())], "only the other device folded");
+        assert_eq!(s.status.as_deref(), Some("Wait for Attaching CarPlay… to finish"), "and it failed nothing");
+    }
+
+    /// Polls until every job has finished and reported.
+    fn finish_jobs(s: &mut State) {
+        let start = std::time::Instant::now();
+        while s.jobs.any() {
+            for done in s.jobs.finished() {
+                if let Err(e) = done.result {
+                    s.status = Some(format!("{}: {e}", s.device_name(&done.udid)));
+                }
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "the jobs finished");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Boots that wait for their device's gate: `release(udid, result)` ends one. The booted
+    /// devices are recorded in the order they were asked for.
+    type Gate = (String, std::sync::mpsc::Sender<Result<(), String>>);
+
+    #[derive(Clone, Default)]
+    struct FakeBoots {
+        gates: Arc<Mutex<Vec<Gate>>>,
+        booted: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeBoots {
+        fn booter(&self) -> jobs::Booter {
+            let me = self.clone();
+            Arc::new(move |info: &DeviceInfo| -> Option<jobs::Work> {
+                let (tx, rx) = std::sync::mpsc::channel();
+                me.gates.lock().expect("gates").push((info.udid.clone(), tx));
+                me.booted.lock().expect("booted").push(info.udid.clone());
+                Some(Box::new(move || rx.recv().unwrap_or(Ok(()))))
+            })
+        }
+
+        fn release(&self, udid: &str, result: Result<(), String>) {
+            let gates = self.gates.lock().expect("gates");
+            let (_, tx) = gates.iter().find(|(u, _)| u == udid).expect("a boot of it");
+            tx.send(result).expect("release");
+        }
+
+        fn booted(&self) -> Vec<String> {
+            self.booted.lock().expect("booted").clone()
+        }
+    }
+
+    fn admit(_: &mut sim_api::Session, _: &str, _: &serde_json::Value) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({"verdict": "admit"}))
+    }
+
+    fn hold(_: &mut sim_api::Session, _: &str, p: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let n = p["count"].as_u64().unwrap_or(1) as usize;
+        Ok(admission::demo_answer("hold", n, 0, (62.0, 91.0), &["memory: used 91% > 85%"]))
+    }
+
+    /// The demo list, polled as the app runs, with boots that wait for the test and an
+    /// admission check that admits.
+    fn booting_runtime(boots: &FakeBoots, call: admission::Call) -> Runtime<State> {
+        let mut rt = polled_runtime(demo);
+        rt.state.offline_screen = false;
+        rt.state.booter = Some(boots.booter());
+        rt.state.admission = admission::Gate::with_call(call);
+        rt
+    }
+
+    /// Runs frames until `what` holds.
+    fn until(rt: &mut Runtime<State>, what: &str, f: impl Fn(&Runtime<State>) -> bool) {
+        let start = std::time::Instant::now();
+        while !f(rt) {
+            assert!(start.elapsed() < Duration::from_secs(5), "{what}");
+            std::thread::sleep(Duration::from_millis(2));
+            rt.frame(1.0 / 60.0);
+        }
+    }
+
+    fn shown(rt: &Runtime<State>, key: &str) -> Option<String> {
+        rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key)).and_then(|e| e.text.clone())
+    }
+
+    /// #558: booting device A and then selecting shut-down device B shows B as Shutdown, with
+    /// no booting stage and its own Boot button; the sidebar counts A's boot. Selecting A shows
+    /// its boot. A's failure names A.
+    #[test]
+    fn another_devices_boot_is_not_the_selected_devices() {
+        let boots = FakeBoots::default();
+        let mut rt = booting_runtime(&boots, admit);
+        press(&mut rt, "device-B2"); // iPhone 17 Pro Max, shut down: one click boots it
+        assert_eq!(boots.booted(), ["B2"]);
+        assert_eq!(rt.state.selected.as_deref(), Some("B2"));
+        assert_eq!(shown(&rt, "busy").as_deref(), Some("Booting…"));
+        assert!(rt.find("boot-button").is_none());
+        assert!(rt.find("window-busy").is_none(), "the shown device's boot isn't counted beside Refresh");
+        // B: another shut-down device, selected only.
+        let (x, y) = rt.find("device-D4").expect("iPad row");
+        rt.physical_input(rune::PhysicalInput::Modifiers(rune::Mods { alt: true, ..rune::Mods::default() }));
+        rt.frame(1.0 / 60.0);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        rt.physical_input(rune::PhysicalInput::Modifiers(rune::Mods::default()));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.selected.as_deref(), Some("D4"));
+        assert_eq!(boots.booted(), ["B2"], "⌥-click selected without booting");
+        assert!(shown(&rt, "device-title").is_some_and(|t| t.ends_with("· Shutdown")), "{:?}", shown(&rt, "device-title"));
+        assert!(rt.find("busy").is_none(), "no booting indicator on D4");
+        assert!(rt.find("boot-button").is_some(), "D4 can be booted");
+        assert!(rt.find("placeholder").is_some());
+        assert!(rt.elements().iter().all(|e| e.text.as_deref() != Some("Waiting for the device to finish booting…")), "no booting stage");
+        assert_eq!(shown(&rt, "window-busy").as_deref(), Some("1 device booting"));
+        // Back on A: its boot shows.
+        let (x, y) = rt.find("device-B2").expect("B2 row");
+        rt.physical_input(rune::PhysicalInput::Modifiers(rune::Mods { alt: true, ..rune::Mods::default() }));
+        rt.frame(1.0 / 60.0);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        rt.physical_input(rune::PhysicalInput::Modifiers(rune::Mods::default()));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(shown(&rt, "busy").as_deref(), Some("Booting…"));
+        assert!(rt.elements().iter().any(|e| e.text.as_deref() == Some("Waiting for the device to finish booting…")));
+        boots.release("B2", Err("no display".into()));
+        until(&mut rt, "B2's boot reported", |rt| !rt.state.jobs.any());
+        assert_eq!(rt.state.status.as_deref(), Some("iPhone 17 Pro Max: no display"));
+        assert!(rt.find("busy").is_none());
+    }
+
+    /// Two boots at once: each finishes and reports on its own, and the stage follows the one
+    /// selected.
+    #[test]
+    fn two_concurrent_boots_finish_and_report_on_their_own() {
+        let boots = FakeBoots::default();
+        let mut rt = booting_runtime(&boots, admit);
+        press(&mut rt, "device-B2"); // B2
+        press(&mut rt, "device-pixel_fold"); // pixel_fold
+        assert_eq!(boots.booted(), ["B2", "pixel_fold"]);
+        assert!(rt.state.jobs.booting("B2") && rt.state.jobs.booting("pixel_fold"));
+        assert_eq!(shown(&rt, "window-busy").as_deref(), Some("1 device booting"));
+        // Both rows sit under "Booted" while they boot.
+        let order = list::order(&rt.state);
+        assert_eq!(&order[..4], [0, 1, 7, 8], "iPhone 17, B2, pixel_9, pixel_fold");
+        boots.release("pixel_fold", Err("emulator exited".into()));
+        until(&mut rt, "pixel_fold's boot reported", |rt| !rt.state.jobs.booting("pixel_fold"));
+        assert_eq!(rt.state.status.as_deref(), Some("pixel_fold: emulator exited"));
+        assert!(rt.state.jobs.booting("B2"), "B2 still boots");
+        assert!(rt.find("busy").is_none(), "pixel_fold, selected, is done");
+        assert_eq!(shown(&rt, "window-busy").as_deref(), Some("1 device booting"), "B2's");
+        boots.release("B2", Ok(()));
+        until(&mut rt, "B2's boot reported", |rt| !rt.state.jobs.any());
+        assert_eq!(rt.state.status.as_deref(), Some("pixel_fold: emulator exited"), "B2's success says nothing over it");
+        assert!(rt.find("window-busy").is_none());
+    }
+
+    /// One click on a shut-down device goes through admission as the Boot button does: a hold
+    /// shows the sheet and boots nothing until it's answered; Return on a focused row is a click.
+    #[test]
+    fn click_to_boot_goes_through_admission() {
+        let boots = FakeBoots::default();
+        let mut rt = booting_runtime(&boots, hold);
+        press(&mut rt, "device-C3"); // iPhone 18 Pro
+        assert_eq!(rt.state.selected.as_deref(), Some("C3"));
+        assert!(boots.booted().is_empty(), "held: nothing boots yet");
+        let sheet = rt.state.admission.sheet.clone().expect("the sheet asks");
+        assert_eq!(sheet.request.devices, [("C3".to_string(), "iPhone 18 Pro".to_string())]);
+        rt.update(|s, _| admission::choose(s, admission::Choice::BootAnyway));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(boots.booted(), ["C3"]);
+        boots.release("C3", Ok(()));
+        until(&mut rt, "C3 booted", |rt| !rt.state.jobs.any());
+        // Return on a focused shut-down row boots it too (admitted this time).
+        rt.state.admission = admission::Gate::with_call(admit);
+        rt.update(|_, tx| tx.focus("device-E5", false));
+        rt.frame(1.0 / 60.0);
+        rt.key(KeyEvent::from(Key::Enter));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.selected.as_deref(), Some("E5"));
+        assert_eq!(boots.booted(), ["C3", "E5"]);
+        boots.release("E5", Ok(()));
+        until(&mut rt, "E5 booted", |rt| !rt.state.jobs.any());
+    }
+
+    /// #565: a click on the row of a device that's out in its own window and stopped there only
+    /// brings that window forward. It boots nothing: not that device, and not the device the
+    /// main window had selected (the pop-out takes the selection, so a boot of "the selected
+    /// one" would have been that other device's).
+    #[test]
+    fn a_click_on_a_stopped_popped_out_device_boots_nothing() {
+        let boots = FakeBoots::default();
+        let mut rt = booting_runtime(&boots, admit);
+        rt.state.offline_screen = true; // A1's synthetic screen, to pop out
+        rt.state.actions.push(Action::PopOut("A1".into()));
+        for _ in 0..4 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(rt.state.popouts.is_open("A1"));
+        // A1 shuts down elsewhere; its window stays open, stopped.
+        rt.state.devices.iter_mut().filter(|d| d.udid == "A1").for_each(|d| d.state = DeviceState::Shutdown);
+        rt.frame(1.0 / 60.0);
+        // The main window selects shut-down B2 without booting it (⌥-click).
+        let (x, y) = rt.find("device-B2").expect("B2 row");
+        rt.physical_input(rune::PhysicalInput::Modifiers(rune::Mods { alt: true, ..rune::Mods::default() }));
+        rt.frame(1.0 / 60.0);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        rt.physical_input(rune::PhysicalInput::Modifiers(rune::Mods::default()));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.selected.as_deref(), Some("B2"));
+        press(&mut rt, "device-A1");
+        rt.frame(1.0 / 60.0);
+        assert!(boots.booted().is_empty(), "neither A1 nor the selected B2 boots: {:?}", boots.booted());
+        assert_eq!(rt.state.selected.as_deref(), Some("B2"), "A1's window came forward instead");
+        // A Boot names its device: B2's boots B2, whatever is selected.
+        rt.state.selected = Some("C3".into());
+        rt.state.actions.push(Action::Boot("B2".into()));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(boots.booted(), ["B2"]);
+        rt.state.actions.push(Action::Boot("A1".into()));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(boots.booted(), ["B2"], "a device in its own window isn't booted here");
+        assert_eq!(rt.state.status.as_deref(), Some("iPhone 17 is in its own window: close it to boot it here"));
+        boots.release("B2", Ok(()));
+        until(&mut rt, "B2 booted", |rt| !rt.state.jobs.any());
+    }
+
+    /// #565: the search highlight follows its device when the list reorders. ↓ to a shut-down
+    /// match and Return boots it, which moves it under "Booted" above the others; a second
+    /// Return acts on that same device (booting: selected only), not on the match that slid
+    /// into its old place.
+    #[test]
+    fn the_search_highlight_follows_its_device_when_the_list_reorders() {
+        let boots = FakeBoots::default();
+        let mut rt = booting_runtime(&boots, admit);
+        rt.on_key = Some(on_key);
+        rt.key(cmd('k'));
+        for c in "pixel".chars() {
+            rt.key(KeyEvent::from(Key::Text(c.to_string())));
+        }
+        rt.frame(1.0 / 60.0);
+        let before = list::order(&rt.state);
+        assert_eq!(before.len(), 3, "pixel_9 (booted), pixel_fold, pixel_tablet");
+        rt.key(KeyEvent::from(Key::Down));
+        rt.key(KeyEvent::from(Key::Down));
+        rt.frame(1.0 / 60.0);
+        let picked = rt.state.devices[list::highlighted(&rt.state).expect("a match")].udid.clone();
+        assert_eq!(list::highlighted(&rt.state), before.last().copied(), "the last match");
+        rt.key(KeyEvent::from(Key::Enter));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(boots.booted(), std::slice::from_ref(&picked));
+        let after = list::order(&rt.state);
+        assert_ne!(after, before, "the boot moved it up");
+        assert_eq!(rt.state.devices[list::highlighted(&rt.state).expect("a match")].udid, picked, "the highlight went with it");
+        rt.key(KeyEvent::from(Key::Enter));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(boots.booted(), std::slice::from_ref(&picked), "the second Return boots no other device");
+        boots.release(&picked, Ok(()));
+        until(&mut rt, "booted", |rt| !rt.state.jobs.any());
+    }
+
+    /// #565: a focused row is its device's, not its place's: a rescan that lists a new AVD above
+    /// it (a farm lane creating one) leaves Return on the device the user focused.
+    #[test]
+    fn return_on_a_focused_row_boots_its_device_after_a_rescan() {
+        let boots = FakeBoots::default();
+        let mut rt = booting_runtime(&boots, admit);
+        rt.update(|_, tx| tx.focus("device-E5", false));
+        rt.frame(1.0 / 60.0);
+        rt.state.devices.insert(0, android_info("lane-x-1", FormFactor::Phone, "android-36;google_apis", DeviceState::Shutdown));
+        rt.frame(1.0 / 60.0);
+        rt.key(KeyEvent::from(Key::Enter));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(boots.booted(), ["E5"], "the focused Apple Watch boots, not what moved into its index");
+        assert_eq!(rt.state.selected.as_deref(), Some("E5"));
+        boots.release("E5", Ok(()));
+        until(&mut rt, "E5 booted", |rt| !rt.state.jobs.any());
+    }
+
+    /// The search: ⌘K focuses it, typing filters and ranks, ↓ ↑ move through the matches,
+    /// Return boots the highlighted one if it's shut down (⌥Return only selects), Escape clears.
+    #[test]
+    fn the_search_field_filters_and_its_keys_move_and_pick() {
+        let boots = FakeBoots::default();
+        let mut rt = booting_runtime(&boots, admit);
+        rt.on_key = Some(on_key);
+        rt.key(cmd('k'));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.search.focused, "⌘K focuses the search");
+        for c in "17 26.5".chars() {
+            rt.key(KeyEvent::from(Key::Text(c.to_string())));
+        }
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.search.text, "17 26.5");
+        assert_eq!(list::order(&rt.state), [0, 1], "the iPhone 17s on iOS 26.5, the booted one first");
+        assert!(rt.find("device-D4").is_none(), "the rest are hidden");
+        assert_eq!(list::highlighted(&rt.state), Some(0));
+        rt.key(KeyEvent::from(Key::Down));
+        rt.key(KeyEvent::from(Key::Down));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(list::highlighted(&rt.state), Some(1), "↓ stops at the last match");
+        assert_eq!(rt.state.search.text, "17 26.5", "the arrows don't edit the query");
+        rt.key(KeyEvent::from(Key::Up));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(list::highlighted(&rt.state), Some(0));
+        rt.key(KeyEvent::from(Key::Down));
+        rt.key(KeyEvent { key: Key::Enter, mods: rune::Mods { alt: true, ..rune::Mods::default() } });
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.selected.as_deref(), Some("B2"));
+        assert!(boots.booted().is_empty(), "⌥Return selects only");
+        rt.key(KeyEvent::from(Key::Enter));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(boots.booted(), ["B2"], "Return boots the shut-down match");
+        // Typing more starts again at the top.
+        rt.key(KeyEvent::from(Key::Text(" ".into())));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.search_highlight, None);
+        rt.key(KeyEvent::from(Key::Escape));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.search.text, "", "Escape clears");
+        assert!(rt.state.search.focused, "and keeps the field");
+        assert!(rt.find("device-D4").is_some(), "every group is back");
+        rt.key(KeyEvent::from(Key::Escape));
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.search.focused, "Escape on an empty field leaves it");
+        boots.release("B2", Ok(()));
+        until(&mut rt, "B2 booted", |rt| !rt.state.jobs.any());
+    }
+
+    /// ⌘F focuses the search only while the list has focus; elsewhere it's the 3D view's.
+    #[test]
+    fn cmd_f_focuses_the_search_from_the_list() {
+        let mut rt = polled_runtime(demo);
+        rt.on_key = Some(on_key);
+        rt.key(cmd('f'));
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.search.focused, "nothing focused: not the list's");
+        press(&mut rt, "device-A1"); // booted: selected, and the row has focus
+        rt.key(cmd('f'));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.search.focused);
     }
 
     #[test]
@@ -1998,8 +2416,12 @@ mod tests {
         let mut rt = runtime(demo);
         press(&mut rt, "home-button");
         press(&mut rt, "lock-button");
-        press(&mut rt, "device-1");
-        assert_eq!(rt.state.actions, vec![Action::Button(Button::Home), Action::Button(Button::Lock), Action::Select("B2".into())]);
+        press(&mut rt, "device-B2");
+        // B2 is shut down: one click selects and boots it.
+        assert_eq!(
+            rt.state.actions,
+            vec![Action::Button(Button::Home), Action::Button(Button::Lock), Action::Select("B2".into()), Action::Boot("B2".into())]
+        );
     }
 
     #[test]
@@ -2144,16 +2566,16 @@ mod tests {
     fn the_selected_device_is_highlighted() {
         let mut rt = polled_runtime(demo);
         let sel = view::selection(rune::tok::theme(true), true);
-        let (row0, row1) = (element(&rt, "device-0"), element(&rt, "device-1"));
+        let (row0, row1) = (element(&rt, "device-A1"), element(&rt, "device-B2"));
         assert!(row0.item_selected && !row1.item_selected, "only iPhone 17 is selected");
         assert_eq!(row0.fill, sel.fill, "the selected row is tinted");
         assert_ne!(row1.fill, sel.fill);
-        assert_eq!(element(&rt, "device-0-bar").fill, sel.bar, "and marked with the accent bar");
-        assert_eq!(element(&rt, "device-1-bar").fill.a, 0.0, "the bar's slot is empty on the others");
+        assert_eq!(element(&rt, "device-A1-bar").fill, sel.bar, "and marked with the accent bar");
+        assert_eq!(element(&rt, "device-B2-bar").fill.a, 0.0, "the bar's slot is empty on the others");
         // The press's frame asks for the next, whose poll selects.
-        press(&mut rt, "device-1");
+        press(&mut rt, "device-B2");
         rt.frame(1.0 / 60.0);
-        assert!(element(&rt, "device-1").item_selected && !element(&rt, "device-0").item_selected);
+        assert!(element(&rt, "device-B2").item_selected && !element(&rt, "device-A1").item_selected);
     }
 
     /// WCAG contrast of two opaque colours (linear light in, as Rune's colours are).
@@ -2184,12 +2606,12 @@ mod tests {
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.wake_deadline(), None, "a still window sleeps");
         let before = rt.state.selected.clone();
-        for key in ["device-1", "home-button", "overlay-blended-layers", "tab-network", "debug-reload"] {
+        for key in ["device-B2", "home-button", "overlay-blended-layers", "tab-network", "debug-reload"] {
             press(&mut rt, key);
             assert!(rt.state.actions.is_empty(), "{key}: performed in its frame");
             assert_eq!(rt.wake_deadline(), None, "{key}: no wake, the window sleeps");
         }
-        assert!(rt.state.selected.is_some() && rt.state.selected != before, "device-1 was selected in its frame");
+        assert!(rt.state.selected.is_some() && rt.state.selected != before, "device-B2 was selected in its frame");
         let ([x, y, w, h], _) = rt.presented("device-screen").expect("screen drawn");
         rt.pointer_down(x + w * 0.5, y + h * 0.5);
         rt.frame(1.0 / 60.0);

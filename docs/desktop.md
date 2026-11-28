@@ -151,6 +151,37 @@ right-hand panel has five debug tabs (Device, Network, Storage, Processes, Logs)
 stream from the emulator's display socket, and the panel shows the device and its live guest
 console.
 
+## Device list
+
+Booted devices come first, under a "Booted" header above the platform and runtime groups.
+Devices that are booting are listed there too, whether the service says so or a boot started
+from this window is still running (`desktop/src/list.rs`, #565).
+
+The search field at the top of the list filters it fuzzily. ⌘K focuses it from anywhere, and ⌘F
+does too while the list has focus (elsewhere ⌘F flips the 3D view). It matches on the name,
+device type, runtime, platform, sub-platform, form factor, and the AVD name or UDID. Letters may
+be scattered: "pix9" finds `acceptance-pixel-9`, and "17 26.5" finds the iPhone 17s on iOS 26.5.
+Every word of the query has to match. A UDID matches only as a run of its characters. The
+scoring is in `sim_core::fuzzy`. While you type, the groups collapse to the matches, booted
+ones first and then the best matches. ↑ and ↓ move through them, Return acts on the
+highlighted one as a click would (⌥Return selects only), and Escape clears the query. Escape
+again leaves the field.
+
+One click on a shut-down device, or Return on its row, selects it and boots it. The boot goes
+through [admission](#admission-before-a-boot) as the Boot button's does. ⌥-click selects
+without booting.
+
+Boots and other long jobs (shutting down, a Duo fold, CarPlay) belong to their device
+(`desktop/src/jobs.rs`, #558). The stage's "Waiting for the device to finish booting…" and the
+indicator at the top right show only the selected device's job, and each row's mark turns
+while its device has one. Work for the whole window ("Refreshing…") and a count of the other
+devices' jobs ("1 device booting") are shown beside Refresh. Two boots at once each finish, and
+each reports its own failure, named by its device. A device runs one job at a time: a second
+waits, and the status line says so.
+
+The headless scenes `list-booted` (a device booting from here, selected, at the top) and
+`list-search` ("17 26.5" typed, the second match highlighted) show the list.
+
 ## Panes and settings
 
 The device list (left) and the panel (right) each have a drag handle on their inner edge:
