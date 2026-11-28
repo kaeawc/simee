@@ -1,5 +1,6 @@
 //! A running device's network, over its console and adb: the NAT's shaping (`network
-//! speed|delay|status`, which simee's emulator and the stock one answer alike), airplane mode
+//! speed|delay|status`, which simee's emulator and the stock one answer alike, and simee's own
+//! `network loss`, which the stock console doesn't have), airplane mode
 //! (what `network_shape`'s offline is on Android), the guest's open sockets with the process
 //! holding each, and the bytes each app uid moved.
 //!
@@ -86,15 +87,30 @@ impl Device {
     }
 
     /// Sets the NAT's `network speed` and `network delay` (stock's syntax: a preset name,
-    /// `<up>:<down>` kbit/s, `<min>:<max>` ms), those given, in one console session; returns the
-    /// commands sent.
-    pub fn set_network(&self, speed: Option<&str>, delay: Option<&str>) -> Result<Vec<String>, String> {
-        let commands: Vec<String> =
-            speed.map(|s| format!("network speed {s}")).into_iter().chain(delay.map(|d| format!("network delay {d}"))).collect();
+    /// `<up>:<down>` kbit/s, `<min>:<max>` ms) and simee's `network loss` (`<percent>`,
+    /// `<up>:<down>` or `none`), those given, in one console session; returns the commands sent.
+    /// Loss on the stock emulator is refused before anything is sent ([`check_network_loss`](Self::check_network_loss)).
+    pub fn set_network(&self, speed: Option<&str>, delay: Option<&str>, loss: Option<&str>) -> Result<Vec<String>, String> {
+        if loss.is_some() {
+            self.check_network_loss()?;
+        }
+        let commands: Vec<String> = speed
+            .map(|s| format!("network speed {s}"))
+            .into_iter()
+            .chain(delay.map(|d| format!("network delay {d}")))
+            .chain(loss.map(|l| format!("network loss {l}")))
+            .collect();
         if !commands.is_empty() {
             self.console(&commands)?;
         }
         Ok(commands)
+    }
+
+    /// Whether the running device can lose packets: only under simee's emu, whose NAT drops them
+    /// (`network loss`). The stock emulator's console has no loss command, so a device it runs
+    /// gets the reason and what to boot instead.
+    pub fn check_network_loss(&self) -> Result<(), String> {
+        self.running_simee("packet loss (the stock emulator's console has no `network loss`)").map(|_| ())
     }
 }
 
@@ -654,9 +670,14 @@ TrafficController:
 /// Run against `testing`'s fake adb and emulator, which are unix only.
 #[cfg(all(test, unix))]
 mod device_tests {
-    use crate::testing::{fake_adb, fake_emulator};
+    use crate::testing::{fake_adb, fake_emulator, fake_stock_emulator};
 
     fn device(tag: &str) -> (crate::Android, std::path::PathBuf, crate::testing::FakeAdb, crate::testing::FakeEmulator) {
+        device_as(tag, false)
+    }
+
+    /// A booted AVD under simee's emu, or under the stock emulator (`stock`).
+    fn device_as(tag: &str, stock: bool) -> (crate::Android, std::path::PathBuf, crate::testing::FakeAdb, crate::testing::FakeEmulator) {
         let root = std::path::PathBuf::from("/tmp").join(format!("sa-net-{tag}-{}", std::process::id()));
         let image = root.join("sdk/system-images/android-36/google_apis/x86_64");
         std::fs::create_dir_all(&image).expect("image dir");
@@ -666,7 +687,7 @@ mod device_tests {
         android.running_dir = Some(root.join("running"));
         android.create("phone", "system-images;android-36;google_apis;x86_64", None).expect("create");
         let adb = fake_adb(&android);
-        let emulator = fake_emulator(&android, "phone");
+        let emulator = if stock { fake_stock_emulator(&android, "phone") } else { fake_emulator(&android, "phone") };
         (android, root, adb, emulator)
     }
 
@@ -677,15 +698,50 @@ mod device_tests {
         let (unshaped, lines) = d.network_conditions().expect("status");
         assert!(!unshaped.is_shaped());
         assert_eq!(lines[0], "Current network status:");
-        let sent = d.set_network(Some("330:780"), Some("200")).expect("shape");
+        let sent = d.set_network(Some("330:780"), Some("200"), None).expect("shape");
         assert_eq!(sent, ["network speed 330:780", "network delay 200"]);
         let (c, _) = d.network_conditions().expect("status");
         assert_eq!((c.upload_bps, c.download_bps, c.min_latency_ms, c.max_latency_ms), (330_000.0, 780_000.0, 200, 200));
-        assert_eq!(d.set_network(None, None).expect("nothing"), Vec::<String>::new());
-        let err = d.set_network(Some("warp"), None).expect_err("bad speed");
+        assert_eq!(d.set_network(None, None, None).expect("nothing"), Vec::<String>::new());
+        let err = d.set_network(Some("warp"), None, None).expect_err("bad speed");
         assert!(err.contains("invalid <speed>"), "{err}");
         let console = emulator.console.lock().expect("console").clone();
         assert_eq!(console.iter().filter(|c| c.starts_with("network speed") || c.starts_with("network delay")).count(), 3);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// simee's `network loss`, sent with the rest and read back from `network status`.
+    #[test]
+    fn loss_is_set_and_read_back_through_simees_console() {
+        let (android, root, _adb, emulator) = device("loss");
+        let d = android.device("phone").expect("device");
+        assert_eq!(d.check_network_loss(), Ok(()));
+        let sent = d.set_network(None, Some("100"), Some("10")).expect("loss");
+        assert_eq!(sent, ["network delay 100", "network loss 10"]);
+        let (c, lines) = d.network_conditions().expect("status");
+        assert_eq!((c.upload_loss_pct, c.download_loss_pct), (10.0, 10.0));
+        assert!(lines.iter().any(|l| l.trim() == "upload loss:      10 %"), "{lines:?}");
+        assert_eq!(d.set_network(None, None, Some("none")).expect("clear"), ["network loss none"]);
+        let (c, lines) = d.network_conditions().expect("status");
+        assert!(!c.is_lossy() && c.min_latency_ms == 100, "only the loss changed: {c:?}");
+        assert!(!lines.iter().any(|l| l.contains("loss")), "{lines:?}");
+        let err = d.set_network(None, None, Some("lots")).expect_err("bad loss");
+        assert!(err.contains("invalid <loss>"), "{err}");
+        assert_eq!(emulator.console.lock().expect("console").iter().filter(|c| c.starts_with("network loss")).count(), 3);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The stock emulator's console has no loss command: asking for loss there is refused before
+    /// anything is sent, saying why and what to boot instead; speed and delay still work.
+    #[test]
+    fn loss_on_the_stock_emulator_is_refused_with_the_reason() {
+        let (android, root, _adb, emulator) = device_as("stockloss", true);
+        let d = android.device("phone").expect("device");
+        let err = d.check_network_loss().expect_err("stock");
+        assert!(err.contains("stock emulator") && err.contains("no `network loss`") && err.contains("simee boot"), "{err}");
+        assert_eq!(d.set_network(Some("full"), None, Some("10")), Err(err));
+        assert!(emulator.console.lock().expect("console").is_empty(), "nothing was sent");
+        assert_eq!(d.set_network(Some("full"), Some("none"), None).expect("speed"), ["network speed full", "network delay none"]);
         std::fs::remove_dir_all(root).ok();
     }
 

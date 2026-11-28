@@ -44,12 +44,15 @@ const GLOSS: Material = Material { base: [0.012, 0.012, 0.014], specular: 0.55, 
 const DARK_GLASS: Material = Material { base: [0.004, 0.004, 0.005], specular: 0.45, shininess: 140.0, live: false };
 /// The screen in use: its frame, under a faint glass highlight.
 const LIVE_GLASS: Material = Material { base: [0.0; 3], specular: 0.18, shininess: 160.0, live: true };
+/// Matte elastomer: straps, a light seal, a dash surround.
+const MATTE: Material = Material { base: [0.03, 0.031, 0.034], specular: 0.06, shininess: 8.0, live: false };
 
 /// The material for a part with `role`, when `live` is the screen showing the device's frame.
 pub fn material(role: Role, live: Display) -> Material {
     match role {
-        Role::Shell | Role::Button | Role::Crown => SHELL,
-        Role::Bump | Role::Cutout => GLOSS,
+        Role::Shell | Role::Button | Role::Crown | Role::Stand | Role::Knob => SHELL,
+        Role::Strap | Role::Trim => MATTE,
+        Role::Bump | Role::Cutout | Role::Lens => GLOSS,
         Role::Screen(d) if d == live => LIVE_GLASS,
         Role::Screen(_) => DARK_GLASS,
     }
@@ -98,5 +101,15 @@ mod tests {
         assert!(!material(Role::Screen(Display::Outer), Display::Inner).live);
         assert!(!material(Role::Shell, Display::Main).live);
         assert_eq!(material(Role::Button, Display::Main), material(Role::Shell, Display::Main));
+    }
+
+    #[test]
+    fn extra_blocks_are_solid_finishes() {
+        for role in [Role::Trim, Role::Strap, Role::Stand, Role::Knob, Role::Lens] {
+            assert!(!material(role, Display::Main).live, "{role:?}");
+        }
+        assert_eq!(material(Role::Strap, Display::Main), material(Role::Trim, Display::Main));
+        assert_ne!(material(Role::Strap, Display::Main), material(Role::Shell, Display::Main), "a strap is matte");
+        assert_eq!(material(Role::Lens, Display::Main), material(Role::Bump, Display::Main), "a lens is glass");
     }
 }

@@ -1521,6 +1521,23 @@ mod tests {
         assert_eq!(g.credit(adb), BUF_ALLOC);
     }
 
+    /// `network loss` is the NAT's, and adb rides vsock outside it. The control: a NAT at 100%
+    /// loss does lose a ping, so the loss is live. Then adb's channel carries bytes both ways.
+    /// adb has no path through the NAT, so a change that sent it through would stall here.
+    #[cfg(unix)]
+    #[test]
+    fn adb_loses_nothing_while_the_nat_drops_every_packet() {
+        assert!(crate::net::tests::full_loss_drops_a_ping(), "the NAT at 100% loss must lose a ping");
+        let (mut g, mut client, adb) = adb_guest();
+        client.write_all(b"CNXN").expect("write");
+        assert_eq!(g.recv_on(adb).1, b"CNXN", "host to guest");
+        g.send(OP_RW, adb.0, adb.1, b"AUTH");
+        client.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+        let mut b = [0u8; 4];
+        client.read_exact(&mut b).expect("guest to host");
+        assert_eq!(&b, b"AUTH");
+    }
+
     #[test]
     fn a_guest_pipe_connects_names_its_service_and_echoes() {
         let mut g = guest();
