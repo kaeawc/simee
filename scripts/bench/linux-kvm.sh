@@ -39,7 +39,6 @@ settle=60
 window=60
 shots=30
 dry=0
-gate=1
 BENCH_ROUNDS=5
 while [ $# -gt 0 ]; do
   case $1 in
@@ -71,11 +70,6 @@ while [ $# -gt 0 ]; do
       dry=1
       shift
       ;;
-    --no-quiet-gate)
-      # Handled here so the script also runs on a lib.sh that doesn't know the option.
-      gate=0
-      shift
-      ;;
     *)
       bench_opt "$@"
       shift "$BENCH_SHIFT"
@@ -92,8 +86,6 @@ for v in port settle window shots; do
 done
 [ "$port" -ge 5700 ] || bench_die "--port $port: benchmarks use ports 5700 and up"
 bench_refuse_protected_port "$port"
-# shellcheck disable=SC2034 # read by lib.sh
-[ "$gate" = 1 ] || BENCH_QUIET_GATE=0
 
 if [ "$dry" = 1 ]; then
   cat <<EOF
@@ -103,7 +95,7 @@ linux-kvm.sh plan (dry run: nothing is built, created or booted)
   ports         console $port, adb $((port + 1))
   rounds        $BENCH_ROUNDS
   accel         -accel on (KVM or fail)
-  quiet gate    $([ "$gate" = 1 ] && echo "on (scripts/bench/quiet.sh, when present)" || echo "off (--no-quiet-gate): load is recorded, not gated")
+  quiet gate    $([ "$BENCH_QUIET_GATE" = 1 ] && echo "on (scripts/bench/quiet.sh, when present)" || echo "off (--no-quiet-gate): load is recorded, not gated")
   each round    1. cold boot to sys.boot_completed (adb listing time, peak RSS)
                 2. stop, warm boot of the same AVD (same two times)
                 3. settle ${settle} s, then RSS and PSS of the process tree
@@ -197,7 +189,7 @@ time_calls() {
 # One boot, with `-accel on`; records its two times and peak RSS under PHASE. Returns 1 on no boot.
 boot() {
   local avd=$1 phase=$2
-  if ! android_boot emu "$avd" "$port" "$BENCH_WORK/$phase-$BENCH_ROUND.log" -accel on; then
+  if ! android_boot "emu${EMU_QEMU:+:EMU_QEMU=$EMU_QEMU}" "$avd" "$port" "$BENCH_WORK/$phase-$BENCH_ROUND.log" -accel on; then
     bench_sample "$label" "$phase boot: launch until sys.boot_completed, s" failed
     android_stop "$BOOT_PID" "$port"
     return 1
@@ -269,4 +261,24 @@ EOF
     printf '%s\n' "$table"
   } >"$BENCH_OUT/linux-kvm-summary.md"
   bench_log "result: $result"
+fi
+
+# A run that measured nothing must not look green: every metric needs a number from at least one
+# round (a failed or empty cell is not one), and some boot must have succeeded.
+missing=()
+while IFS= read -r metric; do
+  awk -F'\t' -v m="$metric" '$3 == m && $4 ~ /^-?[0-9.]+$/ { ok = 1 } END { exit !ok }' "$BENCH_SAMPLES" || missing+=("$metric")
+done <<EOF2
+cold boot: launch until sys.boot_completed, s
+warm boot: launch until sys.boot_completed, s
+memory: RSS of the process tree, MB
+memory: PSS of the process tree, MB
+idle host CPU over ${window} s, % of one core
+screenshot via simee: p50, ms
+screenshot via adb: p50, ms
+frame time p50, ms
+EOF2
+if [ ${#missing[@]} -gt 0 ]; then
+  printf 'linux-kvm.sh: no sample in any round for: %s\n' "${missing[@]}" >&2
+  exit 1
 fi

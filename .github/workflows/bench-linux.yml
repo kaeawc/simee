@@ -117,7 +117,10 @@ jobs:
         if: always()
         run: |
           shopt -s nullglob
-          files=(bench/results/linux-kvm-*.json)
+          files=()
+          for f in bench/results/linux-kvm-*.json; do
+            case "$f" in *.host.json) ;; *) files+=("$f") ;; esac
+          done
           [ "${#files[@]}" -gt 0 ] || exit 0
           python3 -I - "${files[0]}" >> "$GITHUB_STEP_SUMMARY" <<'EOF'
           import json, sys
