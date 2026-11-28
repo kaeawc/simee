@@ -303,23 +303,24 @@ emu -avd phone -accel off   # TCG even where /dev/kvm is usable (-accel on: KVM 
 - **The software-lite profile** (`emu -create-avd NAME -sysdir system-images/android-36/default/x86_64
   -profile software-lite`, also with `-provision … -create-avd`): a 540x960 screen at 240 dpi and
   `hw.lcd.vsync=30` together, for hosts where the guest and SwiftShader share a few cores. Measured
-  against the default 720x1280 at 60 Hz on one 4-vCPU host (2026-11-27, median of 3 warm boots
+  against the default 720x1280 at 60 Hz on one 4-vCPU host (2026-11-28, median of 3 warm boots
   each, [benchmarks](benchmarks.md#software-mode-a-smaller-screen-and-30-hz)):
 
   | | default | software-lite |
   | --- | --- | --- |
-  | Idle host CPU | 0.68 cores | 0.46 |
-  | Host CPU while swiping | 2.41 cores | 1.99 |
-  | Launcher frames in 20 swipes, warm / cold | 188 / 108 | 193 / 127 |
-  | p90 frame time | 350 ms | 200 ms |
-  | Warm boot to `sys.boot_completed` | 174.0 s | 165.0 s (inside the boot-to-boot spread) |
-  | Memory (PSS) | 2356 MB | 2309 MB (no real change) |
+  | Idle host CPU | 0.59 cores | 0.53 (30 Hz alone: 0.49) |
+  | Host CPU while swiping | 2.43 cores | 2.01 (the screen alone: 2.15) |
+  | Launcher frames in 20 swipes, warm / cold | 185 / 121 | 185 / 118 (the same) |
+  | p90 frame time | 300 ms | 200 ms |
+  | Warm boot to `sys.boot_completed` | 169.8 s | 181.9 s (spreads overlap) |
+  | Memory (PSS) | 2868 MB | 2828 MB (no real change) |
 
-  The two halves nearly add on CPU: the screen alone settles 0.11 cores lower, 30 Hz alone 0.15.
-  The profile saves CPU and frame time, not boot time or memory, and it is opt-in because apps
-  see the smaller, slower display; a default AVD stays 720x1280 at 60 Hz. It applies to phone
-  images only (the other form factors have screens of their own and are refused), RAM and vCPUs
-  stay as `-memory` and `-cores` say, and an explicit `-lcd` wins over its screen. An image's
+  The two halves do not add: 30 Hz is what lowers the idle cost and the smaller screen is what
+  lowers the swiping cost and frame times, and the profile gets about a tenth less idle CPU and
+  about 17% less swiping CPU, with no more frames and no faster boot or less memory. It is
+  opt-in because apps see the smaller, slower display; a default AVD stays 720x1280 at 60 Hz. It
+  applies to phone images only (the other form factors have screens of their own and are refused),
+  RAM and vCPUs stay as `-memory` and `-cores` say, and an explicit `-lcd` wins over its screen. An image's
   golden user data is keyed by screen size, so the first software-lite AVD of an image boots once
   to settle its own golden. `scripts/bench/software-profile.sh` reproduces the table.
 - **KFENCE sampling off** (`kfence.sample_interval=0` on the x86 board's command line). These
